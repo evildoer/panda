@@ -1641,7 +1641,12 @@ async function sweepNicks (server)
             // [FIX v2.3.2] VoiceState несёт member из гейтвея (vs.member) даже без
             // GuildMembers-интента; fetch по id нужен только как страховка.
             // (vs.user_id -- сырого API-поля в v14 нет, fetch(undefined) вечно падал):
-            let member = vs.member || await guild.members.fetch (vs.id).catch (() => null);
+            // [FIX v2.3.6] ник берём СВЕЖИМ: без GuildMembers-интента бот не получает
+            // события GUILD_MEMBER_UPDATE (смена ника), кэш знает ник старым --
+            // самодрисованный ключ для свипа невидим (срабатывал только войс-статус).
+            // REST fetch всегда возвращает актуальные данные:
+            let member = await guild.members.fetch (vs.id).catch (() => null)
+                             || vs.member;
             if (!member || member.user.bot) continue;
             checked++;
             let nick = member.nickname || member.user.username;
