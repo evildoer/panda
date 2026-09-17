@@ -539,9 +539,22 @@ async function modNick (server, member/*, add = false*/)
     const tag = '🔑'; // 🔴
     if (SERVERS[server].addTag || false)
     {
-        if (!member.user.bot && !isStaff (server, member)) // [v2.2.3] тег -- ЛЮБОМУ с правами в канале (в т.ч. админам/модерам; раньше они пропускались -- регрессия); [v2.3.4] НО роли ADM/MOD -- не трогаем вообще (ни +, ни -)
+        if (!member.user.bot) // [v2.2.3] тег -- ЛЮБОМУ с правами в канале
         {
             let nick = member.nickname || member.user.username;
+            // [v2.3.5] СМЫСЛ КЛЮЧА: гарантия «права в канале 100%» для обычных участников.
+            // ADM/MOD -- исключение: права у них и так всегда есть, и все свои это знают,
+            // поэтому ключа у staff быть НЕ должно -- даже самодрисованный бот удаляет:
+            if (isStaff (server, member))
+            {
+                if (nick.startsWith (tag))
+                {
+                    console.log ('[' + (d()) + '] [nick] -🔑 (staff) ' + member.user.username);
+                    await member.setNickname (nick.slice (tag.length))
+                        .catch (e => console.error ('[nick] error on setNickname: ' + e.message));
+                }
+                return;
+            }
             if
             (
                 member.voice.channel &&
@@ -1630,12 +1643,21 @@ async function sweepNicks (server)
             // (vs.user_id -- сырого API-поля в v14 нет, fetch(undefined) вечно падал):
             let member = vs.member || await guild.members.fetch (vs.id).catch (() => null);
             if (!member || member.user.bot) continue;
-            if (isStaff (server, member)) continue; // [v2.3.4] ADM/MOD -- ключ не трогаем (даже самопоставленный)
             checked++;
             let nick = member.nickname || member.user.username;
             // [FIX v2.3.3] charCodeAt (0xD83D) ловит ЛЮБОЙ эмодзи в начале ника
             // (💙, 🔊...) и свип срезал их, думая что это ключ. Точная проверка:
             let hasTag = nick.startsWith ('🔑'); // 🔑
+            // [v2.3.5] ADM/MOD: ключ = права для обычных, у staff его быть не должно --
+            // даже самодрисованный удаляем (и это единственное, что бот делает с их никами):
+            if (isStaff (server, member))
+            {
+                if (hasTag)
+                    await member.setNickname (nick.slice (tag.length))
+                        .then (() => { removed++; console.log ('[' + (d()) + '] [nick] -🔑 (staff) ' + member.user.username); })
+                        .catch (e => console.error ('[nick][sweep] error for ' + member.user.username + ': ' + e.message));
+                continue;
+            }
             if (hasRights && !hasTag)
                 await member.setNickname (tag + nick)
                     .then (() => { added++; console.log ('[' + (d()) + '] [nick] +🔑 (sweep) ' + member.user.username + ' in ' + channel.name); })
