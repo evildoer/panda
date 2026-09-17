@@ -5,6 +5,7 @@
   "ERROR":  true,
   "NOTICE": true,
   "DEBUG":  false,
+  "MESSAGE_CONTENT": true,
   "STARTUP_DM": ["247110936115150848"],
   "SERVERS":
   {

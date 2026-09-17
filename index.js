@@ -16,6 +16,14 @@
 //   * channelCreate/channelUpdate: в v14 каналы приходят без guild -> берём через .guild ?? client.guilds.cache.get
 //   * [FIX v2] NaN-баг в логе переименования: скобки вокруг 'Владельцы канала: ' + (owners.size ? ... : ...)
 //   * [FIX v2] e.message там, где e не существует (users.fetch .catch(() => null))
+// CHANGELOG v2.5 (пересылка из пандалогии + текст команд):
+//   * ИНТЕНТ Message Content теперь запрашивается (в портале приложения он ВКЛЮЧЁН).
+//     Без него Discord отдаёт события без текста (content пустой) -- поэтому НЕ работали
+//     ни пересылка из пандалогии в чат, ни текстовые команды 'panda ...'.
+//   * Если Discord интент не даст (после 09.10.2026 без одобрения) -- бот сам
+//     запустится БЕЗ него и напишет об этом в лог (деградация вместо падения).
+//   * Пересылка: сперва отправка, потом удаление оригинала (иначе при ошибке
+//     отправки сообщение терялось). Пустое сообщение больше НЕ удаляется.
 // CHANGELOG v2.1 (работа БЕЗ привилегированных интентов -- заявку Discord подавать не надо!):
 //   * интент GuildMembers УБРАН (привилегированный; после 09.10.2026 без одобрения
 //     бот не запустился бы). Вход/выход участников ловим REST-поллингом
@@ -40,9 +48,15 @@ const
 {
     ID, TOKEN, PREFIX, SERVERS,
     ERROR, DEBUG, NOTICE, STARTUP_DM,
+    MESSAGE_CONTENT,
 }
 = require ('./config.json');
 const space = ' ';
+
+// [v2.5] Привилегированный интент Message Content (в портале приложения включён).
+// Он нужен двум вещам: пересылке из пандалогии и текстовым командам 'panda ...'.
+// Поставь в config.json "MESSAGE_CONTENT": false -- если Discord его отзовёт.
+const USE_MESSAGE_CONTENT = MESSAGE_CONTENT !== false;
 
 // [v2.2] Инструкция по использованию -- рассылается в ЛС при каждом старте бота:
 const STARTUP_DM_TEXT =
@@ -80,19 +94,26 @@ const
 // [v2.1] GuildMembers интент УБРАН -- он привилегированный, без одобрения Discord
 // бот после 09.10.2026 просто не запустился бы ('Used disallowed intents').
 // Вход/выход участников теперь ловим БЕЗ интента -- REST-поллингом (см. pollMembers).
+const INTENTS =
+[
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildBans,
+    GatewayIntentBits.GuildModeration, // [v2.4] журнал аудита: авторство мутов/переносов. НЕ привилегированный -- одобрения Discord не требует
+    GatewayIntentBits.GuildMessages,
+    // GatewayIntentBits.GuildPresences,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.DirectMessages,
+];
+// [v2.5] ТЕКСТ сообщений: без этого интента Discord присылает события с пустым content
+// (пересылка из пандалогии и команды 'panda ...' молчат). Интент привилегированный,
+// но в портале приложения Peka он включён -- заявку подавать не надо (проверено).
+if (USE_MESSAGE_CONTENT)
+    INTENTS.push (GatewayIntentBits.MessageContent);
+
 const client = new Client
 (
     {
-        intents:
-        [
-            GatewayIntentBits.Guilds,
-            GatewayIntentBits.GuildBans,
-            GatewayIntentBits.GuildModeration, // [v2.4] журнал аудита: авторство мутов/переносов. НЕ привилегированный -- одобрения Discord не требует
-            GatewayIntentBits.GuildMessages,
-            // GatewayIntentBits.GuildPresences,
-            GatewayIntentBits.GuildVoiceStates,
-            GatewayIntentBits.DirectMessages,
-        ],
+        intents: INTENTS,
         partials:
         [
             Partials.Channel, // DM-каналы не кэшируются без этого [v14]
@@ -153,9 +174,56 @@ async function db (server, namespace, id, value = undefined, item = undefined)
 process.on ('unhandledRejection', e => console.error ('[' + (d()) + '] [unhandledRejection] ' + String ((e && e.message) || e).slice (0, 300)));
 process.on ('uncaughtException',  e => console.error ('[' + (d()) + '] [uncaughtException] '  + String ((e && e.message) || e).slice (0, 300)));
 
+// [v2.5] Discord отдаёт текст сообщений только с интентом Message Content. Если он
+// отзовёт доступ (заявка не одобрена до 09.10.2026) -- бот всё равно ЗАПУСТИТСЯ,
+// просто без пересылки и команд 'panda ...'. Проверяем это заранее через REST и
+// переподключаемся без интента, если Discord его не даёт ('Used disallowed intents').
+async function messageContentAllowed ()
+{
+    try
+    {
+        const r = await fetch
+        (
+            'https://discord.com/api/v10/applications/@me',
+            {headers: {Authorization: 'Bot ' + TOKEN}, signal: AbortSignal.timeout (5000)}
+        );
+        if (!r.ok) return true; // не смогли проверить -- пробуем с интентом (fallback ниже)
+        const app = await r.json();
+        // GATEWAY_MESSAGE_CONTENT (1<<18) / GATEWAY_MESSAGE_CONTENT_LIMITED (1<<19):
+        return Boolean (app.flags & ((1 << 18) | (1 << 19)));
+    }
+    catch (e) { return true; }
+}
+
 // Heavy GO! +D
 // here you go...
-client.login (TOKEN).catch (e => console.error ('[login] error: ' + e.message));
+(async () =>
+{
+    if (USE_MESSAGE_CONTENT && !(await messageContentAllowed ()))
+    {
+        console.error ('[' + (d()) + '] [login] Message Content у приложения ОТКЛЮЧЁН -- запускаю без него' +
+            ' (пересылка из пандалогии и команды "panda ..." работать не будут)');
+        client.options.intents.remove (GatewayIntentBits.MessageContent);
+    }
+    if (!client.options.intents.has (GatewayIntentBits.MessageContent))
+        console.log ('[' + (d()) + '] [login] без интента Message Content: текст сообщений недоступен');
+    try
+    {
+        await client.login (TOKEN);
+    }
+    catch (e)
+    {
+        const msg = String ((e && e.message) || e);
+        if (/disallowed intent/i.test (msg) && client.options.intents.has (GatewayIntentBits.MessageContent))
+        {
+            console.error ('[' + (d()) + '] [login] Discord запретил Message Content -- переподключаюсь без него');
+            client.options.intents.remove (GatewayIntentBits.MessageContent);
+            await client.login (TOKEN).catch (e2 => console.error ('[login] error: ' + ((e2 && e2.message) || e2)));
+        }
+        else
+            console.error ('[login] error: ' + msg);
+    }
+})();
 
 client.on
 (
@@ -287,7 +355,7 @@ function attachOf (message)
 }
 
 // (node:16096) DeprecationWarning: The message event is deprecated. Use messageCreate instead
-client.on ('messageCreate', message =>
+client.on ('messageCreate', async message =>
 {
     // [IMPORTANT] context of the message...
     if (message.author.bot) return; // from Bot!
@@ -345,33 +413,66 @@ client.on ('messageCreate', message =>
             // command message send to {another} server channel!
             if (message.channel.id === _pipe_channel_source)
             {
-                /* delete source & send message */
-                message.channel.bulkDelete(1);
-                let attach = attachOf (message);
-                // [v14] channels.resolve теперь асинхронный -- берём из кэша:
-                let pipe_channel_target =
-                    client.channels.cache.get
-                        (_pipe_channel_target);
+                /* [v2.5] Пересылка источник -> приёмник ОТ ИМЕНИ БОТА.
+                   Важен порядок: сперва ОТПРАВКА, только потом удаление оригинала --
+                   иначе при любой ошибке отправки сообщение теряется навсегда. */
+                const attach = attachOf (message);
+                const text  = message.content ? message.content : '';
+                const files = attach.files ? attach.files.size : 0;
+                if (!text && !files)
+                {
+                    // Текст сюда попадает только с интентом Message Content: без него Discord
+                    // присылает событие с пустым content. Удалять такое НЕЛЬЗЯ -- потеряем сообщение.
+                    console.log
+                    (
+                        '[' + (d()) + '] [pipe] сообщение от ' + message.author.username +
+                        ' НЕ переслано: Discord не отдал ни текст, ни файлы' +
+                        ' (нужен интент Message Content -- см. config.json / README)'
+                    );
+                    return;
+                }
+                // [v14] channels.resolve асинхронный: сперва кэш, затем запрос к Discord:
+                let pipe_channel_target = client.channels.cache.get (_pipe_channel_target);
+                if (!pipe_channel_target)
+                    pipe_channel_target = await client.channels.fetch (_pipe_channel_target).catch (() => null);
                 if (pipe_channel_target) // check!
                 {
                     pipe_channel_target.send
                     (
                         {
-                            content: message.content
-                                ? message.content
+                            content: text
+                                ? text
                                 : undefined,
                             ...attach // || {}
                         }
                     )
-                    .catch (console.error);
-                    console.log
+                    .then
                     (
-                        '[' + (d()) + '] ' +
-                        'message from bot (by ' + message.author.username + '): ' +
+                        () =>
+                        {
+                            console.log
+                            (
+                                '[' + (d()) + '] [pipe] ' +
+                                'message from bot (by ' + message.author.username + '): ' +
+                                (
+                                    text
+                                        ? '"' + text + '"' + (files ? ' + <ATTACH>' : '')
+                                        : '<ATTACH>'
+                                )
+                            );
+                            // оригинал убираем ТОЛЬКО после успешной пересылки:
+                            return message.delete ().catch
+                            (
+                                e => console.error ('[' + (d()) + '] [pipe] не смог удалить оригинал: ' + e.message)
+                            );
+                        }
+                    )
+                    .catch
+                    (
+                        e => console.error
                         (
-                            message.content
-                                ? '"' + message.content + '"' + (attach.files.length ? ' + <ATTACH>' : '')
-                                : '<ATTACH>'
+                            '[' + (d()) + '] [pipe] НЕ переслано (' + e.message +
+                            ') -- сообщение оставлено в источнике'
                         )
                     );
                 }
@@ -383,8 +484,8 @@ client.on ('messageCreate', message =>
                         '[_CHANNEL_NOT_FOUND_] ' +
                         'message from bot (by ' + message.author.username + '): ' +
                         (
-                            message.content
-                                ? '"' + message.content + '"' + (attach.files.length ? ' + <ATTACH>' : '')
+                            text
+                                ? '"' + text + '"' + (files ? ' + <ATTACH>' : '')
                                 : '<ATTACH>'
                         )
                     );
