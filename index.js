@@ -1672,7 +1672,8 @@ async function sweepNicks (server)
                     .then (() => { removed++; console.log ('[' + (d()) + '] [nick] -🔑 (sweep) ' + member.user.username); })
                     .catch (e => console.error ('[nick][sweep] error for ' + member.user.username + ': ' + e.message));
         }
-        if (checked > 0 && (added > 0 || removed > 0))
+        // [v2.4] итог свипа -- только в DEBUG (периодический шум в логе ни к чему):
+        if (DEBUG && checked > 0 && (added > 0 || removed > 0))
             console.log ('[' + (d()) + '] [nick][sweep] проверено ' + checked + ' в голосе: +' + added + '/-' + removed + ' ключей');
     }
     catch (e)
