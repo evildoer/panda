@@ -6,15 +6,15 @@
   "NOTICE": true,
   "DEBUG":  false,
   "MESSAGE_CONTENT": true,
-  "STARTUP_DM": ["247110936115150848"],
+  "STARTUP_DM": ["ID_ПОЛЬЗОВАТЕЛЯ_1", "ID_ПОЛЬЗОВАТЕЛЯ_2"],
   "SERVERS":
   {
-    "470047648112705546":
+    "ID_СЕРВЕРА":
     {
       "allow": true,
-      "name": "🐼PANDAMIA🐼",
+      "name": "НАЗВАНИЕ_СЕРВЕРА",
       "logo": "images/pandamia.png",
-      "admins": ["247110936115150848"],
+      "admins": ["ID_АДМИНА"],
       "log_channel": "ID_КАНАЛА_ЖУРНАЛА",
       "log_channel_temp": "ID_ВРЕМЕННОГО_КАНАЛА",
       "pipe_channel_source": "ID_КАНАЛА_ИСТОЧНИКА",

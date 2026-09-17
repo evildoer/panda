@@ -58,6 +58,13 @@ const space = ' ';
 // Поставь в config.json "MESSAGE_CONTENT": false -- если Discord его отзовёт.
 const USE_MESSAGE_CONTENT = MESSAGE_CONTENT !== false;
 
+// [v2.5] «Владелец» для текста помощи -- первый id из STARTUP_DM (config.json).
+// Зашитых id в коде быть не должно: репозиторий отдаётся людям как есть.
+const OWNER_ID =
+    (Array.isArray (STARTUP_DM) && /^\d{17,20}$/.test (STARTUP_DM[0] || ''))
+        ? STARTUP_DM[0]
+        : '';
+
 // [v2.2] Инструкция по использованию -- рассылается в ЛС при каждом старте бота:
 const STARTUP_DM_TEXT =
     '**Как пользоваться ботом** 🐼\n' +
@@ -72,13 +79,14 @@ const STARTUP_DM_TEXT =
     '`panda ping` -- проверка связи (ответ: pong)\n' +
     '`panda file` + вложение -- бот вернёт файл обратно\n' +
     '`panda dm @юзер текст` -- ЛС от имени бота (только админы)\n' +
+    '`panda test` -- бот напишет тебе в личку (проверка ЛС)\n' +
     '\n' +
     '🛡️ **Что бот делает сам:**\n' +
     '• мут/глухота в чужих каналах; жалоба -- зайди в общий канал 🆘\n' +
     '• выдаёт права владельцу канала и ставит тег 🔑 в ник\n' +
     '• бан на 20 минут за выход с сервера (таймаут на перезаход)\n' +
     '\n' +
-    '🖥️ **Если бот выключен** -- напиши владельцу: <@!247110936115150848>';
+    '🖥️ **Если бот выключен** -- напиши ' + (OWNER_ID ? u (OWNER_ID) : 'владельцу сервера') + '.';
 
 const
 {
@@ -363,6 +371,35 @@ function attachOf (message)
     };
 }
 
+// [v2.5] Разбор `panda dm`: кому -- упоминание ИЛИ просто id (17-20 цифр).
+// Раньше целью было ТОЛЬКО упоминание, поэтому `panda dm 247110936115150848 текст`
+// молча ничего не делал (а команда при этом удалялась).
+// Возвращает { id, letter }: id может быть null (кому -- не поняли).
+function dmParse (content, mentions)
+{
+    let rest = content.slice ((PREFIX + 'dm').length);
+    let id = null;
+    let mentioned = mentions.users.first () || null;
+    if (mentioned)
+    {
+        id = mentioned.id;
+        // Упоминание в тексте приходит в двух формах: <@id> и <@!id> -- срезаем любую
+        // (в старой версии срезалась только <@!id>, и в ЛС уезжал мусор вроде <@123>):
+        rest = rest.replace (new RegExp ('<@!?' + id + '>', 'g'), '');
+    }
+    else
+    {
+        // <@id> / <@!id> / голый id первым словом:
+        let m = rest.match (/^\s*(?:<@!?(\d{17,20})>|(\d{17,20})(?!\d))/);
+        if (m)
+        {
+            id = m[1] || m[2];
+            rest = rest.slice (m[0].length);
+        }
+    }
+    return { id: id, letter: rest.trim () };
+}
+
 // (node:16096) DeprecationWarning: The message event is deprecated. Use messageCreate instead
 client.on ('messageCreate', async message =>
 {
@@ -387,28 +424,24 @@ client.on ('messageCreate', async message =>
             //message.reply ('Pika!');
         }
 
-        // command 'test' ## Test POWER Function! >D
+        // command 'test' ## [v2.5] Самопроверка ЛС.
+        // Раньше тут был зашит один uid (остался от тестов на себе) и красный эмбед
+        // «оппозиция» -- команда писала ЕМУ, а не тому, кто её вызвал. Теперь -- вызывающему.
         if (message.content.startsWith (PREFIX + 'test'))
         {
-            // to User (DM):
-            const lapulya = '247110936115150848';//uid
-            // v14: users.fetch с одним аргументом (cache/force убраны); resolve -> кэш:
-            let destination = client.users.cache.get (lapulya);
-            // sending...
-            if (destination)
-                destination.send
+            message.author.send ({ content: 'pong 🐼 ЛС работают.' })
+            .then
+            (
+                () => console.log ('[' + (d()) + '] [dm] self-test -> ' + message.author.username + ' OK')
+            )
+            .catch
+            (
+                e => console.error
                 (
-                    {
-                        embeds:
-                        [
-                            {
-                                color: 0xFF0000, // 'RED',
-                                description: `${destination}` + ', вам ограниченно общение в канале `оппозиция` 😉',
-                            }
-                        ],
-                    }
+                    '[' + (d()) + '] [dm] self-test -> ' + message.author.username +
+                    ': ЛС не ушло (' + e.message + ')'
                 )
-                .catch (console.error);
+            );
         }
     }
     if (message.channel.type === ChannelType.GuildText)
@@ -556,47 +589,101 @@ client.on ('messageCreate', async message =>
                 // command 'dm' ## DM to specific @user...
                 else if (message.content.startsWith (PREFIX + 'dm'))
                 {
-                    let admin = message.member._roles.includes (SERVERS[server].role_admin);
-                    if (admin)
+                    // [v2.5] Раньше было три ловушки: цель только упоминанием (голый id
+                    // игнорировался), команда удалялась ДО отправки (bulkDelete) и пользователь
+                    // искался ТОЛЬКО в кэше -- если его там нет, ЛС не уходило без единой
+                    // строки в логе. Теперь: удаляем команду ТОЛЬКО после успешной отправки.
+                    let is_admin = !!message.member && !!SERVERS[server].role_admin &&
+                        message.member._roles.includes (SERVERS[server].role_admin);
+                    const { id, letter } = dmParse (message.content, message.mentions);
+                    const attach = attachOf (message);
+                    if (!is_admin)
                     {
-                        message.channel.bulkDelete(1); // Tss... ;]
-                        // https://discordjs.guide/miscellaneous/parsing-mention-arguments.html#how-discord-mentions-work
-                        let mention = message.mentions.users.first();
-                        if (mention) // <@!696094527328616569>
-                        {
-                            let letter = message.content.slice
-                            (
-                                (PREFIX + 'dm').length
-                            )
-                            .replace
-                            (
-                                u (mention.id),  // <@!...> // !
-                                    '' // <--|
-                            )
-                            .trim();
-                            let attach = attachOf (message);
-                            if (letter || attach.files.length)
+                        console.log
+                        (
+                            '[' + (d()) + '] [dm] отказано: ' +
+                            (message.member ? uuu (message.member) : message.author.username) +
+                            ' -- нет роли админа'
+                        );
+                    }
+                    else if (!id)
+                    {
+                        message.channel.send
+                        (
                             {
-                                mention.send ({content: letter ? letter : undefined, ...attach})
-                                .catch (console.error);
-                                console.log
-                                (
-                                    '[' + (d()) + '] ' +
-                                        'DM from ' + message.author.username + ' to ' + mention.username + ': ' +
-                                        (
-                                            letter
-                                                ? '"' + letter + '"' + (attach.files.length ? ' + <ATTACH>' : '')
-                                                : '<ATTACH>' // we have an empty message content... // ;)
-                                        )
-                                );
+                                content: '🤔 Кому? `panda dm @юзер текст` ' +
+                                    'или `panda dm 247110936115150848 текст`'
                             }
+                        )
+                        .catch (console.error);
+                    }
+                    else if (!letter && !attach.files.length)
+                    {
+                        message.channel.send
+                        (
+                            { content: '🤔 Что отправить? В команде нет ни текста, ни вложения.' }
+                        )
+                        .catch (console.error);
+                    }
+                    else
+                    {
+                        // кэш -> запрос к Discord (в кэше далеко не все -- см. выше):
+                        let user = client.users.cache.get (id);
+                        if (!user) user = await client.users.fetch (id).catch (() => null);
+                        if (!user)
+                        {
+                            message.channel.send
+                            (
+                                { content: '🤔 Пользователь с id `' + id + '` не найден.' }
+                            )
+                            .catch (console.error);
+                        }
+                        else
+                        {
+                            user.send ({content: letter ? letter : undefined, ...attach})
+                            .then
+                            (
+                                () =>
+                                {
+                                    console.log
+                                    (
+                                        '[' + (d()) + '] [dm] ' +
+                                            (message.member ? uuu (message.member) : message.author.username) +
+                                            ' -> ' + uu (user) + ': ' +
+                                            (
+                                                letter
+                                                    ? '"' + letter + '"' + (attach.files.length ? ' + <ATTACH>' : '')
+                                                    : '<ATTACH>'
+                                            )
+                                    );
+                                    // команду убираем ТОЛЬКО после успешной отправки:
+                                    return message.delete ().catch
+                                    (
+                                        e => console.error ('[' + (d()) + '] [dm] не смог удалить команду: ' + e.message)
+                                    );
+                                }
+                            )
+                            .catch
+                            (
+                                e =>
+                                {
+                                    console.error ('[' + (d()) + '] [dm] НЕ отправлено ' + uu (user) + ': ' + e.message);
+                                    // админ должен видеть причину, а не тишину:
+                                    message.channel.send
+                                    (
+                                        { content: '⚠️ ЛС не ушло: `' + code (e.message) + '`' }
+                                    )
+                                    .catch (() => {});
+                                }
+                            );
                         }
                     }
                 }
-                // command 'test' ## Block test in TEXT channels... ;)
+                // command 'test' ## в текстовом канале команда просто убирается из чата
+                // (само ЛС отправил блок выше -- см. 'test' / self-test)
                 else if (message.content.startsWith (PREFIX + 'test'))
                 {
-                    message.channel.bulkDelete(1); // delete command?
+                    message.delete ().catch (console.error); // delete command?
                 }
             }
         }
