@@ -349,9 +349,18 @@ function code (s) // '`' + s + '`'
 }
 
 // ONE attach from files!?
+// [v2.5] discord.js принимает в files URL/буфер/поток, но НЕ объекты Attachment:
+// внутри получается attachment === undefined, файлы молча теряются и Discord
+// отвечает 50006 'Cannot send an empty message'. Поэтому разворачиваем вложения
+// в {attachment: url, name} -- discord.js сам скачает их по ссылке CDN.
 function attachOf (message)
 {
-    return {files: message.attachments};
+    return {
+        files: [...message.attachments.values ()].map
+        (
+            a => ({ attachment: a.url, name: a.name })
+        )
+    };
 }
 
 // (node:16096) DeprecationWarning: The message event is deprecated. Use messageCreate instead
@@ -418,7 +427,7 @@ client.on ('messageCreate', async message =>
                    иначе при любой ошибке отправки сообщение теряется навсегда. */
                 const attach = attachOf (message);
                 const text  = message.content ? message.content : '';
-                const files = attach.files ? attach.files.size : 0;
+                const files = attach.files ? attach.files.length : 0;
                 if (!text && !files)
                 {
                     // Текст сюда попадает только с интентом Message Content: без него Discord
@@ -593,6 +602,33 @@ client.on ('messageCreate', async message =>
         }
     }
 });
+// [v2.5] Перенос участника в голосовой канал.
+// Важно: setChannel() принимает канал ТОЛЬКО из кэша guild -- если id там нет
+// (старый config.json, канала больше нет, бота не перезапустили после правки),
+// discord.js падает с 'Could not resolve channel to a guild voice channel'.
+// Поэтому резолвим сами (кэш -> запрос к Discord) и пишем в лог, ЧТО именно не так.
+async function moveToVoice (state, channel_id, reason)
+{
+    let who = state.member ? uuu (state.member) : state.id;
+    if (!channel_id) return false;
+    let target = state.guild.channels.cache.get (channel_id);
+    if (!target) target = await state.guild.channels.fetch (channel_id).catch (() => null);
+    if (!target)
+    {
+        console.error ('[voice] перенос ' + who + ': канала ' + channel_id + ' нет -- проверь config.json и ПЕРЕЗАПУСТИ бота');
+        return false;
+    }
+    if (typeof target.isVoiceBased !== 'function' || !target.isVoiceBased ())
+    {
+        console.error ('[voice] перенос ' + who + ': канал "' + target.name + '" не голосовой (type=' + target.type + ')');
+        return false;
+    }
+    let ok = true;
+    await state.setChannel (target, reason)
+        .catch (e => { ok = false; console.error ('[voice] перенос ' + who + ' в "' + target.name + '": ' + e.message); });
+    return ok;
+}
+
 // Members with MANAGE_CHANNELS:
 async function ownersOf (channel)
 {
@@ -1319,12 +1355,24 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                         )
                         .then
                         (
-                            channel =>
+                            async channel =>
                             {
                                 if (channel_common && channel.id !== channel_common)
                                 {
-                                    newState.setChannel (channel_common)
-                                    .catch (e => console.error ('[voiceStateUpdate] error on newState.setChannel: ' + e.message));
+                                    // [v2.5] резолв канала + внятный лог (см. moveToVoice):
+                                    if (await moveToVoice (newState, channel_common, 'Запрещённый канал (deaf)'))
+                                    {
+                                        // [v2.5] если deaf-участника отправляем в лобби личных
+                                        // каналов -- не ждём до 45 сек следующего тика поллера,
+                                        // комната создаётся сразу (tempCreateFor идемпотентна):
+                                        if (SERVERS[server].temp_lobby === channel_common)
+                                            setTimeout
+                                            (
+                                                () => tempCreateFor (server, newState.member)
+                                                    .catch (e => console.error ('[temp] ' + e.message)),
+                                                1500
+                                            );
+                                    }
                                 }
                                 else
                                 {
@@ -1602,38 +1650,72 @@ const POLL_PERIOD = 45 * 1000; // раз в 45 сек (REST без интент�
 // Снапшоты участников по серверам: server_id -> Map<user_id, {user, member}>
 var $membersSnapshot = {};
 
-// Лог входа/выхода участника в журнал (как было на событиях):
-function logMemberJoinLeave (server, memberUser, isJoin)
+// [v2.5] Поллер отдаёт СЫРОЙ JSON участника из REST, а логам нужен объект User:
+// у сырого нет displayAvatarURL() (была ошибка 'memberUser.displayAvatarURL is not
+// a function'), а упоминание рисовалось как [object Object]. Разрешаем в User.
+async function resolveUser (uid, raw)
 {
-    let log_channel = SERVERS[server].log_channel || '';
-    if (!log_channel) return;
-    let log_text = isJoin
-        ? `${memberUser} **зашёл** 👋 на сервер \`${SERVERS[server].name}\` 🟩`
-        : `${memberUser} **вышел** 🚪 с сервера \`${SERVERS[server].name}\` 🟥`;
-    client.channels.resolve(log_channel).send
-    (
+    let user = client.users.cache.get (uid);
+    if (!user) user = await client.users.fetch (uid).catch (() => null);
+    if (user) return user;
+    // крайний случай (пользователь недоступен) -- лог не должен падать:
+    let stub =
+    {
+        id: uid,
+        username: (raw && raw.user && raw.user.username) || uid,
+        displayAvatarURL: () => null,
+        toString: () => '<@' + uid + '>',
+    };
+    return stub;
+}
+
+// Лог входа/выхода участника в журнал (как было на событиях):
+async function logMemberJoinLeave (server, memberUser, isJoin)
+{
+    try
+    {
+        let log_channel = SERVERS[server].log_channel || '';
+        if (!log_channel) return;
+        let channel = client.channels.cache.get (log_channel);
+        if (!channel) channel = await client.channels.fetch (log_channel).catch (() => null);
+        if (!channel)
         {
-            content: `${memberUser}`,
-            embeds:
-            [
-                {
-                    author:
-                    {
-                        name: memberUser.username,
-                        icon_url: memberUser.displayAvatarURL ({extension: 'png', forceStatic: false, size: 1024}),
-                    },
-                    color: isJoin ? 0x00FF00 : 0xFF0000, // GREEN / RED
-                    description: log_text,
-                    footer:
-                    {
-                        text: SERVERS[server].name,
-                    },
-                    timestamp: dt(),
-                },
-            ]
+            console.error ('[member] лог-канал ' + log_channel + ' не найден');
+            return;
         }
-    )
-    .catch (console.error);
+        let log_text = isJoin
+            ? `${memberUser} **зашёл** 👋 на сервер \`${SERVERS[server].name}\` 🟩`
+            : `${memberUser} **вышел** 🚪 с сервера \`${SERVERS[server].name}\` 🟥`;
+        let author = {name: memberUser.username}; // без icon_url, если аватара нет
+        if (typeof memberUser.displayAvatarURL === 'function')
+            author.icon_url = memberUser.displayAvatarURL ({extension: 'png', forceStatic: false, size: 1024});
+        channel.send
+        (
+            {
+                content: `${memberUser}`,
+                embeds:
+                [
+                    {
+                        author: author,
+                        color: isJoin ? 0x00FF00 : 0xFF0000, // GREEN / RED
+                        description: log_text,
+                        footer:
+                        {
+                            text: SERVERS[server].name,
+                        },
+                        timestamp: dt(),
+                    },
+                ]
+            }
+        )
+        .catch (console.error);
+    }
+    catch (e)
+    {
+        // Ошибка лога НЕ должна ронять поллер (иначе снапшот не обновится и
+        // один и тот же человек будет 'входить' на каждом тике).
+        console.error ('[member] logMemberJoinLeave: ' + e.message);
+    }
 }
 
 // [!!!] Рестарт-безопасность: ban-таймеры живут в памяти (setTimeout) и умирают
@@ -2022,6 +2104,27 @@ async function tempLobbyCheck (server)
     }
 }
 
+// [v2.5] Проверка id из config.json при старте: битый id вылезет сразу,
+// а не загадочной ошибкой переноса/лога через час. Молчим, если всё цело.
+async function checkConfigChannels (server)
+{
+    const guild = client.guilds.cache.get (server);
+    if (!guild) return;
+    for (let key of ['log_channel', 'pipe_channel_source', 'pipe_channel_target', 'channel_common', 'temp_lobby'])
+    {
+        let id = SERVERS[server][key];
+        if (!id) continue;
+        let ch = guild.channels.cache.get (id) || await guild.channels.fetch (id).catch (() => null);
+        if (!ch)
+        {
+            console.error ('[config] ' + key + ' = ' + id + ': канала нет -- исправь config.json и ПЕРЕЗАПУСТИ бота');
+            continue;
+        }
+        if ((key === 'channel_common' || key === 'temp_lobby') && !ch.isVoiceBased ())
+            console.error ('[config] ' + key + ' = ' + id + ' ("' + ch.name + '"): не голосовой канал');
+    }
+}
+
 // Один тик поллера по серверу:
 async function pollMembers (server)
 {
@@ -2033,30 +2136,49 @@ async function pollMembers (server)
         let previous = $membersSnapshot[server];
         if (previous)
         {
-            // входы:
-            for (let [uid, raw] of current)
+            // [v2.5] Каждый участник -- в своём предохранителе, а снапшот
+            // обновляется ВСЕГДА (finally). Раньше одно падение (например,
+            // logMemberJoinLeave на сыром JSON) оставляло старый снапшот, и
+            // следующие тики снова считали человека 'вошедшим' -- повторные
+            // строки JOINED и повторные выдачи бан-таймаутов.
+            try
             {
-                if (!previous.has (uid))
+                // входы:
+                for (let [uid, raw] of current)
                 {
-                    let memberUser = raw.user;
-                    console.log ('[' + (d()) + '] member ' + memberUser.username + ' JOINED ' + SERVERS[server].name);
-                    logMemberJoinLeave (server, memberUser, true);
-                    await handleMemberJoin (server, uid, raw);
+                    if (previous.has (uid)) continue;
+                    try
+                    {
+                        let memberUser = await resolveUser (uid, raw);
+                        console.log ('[' + (d()) + '] member ' + memberUser.username + ' JOINED ' + SERVERS[server].name);
+                        await logMemberJoinLeave (server, memberUser, true);
+                        await handleMemberJoin (server, uid, raw);
+                    }
+                    catch (e) { console.error ('[pollMembers] join ' + uid + ': ' + e.message); }
+                }
+                // выходы:
+                for (let [uid, raw] of previous)
+                {
+                    if (current.has (uid)) continue;
+                    try
+                    {
+                        let memberUser = await resolveUser (uid, raw);
+                        console.log ('[' + (d()) + '] member ' + memberUser.username + ' LEFT ' + SERVERS[server].name);
+                        await logMemberJoinLeave (server, memberUser, false);
+                        await handleMemberLeave (server, uid, raw);
+                    }
+                    catch (e) { console.error ('[pollMembers] leave ' + uid + ': ' + e.message); }
                 }
             }
-            // выходы:
-            for (let [uid, raw] of previous)
+            finally
             {
-                if (!current.has (uid))
-                {
-                    let memberUser = raw.user;
-                    console.log ('[' + (d()) + '] member ' + memberUser.username + ' LEFT ' + SERVERS[server].name);
-                    logMemberJoinLeave (server, memberUser, false);
-                    await handleMemberLeave (server, uid, raw);
-                }
+                $membersSnapshot[server] = current;
             }
         }
-        $membersSnapshot[server] = current;
+        else
+        {
+            $membersSnapshot[server] = current;
+        }
     }
     catch (e)
     {
@@ -2077,6 +2199,8 @@ client.on
             // чтобы рестарт бота не разбудил ложные "выходы":
             $membersSnapshot[server] = await fetchAllMembersRest (server).catch (() => null);
             console.log ('[' + (d()) + '] [poll] snapshot ready: ' + ($membersSnapshot[server] ? $membersSnapshot[server].size : 'ERR') + ' members @ ' + SERVERS[server].name);
+            // [v2.5] заодно проверить id из config.json (молчит, если всё цело):
+            await checkConfigChannels (server);
             // Рестарт-безопасность: снять истёкшие бан-таймауты из SQLite:
             await sweepExpiredBans (server);
             // [v2.3] почистить пустые личные каналы после рестарта:
