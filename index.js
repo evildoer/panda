@@ -157,7 +157,7 @@ client.login (TOKEN).catch (e => console.error ('[login] error: ' + e.message));
 
 client.on
 (
-    'ready',
+    'clientReady', // [v2.4] 'ready' в v15 уйдёт -- без warnings в логе (только события)
     async () =>
     {
         console.log
@@ -1827,7 +1827,7 @@ async function pollMembers (server)
 // Старт поллинга после готовности клиента:
 client.on
 (
-    'ready',
+    'clientReady', // [v2.4] 'ready' в v15 уйдёт -- без warnings в логе (только события)
     async () =>
     {
         for (let server in SERVERS)
@@ -2352,4 +2352,4 @@ client.on ('interactionCreate', async (interaction) =>
 });
 
 // Регистрируем команды после готовности клиента:
-client.once ('ready', () => registerMusicCommands ());
+client.once ('clientReady', () => registerMusicCommands ());
