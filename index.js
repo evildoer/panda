@@ -1,4 +1,4 @@
-// Discord Peka Bot ## panda ;D
+// Discord PANDAMIA Bot ## panda ;D
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
@@ -46,7 +46,7 @@ const space = ' ';
 
 // [v2.2] Инструкция по использованию -- рассылается в ЛС при каждом старте бота:
 const STARTUP_DM_TEXT =
-    '**Как пользоваться ботом Peka** 🐼\n' +
+    '**Как пользоваться ботом** 🐼\n' +
     '\n' +
     '🎵 **Музыка** (слэш-команды; сначала зайди в голосовой канал):\n' +
     '`/play ссылка или запрос` -- трек или плейлист (YouTube, SoundCloud и др.)\n' +
@@ -179,11 +179,11 @@ client.on
                         [
                             {
                                 color: 0x00CCFF,
-                                title: '🐼 Peka Bot: инструкция',
+                                title: '🐼 PANDAMIA Bot: инструкция',
                                 description: STARTUP_DM_TEXT,
                                 footer:
                                 {
-                                    text: SERVERS[Object.keys (SERVERS)[0]] ? SERVERS[Object.keys (SERVERS)[0]].name : 'Peka Bot',
+                                    text: SERVERS[Object.keys (SERVERS)[0]] ? SERVERS[Object.keys (SERVERS)[0]].name : 'PANDAMIA Bot',
                                 },
                                 timestamp: dt(), // [v14] только Date/number (locale-строка кидала 'Invalid time value'),
                             },
@@ -1761,7 +1761,7 @@ async function tempSweep (server)
         for (let [, vs] of guild.voiceStates.cache)
             if (vs.channelId === ch.id) { busy = true; break; }
         if (busy) continue; // в канале кто-то есть -- живём
-        await ch.delete ('Peka: pustoy lichny kanal')
+        await ch.delete ('PANDAMIA: pustoy lichny kanal')
             .then (() => console.log ('[' + (d()) + '] [temp] deleted empty ' + ch.name))
             .catch (e => console.error ('[temp] error on delete: ' + e.message));
     }

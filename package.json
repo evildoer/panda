@@ -1,7 +1,7 @@
 {
-  "name": "peka",
+  "name": "pandamia-bot",
   "version": "2.2.0",
-  "description": "Peka",
+  "description": "PANDAMIA Discord bot",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
@@ -10,7 +10,7 @@
   "keywords": [
     "discord",
     "panda",
-    "peka",
+    "pandamia",
     "bot"
   ],
   "author": "",
