@@ -1,4 +1,6 @@
-// Discord PANDAMIA Bot ## panda ;D
+// Discord-бот PANDAMIA: модерация голосовых каналов (права владельцев, мут/глухота,
+// тег 🔑), бан-таймаут за выход с сервера, музыка и мост между серверами (pipe).
+// Всё, что зависит от конкретного сервера, -- в config.json (шаблон: config.example.json).
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
@@ -33,16 +35,6 @@
 //   * Причины банов -- как было: 'Забанен ботом на N мин.'
 //   * [БОНУС] ban-таймауты теперь рестарт-безопасны: при старте и в каждом тике
 //     просроченные membersBanTimeout из SQLite снимаются (sweepExpiredBans).
-// ## panda
-// https://discord.com/developers/applications/707658265189941268
-// https://discord.com/oauth2/authorize?client_id=707658265189941268&scope=bot&permissions=8
-//
-// TODO:
-// * top ? ;-)
-// * create rooms!
-// * many room's...
-// * /unban & /claim
-// * democracy? ban/mod...
 
 const
 {
@@ -81,6 +73,8 @@ const STARTUP_DM_TEXT =
     'Управлять музыкой могут админы, модеры и роль DJ (смотреть очередь -- всем).\n' +
     'Сам бот никуда не уходит: кончилась песня или /stop -- он остаётся в канале,\n' +
     'пока не позовёшь в другую комнату или не скажешь `/leave`.\n' +
+    'Пока сидит, он пишет в самом канале, что играет, сколько в очереди,\n' +
+    'сколько людей в комнате и сколько он тут.\n' +
     '\n' +
     '💬 **Команды в чате** (префикс `panda `):\n' +
     '`panda ping` -- проверка связи (ответ: pong)\n' +
@@ -1289,6 +1283,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
     if (server in SERVERS && SERVERS[server].allow)
     {
         logVoiceEvent (oldState, newState);
+        scheduleVoiceStatus (server); // [v2.7] «в канале: N» в статусе канала (дебаунс)
         await modNick
         (
             server, newState.member
@@ -2574,11 +2569,13 @@ async function playNext (guildId)
     if (!m.tracks.length)
     {
         m.current = null;
+        scheduleVoiceStatus (guildId); // [v2.7] «очередь: —» в статусе канала
         return;
     }
     let track = m.tracks.shift ();
     m.current = track;
     console.log ('[' + (d()) + '] [music] играю: ' + (track.title || track.url || 'трек')); // [v2.4] активное событие в лог
+    scheduleVoiceStatus (guildId, true); // [v2.7] сразу показать новый трек и очередь
     try
     {
         let { resource, viaProxy } = await createTrackStream (track);
@@ -2609,6 +2606,128 @@ async function playNext (guildId)
     }
 }
 
+// ============================================================================
+// [v2.7] СТАТУС В ГОЛОСОВОМ КАНАЛЕ: что играет / очередь / сколько людей / сколько
+// бот тут. Discord рисует эту строку в самом канале (PUT /channels/{id}/voice-status).
+// У роута жёсткий лимит, поэтому вызовы склеиваются дебаунсом, а в лог идёт ТОЛЬКО
+// ошибка -- иначе статус забил бы журнал событий (там должны быть люди, не интерфейс).
+// ============================================================================
+const VOICE_STATUS_MIN_GAP = 3000; // мс: не чаще одного раза в 3 сек на сервер (лимит роута)
+const musicRest = new REST ({ version: '10' }).setToken (TOKEN);
+const $voiceStatus = {}; // guildId -> { timer, last, text, channelId }
+
+// «40 сек» / «12 мин» / «1 ч 5 мин» -- коротко, для строки статуса:
+function fmtAgo (ms)
+{
+    let s = Math.max (0, Math.round (ms / 1000));
+    let h = s / 3600 | 0, mi = (s % 3600) / 60 | 0;
+    if (h) return h + ' ч ' + mi + ' мин';
+    if (mi) return mi + ' мин';
+    return s + ' сек';
+}
+
+// Текст статуса для текущего состояния. null -- бот не в голосовом канале.
+function voiceStatusText (guildId)
+{
+    const m = $music[guildId];
+    if (!m || !m.connection) return null;
+    const chId = m.connection.joinConfig.channelId;
+    const guild = client.guilds.cache.get (guildId);
+    // людей в канале считаем по кэшу голосовых состояний -- channel.members без
+    // интента GuildMembers пуст (в коде уже есть такое место -- tempSweep):
+    let people = 0;
+    const selfId = client.user ? client.user.id : null; // до ready client.user может быть null
+    if (guild)
+        for (const vs of guild.voiceStates.cache.values ())
+            if (vs.channelId === chId && vs.id !== selfId && !(vs.member && vs.member.user.bot))
+                people++;
+    let parts = [];
+    if (m.current)
+        parts.push ((m.player.state.status === AudioPlayerStatus.Paused ? '⏸ ' : '🎶 ') +
+            (m.current.title || 'трек') + ' — ' + fmtDur (m.current.duration));
+    else
+        parts.push ('😴 музыка не играет');
+    parts.push ('📜 очередь: ' + (m.tracks.length ? m.tracks.length : '—'));
+    parts.push ('🎧 в канале: ' + people);
+    if (m.since) parts.push ('⏱ бот тут: ' + fmtAgo (Date.now () - m.since));
+    return parts.join (' • ').slice (0, 500); // 500 -- лимит поля статуса
+}
+
+// Снять статус с канала (при выходе/переезде) -- иначе в нём останется старая строка:
+function clearVoiceStatus (channelId)
+{
+    if (!channelId) return;
+    // status: null -- это именно «снять статус» (по документации Discord):
+    musicRest.put (Routes.channelVoiceStatus (channelId), { body: { status: null } })
+        .catch (e => console.error ('[' + (d()) + '] [music] статус канала не снялся: ' + e.message));
+}
+
+// Записать текущий статус в канал, где сидит бот:
+async function writeVoiceStatus (guildId)
+{
+    const st = $voiceStatus[guildId] = $voiceStatus[guildId] || {};
+    const text = voiceStatusText (guildId);
+    if (text === null)
+    {
+        // бота уже нет в канале -- статус снимаем и чистим память о нём
+        const old = st.channelId;
+        st.text = null;
+        st.channelId = null;
+        clearVoiceStatus (old);
+        return;
+    }
+    const channelId = $music[guildId].connection.joinConfig.channelId;
+    if (st.text === text && st.channelId === channelId) return; // не дёргаем API зря
+    const prev = { text: st.text, channelId: st.channelId };
+    st.text = text;
+    st.channelId = channelId;
+    st.last = Date.now ();
+    try
+    {
+        await musicRest.put (Routes.channelVoiceStatus (channelId), { body: { status: text } });
+    }
+    catch (e)
+    {
+        console.error ('[' + (d()) + '] [music] статус канала не записался: ' + e.message);
+        st.text = prev.text; // вернём, чтобы попробовать снова
+        st.channelId = prev.channelId;
+    }
+}
+
+// Дебаунс: события сыпятся пачками (вошёл человек, сменился трек) -- пишем один раз,
+// причём пишется ВСЕГДА актуальный текст (он берётся в момент записи, а не в момент вызова).
+// immediate=true -- «событие важное» (сменился трек, пауза, стоп): пишем сразу, если
+// прошлый запрос был достаточно давно по меркам лимита.
+function scheduleVoiceStatus (guildId, immediate = false)
+{
+    if (!guildId || !(guildId in SERVERS)) return;
+    if (!$music[guildId] || !$music[guildId].connection) return; // не сидим -- нечего показывать
+    const st = $voiceStatus[guildId] = $voiceStatus[guildId] || {};
+    if (st.timer) return;
+    const wait = immediate ? Math.max (VOICE_STATUS_MIN_GAP - (Date.now () - (st.last || 0)), 0) : VOICE_STATUS_MIN_GAP;
+    st.timer = setTimeout
+    (
+        () =>
+        {
+            st.timer = null;
+            writeVoiceStatus (guildId).catch (e => console.error ('[' + (d()) + '] [music] статус: ' + e.message));
+        },
+        wait
+    );
+}
+
+// Раз в минуту обновляем счётчик «бот тут N мин» (в лог не пишется -- там только события):
+const voiceStatusTick = setInterval
+(
+    () =>
+    {
+        for (let g in $music)
+            if ($music[g].connection) scheduleVoiceStatus (g);
+    },
+    60 * 1000
+);
+if (voiceStatusTick.unref) voiceStatusTick.unref ();
+
 // Подключение к голосовому каналу пользователя:
 function connectTo (interaction)
 {
@@ -2626,6 +2745,7 @@ function connectTo (interaction)
             }
         );
         console.log ('[' + (d()) + '] [music] подключился к «' + voiceChannel.name + '»'); // [v2.4] активное событие в лог
+        m.since = Date.now (); // [v2.7] от этого считаем «бот тут N мин» в статусе
         m.player.on (AudioPlayerStatus.Idle, () =>
         {
             // трек кончился -- следующий:
@@ -2646,15 +2766,20 @@ function connectTo (interaction)
                 destroyMusic (interaction.guildId);
             }
         });
+        scheduleVoiceStatus (interaction.guildId, true); // [v2.7] показать статус сразу
     }
     else
     {
         // пересоединение в другой канал («вызвали в другую комнату»):
         if (m.connection.joinConfig.channelId !== voiceChannel.id)
         {
+            const oldChId = m.connection.joinConfig.channelId;
             m.connection.rejoin ({ channelId: voiceChannel.id });
             // [v2.7] активное событие в лог: переезд раньше нигде не писался
             console.log ('[' + (d()) + '] [music] перешёл в «' + voiceChannel.name + '»');
+            // [v2.7] статус живёт в канале: из старого снимаем, в новом пишем заново
+            clearVoiceStatus (oldChId);
+            scheduleVoiceStatus (interaction.guildId, true);
         }
     }
 }
@@ -2670,6 +2795,11 @@ function destroyMusic (guildId)
     try { m.player.stop (true); } catch {}
     try { m.connection.destroy (); } catch {}
     delete $music[guildId];
+    // [v2.7] снимаем статус: иначе в канале останется старая строка
+    clearVoiceStatus (chId);
+    if ($voiceStatus[guildId] && $voiceStatus[guildId].timer)
+        clearTimeout ($voiceStatus[guildId].timer);
+    delete $voiceStatus[guildId];
     if (chId)
         console.log ('[' + (d()) + '] [music] вышел из «' + (ch ? ch.name : chId) + '»');
 }
@@ -2826,6 +2956,7 @@ client.on ('interactionCreate', async (interaction) =>
             m.textChannelId = interaction.channelId;
             let wasIdle = !m.current && !m.tracks.length;
             m.tracks.push (...tracks);
+            scheduleVoiceStatus (guildId); // [v2.7] очередь изменилась -- обновим статус канала
             await interaction.editReply
             (
                 '🎶 Добавлено: **' + (tracks[0].title || query) + '**' +
@@ -2841,6 +2972,7 @@ client.on ('interactionCreate', async (interaction) =>
             m.tracks = [];
             m.current = null;
             m.player.stop (true);
+            scheduleVoiceStatus (guildId, true); // [v2.7] статус: тишина, очередь пустая
             return interaction.reply ('⏹ Остановлено, очередь очищена.');
         }
         else if (name === 'skip')
@@ -2854,11 +2986,13 @@ client.on ('interactionCreate', async (interaction) =>
         else if (name === 'pause')
         {
             m.player.pause ();
+            scheduleVoiceStatus (guildId, true); // [v2.7] статус: ⏸
             return interaction.reply ('⏸ Пауза.');
         }
         else if (name === 'resume')
         {
             m.player.unpause ();
+            scheduleVoiceStatus (guildId, true);
             return interaction.reply ('▶️ Продолжаем.');
         }
         else if (name === 'queue')
