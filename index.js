@@ -74,10 +74,13 @@ const STARTUP_DM_TEXT =
     '\n' +
     '🎵 **Музыка** (слэш-команды; сначала зайди в голосовой канал):\n' +
     '`/play ссылка или запрос` -- трек или плейлист (YouTube, SoundCloud и др.)\n' +
+    '`/join` -- зайти в твой канал и остаться там (даже без музыки)\n' +
     '`/skip` -- следующий • `/stop` -- стоп и очистить очередь\n' +
     '`/pause` / `/resume` -- пауза / продолжить • `/queue` -- что играет\n' +
     '`/leave` -- выйти из голосового канала\n' +
     'Управлять музыкой могут админы, модеры и роль DJ (смотреть очередь -- всем).\n' +
+    'Сам бот никуда не уходит: кончилась песня или /stop -- он остаётся в канале,\n' +
+    'пока не позовёшь в другую комнату или не скажешь `/leave`.\n' +
     '\n' +
     '💬 **Команды в чате** (префикс `panda `):\n' +
     '`panda ping` -- проверка связи (ответ: pong)\n' +
@@ -2646,9 +2649,13 @@ function connectTo (interaction)
     }
     else
     {
-        // пересоединение в другой канал:
+        // пересоединение в другой канал («вызвали в другую комнату»):
         if (m.connection.joinConfig.channelId !== voiceChannel.id)
+        {
             m.connection.rejoin ({ channelId: voiceChannel.id });
+            // [v2.7] активное событие в лог: переезд раньше нигде не писался
+            console.log ('[' + (d()) + '] [music] перешёл в «' + voiceChannel.name + '»');
+        }
     }
 }
 
@@ -2656,9 +2663,15 @@ function destroyMusic (guildId)
 {
     const m = $music[guildId];
     if (!m) return;
+    // [v2.7] активное событие в лог: «вышел» раньше нигде не писалось,
+    // а по логу должно быть видно и заход, и выход:
+    const chId = m.connection && m.connection.joinConfig ? m.connection.joinConfig.channelId : null;
+    const ch = chId ? client.channels.cache.get (chId) : null;
     try { m.player.stop (true); } catch {}
     try { m.connection.destroy (); } catch {}
     delete $music[guildId];
+    if (chId)
+        console.log ('[' + (d()) + '] [music] вышел из «' + (ch ? ch.name : chId) + '»');
 }
 
 // Форматирование длительности:
@@ -2690,6 +2703,10 @@ const musicCommands =
             o.setName ('запрос')
              .setDescription ('Ссылка или название трека')
              .setRequired (true)),
+    // [v2.7] /join -- просто зайти в канал и сидеть (музыка не нужна):
+    new SlashCommandBuilder ()
+        .setName ('join')
+        .setDescription ('Зайти в твой голосовой канал и остаться там (даже без музыки)'),
     new SlashCommandBuilder ()
         .setName ('stop')
         .setDescription ('Остановить музыку и очистить очередь'),
@@ -2751,7 +2768,7 @@ client.on ('interactionCreate', async (interaction) =>
     // [v2.6] /help -- всем и всегда: без DJ-роли и без голосового канала, ephemeral.
     if (name === 'help')
         return interaction.reply ({ embeds: [helpEmbed ()], flags: MessageFlags.Ephemeral });
-    if (!['play','stop','skip','pause','resume','queue','leave'].includes (name)) return;
+    if (!['play','join','stop','skip','pause','resume','queue','leave'].includes (name)) return;
     const guildId = interaction.guildId;
     const m = musicOf (guildId);
 
@@ -2762,6 +2779,27 @@ client.on ('interactionCreate', async (interaction) =>
         {
             let role_dj = SERVERS[guildId].role_dj || '';
             return interaction.reply ({ content: '🚫 Музыка только для ' + (role_dj ? '<@&' + role_dj + '>' : 'DJ'), flags: MessageFlags.Ephemeral });
+        }
+
+        // [v2.7] /join -- «посидеть с ботом»: заходит в канал вызывающего и ОСТАЁТСЯ там.
+        // Уходит только по /leave или когда его позвали в другую комнату (тогда connectTo
+        // делает rejoin). Проверяем «уже здесь?» ДО connectTo -- иначе ответ соврёт.
+        if (name === 'join')
+        {
+            const voiceChannel = interaction.member && interaction.member.voice ? interaction.member.voice.channel : null;
+            if (!voiceChannel)
+                return interaction.reply ({ content: '🔊 Сначала зайди в голосовой канал!', flags: MessageFlags.Ephemeral });
+            const here = !!m.connection && m.connection.joinConfig.channelId === voiceChannel.id;
+            connectTo (interaction);
+            // [v2.7] куда писать уведомления (например «трек не воспроизвёлся»), если
+            // /join был первым вызовом, а /play никто не делал:
+            if (!m.textChannelId) m.textChannelId = interaction.channelId;
+            return interaction.reply
+            (
+                here
+                    ? '🎧 Я уже тут: **' + voiceChannel.name + '**. Выйти -- `/leave`.'
+                    : '🎧 Зашёл в **' + voiceChannel.name + '** и остаюсь. Выйти -- `/leave`.'
+            );
         }
 
         if (name === 'play')
@@ -2836,6 +2874,9 @@ client.on ('interactionCreate', async (interaction) =>
         }
         else if (name === 'leave')
         {
+            // [v2.7] раньше бот отвечал «вышел», даже если нигде не сидел:
+            if (!m.connection)
+                return interaction.reply ({ content: '🤷 Я и так не в голосовом канале.', flags: MessageFlags.Ephemeral });
             destroyMusic (guildId);
             return interaction.reply ('👋 Вышел из голосового канала.');
         }
