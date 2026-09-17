@@ -874,6 +874,14 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
             server, newState.member
         )
         .catch (console.error);
+        // [v2.3] личные каналы: заход в лобби -> создать; выход из категории -> чистка пустых:
+        let temp_lobby = SERVERS[server].temp_lobby || '';
+        let temp_category = SERVERS[server].temp_category || '';
+        if (temp_lobby && newState.channelId === temp_lobby)
+            await tempCreateFor (server, newState.member).catch (console.error);
+        if (oldState.channelId && (oldState.channelId === temp_lobby ||
+            (oldState.channel && oldState.channel.parentId === temp_category)))
+            await tempSweep (server).catch (console.error);
         // Stage type channel is null! But exists channelID.
         if (newState.channel === null && newState.channelId)
         {
@@ -1623,6 +1631,85 @@ async function sweepNicks (server)
     }
 }
 
+// [v2.3] Личные каналы: заход в «➕ Создать канал» -> канал «@Ник» с правами владельца + 🔑.
+// Ничего не храним: пустой канал -- удаляется. После рестарта осиротевшие чистятся свипом.
+async function tempCreateFor (server, member)
+{
+    const guild = client.guilds.cache.get (server);
+    const catId = SERVERS[server].temp_category || '';
+    const lobbyId = SERVERS[server].temp_lobby || '';
+    if (!guild || !catId) return;
+    // у человека уже есть личный канал? -- возвращаем туда:
+    let exists = guild.channels.cache.find
+    (
+        c => c.parentId === catId &&
+             c.type === ChannelType.GuildVoice &&
+             c.permissionOverwrites.cache.has (member.id)
+    );
+    if (exists)
+    {
+        if (member.voice.channelId && member.voice.channelId !== exists.id)
+            await member.voice.setChannel (exists.id).catch (() => {});
+        return;
+    }
+    let name = '@' + (member.nickname || member.user.username);
+    let created = await guild.channels.create
+    (
+        {
+            name: name,
+            type: ChannelType.GuildVoice,
+            parent: catId,
+            permissionOverwrites:
+            [
+                {
+                    id: member.id,
+                    allow:
+                    [
+                        PermissionsBitField.Flags.ManageChannels,
+                        PermissionsBitField.Flags.MoveMembers,
+                        PermissionsBitField.Flags.MuteMembers,
+                        PermissionsBitField.Flags.DeafenMembers,
+                        PermissionsBitField.Flags.Stream,
+                    ],
+                },
+            ],
+        }
+    )
+    .catch (e => { console.error ('[temp] error on create: ' + e.message); return null; });
+    if (!created) return;
+    console.log ('[' + (d()) + '] [temp] created ' + created.name + ' for ' + member.user.username);
+    if (member.voice.channelId === lobbyId)
+        await member.voice.setChannel (created.id)
+            .catch (e => console.error ('[temp] error on setChannel: ' + e.message));
+    // ключ владельцу (он в своём канале -- права есть):
+    if (SERVERS[server].addTag || false)
+    {
+        let nick = member.nickname || member.user.username;
+        if (nick.charCodeAt (0) !== 0xD83D)
+            await member.setNickname ('🔑' + nick)
+                .then (() => console.log ('[' + (d()) + '] [nick] +🔑 (temp) ' + member.user.username))
+                .catch (e => console.error ('[temp] error on setNickname: ' + e.message));
+    }
+    await tempSweep (server); // заодно убрать осиротевшие
+}
+
+// Удаление ПУСТЫХ личных каналов в категории:
+async function tempSweep (server)
+{
+    const guild = client.guilds.cache.get (server);
+    const catId = SERVERS[server].temp_category || '';
+    const lobbyId = SERVERS[server].temp_lobby || '';
+    if (!guild || !catId) return;
+    for (let [, ch] of guild.channels.cache)
+    {
+        if (ch.parentId !== catId || ch.type !== ChannelType.GuildVoice || ch.id === lobbyId) continue;
+        if (ch.members.size) continue; // в канале кто-то есть (владелец или гости) -- живём
+        await ch.delete ('Peka: pustoy lichny kanal')
+            .then (() => console.log ('[' + (d()) + '] [temp] deleted empty ' + ch.name))
+            .catch (e => console.error ('[temp] error on delete: ' + e.message));
+    }
+}
+
 // Один тик поллера по серверу:
 async function pollMembers (server)
 {
@@ -1680,6 +1767,8 @@ client.on
             console.log ('[' + (d()) + '] [poll] snapshot ready: ' + ($membersSnapshot[server] ? $membersSnapshot[server].size : 'ERR') + ' members @ ' + SERVERS[server].name);
             // Рестарт-безопасность: снять истёкшие бан-таймауты из SQLite:
             await sweepExpiredBans (server);
+            // [v2.3] почистить пустые личные каналы после рестарта:
+            await tempSweep (server);
         }
         setInterval
         (            async () =>
@@ -1690,6 +1779,14 @@ client.on
                         await pollMembers (server);
                         await sweepExpiredBans (server);
                         await sweepNicks (server); // [v2.2.3] теги 🔑 -- рестарт-безопасно
+                        await tempSweep (server); // [v2.3] пустые личные каналы
+                        // [v2.3] кто-то сидит в лобби (в т.ч. с момента до старта бота) -- создать канал:
+                        let _tg = client.guilds.cache.get (server);
+                        let _lobby = SERVERS[server].temp_lobby || '';
+                        if (_tg && _lobby)
+                            for (let [, _vs] of _tg.voiceStates.cache)
+                                if (_vs.channelId === _lobby && _vs.member)
+                                    await tempCreateFor (server, _vs.member).catch (console.error);
                     }
                 },
             POLL_PERIOD

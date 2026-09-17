@@ -22,6 +22,8 @@
       "role_admin": "ID_РОЛИ_АДМИН",
       "role_moder": "ID_РОЛИ_МОДЕР",
       "role_dj": "ID_РОЛИ_DJ",
+      "temp_category": "ID_КАТЕГОРИИ_ЛИЧНЫХ_КАНАЛОВ",
+      "temp_lobby": "ID_ЛОББИ_КАНАЛА_ДЛЯ_СОЗДАНИЯ",
       "addTag": true,
       "role_for_manage": "ID_РОЛИ",
       "role_for_no_speak": "ID_РОЛИ",
