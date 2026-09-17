@@ -1586,13 +1586,15 @@ async function sweepNicks (server)
         const guild = client.guilds.cache.get (server);
         if (!guild || !(SERVERS[server].addTag || false)) return;
         const tag = '🔑';
-        let states = await client.rest.get (Routes.guildVoiceStates (server));
-        for (let vs of states)
+        // [FIX v2.2.4] REST-эндпоинт voice-states ботам недоступен (404) -- берём
+        // кэш гейтвея: guild.voiceStates заполнен из GUILD_CREATE/voice-событий:
+        let states = guild.voiceStates.cache;
+        for (let vs of states.values ())
         {
-            if (vs.user_id === client.user.id) continue;
-            const channel = client.channels.cache.get (vs.channel_id);
+            if (vs.id === client.user.id) continue;
+            const channel = vs.channel || client.channels.cache.get (vs.channelId);
             if (!channel) continue;
-            const ow = channel.permissionOverwrites.cache.get (vs.user_id);
+            const ow = channel.permissionOverwrites.cache.get (vs.id);
             const hasRights = !!ow &&
             (
                 ow.allow.has (PermissionsBitField.Flags.ManageChannels) ||
