@@ -74,6 +74,7 @@ const
     ChannelType,
     PermissionsBitField,
     Collection,
+    AuditLogEvent, // [v2.4] авторство действий: кто замутил/перенёс (из журнала аудита)
 } = require ('discord.js');
 
 // [v2.1] GuildMembers интент УБРАН -- он привилегированный, без одобрения Discord
@@ -86,6 +87,7 @@ const client = new Client
         [
             GatewayIntentBits.Guilds,
             GatewayIntentBits.GuildBans,
+            GatewayIntentBits.GuildModeration, // [v2.4] журнал аудита: авторство мутов/переносов. НЕ привилегированный -- одобрения Discord не требует
             GatewayIntentBits.GuildMessages,
             // GatewayIntentBits.GuildPresences,
             GatewayIntentBits.GuildVoiceStates,
@@ -395,6 +397,8 @@ client.on ('messageCreate', message =>
             // [?] messages for bot 'panda' // '*'
             if (message.content.startsWith (PREFIX))
             {
+                // [v2.4] активное действие -- в лог: кто и какую команду написал
+                console.log ('[' + (d()) + '] [cmd] ' + (message.member ? uuu (message.member) : message.author.username) + ': ' + message.content.slice (0, 120));
                 // command 'file' ## return the attach...
                 if (message.content.startsWith (PREFIX + 'file'))
                 {
@@ -900,6 +904,98 @@ client.on
     }
 );
 
+// ============================================================
+// [v2.4] АВТОРСТВО ДЕЙСТВИЙ
+// voiceStateUpdate автора НЕ содержит -- его сообщает журнал аудита
+// (интент GuildModeration -- НЕ привилегированный, одобрения не требует).
+// Кэш из гейтвея + фолбэк свежим REST-запросом (если событие ещё не дошло).
+// ============================================================
+const $audit = []; // {action, targetId, who, at, used}
+
+// из MemberUpdate нам важны только мут/глухота (ники/роли -- не наше дело)
+function isMuteDeafChange (changes)
+{
+    return (changes || []).some (c => /^\$?(mute|deaf)$/i.test (String (c.key)));
+}
+
+client.on ('guildAuditLogEntryCreate', (entry, guild) =>
+{
+    try
+    {
+        if (!guild || !SERVERS[guild.id] || !SERVERS[guild.id].allow) return;
+        if (entry.action === AuditLogEvent.MemberUpdate && !isMuteDeafChange (entry.changes)) return;
+        $audit.push
+        ({
+            action: entry.action,
+            targetId: entry.targetId || null,
+            who: (entry.executor && entry.executor.username) || null,
+            at: Date.now (),
+            used: false,
+        });
+        if ($audit.length > 300) $audit.splice (0, $audit.length - 300);
+    }
+    catch (e) { console.error ('[audit] error: ' + e.message); }
+});
+
+// кто совершил action над targetId. targetId === null -- цель в журнале не указана
+// (Discord не пишет её для переносов/отключений), тогда связываем по времени.
+async function auditWho (guild, action, targetId, maxAgeMs = 20000)
+{
+    for (let i = $audit.length - 1; i >= 0; i--)
+    {
+        let r = $audit[i];
+        if (r.action !== action) continue;
+        if (targetId && r.targetId !== targetId) continue;
+        if (!targetId && r.used) continue;
+        if ((Date.now () - r.at) > maxAgeMs) continue;
+        if (!targetId) r.used = true;
+        return r.who;
+    }
+    if (!guild) return null;
+    try
+    {
+        let logs = await guild.fetchAuditLogs ({ type: action, limit: 5 });
+        for (const e of logs.entries.values ())
+        {
+            if (targetId && e.targetId !== targetId) continue;
+            if (action === AuditLogEvent.MemberUpdate && !isMuteDeafChange (e.changes)) continue;
+            if ((Date.now () - e.createdTimestamp) > maxAgeMs) continue;
+            return (e.executor && e.executor.username) || null;
+        }
+    }
+    catch (e) { /* нет прав или лимит -- просто без автора */ }
+    return null;
+}
+
+// '(кто: Имя) ' (или '(кто: бот) ', если действовал сам бот)
+function whoText (who)
+{
+    if (!who) return '';
+    return '(кто: ' + ((client.user && who === client.user.username) ? 'бот' : who) + ') ';
+}
+
+// строка действия + автор (мут/разглухота и т.п.) -- ждём запись журнала, потом пишем одной строкой
+function logAction (guild, action, targetId, text)
+{
+    setTimeout (() =>
+    {
+        auditWho (guild, action, targetId, 20000)
+        .then (who => console.log ('[' + (d()) + '] ' + whoText (who) + text))
+        .catch (() => console.log ('[' + (d()) + '] ' + text));
+    }, 700);
+}
+
+// то же, но для событий без цели в журнале (перенос/отключение) -- отдельной строкой
+function byWhom (guild, action, text)
+{
+    setTimeout (() =>
+    {
+        auditWho (guild, action, null, 12000)
+        .then (who => { if (who) console.log ('[' + (d()) + '] ' + whoText (who) + text); })
+        .catch (() => {});
+    }, 1500);
+}
+
 // [v2.4] Активные голосовые события -- всегда в лог (вход/выход/переход/микрофон/наушники/стрим/камера):
 function logVoiceEvent (oldState, newState)
 {
@@ -910,8 +1006,16 @@ function logVoiceEvent (oldState, newState)
         let nm = (st) => st.channel ? ('«' + st.channel.name + '»') : ('[канал ' + st.channelId + ']');
         let o = oldState.channelId, n = newState.channelId;
         if      (!o && n)           console.log ('[' + (d()) + '] [voice] + ' + who + ' -> ' + nm (newState));
-        else if (o && !n)           console.log ('[' + (d()) + '] [voice] - ' + who + ' <- ' + nm (oldState));
-        else if (o && n && o !== n) console.log ('[' + (d()) + '] [voice] > ' + who + ': ' + nm (oldState) + ' -> ' + nm (newState));
+        else if (o && !n)
+        {
+            console.log ('[' + (d()) + '] [voice] - ' + who + ' <- ' + nm (oldState));
+            byWhom (newState.guild, AuditLogEvent.MemberDisconnect, 'выкинул из голосового ' + who);
+        }
+        else if (o && n && o !== n)
+        {
+            console.log ('[' + (d()) + '] [voice] > ' + who + ': ' + nm (oldState) + ' -> ' + nm (newState));
+            byWhom (newState.guild, AuditLogEvent.MemberMove, 'перенёс ' + who + ': ' + nm (oldState) + ' -> ' + nm (newState));
+        }
         if (oldState.selfMute  !== newState.selfMute)
             console.log ('[' + (d()) + '] [voice] микрофон '  + (newState.selfMute  ? 'ВЫКЛ' : 'ВКЛ') + ': ' + who + ' ' + nm (newState));
         if (oldState.selfDeaf  !== newState.selfDeaf)
@@ -1087,7 +1191,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                                         )
                                         .catch (console.error);
                                     }
-                                    console.log ('[' + (d()) + '] ' + newState.member.user.username + ' get mute in ' + channel.name);
+                                    logAction (newState.guild, AuditLogEvent.MemberUpdate, newState.id, newState.member.user.username + ' get mute in ' + channel.name);
                                 }
                             )
                             .catch (console.error);
@@ -1175,7 +1279,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                                     )
                                     .catch (console.error);
                                 }
-                                console.log ('[' + (d()) + '] ' + newState.member.user.username + ' get deaf in ' + channel.name);
+                                logAction (newState.guild, AuditLogEvent.MemberUpdate, newState.id, newState.member.user.username + ' get deaf in ' + channel.name);
                             }
                         )
                         .catch (console.error);
@@ -1249,7 +1353,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                                     )
                                     .catch (console.error);
                                 }
-                                console.log ('[' + (d()) + '] ' + newState.member.user.username + ' get unmute in ' + channel.name);
+                                logAction (newState.guild, AuditLogEvent.MemberUpdate, newState.id, newState.member.user.username + ' get unmute in ' + channel.name);
                             }
                         )
                         .catch (console.error);
@@ -1325,7 +1429,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                                     )
                                     .catch (console.error);
                                 }
-                                console.log ('[' + (d()) + '] ' + newState.member.user.username + ' get undeaf in ' + channel.name);
+                                logAction (newState.guild, AuditLogEvent.MemberUpdate, newState.id, newState.member.user.username + ' get undeaf in ' + channel.name);
                             }
                         )
                         .catch (console.error);
@@ -2289,6 +2393,16 @@ client.on ('interactionCreate', async (interaction) =>
 {
     if (!interaction.isChatInputCommand ()) return;
     const name = interaction.commandName;
+    // [v2.4] активное действие -- в лог: кто и что вызвал
+    console.log
+    (
+        '[' + (d()) + '] [cmd] /' + name +
+        ((interaction.options.data || []).length
+            ? ' ' + interaction.options.data.map (o => o.name + '=' + String (o.value === undefined ? '' : o.value).slice (0, 120)).join (' ')
+            : '') +
+        ' -- ' + (interaction.member ? uuu (interaction.member) : (interaction.user ? interaction.user.username : '?')) +
+        (interaction.channel && interaction.channel.name ? ' @ #' + interaction.channel.name : '')
+    );
     if (!['play','stop','skip','pause','resume','queue','leave'].includes (name)) return;
     const guildId = interaction.guildId;
     const m = musicOf (guildId);
