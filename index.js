@@ -602,6 +602,8 @@ client.on ('channelCreate', async (newChannel) =>
         const server = guild.id; // Guild need!
         if (server in SERVERS && SERVERS[server].allow)
         {
+            // [v2.4] активное событие -- в лог:
+            console.log ('[' + (d()) + '] [channel] создан ' + (newChannel.parent ? '«' + newChannel.parent.name + '» / ' : '') + '«' + newChannel.name + '»');
             let log_channel = SERVERS[server].log_channel;
             if (newChannel.type === ChannelType.GuildVoice)
             {
@@ -741,6 +743,14 @@ client.on ('channelCreate', async (newChannel) =>
 });
 
 // https://maah.gitbooks.io/discord-bots/content/getting-started/roles-and-channels-permissions.html
+// [v2.4] активное событие: канал удалён -- в лог:
+client.on ('channelDelete', (channel) =>
+{
+    const server = channel.guild ? channel.guild.id : '';
+    if (server in SERVERS && SERVERS[server].allow)
+        console.log ('[' + (d()) + '] [channel] удалён ' + (channel.parent ? '«' + channel.parent.name + '» / ' : '') + '«' + channel.name + '»');
+});
+
 client.on ('channelUpdate', async (oldChannel, newChannel) =>
 {
     // [v14] у каналов больше нет .guild -- берём из кэша гильдий:
@@ -890,11 +900,36 @@ client.on
     }
 );
 
+// [v2.4] Активные голосовые события -- всегда в лог (вход/выход/переход/микрофон/наушники/стрим/камера):
+function logVoiceEvent (oldState, newState)
+{
+    try
+    {
+        if (!newState.member || newState.member.user.bot) return; // боты (в т.ч. сам бот с музыкой) -- не шумим
+        let who = uuu (newState.member);
+        let nm = (st) => st.channel ? ('«' + st.channel.name + '»') : ('[канал ' + st.channelId + ']');
+        let o = oldState.channelId, n = newState.channelId;
+        if      (!o && n)           console.log ('[' + (d()) + '] [voice] + ' + who + ' -> ' + nm (newState));
+        else if (o && !n)           console.log ('[' + (d()) + '] [voice] - ' + who + ' <- ' + nm (oldState));
+        else if (o && n && o !== n) console.log ('[' + (d()) + '] [voice] > ' + who + ': ' + nm (oldState) + ' -> ' + nm (newState));
+        if (oldState.selfMute  !== newState.selfMute)
+            console.log ('[' + (d()) + '] [voice] микрофон '  + (newState.selfMute  ? 'ВЫКЛ' : 'ВКЛ') + ': ' + who + ' ' + nm (newState));
+        if (oldState.selfDeaf  !== newState.selfDeaf)
+            console.log ('[' + (d()) + '] [voice] наушники '  + (newState.selfDeaf  ? 'ВЫКЛ' : 'ВКЛ') + ': ' + who + ' ' + nm (newState));
+        if (oldState.selfStream !== newState.selfStream && newState.selfStream)
+            console.log ('[' + (d()) + '] [voice] стрим ВКЛ: '    + who + ' ' + nm (newState));
+        if (oldState.selfVideo  !== newState.selfVideo  && newState.selfVideo)
+            console.log ('[' + (d()) + '] [voice] камера ВКЛ: '   + who + ' ' + nm (newState));
+    }
+    catch (e) { console.error ('[voice] log error: ' + e.message); }
+}
+
 client.on ('voiceStateUpdate', async (oldState, newState) =>
 {
     const server = newState.guild.id; // Guild need!
     if (server in SERVERS && SERVERS[server].allow)
     {
+        logVoiceEvent (oldState, newState);
         await modNick
         (
             server, newState.member
@@ -2096,6 +2131,7 @@ async function playNext (guildId)
     }
     let track = m.tracks.shift ();
     m.current = track;
+    console.log ('[' + (d()) + '] [music] играю: ' + (track.title || track.url || 'трек')); // [v2.4] активное событие в лог
     try
     {
         let { resource, viaProxy } = await createTrackStream (track);
@@ -2142,6 +2178,7 @@ function connectTo (interaction)
                 selfDeaf: false,
             }
         );
+        console.log ('[' + (d()) + '] [music] подключился к «' + voiceChannel.name + '»'); // [v2.4] активное событие в лог
         m.player.on (AudioPlayerStatus.Idle, () =>
         {
             // трек кончился -- следующий:
