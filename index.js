@@ -2561,13 +2561,16 @@ async function createTrackStream (track)
     );
     if (resource.volume)
         resource.volume.setVolume (musicOf('').volume || 0.5);
-    return { resource, viaProxy };
+    // [v2.9] source/proc отдаём наружу: у предзагрузки нужно уметь всё это глушить
+    // (иначе непригодившийся трек оставил бы висеть yt-dlp, ждущий читателя в пайпе).
+    return { resource, viaProxy, source: ytdlpStream.stdout, proc: ytdlpStream };
 }
 
 // Воспроизведение следующего трека:
 async function playNext (guildId)
 {
     const m = musicOf (guildId);
+    if (m.leaving) return; // [v2.9] бот уже уходит -- новый трек не запускаем
     if (!m.tracks.length)
     {
         m.current = null;
@@ -2582,25 +2585,27 @@ async function playNext (guildId)
     schedulePresence (true);             // [v2.8] «слушает» этот трек
     try
     {
-        let { resource, viaProxy } = await createTrackStream (track);
-        // [FIX v2.2.1] ошибка в потоке (битое/удалённое видео) раньше валила весь бот:
-        // теперь пропускаем трек и играем следующий, с уведомлением в чат:
-        resource.playStream.once ('error', e =>
+        let resource = null, viaProxy = false;
+        const p = m.preload;
+        if (p && p.track === track)
         {
-            console.error ('[music] stream error (skip track): ' + e.message);
-            // [v2.2.2] сеть упала при стриме через прокси -- следующие треки временно DIRECT:
-            if (viaProxy && isNetworkError (e))
-                proxyStreamDead = true;
-            if (m.current === track)
-            {
-                m.current = null;
-                let ch = m.textChannelId && client.channels.cache.get (m.textChannelId);
-                if (ch)
-                    ch.send ('⚠️ **' + (track.title || 'Трек') + '** -- не удалось воспроизвести, пропускаю.').catch (() => {});
-                m.player.stop (true); // Idle -> playNext
-            }
-        });
+            // [v2.9] этот трек уже готовился пока играл предыдущий -- берём готовое
+            m.preload = null; // вынули: теперь это обычный играющий ресурс, не предзагрузка
+            const r = await p.promise; // в бою уже готова (песня играла минуты)
+            if (r) { resource = r.resource; viaProxy = r.viaProxy; }
+        }
+        else
+        {
+            // готовили не этот трек (или вообще ничего) -- выкидываем, иначе утечёт ffmpeg
+            dropPreload (m);
+        }
+        if (resource)
+            console.log ('[' + (d()) + '] [music] предзагрузка сыграла: ' + (track.title || 'трек') + ' (без паузы)');
+        else
+            ({ resource, viaProxy } = await createTrackStream (track));
+        wireStreamErrors (m, track, resource, viaProxy, guildId);
         m.player.play (resource);
+        startPreload (guildId); // [v2.9] пока играет -- готовим следующий трек
     }
     catch (e)
     {
@@ -2608,6 +2613,98 @@ async function playNext (guildId)
         m.current = null;
         playNext (guildId); // пропустить битый трек
     }
+}
+
+// ============================================================================
+// [v2.9] ПРЕДЗАГРУЗКА следующего трека: пока играет текущий, поток следующего уже
+// готовится (yt-dlp качает в пайп и упирается в backpressure -- память не растёт).
+// Раньше yt-dlp запускался только после Idle, поэтому между песнями была слышна
+// пауза на поиск/буферизацию; теперь следующая песня стартует мгновенно.
+// ============================================================================
+
+// Выбросить предзагрузку: чужие ffmpeg/yt-dlp должны умереть, а не висеть в памяти.
+function dropPreload (m)
+{
+    const p = m && m.preload;
+    if (!p) return;
+    m.preload = null;
+    p.cancelled = true;
+    killStream ({ resource: p.resource, source: p.source, proc: p.proc });
+}
+
+// Глушим поток трека целиком: сам ресурс, поток yt-dlp и его процесс.
+function killStream (r)
+{
+    if (!r) return;
+    try { if (r.resource) r.resource.playStream.destroy (); } catch {}
+    try { if (r.source) r.source.destroy (); } catch {}
+    try { if (r.proc && typeof r.proc.kill === 'function') r.proc.kill (); } catch {}
+}
+
+// Начать готовить первый трек очереди (повторные вызовы безопасны).
+function startPreload (guildId)
+{
+    const m = musicOf (guildId);
+    const next = m.tracks[0];
+    if (!next) { dropPreload (m); return; }
+    if (m.preload && m.preload.track === next) return; // этот уже готовим
+    dropPreload (m);                                   // готовили не то -- выкидываем
+    const p = { track: next, resource: null, viaProxy: false, cancelled: false };
+    m.preload = p;
+    p.promise = createTrackStream (next).then
+    (
+        r =>
+        {
+            if (p.cancelled)
+            {
+                killStream (r); // предзагрузку уже выбросили -- глушим всё, что успело открыться
+                return null;
+            }
+            p.resource = r.resource;
+            p.viaProxy = r.viaProxy;
+            p.source = r.source;
+            p.proc = r.proc;
+            // Обработчик ошибок вешаем сразу (а не когда трек начнёт играть): иначе
+            // 'error' у потока без слушателя уронил бы процесс.
+            wireStreamErrors (m, next, r.resource, r.viaProxy, guildId);
+            console.log ('[' + (d()) + '] [music] предзагрузка готова: ' + (next.title || 'трек'));
+            return r;
+        },
+        e =>
+        {
+            // не получилось -- не беда: playNext просто возьмёт свежий поток
+            p.cancelled = true;
+            console.error ('[music] предзагрузка не удалась (' + (next.title || 'трек') + '): ' + e.message);
+            return null;
+        }
+    );
+}
+
+// [FIX v2.2.1] ошибка в потоке (битое/удалённое видео) раньше валила весь бот.
+// [v2.9] теперь поток может быть (а) играющим -- пропускаем трек и едем дальше,
+// или (б) только предзагруженным -- просто выбрасываем испорченную заготовку.
+function wireStreamErrors (m, track, resource, viaProxy, guildId)
+{
+    resource.playStream.once ('error', e =>
+    {
+        const playing = m.current === track;
+        console.error ('[music] stream error (' + (playing ? 'skip track' : 'предзагрузка') + '): ' + e.message);
+        // [v2.2.2] сеть упала при стриме через прокси -- следующие треки временно DIRECT:
+        if (viaProxy && isNetworkError (e))
+            proxyStreamDead = true;
+        if (playing)
+        {
+            m.current = null;
+            let ch = m.textChannelId && client.channels.cache.get (m.textChannelId);
+            if (ch)
+                ch.send ('⚠️ **' + (track.title || 'Трек') + '** -- не удалось воспроизвести, пропускаю.').catch (() => {});
+            m.player.stop (true); // Idle -> playNext
+        }
+        else if (m.preload && m.preload.track === track)
+        {
+            m.preload = null; // сломанную заготовку даже не пробуем ставить
+        }
+    });
 }
 
 // ============================================================================
@@ -2630,21 +2727,36 @@ function fmtAgo (ms)
     return s + ' сек';
 }
 
+// Сколько ЛЮДЕЙ в голосовом канале (боты и сам бот не считаются). Считаем по кэшу
+// голосовых состояний: channel.members без интента GuildMembers пуст (в коде уже
+// есть такое место -- tempSweep).
+function humansInChannel (guildId, channelId)
+{
+    const guild = client.guilds.cache.get (guildId);
+    if (!guild || !channelId) return 0;
+    const selfId = client.user ? client.user.id : null; // до ready client.user может быть null
+    let n = 0;
+    for (const vs of guild.voiceStates.cache.values ())
+        if (vs.channelId === channelId && vs.id !== selfId && !(vs.member && vs.member.user.bot))
+            n++;
+    return n;
+}
+
+// Обрезка длинного текста (названия трека) под лимит поля: с многоточием.
+function clipText (s, max)
+{
+    s = String (s);
+    max = Math.max (4, max | 0);
+    return s.length <= max ? s : s.slice (0, max - 1) + '…';
+}
+
 // Текст статуса для текущего состояния. null -- бот не в голосовом канале.
 function voiceStatusText (guildId)
 {
     const m = $music[guildId];
     if (!m || !m.connection) return null;
     const chId = m.connection.joinConfig.channelId;
-    const guild = client.guilds.cache.get (guildId);
-    // людей в канале считаем по кэшу голосовых состояний -- channel.members без
-    // интента GuildMembers пуст (в коде уже есть такое место -- tempSweep):
-    let people = 0;
-    const selfId = client.user ? client.user.id : null; // до ready client.user может быть null
-    if (guild)
-        for (const vs of guild.voiceStates.cache.values ())
-            if (vs.channelId === chId && vs.id !== selfId && !(vs.member && vs.member.user.bot))
-                people++;
+    const people = humansInChannel (guildId, chId);
     let parts = [];
     if (m.current)
         parts.push ((m.player.state.status === AudioPlayerStatus.Paused ? '⏸ ' : '🎶 ') +
@@ -2751,13 +2863,22 @@ function presenceNow ()
     {
         const m = $music[g];
         if (!m.connection) continue;
-        const ch = client.channels.cache.get (m.connection.joinConfig.channelId);
+        const chId = m.connection.joinConfig.channelId;
+        const ch = client.channels.cache.get (chId);
         const where = ch ? '«' + ch.name + '»' : 'голосовом канале';
+        // хвост: что ещё ждёт и сколько людей в комнате (обе части -- только если есть)
+        const people = humansInChannel (g, chId);
+        const tail = (m.tracks.length ? ' · в очереди ' + m.tracks.length : '') +
+            (people ? ' · в канале ' + people : '');
         if (m.current)
-            playing = (m.player.state.status === AudioPlayerStatus.Paused ? '⏸ ' : '🎶 ') +
-                (m.current.title || 'трек') + ' — ' + where;
+        {
+            const icon = m.player.state.status === AudioPlayerStatus.Paused ? '⏸ ' : '🎶 ';
+            const suffix = ' — ' + where + tail;
+            // 128 символов -- лимит поля активности: режем НАЗВАНИЕ, а не хвост с очередью
+            playing = icon + clipText (m.current.title || 'трек', 128 - icon.length - suffix.length) + suffix;
+        }
         else if (!waiting)
-            waiting = '🎧 ' + where;
+            waiting = '🎧 ' + where + tail;
     }
     if (playing) return { type: ActivityType.Listening, name: playing };
     if (waiting) return { type: ActivityType.Watching, name: waiting };
@@ -2810,6 +2931,7 @@ function connectTo (interaction)
         m.since = Date.now (); // [v2.7] от этого считаем «бот тут N мин» в статусе
         m.player.on (AudioPlayerStatus.Idle, () =>
         {
+            if (m.leaving) return; // [v2.9] это Idle от нашего же выхода, а не конец трека
             // трек кончился -- следующий:
             m.current = null;
             playNext (interaction.guildId);
@@ -2852,10 +2974,16 @@ function destroyMusic (guildId)
 {
     const m = $music[guildId];
     if (!m) return;
+    // [v2.9] player.stop() синхронно шлёт Idle, а его обработчик запускает следующий трек.
+    // На выходе это означало лишний yt-dlp: ставим флаг и обнуляем очередь ДО stop().
+    m.leaving = true;
+    m.tracks = [];
+    m.current = null;
     // [v2.7] активное событие в лог: «вышел» раньше нигде не писалось,
     // а по логу должно быть видно и заход, и выход:
     const chId = m.connection && m.connection.joinConfig ? m.connection.joinConfig.channelId : null;
     const ch = chId ? client.channels.cache.get (chId) : null;
+    dropPreload (m); // [v2.9] убираем за собой: заготовка следующего трека тоже не нужна
     try { m.player.stop (true); } catch {}
     try { m.connection.destroy (); } catch {}
     delete $music[guildId];
@@ -3022,6 +3150,8 @@ client.on ('interactionCreate', async (interaction) =>
             let wasIdle = !m.current && !m.tracks.length;
             m.tracks.push (...tracks);
             scheduleVoiceStatus (guildId); // [v2.7] очередь изменилась -- обновим статус канала
+            schedulePresence ();           // [v2.8] «ещё N в очереди»
+            if (!wasIdle) startPreload (guildId); // [v2.9] уже играет что-то -- готовим следующий
             await interaction.editReply
             (
                 '🎶 Добавлено: **' + (tracks[0].title || query) + '**' +
@@ -3036,6 +3166,7 @@ client.on ('interactionCreate', async (interaction) =>
         {
             m.tracks = [];
             m.current = null;
+            dropPreload (m); // [v2.9] очередь очищена -- заготовка больше не нужна
             m.player.stop (true);
             scheduleVoiceStatus (guildId, true); // [v2.7] статус: тишина, очередь пустая
             schedulePresence (true);             // [v2.8] больше не «слушает»
