@@ -1,0 +1,31 @@
+{
+  "name": "peka",
+  "version": "2.2.0",
+  "description": "Peka",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node ."
+  },
+  "keywords": [
+    "discord",
+    "panda",
+    "peka",
+    "bot"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@discordjs/opus": "^0.10.0",
+    "@discordjs/voice": "^0.19.2",
+    "@keyv/sqlite": "^4.0.8",
+    "discord.js": "^14.27.0",
+    "ffmpeg-static": "^5.3.0",
+    "keyv": "^5.6.0",
+    "libsodium-wrappers": "^0.8.4",
+    "youtube-dl-exec": "^3.1.15"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

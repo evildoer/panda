@@ -1,0 +1,21 @@
+# Секреты и личное -- НЕ коммитить!
+config.json
+*.sqlite
+*.sqlite-journal
+logs/
+
+# Зависимости и рантайм
+node_modules/
+node-v*/
+
+# Мусор систем и редакторов
+Thumbs.db
+Desktop.ini
+~$*
+*.log
+*.tmp
+_*
+
+
+# Freebuff служебное
+.freebuff/

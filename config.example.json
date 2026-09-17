@@ -1,0 +1,39 @@
+{
+  "ID": "ТВОЙ_APPLICATION_ID",
+  "TOKEN": "ТВОЙ_ТОКЕН_БОТА",
+  "PREFIX": "panda ",
+  "ERROR":  true,
+  "NOTICE": true,
+  "DEBUG":  false,
+  "STARTUP_DM": ["247110936115150848"],
+  "SERVERS":
+  {
+    "470047648112705546":
+    {
+      "allow": true,
+      "name": "🐼PANDAMIA🐼",
+      "logo": "images/pandamia.png",
+      "admins": ["247110936115150848"],
+      "log_channel": "ID_КАНАЛА_ЖУРНАЛА",
+      "log_channel_temp": "ID_ВРЕМЕННОГО_КАНАЛА",
+      "pipe_channel_source": "ID_КАНАЛА_ИСТОЧНИКА",
+      "pipe_channel_target": "ID_КАНАЛА_ПРИЁМНИКА",
+      "channel_common": "ID_ОБЩЕГО_КАНАЛА",
+      "role_admin": "ID_РОЛИ_АДМИН",
+      "role_moder": "ID_РОЛИ_МОДЕР",
+      "role_dj": "ID_РОЛИ_DJ",
+      "addTag": true,
+      "role_for_manage": "ID_РОЛИ",
+      "role_for_no_speak": "ID_РОЛИ",
+      "role_for_no_stream": "ID_РОЛИ",
+      "role_for_no_media": "ID_РОЛИ",
+      "role_for_no_chat": "ID_РОЛИ",
+      "welcome_channel": "ID_КАНАЛА",
+      "welcome_message": "ID_СООБЩЕНИЯ",
+      "onLeaveBanTimeout": 20,
+      "onLeaveBanRealy": false,
+      "onEnterBanRealy": true,
+      "afkLikeChannels": []
+    }
+  }
+}
