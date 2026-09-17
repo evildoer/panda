@@ -601,7 +601,7 @@ client.on ('channelCreate', async (newChannel) =>
                         SERVERS[server]
                             .role_for_no_stream,
                         {
-                            STREAM: false,
+                            Stream: false,
                         }
                     )
                     .catch (console.error);
@@ -614,7 +614,7 @@ client.on ('channelCreate', async (newChannel) =>
                         SERVERS[server]
                             .role_for_no_speak,
                         {
-                            SPEAK: false,
+                            Speak: false,
                         }
                     )
                     .catch (console.error);
@@ -627,10 +627,10 @@ client.on ('channelCreate', async (newChannel) =>
                         SERVERS[server]
                             .role_for_no_media,
                         {
-                            ATTACH_FILES: false,
-                            EMBED_LINKS: false,
-                            USE_EXTERNAL_EMOJIS: false,
-                            USE_EXTERNAL_STICKERS: false,
+                            AttachFiles: false,
+                            EmbedLinks: false,
+                            UseExternalEmojis: false,
+                            UseExternalStickers: false,
                         }
                     )
                     .catch (console.error);
@@ -642,7 +642,7 @@ client.on ('channelCreate', async (newChannel) =>
                         SERVERS[server]
                             .role_for_no_chat,
                         {
-                            SEND_MESSAGES: false,
+                            SendMessages: false,
                         }
                     )
                     .catch (console.error);
@@ -656,13 +656,13 @@ client.on ('channelCreate', async (newChannel) =>
                         id, // owner.id
                         {
                             //MANAGE_CHANNELS:
-                            //MANAGE_ROLES: true,
-                              MANAGE_ROLES: owner.roles.cache.has (SERVERS[server].role_for_manage) ? true : null,
-                                     SPEAK: true,
-                              MUTE_MEMBERS: true,
-                            DEAFEN_MEMBERS: true,
-                              MOVE_MEMBERS: owner.roles.cache.has (SERVERS[server].role_for_manage) ? true : null,
-                            //VIEW_CHANNEL: true,
+                            //ManageRoles: true,
+                              ManageRoles: owner.roles.cache.has (SERVERS[server].role_for_manage) ? true : null,
+                                     Speak: true,
+                              MuteMembers: true,
+                            DeafenMembers: true,
+                              MoveMembers: owner.roles.cache.has (SERVERS[server].role_for_manage) ? true : null,
+                            //ViewChannel: true,
                         }
                     )
                     .then
@@ -775,12 +775,12 @@ client.on ('channelUpdate', async (oldChannel, newChannel) =>
                             id, // owner.id
                             {
                                 //MANAGE_CHANNELS:
-                                //MANAGE_ROLES: true,
-                                MANAGE_ROLES: owner.roles.cache.has (SERVERS[server].role_for_manage) ? true : null,
-                                         SPEAK: true,
-                                  MUTE_MEMBERS: true,
-                                DEAFEN_MEMBERS: true,
-                                MOVE_MEMBERS: owner.roles.cache.has (SERVERS[server].role_for_manage) ? true : null,
+                                //ManageRoles: true,
+                                ManageRoles: owner.roles.cache.has (SERVERS[server].role_for_manage) ? true : null,
+                                         Speak: true,
+                                  MuteMembers: true,
+                                DeafenMembers: true,
+                                MoveMembers: owner.roles.cache.has (SERVERS[server].role_for_manage) ? true : null,
                             }
                         )
                         .then
@@ -962,7 +962,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                             (
                                 newState.id,
                                 {
-                                    SPEAK: false,
+                                    Speak: false,
                                 }
                             )
                             .then
@@ -1040,7 +1040,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                             {
                                 //SPEAK: false,
                                 //STREAM: false,
-                                CONNECT: false,
+                                Connect: false,
                             }
                         )
                         .then
@@ -1124,7 +1124,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                         (
                             newState.id,
                             {
-                                SPEAK: null,
+                                Speak: null,
                             }
                         )
                         .then
@@ -1200,7 +1200,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                             {
                                 ///SPEAK: null,
                                 //STREAM: null,
-                                CONNECT: null,
+                                Connect: null,
                             }
                         )
                         .then
