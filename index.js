@@ -543,7 +543,9 @@ async function modNick (server, member/*, add = false*/)
                 )
             )
             {
-                if (nick.charCodeAt(0) !== 0xD83D) // 🔑 (старый чар-код оставлен как был: два UTF-16 слова)
+                // [FIX v2.3.3] точная проверка ключа: старый чар-код 0xD83D ловил ЛЮБОЙ
+                // эмодзи в начале ника (💙, 🔊...) и срезал его, думая что это ключ:
+                if (!nick.startsWith (tag))
                 {
                     let nickNew = tag + nick;
                     console.log ('[' + (d()) + '] [nick] +🔑 ' + member.user.username + ' in ' + member.voice.channel.name);
@@ -1594,9 +1596,10 @@ async function sweepNicks (server)
         const guild = client.guilds.cache.get (server);
         if (!guild || !(SERVERS[server].addTag || false)) return;
         const tag = '🔑';
-        // [FIX v2.2.4] REST-эндпоинт voice-states ботам недоступен (404) -- берём
+        // [FIX v2.3.2] REST-эндпоинт voice-states ботам недоступен (404) -- берём
         // кэш гейтвея: guild.voiceStates заполнен из GUILD_CREATE/voice-событий:
         let states = guild.voiceStates.cache;
+        let checked = 0, added = 0, removed = 0;
         for (let vs of states.values ())
         {
             if (vs.id === client.user.id) continue;
@@ -1611,19 +1614,27 @@ async function sweepNicks (server)
                 ow.allow.has (PermissionsBitField.Flags.DeafenMembers) ||
                 ow.allow.has (PermissionsBitField.Flags.MuteMembers)
             );
-            let member = await guild.members.fetch (vs.user_id).catch (() => null);
+            // [FIX v2.3.2] VoiceState несёт member из гейтвея (vs.member) даже без
+            // GuildMembers-интента; fetch по id нужен только как страховка.
+            // (vs.user_id -- сырого API-поля в v14 нет, fetch(undefined) вечно падал):
+            let member = vs.member || await guild.members.fetch (vs.id).catch (() => null);
             if (!member || member.user.bot) continue;
+            checked++;
             let nick = member.nickname || member.user.username;
-            let hasTag = nick.charCodeAt (0) === 0xD83D; // 🔑
+            // [FIX v2.3.3] charCodeAt (0xD83D) ловит ЛЮБОЙ эмодзи в начале ника
+            // (💙, 🔊...) и свип срезал их, думая что это ключ. Точная проверка:
+            let hasTag = nick.startsWith ('🔑'); // 🔑
             if (hasRights && !hasTag)
                 await member.setNickname (tag + nick)
-                    .then (() => console.log ('[' + (d()) + '] [nick] +🔑 (sweep) ' + member.user.username + ' in ' + channel.name))
+                    .then (() => { added++; console.log ('[' + (d()) + '] [nick] +🔑 (sweep) ' + member.user.username + ' in ' + channel.name); })
                     .catch (e => console.error ('[nick][sweep] error for ' + member.user.username + ': ' + e.message));
             else if (!hasRights && hasTag)
                 await member.setNickname (nick.slice (tag.length))
-                    .then (() => console.log ('[' + (d()) + '] [nick] -🔑 (sweep) ' + member.user.username))
+                    .then (() => { removed++; console.log ('[' + (d()) + '] [nick] -🔑 (sweep) ' + member.user.username); })
                     .catch (e => console.error ('[nick][sweep] error for ' + member.user.username + ': ' + e.message));
         }
+        if (checked > 0 && (added > 0 || removed > 0))
+            console.log ('[' + (d()) + '] [nick][sweep] проверено ' + checked + ' в голосе: +' + added + '/-' + removed + ' ключей');
     }
     catch (e)
     {
@@ -1685,7 +1696,8 @@ async function tempCreateFor (server, member)
     if (SERVERS[server].addTag || false)
     {
         let nick = member.nickname || member.user.username;
-        if (nick.charCodeAt (0) !== 0xD83D)
+        // [FIX v2.3.3] точная проверка ключа (см. комментарий в sweepNicks):
+        if (!nick.startsWith ('🔑'))
             await member.setNickname ('🔑' + nick)
                 .then (() => console.log ('[' + (d()) + '] [nick] +🔑 (temp) ' + member.user.username))
                 .catch (e => console.error ('[temp] error on setNickname: ' + e.message));
@@ -1694,6 +1706,8 @@ async function tempCreateFor (server, member)
 }
 
 // Удаление ПУСТЫХ личных каналов в категории:
+// [FIX v2.3.1] пустоту определяем ТОЛЬКО по кэшу голосовых состояний (voiceStates):
+// channel.members требует кэша участников, которого без GuildMembers-интента НЕТ.
 async function tempSweep (server)
 {
     const guild = client.guilds.cache.get (server);
@@ -1703,10 +1717,28 @@ async function tempSweep (server)
     for (let [, ch] of guild.channels.cache)
     {
         if (ch.parentId !== catId || ch.type !== ChannelType.GuildVoice || ch.id === lobbyId) continue;
-        if (ch.members.size) continue; // в канале кто-то есть (владелец или гости) -- живём
+        let busy = false;
+        for (let [, vs] of guild.voiceStates.cache)
+            if (vs.channelId === ch.id) { busy = true; break; }
+        if (busy) continue; // в канале кто-то есть -- живём
         await ch.delete ('Peka: pustoy lichny kanal')
             .then (() => console.log ('[' + (d()) + '] [temp] deleted empty ' + ch.name))
             .catch (e => console.error ('[temp] error on delete: ' + e.message));
+    }
+}
+
+// [v2.3.1] кто-то в лобби (в т.ч. с момента до старта бота) -- создать личный канал:
+async function tempLobbyCheck (server)
+{
+    const guild = client.guilds.cache.get (server);
+    const lobbyId = SERVERS[server].temp_lobby || '';
+    if (!guild || !lobbyId) return;
+    for (let [, vs] of guild.voiceStates.cache)
+    {
+        if (vs.channelId !== lobbyId) continue;
+        let member = vs.member || await guild.members.fetch (vs.id).catch (() => null);
+        if (member && !member.user.bot)
+            await tempCreateFor (server, member).catch (e => console.error ('[temp] lobby error: ' + e.message));
     }
 }
 
@@ -1769,28 +1801,32 @@ client.on
             await sweepExpiredBans (server);
             // [v2.3] почистить пустые личные каналы после рестарта:
             await tempSweep (server);
-        }
-        setInterval
-        (            async () =>
+        }            setInterval
+            (
+                async () =>
                 {
                     for (let server in SERVERS)
                     {
                         if (!SERVERS[server].allow) continue;
-                        await pollMembers (server);
-                        await sweepExpiredBans (server);
-                        await sweepNicks (server); // [v2.2.3] теги 🔑 -- рестарт-безопасно
-                        await tempSweep (server); // [v2.3] пустые личные каналы
-                        // [v2.3] кто-то сидит в лобби (в т.ч. с момента до старта бота) -- создать канал:
-                        let _tg = client.guilds.cache.get (server);
-                        let _lobby = SERVERS[server].temp_lobby || '';
-                        if (_tg && _lobby)
-                            for (let [, _vs] of _tg.voiceStates.cache)
-                                if (_vs.channelId === _lobby && _vs.member)
-                                    await tempCreateFor (server, _vs.member).catch (console.error);
+                        // [FIX v2.3.1] КАЖДЫЙ шаг в своём предохранителе -- падение одного
+                        // шага (сеть, кэш) больше не отменяет остальные (ключи, кабинеты):
+                        let steps =
+                        [
+                            () => pollMembers (server),
+                            () => sweepExpiredBans (server),
+                            () => sweepNicks (server),        // ключи 🔑
+                            () => tempSweep (server),         // пустые кабинеты
+                            () => tempLobbyCheck (server),    // лобби -> кабинет
+                        ];
+                        for (let step of steps)
+                        {
+                            try { await step (); }
+                            catch (e) { console.error ('[' + (d()) + '] [tick] ' + (step.name || 'step') + ': ' + e.message); }
+                        }
                     }
                 },
-            POLL_PERIOD
-        );
+                POLL_PERIOD
+            );
     }
 );
 
