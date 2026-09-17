@@ -523,12 +523,23 @@ async function ownersOf (channel)
     return owners;
 }
 
+// [v2.3.4] ADM/MOD-роли: бот НЕ управляет их ключом 🔑 -- права у них и так есть
+// в любом канале, а захотят -- поставят себе сами (и бот его не срежет):
+function isStaff (server, member)
+{
+    return !!member &&
+    (
+        (SERVERS[server].role_admin && member.roles.cache.has (SERVERS[server].role_admin)) ||
+        (SERVERS[server].role_moder && member.roles.cache.has (SERVERS[server].role_moder))
+    );
+}
+
 async function modNick (server, member/*, add = false*/)
 {
     const tag = '🔑'; // 🔴
     if (SERVERS[server].addTag || false)
     {
-        if (!member.user.bot) // [v2.2.3] тег -- ЛЮБОМУ с правами в канале (в т.ч. админам/модерам; раньше они пропускались -- регрессия)
+        if (!member.user.bot && !isStaff (server, member)) // [v2.2.3] тег -- ЛЮБОМУ с правами в канале (в т.ч. админам/модерам; раньше они пропускались -- регрессия); [v2.3.4] НО роли ADM/MOD -- не трогаем вообще (ни +, ни -)
         {
             let nick = member.nickname || member.user.username;
             if
@@ -1619,6 +1630,7 @@ async function sweepNicks (server)
             // (vs.user_id -- сырого API-поля в v14 нет, fetch(undefined) вечно падал):
             let member = vs.member || await guild.members.fetch (vs.id).catch (() => null);
             if (!member || member.user.bot) continue;
+            if (isStaff (server, member)) continue; // [v2.3.4] ADM/MOD -- ключ не трогаем (даже самопоставленный)
             checked++;
             let nick = member.nickname || member.user.username;
             // [FIX v2.3.3] charCodeAt (0xD83D) ловит ЛЮБОЙ эмодзи в начале ника
@@ -1692,8 +1704,8 @@ async function tempCreateFor (server, member)
     if (member.voice.channelId === lobbyId)
         await member.voice.setChannel (created.id)
             .catch (e => console.error ('[temp] error on setChannel: ' + e.message));
-    // ключ владельцу (он в своём канале -- права есть):
-    if (SERVERS[server].addTag || false)
+    // ключ владельцу (он в своём канале -- права есть; ADM/MOD -- не трогаем):
+    if ((SERVERS[server].addTag || false) && !isStaff (server, member))
     {
         let nick = member.nickname || member.user.username;
         // [FIX v2.3.3] точная проверка ключа (см. комментарий в sweepNicks):
