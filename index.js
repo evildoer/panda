@@ -65,28 +65,54 @@ const OWNER_ID =
         ? STARTUP_DM[0]
         : '';
 
-// [v2.2] Инструкция по использованию -- рассылается в ЛС при каждом старте бота:
+// [v2.2] Инструкция по использованию. Один текст на все входы: стартовая ЛС
+// (STARTUP_DM из config.json), слэш `/help` и `panda help` -- правки только здесь.
 const STARTUP_DM_TEXT =
     '**Как пользоваться ботом** 🐼\n' +
+    '📌 Вызвать эту инструкцию в любой момент: `/help` (видно только тебе)\n' +
+    'или `panda help` (бот пришлёт её в ЛС).\n' +
     '\n' +
     '🎵 **Музыка** (слэш-команды; сначала зайди в голосовой канал):\n' +
     '`/play ссылка или запрос` -- трек или плейлист (YouTube, SoundCloud и др.)\n' +
     '`/skip` -- следующий • `/stop` -- стоп и очистить очередь\n' +
     '`/pause` / `/resume` -- пауза / продолжить • `/queue` -- что играет\n' +
     '`/leave` -- выйти из голосового канала\n' +
+    'Управлять музыкой могут админы, модеры и роль DJ (смотреть очередь -- всем).\n' +
     '\n' +
     '💬 **Команды в чате** (префикс `panda `):\n' +
     '`panda ping` -- проверка связи (ответ: pong)\n' +
+    '`panda help` -- бот пришлёт эту инструкцию в ЛС\n' +
     '`panda file` + вложение -- бот вернёт файл обратно\n' +
-    '`panda dm @юзер текст` -- ЛС от имени бота (только админы)\n' +
+    '`panda dm @юзер текст` -- ЛС от имени бота (только админы);\n' +
+    'вместо упоминания можно указать id: `panda dm 123456789012345678 текст`\n' +
     '`panda test` -- бот напишет тебе в личку (проверка ЛС)\n' +
     '\n' +
     '🛡️ **Что бот делает сам:**\n' +
-    '• мут/глухота в чужих каналах; жалоба -- зайди в общий канал 🆘\n' +
+    '• мут/глухота действуют только в своём канале: в других говорить можно,\n' +
+    '  вернёшься -- мут на месте; жалоба -- зайди в общий канал 🆘\n' +
     '• выдаёт права владельцу канала и ставит тег 🔑 в ник\n' +
     '• бан на 20 минут за выход с сервера (таймаут на перезаход)\n' +
     '\n' +
+    '🔑 **Тег 🔑 в нике** -- права в этом канале есть. У ADM/MOD тега нет: у них права и так.\n' +
+    '\n' +
     '🖥️ **Если бот выключен** -- напиши ' + (OWNER_ID ? u (OWNER_ID) : 'владельцу сервера') + '.';
+
+// [v2.6] Инструкция одним объектом -- чтобы /help, `panda help` и стартовая ЛС
+// никогда не разъезжались по тексту:
+function helpEmbed ()
+{
+    const first = Object.keys (SERVERS)[0];
+    return {
+        color: 0x00CCFF,
+        title: '🐼 PANDAMIA Bot: инструкция',
+        description: STARTUP_DM_TEXT,
+        footer:
+        {
+            text: (first && SERVERS[first]) ? SERVERS[first].name : 'PANDAMIA Bot',
+        },
+        timestamp: dt(), // [v14] только Date/number (locale-строка кидала 'Invalid time value'),
+    };
+}
 
 const
 {
@@ -250,24 +276,7 @@ client.on
             .then
             (
                 user =>
-                user.send
-                (
-                    {
-                        embeds:
-                        [
-                            {
-                                color: 0x00CCFF,
-                                title: '🐼 PANDAMIA Bot: инструкция',
-                                description: STARTUP_DM_TEXT,
-                                footer:
-                                {
-                                    text: SERVERS[Object.keys (SERVERS)[0]] ? SERVERS[Object.keys (SERVERS)[0]].name : 'PANDAMIA Bot',
-                                },
-                                timestamp: dt(), // [v14] только Date/number (locale-строка кидала 'Invalid time value'),
-                            },
-                        ],
-                    }
-                )
+                user.send ({ embeds: [helpEmbed ()] }) // [v2.6] тот же текст, что у /help
             )
             .then (() => console.log ('[' + (d()) + '] startup DM sent to ' + uid))
             .catch (e => console.error ('[' + (d()) + '] startup DM error for ' + uid + ': ' + e.message));
@@ -372,7 +381,7 @@ function attachOf (message)
 }
 
 // [v2.5] Разбор `panda dm`: кому -- упоминание ИЛИ просто id (17-20 цифр).
-// Раньше целью было ТОЛЬКО упоминание, поэтому `panda dm 247110936115150848 текст`
+// Раньше целью было ТОЛЬКО упоминание, поэтому `panda dm <id> текст`
 // молча ничего не делал (а команда при этом удалялась).
 // Возвращает { id, letter }: id может быть null (кому -- не поняли).
 function dmParse (content, mentions)
@@ -419,9 +428,22 @@ client.on ('messageCreate', async message =>
                     content: 'pong'
                 }
             )
-            .then  (console.log)
-            .catch (console.error);
+            // [v2.6] .then (console.log) печатал в лог весь объект сообщения --
+            // строку события ('[cmd] ... panda ping') уже пишет обработчик выше.
+            .catch (e => console.error ('[' + (d()) + '] [cmd] ping: ' + e.message));
             //message.reply ('Pika!');
+        }
+
+        // command 'help' ## [v2.6] Инструкция в ЛС тому, кто спросил.
+        // В чат её не льём (20 строк шума); саму команду в канале уберёт блок ниже.
+        if (message.content.startsWith (PREFIX + 'help'))
+        {
+            message.author.send ({ embeds: [helpEmbed ()] })
+            .then (() => console.log ('[' + (d()) + '] [dm] help -> ' + uu (message.author) + ' OK'))
+            .catch (e => console.error
+            (
+                '[' + (d()) + '] [dm] help -> ' + uu (message.author) + ': ЛС не ушло (' + e.message + ')'
+            ));
         }
 
         // command 'test' ## [v2.5] Самопроверка ЛС.
@@ -612,7 +634,7 @@ client.on ('messageCreate', async message =>
                         (
                             {
                                 content: '🤔 Кому? `panda dm @юзер текст` ' +
-                                    'или `panda dm 247110936115150848 текст`'
+                                    'или `panda dm 123456789012345678 текст`'
                             }
                         )
                         .catch (console.error);
@@ -684,6 +706,12 @@ client.on ('messageCreate', async message =>
                 else if (message.content.startsWith (PREFIX + 'test'))
                 {
                     message.delete ().catch (console.error); // delete command?
+                }
+                // command 'help' ## [v2.6] инструкция уже ушла в ЛС (блок выше) --
+                // в канале убираем саму команду:
+                else if (message.content.startsWith (PREFIX + 'help'))
+                {
+                    message.delete ().catch (console.error);
                 }
             }
         }
@@ -2650,6 +2678,11 @@ function isUrl (s)
 // Слэш-команды:
 const musicCommands =
 [
+    // [v2.6] /help -- та же инструкция, что в стартовой ЛС, видна только вызвавшему
+    // (доступна всем, без DJ и без голосового канала):
+    new SlashCommandBuilder ()
+        .setName ('help')
+        .setDescription ('Инструкция: как пользоваться ботом'),
     new SlashCommandBuilder ()
         .setName ('play')
         .setDescription ('Включить музыку: ссылка (YouTube/плейлист) или поиск')
@@ -2715,6 +2748,9 @@ client.on ('interactionCreate', async (interaction) =>
         ' -- ' + (interaction.member ? uuu (interaction.member) : (interaction.user ? interaction.user.username : '?')) +
         (interaction.channel && interaction.channel.name ? ' @ #' + interaction.channel.name : '')
     );
+    // [v2.6] /help -- всем и всегда: без DJ-роли и без голосового канала, ephemeral.
+    if (name === 'help')
+        return interaction.reply ({ embeds: [helpEmbed ()], flags: MessageFlags.Ephemeral });
     if (!['play','stop','skip','pause','resume','queue','leave'].includes (name)) return;
     const guildId = interaction.guildId;
     const m = musicOf (guildId);
