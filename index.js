@@ -120,6 +120,7 @@ const
     PermissionsBitField,
     Collection,
     AuditLogEvent, // [v2.4] авторство действий: кто замутил/перенёс (из журнала аудита)
+    ActivityType,  // [v2.8] профильный статус бота (слушает/смотрит/играет)
 } = require ('discord.js');
 
 // [v2.1] GuildMembers интент УБРАН -- он привилегированный, без одобрения Discord
@@ -266,6 +267,7 @@ client.on
             '[' + (d()) + '] ' +
             `Logged in as ${client.user.tag}!` // v14: tag === username (discriminator убрали)
         );
+        schedulePresence (true); // [v2.8] профильный статус: «свободен, жду команду»
         // [v2.2] Инструкция по использованию -- в ЛС владельцу и коллеге (STARTUP_DM из config.json):
         for (const uid of (STARTUP_DM || []))
         {
@@ -2570,12 +2572,14 @@ async function playNext (guildId)
     {
         m.current = null;
         scheduleVoiceStatus (guildId); // [v2.7] «очередь: —» в статусе канала
+        schedulePresence ();           // [v2.8] трек кончился -- «смотрит канал»
         return;
     }
     let track = m.tracks.shift ();
     m.current = track;
     console.log ('[' + (d()) + '] [music] играю: ' + (track.title || track.url || 'трек')); // [v2.4] активное событие в лог
     scheduleVoiceStatus (guildId, true); // [v2.7] сразу показать новый трек и очередь
+    schedulePresence (true);             // [v2.8] «слушает» этот трек
     try
     {
         let { resource, viaProxy } = await createTrackStream (track);
@@ -2728,6 +2732,64 @@ const voiceStatusTick = setInterval
 );
 if (voiceStatusTick.unref) voiceStatusTick.unref ();
 
+// ============================================================================
+// [v2.8] ПРОФИЛЬНЫЙ СТАТУС: «что бот делает» — видно везде, даже вне голосового.
+//   слушает трек / смотрит канал, где сидит / свободен (ждёт команду).
+// Discord лимитирует обновления presence, поэтому здесь та же схема, что у статуса
+// канала: дебаунс + текст берётся В МОМЕНТ записи (на экране всегда актуальное).
+// ============================================================================
+const PRESENCE_MIN_GAP = 5000; // мс между обновлениями (лимит Discord на presence)
+let $presenceTimer = null;
+let $presenceLast = 0;
+let $presenceDone = null; // что уже выставлено на экран (чтобы не дёргать API зря)
+
+function presenceNow ()
+{
+    // если серверов несколько -- показываем самое интересное: трек важнее ожидания:
+    let playing = null, waiting = null;
+    for (let g in $music)
+    {
+        const m = $music[g];
+        if (!m.connection) continue;
+        const ch = client.channels.cache.get (m.connection.joinConfig.channelId);
+        const where = ch ? '«' + ch.name + '»' : 'голосовом канале';
+        if (m.current)
+            playing = (m.player.state.status === AudioPlayerStatus.Paused ? '⏸ ' : '🎶 ') +
+                (m.current.title || 'трек') + ' — ' + where;
+        else if (!waiting)
+            waiting = '🎧 ' + where;
+    }
+    if (playing) return { type: ActivityType.Listening, name: playing };
+    if (waiting) return { type: ActivityType.Watching, name: waiting };
+    return { type: ActivityType.Playing, name: '/help · /play · /join' }; // свободен
+}
+
+function writePresence ()
+{
+    if (!client.user) return; // до ready менять нечего
+    const want = presenceNow ();
+    want.name = String (want.name).slice (0, 128); // лимит поля активности
+    if ($presenceDone && $presenceDone.type === want.type && $presenceDone.name === want.name) return;
+    $presenceDone = want;
+    $presenceLast = Date.now ();
+    try
+    {
+        client.user.setActivity ({ name: want.name, type: want.type });
+    }
+    catch (e)
+    {
+        console.error ('[' + (d()) + '] [presence] статус не выставился: ' + e.message);
+        $presenceDone = null; // попробуем при следующем событии
+    }
+}
+
+function schedulePresence (immediate = false)
+{
+    if ($presenceTimer) return; // уже запланировано -- текст возьмётся свежий в момент записи
+    const wait = immediate ? Math.max (PRESENCE_MIN_GAP - (Date.now () - $presenceLast), 0) : PRESENCE_MIN_GAP;
+    $presenceTimer = setTimeout (() => { $presenceTimer = null; writePresence (); }, wait);
+}
+
 // Подключение к голосовому каналу пользователя:
 function connectTo (interaction)
 {
@@ -2767,6 +2829,7 @@ function connectTo (interaction)
             }
         });
         scheduleVoiceStatus (interaction.guildId, true); // [v2.7] показать статус сразу
+        schedulePresence (true);                         // [v2.8] «смотрит канал»
     }
     else
     {
@@ -2780,6 +2843,7 @@ function connectTo (interaction)
             // [v2.7] статус живёт в канале: из старого снимаем, в новом пишем заново
             clearVoiceStatus (oldChId);
             scheduleVoiceStatus (interaction.guildId, true);
+            schedulePresence (true); // [v2.8] название канала в статусе тоже сменилось
         }
     }
 }
@@ -2800,6 +2864,7 @@ function destroyMusic (guildId)
     if ($voiceStatus[guildId] && $voiceStatus[guildId].timer)
         clearTimeout ($voiceStatus[guildId].timer);
     delete $voiceStatus[guildId];
+    schedulePresence (true); // [v2.8] вышел -- статус снова «свободен»
     if (chId)
         console.log ('[' + (d()) + '] [music] вышел из «' + (ch ? ch.name : chId) + '»');
 }
@@ -2973,6 +3038,7 @@ client.on ('interactionCreate', async (interaction) =>
             m.current = null;
             m.player.stop (true);
             scheduleVoiceStatus (guildId, true); // [v2.7] статус: тишина, очередь пустая
+            schedulePresence (true);             // [v2.8] больше не «слушает»
             return interaction.reply ('⏹ Остановлено, очередь очищена.');
         }
         else if (name === 'skip')
@@ -2987,12 +3053,14 @@ client.on ('interactionCreate', async (interaction) =>
         {
             m.player.pause ();
             scheduleVoiceStatus (guildId, true); // [v2.7] статус: ⏸
+            schedulePresence (true);             // [v2.8] статус: ⏸ трек
             return interaction.reply ('⏸ Пауза.');
         }
         else if (name === 'resume')
         {
             m.player.unpause ();
             scheduleVoiceStatus (guildId, true);
+            schedulePresence (true);
             return interaction.reply ('▶️ Продолжаем.');
         }
         else if (name === 'queue')
