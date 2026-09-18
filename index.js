@@ -249,7 +249,9 @@
 const
 {
     ID, TOKEN, PREFIX, SERVERS,
-    ERROR, DEBUG, NOTICE, STARTUP_DM,
+    // [v2.23] Ключей ERROR и NOTICE здесь больше нет: они были объявлены, но код их
+    // нигде не читал -- то есть настройка «влияла» ровно ни на что.
+    DEBUG, STARTUP_DM,
     MESSAGE_CONTENT,
     // [v2.17] Интент Guild Members (привилегированный): мгновенные события входа/выхода.
     // Поставь "GUILD_MEMBERS": false в config.json, если Discord его отзовёт -- тогда
@@ -432,8 +434,7 @@ const USE_MESSAGE_CONTENT = MESSAGE_CONTENT !== false;
 const USE_GUILD_MEMBERS = GUILD_MEMBERS !== false;
 
 // [v2.14] КТО В КОНТАКТАХ. Контактов теперь два, и оба необязательны:
-//   * владелец ХОСТИНГА бота -- кто его запускает и следит (верхний ключ OWNER,
-//     иначе первый id из STARTUP_DM, как было раньше);
+//   * владелец ХОСТИНГА бота -- кто его запускает и следит (верхний ключ OWNER);
 //   * владелец СЕРВЕРА -- чей это сервер (ключ сервера owner_server).
 // Это разные люди: бот может стоять на сервере, где владелец хостинга -- не админ.
 // Показывать каждый контакт можно отдельно: show_owner_hoster / show_owner_server
@@ -4049,6 +4050,75 @@ async function tempLobbyCheck (server)
     }
 }
 
+// ============================================================================
+// [v2.23] НАСТРОЙКИ, КОТОРЫЕ МОЛЧА НИЧЕГО НЕ ДЕЛАЮТ.
+// Часть ключей config.json работает только ВМЕСТЕ с соседним или при определённом
+// его значении: welcome_message без welcome_channel найти невозможно (в Discord нет
+// поиска сообщения по id без канала), temp_lobby без temp_category не создаёт личных
+// каналов, pipe_channel_source без pipe_channel_target некуда пересылать, а таймаут за
+// выход с выключенными onLeaveBanRealy и onEnterBanRealy вообще никого не ограничивает.
+// Раньше всё это выглядело как «бот просто ничего не делает» -- без единой строки в
+// логе. Теперь при старте каждая такая настройка получает строку [config], а если всё
+// настроено правильно -- функция молчит. Проверяются СМЫСЛОВЫЕ нестыковки (пары и
+// «ни на что не влияет»); существование каналов и ролей -- отдельно, в
+// checkConfigChannels (там есть guild).
+// ============================================================================
+function configSanityIssues ()
+{
+    const out = [];
+    const idOk = v => /^\d{17,20}$/.test (String (v === undefined || v === null ? '' : v).trim ());
+    const has = v => String (v === undefined || v === null ? '' : v).trim () !== '';
+    // PREFIX без пробела на конце: 'panda ping' не соберётся ни в одну команду.
+    if (has (PREFIX) && !/\s$/.test (String (PREFIX)))
+        out.push ('PREFIX = "' + PREFIX + '": нет пробела на конце -- текстовые команды (' +
+            'panda ping, panda help, panda dm) работать не будут');
+    if (has (privacy_url) && !PRIVACY_URL)
+        out.push ('privacy_url: не похоже на ссылку http(s) -- /mydata и /help её не покажут');
+    if (has (MUSIC_CFG.filter) && MUSIC_CFG.normalize === false)
+        out.push ('MUSIC.filter задан, но MUSIC.normalize: false -- фильтр не применяется (играю как записано)');
+    for (let server in SERVERS)
+    {
+        // Значение не объект (в конфиг случайно попала строка/число) -- не падаем:
+        // просто считаем блок пустым, и он получит предупреждение про allow ниже.
+        const s = (SERVERS[server] && typeof SERVERS[server] === 'object') ? SERVERS[server] : {};
+        const nm = (s.name || server) + ' (' + server + ')';
+        // Ключа allow нет -- сервер не обслуживается вообще (все шаги пропускают его).
+        if (!('allow' in s))
+        {
+            out.push ('сервер ' + nm + ': нет ключа "allow" -- бот его НЕ обслуживает (поставь "allow": true)');
+            continue; // остальные настройки выключенного сервера не разбираем
+        }
+        if (s.allow === false) continue; // выключен осознанно -- придираться не к чему
+        if (idOk (s.welcome_message) && !idOk (s.welcome_channel))
+            out.push ('сервер ' + nm + ': welcome_message задан, а welcome_channel пуст/неверен -- ' +
+                'сообщение с правилами найти негде, приветствие новичкам ВЫКЛЮЧЕНО');
+        if (idOk (s.temp_lobby) && !idOk (s.temp_category))
+            out.push ('сервер ' + nm + ': temp_lobby задан, а temp_category пуст/неверен -- ' +
+                'личные каналы (@ник) создаваться не будут');
+        if (idOk (s.pipe_channel_source) && !idOk (s.pipe_channel_target))
+            out.push ('сервер ' + nm + ': pipe_channel_source задан, а pipe_channel_target пуст -- ' +
+                'пересылать некуда, мост ничего не делает');
+        if ((Number (s.onLeaveBanTimeout) > 0) && s.onLeaveBanRealy === false && s.onEnterBanRealy === false)
+            out.push ('сервер ' + nm + ': onLeaveBanTimeout = ' + s.onLeaveBanTimeout + ', но onLeaveBanRealy ' +
+                'и onEnterBanRealy выключены -- таймаут только записывается, никто не ограничивается');
+        for (let key of ['role_admin', 'role_moder', 'role_dj', 'role_for_manage',
+                         'role_for_no_speak', 'role_for_no_stream', 'role_for_no_media', 'role_for_no_chat'])
+        {
+            if (!has (s[key])) continue;
+            if (!idOk (s[key]))
+                out.push ('сервер ' + nm + ': ' + key + ' = "' + s[key] + '": не похоже на id роли -- ' +
+                    'настройка молча не работает');
+        }
+        if (has (s.owner_server) && !idOk (s.owner_server))
+            out.push ('сервер ' + nm + ': owner_server = "' + s.owner_server + '": не похоже на id -- ' +
+                'в помощи он не показывается');
+        if (has (s.queue_page) && Number.isFinite (Number (s.queue_page)) && Number (s.queue_page) > 25)
+            out.push ('сервер ' + nm + ': queue_page = ' + s.queue_page + ' -- страница будет 25 ' +
+                '(больше Discord не принимает)');
+    }
+    return out;
+}
+
 // [v2.5] Проверка id из config.json при старте: битый id вылезет сразу,
 // а не загадочной ошибкой переноса/лога через час. Молчим, если всё цело.
 async function checkConfigChannels (server)
@@ -4067,6 +4137,19 @@ async function checkConfigChannels (server)
         }
         if ((key === 'channel_common' || key === 'temp_lobby') && !ch.isVoiceBased ())
             console.error ('[config] ' + key + ' = ' + id + ' ("' + ch.name + '"): не голосовой канал');
+    }
+    // [v2.23] Роли из config.json: id, которой на сервере нет (удалили, перепутали,
+    // скопировали из чужого конфига), молча обнуляет настройку -- а вместе с ней и
+    // права: «role_dj» пропадёт -> музыку сможет любой с правами в канале,
+    // «role_admin» пропадёт -> админы потеряют права в боте без единой строки в логе.
+    for (let key of ['role_admin', 'role_moder', 'role_dj', 'role_for_manage',
+                     'role_for_no_speak', 'role_for_no_stream', 'role_for_no_media', 'role_for_no_chat'])
+    {
+        let id = SERVERS[server][key];
+        if (!id) continue;
+        if (!guild.roles.cache.get (String (id)))
+            console.error ('[config] ' + key + ' = ' + id + ': такой роли на сервере нет -- ' +
+                'настройка молча не работает');
     }
 }
 
@@ -4335,7 +4418,15 @@ const
 const MUSIC_CFG = MUSIC || {};
 // Прокси для yt-dlp (YouTube напрямую из РФ недоступен).
 // [v2.2.2] Стратегия: сначала через прокси; если не отвечает 3 секунды -- DIRECT:
-const MUSIC_PROXY = MUSIC_CFG.proxy || process.env.MUSIC_PROXY || 'socks5://127.0.0.1:10808';
+// [v2.23] Раньше здесь стояло `MUSIC_CFG.proxy || env || 'socks5://127.0.0.1:10808'`, и
+// ПУСТАЯ строка (а подсказка в конфиге обещает «пустая строка -- без прокси») молча
+// подменялась сперва переменной окружения, а затем ЗАШИТЫМ адресом -- то есть бот всё
+// равно лез в несуществующий прокси и терял 3 секунды на каждой песне. Теперь смысл
+// ключа честный: ключ есть -- берём его как есть (пустой = DIRECT); ключа нет --
+// переменная окружения MUSIC_PROXY, иначе DIRECT. Зашитого адреса в коде больше нет.
+const MUSIC_PROXY = ('proxy' in MUSIC_CFG)
+    ? String (MUSIC_CFG.proxy === undefined || MUSIC_CFG.proxy === null ? '' : MUSIC_CFG.proxy).trim ()
+    : String (process.env.MUSIC_PROXY || '').trim ();
 const MUSIC_PROXY_TIMEOUT = 3000; // мс -- «не получилось за 3 сек» -> DIRECT
 let proxyStreamDead = false;      // прокси отвечает по TCP, но стрим умер -> временно DIRECT
 // [v2.14] ВЫРАВНИВАНИЕ ГРОМКОСТИ: yt-dlp -> ffmpeg(-af loudnorm) -> Discord.
@@ -4346,6 +4437,11 @@ let proxyStreamDead = false;      // прокси отвечает по TCP, н�
 // (обычным путём), музыка из-за этого не встаёт.
 const MUSIC_NORMALIZE = MUSIC_CFG.normalize !== false;
 const MUSIC_NORMALIZE_FILTER = MUSIC_CFG.filter || 'loudnorm=I=-16:TP=-1.5:LRA=11';
+// [v2.23] Одна строка при старте о том, как бот ходит на YouTube: видно, что ключ
+// MUSIC.proxy действительно подхватился (промах в этом месте раньше не был заметен).
+console.log ('[' + (d()) + '] [music] YouTube: ' + (MUSIC_PROXY
+    ? 'через прокси ' + MUSIC_PROXY + ' (не ответит за 3 сек -- иду напрямую)'
+    : 'напрямую (DIRECT) -- прокси не задан'));
 // Роль DJ -- задаётся в config.json сервера как role_dj.
 
 // [v2.2.2] Быстрая TCP-проверка прокси (коннект за timeoutMs, иначе -- мёртв):
@@ -7056,3 +7152,8 @@ client.on ('interactionCreate', async (interaction) =>
 
 // Регистрируем команды после готовности клиента:
 client.once ('clientReady', () => registerMusicCommands ());
+
+// [v2.23] Один раз при старте: настройки, которые молча ничего не делают (пары ключей
+// и «ни на что не влияет»). Если всё настроено правильно -- ниже ни одной строки.
+for (const _cfgIssue of configSanityIssues ())
+    console.log ('[' + (d()) + '] [config] ' + _cfgIssue);
