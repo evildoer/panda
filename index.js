@@ -629,6 +629,57 @@ console.log ('[' + new Date ().toLocaleString () + '] [db] шифрование 
     (DB_KEY ? 'ВКЛЮЧЕНО (db_key), AES-256-GCM -- не потеряй config.json: без ключа записи не прочитаются'
             : 'выключено (нет db_key в config.json)'));
 
+// [v2.20] Перевод СТАРЫХ записей в шифрованный вид -- один раз при старте.
+// Зачем: шифрование не действует задним числом. Записи, сделанные до включения ключа
+// (id ролей, история наказаний, таймауты), оставались бы открытым текстом -- а в заявке
+// на привилегированные интенты мы говорим, что данные зашифрованы, и «часть данных
+// открыта» быть не должно. Работаем через стор (сырые строки): у keyv значение -- это
+// конверт {value,expires}, поэтому шифруем строку целиком.
+// Идемпотентно: записи с префиксом не трогаются, значения остаются теми же (только
+// зашифрованными), ключи не меняются. Без db_key ничего не делает вообще.
+// Сначала собираем список, потом пишем: пагинация стор-итератора идёт по OFFSET, а
+// правки во время обхода могли бы сдвинуть строки под курсором.
+async function dbEncryptLegacy (_server)
+{
+    if (!DB_KEY) return { n: 0, bad: 0 };
+    let n = 0, bad = 0;
+    for (const _ns of Object.keys ($db[_server] || {}))
+    {
+        const _store = $db[_server][_ns] && $db[_server][_ns].store;
+        if (!_store || typeof _store.iterator !== 'function') continue;
+        const _legacy = [];
+        try
+        {
+            for await (const [_key, _raw] of _store.iterator (_ns))
+            {
+                const _s = Buffer.isBuffer (_raw) ? _raw.toString ('utf8')
+                    : String (_raw === undefined || _raw === null ? '' : _raw);
+                if (_s && !_s.startsWith (DB_ENC_PREFIX)) _legacy.push ([_key, _s]);
+            }
+            for (const [_key, _s] of _legacy) { await _store.set (_key, dbEnc (_s)); n++; }
+        }
+        catch (e)
+        {
+            bad++;
+            console.log ('[' + new Date ().toLocaleString () + '] [db] ' + _ns +
+                ': старые записи не удалось зашифровать -- ' + String ((e && e.message) || e));
+        }
+    }
+    return { n: n, bad: bad };
+}
+(async () =>
+{
+    if (!DB_KEY) return;
+    let _n = 0;
+    for (const _s in $db)
+    {
+        const _r = await dbEncryptLegacy (_s);
+        _n += _r.n;
+    }
+    if (_n) console.log ('[' + new Date ().toLocaleString () + '] [db] перевёл на шифрование ' + _n +
+        ' записей от прошлых версий -- открытого текста в базе больше нет');
+}) ();
+
 async function db (server, namespace, id, value = undefined, item = undefined)
 {
     if (id === '!!!WIPE!!!') // CLEAR ALL DB/SERVERS!
