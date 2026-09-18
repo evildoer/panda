@@ -809,6 +809,205 @@ const client = new Client
     }
 );
 
+// ============================================================================
+// [v2.23] РЕЗЕРВНАЯ КОПИЯ БАЗЫ И ЗАЩИТА ОТ ЗАПУСКА С ПОВРЕЖДЁННОЙ БАЗОЙ.
+// Зачем: база -- единственное место, где живут роли, история и очередь, и пострадать
+// она может не от бота, а от резкого выключения ПК, обрыва питания, диска, антивируса.
+//   * перед каждым запуском база ПРОВЕРЯЕТСЯ (integrity_check): побитый файл -- бот НЕ
+//     запускается, иначе он работал бы «с нуля» и затирал живые данные;
+//   * рядом всегда лежит ОДНА копия (<имя>.backup.sqlite): она обновляется при запуске,
+//     а перед подменой проверяется чтением (целостность + число записей);
+//   * `node . backup` -- сделать и проверить копию вручную;
+//   * `node . restore` -- положить копию на место базы, а побитую отложить рядом
+//     (<имя>.broken.sqlite).
+// Копий НЕ копится: на сервер максимум два служебных файла, и оба перезаписываются --
+// это копия «на случай обрыва», а не архив по датам.
+// ============================================================================
+function dbFileOf (_srv)   { return __dirname + '/' + _srv + '.sqlite'; }
+function dbBackupOf (_srv) { return __dirname + '/' + _srv + '.backup.sqlite'; }
+function dbBrokenOf (_srv) { return __dirname + '/' + _srv + '.broken.sqlite'; }
+function dbServerList ()   { return Object.keys (SERVERS).filter (_k => /^\d{17,20}$/.test (_k)); }
+
+// Прочитать базу отдельным соединением и сказать, цела ли она и сколько в ней записей.
+// Только чтение: сама проверка ничего не меняет. Нет node:sqlite (старый Node) --
+// проверка пропускается (бот работает как раньше: не проверять лучше, чем не работать).
+function dbIntegrity (_file)
+{
+    const _f = require ('fs');
+    if (!_f.existsSync (_file)) return { exists: false, ok: true, rows: 0, why: 'файла нет' };
+    let DatabaseSync = null;
+    try { ({ DatabaseSync } = require ('node:sqlite')); } catch (e) { /* старый Node */ }
+    if (!DatabaseSync) return { exists: true, ok: true, rows: 0, why: 'нет node:sqlite' };
+    let _db = null;
+    try
+    {
+        _db = new DatabaseSync (_file, { readOnly: true });
+        const _ic = _db.prepare ('PRAGMA integrity_check').all ();
+        const _verdict = _ic && _ic[0] ? String (Object.values (_ic[0])[0]) : '';
+        if (!/^ok$/i.test (_verdict))
+            return { exists: true, ok: false, rows: 0, why: 'integrity_check: ' + clipText (_verdict, 120) };
+        let _rows = 0;
+        try { _rows = Number ((_db.prepare ('SELECT COUNT(*) AS n FROM keyv').get () || {}).n || 0); }
+        catch (e) { _rows = 0; } // таблицы ещё нет -- для свежей базы это норма
+        return { exists: true, ok: true, rows: _rows, why: 'ok' };
+    }
+    catch (e)
+    {
+        return { exists: true, ok: false, rows: 0, why: 'не открылась: ' + clipText (String ((e && e.message) || e), 160) };
+    }
+    finally { try { if (_db) _db.close (); } catch (e) { } }
+}
+
+// Копирование с проверкой: пишем во временный файл, проверяем ЕГО, и только потом
+// подменяем копию. Так неудачная копия (например, сделанная на ходу) не может затереть
+// единственную целую.
+function dbCopyAndVerify (_src, _dst, _expectRows)
+{
+    const _f = require ('fs');
+    const _tmp = _dst + '.tmp';
+    try
+    {
+        _f.copyFileSync (_src, _tmp);
+        const _chk = dbIntegrity (_tmp);
+        if (!_chk.ok) { _f.rmSync (_tmp, { force: true }); return { ok: false, why: 'копия не читается: ' + _chk.why }; }
+        if (Number.isFinite (_expectRows) && _chk.rows !== _expectRows)
+        {
+            _f.rmSync (_tmp, { force: true });
+            return { ok: false, why: 'в копии ' + _chk.rows + ' записей, а в базе ' + _expectRows };
+        }
+        try { _f.renameSync (_tmp, _dst); }
+        catch (e) { _f.copyFileSync (_tmp, _dst); _f.rmSync (_tmp, { force: true }); }
+        return { ok: true, rows: _chk.rows };
+    }
+    catch (e)
+    {
+        try { _f.rmSync (_tmp, { force: true }); } catch (e2) { }
+        return { ok: false, why: String ((e && e.message) || e) };
+    }
+}
+
+// Обновление копии с двумя предосторожностями: (1) неудачная копия не подменяет целую
+// (см. dbCopyAndVerify), (2) база с МЕНЬШИМ числом записей, чем в копии, копию не
+// перезаписывает -- иначе уменьшившаяся (или полупустая) база затёрла бы целую копию.
+// В обычной жизни записи то прибавляются (кто-то вышел -- сохранились роли), то
+// уменьшаются (вернулся -- запись больше не нужна), так что копия всё равно обновляется.
+function dbBackupRefresh (_file, _bak, _rows, _old)
+{
+    if (_old.exists && _rows < _old.rows)
+        return { ok: false, why: 'в базе ' + _rows + ', а в копии ' + _old.rows +
+            ' ' + plural (_old.rows, 'запись', 'записи', 'записей') +
+            ' -- оставил копию как есть (если так и надо, удали ' + _bak.split ('/').pop () + ' и запусти `node . backup`)' };
+    return dbCopyAndVerify (_file, _bak, _rows);
+}
+
+// Одна строка при нормальном старте и ГРОМКИЙ отказ -- при побитой базе.
+function dbStartupGuard ()
+{
+    const _f = require ('fs');
+    const _good = [], _bad = [];
+    for (const _srv of dbServerList ())
+    {
+        const _file = dbFileOf (_srv), _bak = dbBackupOf (_srv);
+        const _nm = (_srv + ((SERVERS[_srv] || {}).name ? ' («' + SERVERS[_srv].name + '»)' : ''));
+        const _cur = dbIntegrity (_file), _old = dbIntegrity (_bak);
+        if (_cur.exists && !_cur.ok) { _bad.push ({ nm: _nm, why: _cur.why, old: _old }); continue; }
+        // Файл целый, но пустой, а в копии записи -- похоже на обрезанную базу.
+        if (_cur.exists && _cur.rows === 0 && _old.exists && _old.rows > 0)
+        {
+            _bad.push ({ nm: _nm, why: 'в базе 0 записей, а в копии ' + _old.rows, old: _old });
+            continue;
+        }
+        let _tail = ' (базы ещё нет)';
+        if (_cur.exists)
+        {
+            const _res = dbBackupRefresh (_file, _bak, _cur.rows, _old);
+            _tail = ' -- ' + _cur.rows + ' ' + plural (_cur.rows, 'запись', 'записи', 'записей') +
+                (_res.ok ? ', копия обновлена' : ', копия НЕ обновлена: ' + _res.why);
+            if (_f.existsSync (_file + '-journal') || _f.existsSync (_file + '-wal'))
+                _tail += ', был аварийный выход (журнал на диске -- SQLite откатит сам)';
+        }
+        _good.push (_nm + _tail);
+    }
+    // Время берём через toLocaleString: d() опирается на `var pad`, который на этом
+    // этапе загрузки ещё не определён (как и в строке [db] про шифрование).
+    if (_good.length)
+        console.log ('[' + new Date ().toLocaleString () + '] [db] базы: ' + _good.join (' | '));
+    if (!_bad.length) return;
+    console.log ('' + '='.repeat (72));
+    console.log ('[db] БАЗА ПОВРЕЖДЕНА -- БОТ НЕ ЗАПУСКАЕТСЯ, чтобы не потерять данные.');
+    for (const _b of _bad)
+    {
+        console.log ('[db] ' + _b.nm + ': ' + _b.why +
+            (_b.old.exists ? ' | копия: ' + _b.old.rows + ' ' + plural (_b.old.rows, 'запись', 'записи', 'записей') +
+                ', ' + (_b.old.ok ? 'читается' : 'тоже не читается') : ' | копии нет'));
+    }
+    console.log ('[db] что делать: `node . restore` -- вернуть базу из копии (текущую отложит рядом как <имя>.broken.sqlite).');
+    console.log ('[db] если копия не нужна и данные не жалко -- переименуй или удали файл базы и запусти снова.');
+    console.log ('='.repeat (72));
+    process.exit (1);
+}
+
+// `node . backup` -- сделать и проверить копию вручную.
+function dbBackupCli ()
+{
+    let _fail = 0;
+    console.log ('[backup] копия базы: <имя>.sqlite -> <имя>.backup.sqlite (одна на сервер, перезаписывается)');
+    for (const _srv of dbServerList ())
+    {
+        const _file = dbFileOf (_srv), _bak = dbBackupOf (_srv);
+        const _cur = dbIntegrity (_file);
+        if (!_cur.exists) { console.log ('[backup] ' + _srv + ': базы ещё нет -- копировать нечего'); continue; }
+        if (!_cur.ok) { console.log ('[backup] ' + _srv + ': база ПОВРЕЖДЕНА (' + _cur.why + ') -- копию НЕ делаю, чтобы не затереть целую'); _fail++; continue; }
+        if (_cur.rows === 0) { console.log ('[backup] ' + _srv + ': в базе 0 записей -- копия не нужна'); continue; }
+        const _res = dbBackupRefresh (_file, _bak, _cur.rows, dbIntegrity (_bak));
+        if (_res.ok) console.log ('[backup] ' + _srv + ': готово -- ' + _res.rows + ' ' +
+            plural (_res.rows, 'запись', 'записи', 'записей') + ', копия прочитана (' + _bak + ')');
+        else { console.log ('[backup] ' + _srv + ': не вышло: ' + _res.why + ' (прежняя копия не тронута)'); _fail++; }
+    }
+    return _fail ? 1 : 0;
+}
+
+// `node . restore` -- положить копию на место базы.
+function dbRestoreCli ()
+{
+    const _f = require ('fs');
+    let _fail = 0;
+    for (const _srv of dbServerList ())
+    {
+        const _file = dbFileOf (_srv), _bak = dbBackupOf (_srv), _broken = dbBrokenOf (_srv);
+        const _b = dbIntegrity (_bak);
+        if (!_b.exists) { console.log ('[restore] ' + _srv + ': копии нет -- восстанавливать нечего'); _fail++; continue; }
+        if (!_b.ok) { console.log ('[restore] ' + _srv + ': копия сама не читается (' + _b.why + ')'); _fail++; continue; }
+        if (_b.rows === 0) { console.log ('[restore] ' + _srv + ': копия пустая -- восстанавливать нечего'); _fail++; continue; }
+        const _cur = dbIntegrity (_file);
+        if (_cur.exists)
+        {
+            try { _f.copyFileSync (_file, _broken); console.log ('[restore] ' + _srv + ': текущая база отложена в ' + _broken); }
+            catch (e) { console.log ('[restore] ' + _srv + ': не смог отложить текущую базу: ' + clipText (String ((e && e.message) || e), 160) + ' -- ничего не трогаю'); _fail++; continue; }
+        }
+        const _res = dbCopyAndVerify (_bak, _file, _b.rows);
+        if (_res.ok) console.log ('[restore] ' + _srv + ': база восстановлена из копии -- ' + _res.rows + ' ' +
+            plural (_res.rows, 'запись', 'записи', 'записей') + ', файл прочитан');
+        else { console.log ('[restore] ' + _srv + ': не вышло: ' + _res.why + ' (копия цела, можно повторить)'); _fail++; }
+    }
+    return _fail ? 1 : 0;
+}
+
+if (process.argv.slice (2).some (_a => /^backup$/i.test (_a)))
+{
+    let _code = 1;
+    try { _code = dbBackupCli (); } catch (e) { console.log ('[backup] ошибка: ' + ((e && e.message) || e)); }
+    process.exit (_code);
+}
+if (process.argv.slice (2).some (_a => /^restore$/i.test (_a)))
+{
+    let _code = 1;
+    try { _code = dbRestoreCli (); } catch (e) { console.log ('[restore] ошибка: ' + ((e && e.message) || e)); }
+    process.exit (_code);
+}
+// Проверка целостности и обновление копии -- ПЕРЕД тем, как бот откроет базы на запись.
+dbStartupGuard ();
+
 // ## DB!:
 // keyv v5: именованный экспорт!
 const { Keyv } = require ('keyv');

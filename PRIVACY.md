@@ -56,7 +56,9 @@ server's own log channel (messages posted by the bot inside Discord).
 In a single local SQLite file next to the bot on the machine of the person who runs it (the operator).
 The bot runs on the operator's own computer/hosting; there is no external database and no API calls to
 any service other than Discord itself. Access to the machine and to the file is limited to the
-operator. The bot token and the configuration file are never published.
+operator. The bot token and the configuration file are never published. One **local backup copy** of that file may
+sit next to it (same folder, same machine, overwritten on every start), so that an abrupt power loss cannot leave
+the bot without a readable database. It never leaves the machine and is never uploaded anywhere.
 
 ### Encryption
 
