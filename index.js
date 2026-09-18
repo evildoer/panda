@@ -18,6 +18,15 @@
 //   * channelCreate/channelUpdate: в v14 каналы приходят без guild -> берём через .guild ?? client.guilds.cache.get
 //   * [FIX v2] NaN-баг в логе переименования: скобки вокруг 'Владельцы канала: ' + (owners.size ? ... : ...)
 //   * [FIX v2] e.message там, где e не существует (users.fetch .catch(() => null))
+// CHANGELOG v2.12.2 (управление длинными плейлистами + живучесть при перезапуске):
+//   * [/move номер to номер] -- переставить трек в очереди (номера те же, что в
+//     /queue). Ждущий продолжения трек после /leave/обрыва переставляется вместе с
+//     местом в нём: seekTrack/seekSec привязаны к треку, а не к номеру, а сама позиция
+//     переезжает в поле трека (track.seek) и не теряется, пока очередь до него не дойдёт.
+//   * [FIX] база хранит и позицию ждущего трека (curIdx): /move 1 4 больше не
+//     откатывается после перезапуска (раньше resumeMusic всегда ставил его первым).
+//   * тик сохранения позиции: 20 сек -> 5 сек и ТОЛЬКО когда трек реально играет
+//     (на простое и на паузе меняться нечему -- раньше писал вхолостую).
 // CHANGELOG v2.12.1 (баг найден стендом при проверке памяти музыки):
 //   * [FIX] БАЗА СНОВА ПИШЕТ НА ДИСК. В keyv v5 конструктор со строкой-URI больше не
 //     подгружает адаптер: `new Keyv('sqlite://...')` молча уходил в стор по умолчанию
@@ -110,8 +119,10 @@ const STARTUP_DM_TEXT =
     '`/play ссылка или запрос` -- трек, плейлист или прямой эфир (YouTube и др.)\n' +
     '  Добавляется В КОНЕЦ очереди. Стоять в голосовом канале не обязательно:\n' +
     '  DJ может просто собирать плейлист -- бот зайдёт, когда позовёшь.\n' +
-    '`/queue` -- что играет и что дальше (долгие очереди: `/queue from:11`)\n' +
-    '`/remove номер` -- убрать трек, `/jump номер` -- прыгнуть к треку, `/clear` -- очистить\n' +
+    '`/queue` -- что играет и что дальше, с номерами (`from:11` -- дальше по списку)\n' +
+    '`/remove number` -- убрать трек, `/move number to` -- переставить его,\n' +
+    '`/jump number` -- прыгнуть к треку, `/clear` -- очистить очередь\n' +
+    '  (number/to -- те же номера, что в `/queue`; текущий трек в них не входит)\n' +
     '`/skip` -- следующий • `/stop` -- стоп и забыть очередь совсем\n' +
     '`/pause` / `/resume` -- пауза / продолжить\n' +
     '`/join` -- зайти в твой канал и остаться там (даже без музыки)\n' +
@@ -2820,7 +2831,9 @@ async function playNext (guildId)
             // пробуем начать с того же места, а не с начала:
             // [v2.12] ВСЕГДА пробуем продолжить с места (даже с 1 секунды и даже если
             // до конца трека оставалось 15 сек): не вышло -- тогда берём с начала.
-            let seekSec = (m.seekTrack === track) ? (m.seekSec || 0) : 0;
+            // [v2.12.2] если этот трек когда-то был «прерван» и ждёт в очереди не
+            // первым (/move), его позиция приехала вместе с ним (track.seek)
+            let seekSec = (m.seekTrack === track) ? (m.seekSec || 0) : (track.seek || 0);
             let opened = await createTrackStream (track, seekSec);
             if (seekSec >= 1 && await failedFast (opened.proc))
             {
@@ -2833,8 +2846,13 @@ async function playNext (guildId)
             viaProxy = opened.viaProxy;
             startedAt = seekSec;
         }
+        // [v2.12.2] позиция «прерванного» трека не теряется, если он стоит в очереди
+        // не первым: кладём её в сам трек (вернётся, когда очередь до него дойдёт).
+        // А у трека, который играем сейчас, заявка на сдвиг считана.
+        if (m.seekTrack && m.seekTrack !== track && m.seekSec) m.seekTrack.seek = m.seekSec;
         m.seekTrack = null;
         m.seekSec = 0;
+        if (track.seek) track.seek = 0; // свой сдвиг у этого трека уже использован
         // [v2.12] если трек продолжается с места -- позиция считается от него, иначе
         // следующее сохранение «теряло» уже прослушанное (было: всегда 0)
         m.playedMs = startedAt * 1000;
@@ -3150,22 +3168,32 @@ const voiceStatusTick = setInterval
 );
 if (voiceStatusTick.unref) voiceStatusTick.unref ();
 
-// [v2.10] Пока играет трек, позиция меняется сама -- раз в 20 сек кладём очередь и
-// позицию в базу, чтобы перезапуск (Ctrl+C, падение) не сбрасывал музыку.
+// [v2.10] Позиция внутри трека «бежит» сама, событий у неё нет -- кладём её в базу
+// по таймеру. [v2.12.2] Пишем только когда трек РЕАЛЬНО играет (current +
+// playingSince): раньше тик молотил запись и на простое, и на паузе, а меняться там
+// было нечему (и в простое он ещё и стирал/переписывал одну и ту же строку).
+// Очередь, переходы, /stop и /leave пишутся по событиям -- этот тик только про сек.
+// 20 сек -> 5 сек: даже если окно закрыли крестиком (без Ctrl+C, т.е. без
+// saveAllMusic), очередь всё равно цела, теряются лишь секунды позиции.
 const musicSaveTick = setInterval
 (
     () =>
     {
         for (let g in $music)
-            if ($music[g] && ($music[g].connection || $music[g].pending || $music[g].tracks.length))
-                saveMusicState (g);
+        {
+            const m = $music[g];
+            if (m && m.current && m.playingSince) saveMusicState (g);
+        }
     },
-    20 * 1000
+    5 * 1000
 );
 if (musicSaveTick.unref) musicSaveTick.unref ();
 
-// [v2.12] Ctrl+C / закрытие окна -- сохраняем музыку В МОМЕНТ выхода, а не «как успел
-// за 20 секунд»: после запуска позиция восстанавливается точнее.
+// [v2.12] Ctrl+C -- сохраняем музыку В МОМЕНТ выхода, а не «как успел по таймеру»:
+// позиция восстанавливается точнее. [v2.12.2] Уточнение: это именно Ctrl+C/SIGTERM.
+// Закрытие окна крестиком на Windows убивает процесс без сигнала -- здесь ничего не
+// помочь, но очередь и трек к тому моменту уже в базе (пишутся по событиям), а
+// позиция отстаёт максимум на один тик (5 сек), см. musicSaveTick.
 let $exiting = false;
 async function saveAllMusic ()
 {
@@ -3204,7 +3232,8 @@ const MUSIC_STREAM_RETRIES = 3;
 
 function trackToJson (t)
 {
-    return { url: t.url, title: t.title, duration: t.duration || 0, author: t.author || '', isLive: !!t.isLive };
+    return { url: t.url, title: t.title, duration: t.duration || 0, author: t.author || '',
+             isLive: !!t.isLive, seek: t.seek || 0 };
 }
 
 // сколько миллисекунд играет текущий трек (пауза не считается):
@@ -3237,16 +3266,21 @@ async function saveMusicState (guildId)
         if (m.current) elapsed = Math.round (playedMsOf (m) / 1000);
         else if (m.seekTrack) elapsed = Math.max (0, Math.round (m.seekSec || 0));
         // [v2.12-fix] ЖДУЩИЙ трек (после /leave, обрыва или попытки продолжить) лежит
-        // в НАЧАЛЕ m.tracks -- так его ждёт playNext. В базу он уходит полем current,
+        // где-то в m.tracks -- так его ждёт playNext. В базу он уходит полем current,
         // и второй раз в tracks он не нужен: иначе после перезапуска resumeMusic
         // склеивал его сам с собой и трек играл бы дважды (стенд: 'Дубликат' x2).
-        const rest = (waiting && !playing && m.tracks[0] === waiting) ? m.tracks.slice (1) : m.tracks;
+        // Сверяемся по объекту, а не по позиции: /move может сдвинуть его глубже.
+        const rest = (waiting && !playing) ? m.tracks.filter (t => t !== waiting) : m.tracks;
+        // [v2.12.2] и запоминаем, на каком месте в очереди он стоял (0 = первым):
+        // /move 1 4 не должен после перезапуска откатываться обратно в начало.
+        const curIdx = (waiting && !playing) ? Math.max (0, m.tracks.indexOf (waiting)) : 0;
         await db (guildId, 'musicState', 'queue',
         {
             at: Date.now (),
             channelId: channelId,
             textChannelId: m.textChannelId || null,
             current: waiting ? trackToJson (waiting) : null,
+            curIdx: curIdx,
             elapsed: elapsed,
             tracks: rest.map (trackToJson),
             left: !!m.leftByUser, // вышел по /leave -- сами не возвращаемся, ждём /join
@@ -3268,6 +3302,14 @@ function restCount (m)
     return Math.max (0, m.tracks.length - (m.seekTrack ? 1 : 0));
 }
 
+// Короткая выжимка очереди с теми же номерами, что в /queue (для ответов вроде /move):
+function queuePreview (m, max = 5)
+{
+    const total = m.tracks.length;
+    const list = m.tracks.slice (0, max).map ((t, i) => (i + 1) + '. ' + (t.title || 'трек')).join ('\n');
+    return '**Очередь (' + total + '):**\n' + list + (total > max ? '\n*...и ещё ' + (total - max) + ' -- /queue*' : '');
+}
+
 // Старт после перезапуска/падения: вернуть в память очередь, текущий трек и позицию.
 // Сами заходим в тот же канал только если там уже есть живой слушатель; иначе очередь
 // ЖДЁТ (ничего не забываем): зайдём, как только человек появится, или по /join.
@@ -3285,7 +3327,10 @@ async function resumeMusic (server)
         const m = musicOf (server);
         m.savedChannelId = saved.channelId || null;
         m.textChannelId = saved.textChannelId || m.textChannelId;
-        m.tracks = current ? [current, ...tracks] : tracks;
+        // [v2.12.2] ждущий трек возвращается НА СВОЁ место из очереди (curIdx), а не
+        // всегда в начало: если DJ переставил его через /move, порядок сохраняется
+        const at = Math.min (Math.max (0, Math.round (saved.curIdx || 0)), tracks.length);
+        m.tracks = current ? [...tracks.slice (0, at), current, ...tracks.slice (at)] : tracks;
         m.seekTrack = current;   // этому треку playNext попробует сдвиг на elapsed
         m.seekSec = Math.max (0, Math.round (saved.elapsed || 0));
         m.leftByUser = !!saved.left;
@@ -3397,7 +3442,7 @@ function checkListeners (server)
 function jsonToTrack (t)
 {
     return { url: t.url, streamUrl: t.url, title: t.title || 'Без названия', duration: t.duration || 0,
-             author: t.author || '', isLive: !!t.isLive, thumbnail: '' };
+             author: t.author || '', isLive: !!t.isLive, thumbnail: '', seek: t.seek || 0 };
 }
 
 // ============================================================================
@@ -3677,6 +3722,19 @@ const musicCommands =
              .setMinValue (1)
              .setRequired (true)),
     new SlashCommandBuilder ()
+        .setName ('move')
+        .setDescription ('Переставить трек в очереди на другое место')
+        .addIntegerOption (o =>
+            o.setName ('number')
+             .setDescription ('Какой трек двигать (номер из /queue)')
+             .setMinValue (1)
+             .setRequired (true))
+        .addIntegerOption (o =>
+            o.setName ('to')
+             .setDescription ('На какое место поставить (номер из /queue)')
+             .setMinValue (1)
+             .setRequired (true)),
+    new SlashCommandBuilder ()
         .setName ('clear')
         .setDescription ('Очистить очередь (текущий трек доиграет; совсем остановить -- /stop)'),
     new SlashCommandBuilder ()
@@ -3746,7 +3804,7 @@ client.on ('interactionCreate', async (interaction) =>
     // [v2.6] /help -- всем и всегда: без DJ-роли и без голосового канала, ephemeral.
     if (name === 'help')
         return interaction.reply ({ embeds: [helpEmbed ()], flags: MessageFlags.Ephemeral });
-    if (!['play','join','stop','skip','pause','resume','queue','leave','remove','clear','jump'].includes (name)) return;
+    if (!['play','join','stop','skip','pause','resume','queue','leave','remove','clear','jump','move'].includes (name)) return;
     const guildId = interaction.guildId;
     const m = musicOf (guildId);
 
@@ -3892,6 +3950,46 @@ client.on ('interactionCreate', async (interaction) =>
             (
                 '🗑 Убрал №' + n + ': **' + (gone.title || 'трек') + '**' +
                 (m.tracks.length ? ' (в очереди осталось ' + m.tracks.length + ')' : ' (очередь пуста)')
+            );
+        }
+        else if (name === 'move')
+        {
+            // [v2.12.2] перестановка внутри очереди. Номера -- те же, что в /queue
+            // (текущий трек в них не входит: он показан отдельной строкой «Сейчас»).
+            const n = interaction.options.getInteger ('number');
+            const to = interaction.options.getInteger ('to');
+            const total = m.tracks.length;
+            if (total < 2)
+                return interaction.reply
+                ({
+                    content: '↔️ Для перестановки нужно хотя бы два трека в очереди' +
+                        (m.current ? ' (сейчас играет только **' + (m.current.title || 'трек') + '**).' : '.'),
+                    flags: MessageFlags.Ephemeral,
+                });
+            if (n < 1 || n > total || to < 1 || to > total)
+                return interaction.reply
+                ({
+                    content: '🤔 В очереди ' + total + ' треков -- номера от 1 до ' + total + '.',
+                    flags: MessageFlags.Ephemeral,
+                });
+            if (n === to)
+                return interaction.reply ({ content: '↔️ №' + n + ' уже на этом месте.', flags: MessageFlags.Ephemeral });
+            const moved = m.tracks.splice (n - 1, 1)[0];
+            m.tracks.splice (to - 1, 0, moved);
+            // ждущий продолжения трек (после /leave, обрыва или попытки продолжить) --
+            // тот же самый объект в очереди, так что место в нём едет вместе с ним:
+            // m.seekTrack/m.seekSec указывают на трек, а не на номер.
+            dropPreload (m);   // следующий трек мог смениться -- заготовка была не та
+            startPreload (guildId);
+            saveMusicState (guildId);
+            scheduleVoiceStatus (guildId, true);
+            schedulePresence (true);
+            console.log ('[' + (d()) + '] [music] переставил в очереди №' + n + ' -> №' + to + ': ' + (moved.title || 'трек'));
+            return interaction.reply
+            (
+                '↔️ **' + (moved.title || 'трек') + '**: №' + n + ' -> №' + to +
+                (m.current ? ' (сейчас играет **' + (m.current.title || 'трек') + '**)' : '') +
+                '\n' + queuePreview (m)
             );
         }
         else if (name === 'clear')
