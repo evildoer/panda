@@ -263,7 +263,9 @@ const
     // [v2.20] Ключ шифрования базы (необязательный): 64 hex-символа или парольная фраза.
     // Пусто или ключа нет -- записи хранятся как раньше, открытым текстом.
     // Новый ключ: `node . keygen` (или node.cmd keygen в папке бота).
-    db_key,
+    db_key, db_key_prev,
+    // [v2.22] Ссылка на публичную политику конфиденциальности (её показывают /mydata и /help).
+    privacy_url,
 }
 = require ('./config.json');
 const space = ' ';
@@ -300,31 +302,54 @@ function dbKeyMake (_raw)
     if (DB_ENC_HEX.test (_s)) return Buffer.from (_s, 'hex');// 64 hex -- ключ как есть
     return crypto.scryptSync (_s, DB_ENC_SALT, 32);// парольная фраза -- тоже годится
 }
-const DB_KEY = dbKeyMake (db_key);
+const _key0 = dbKeyMake (db_key);
+// [v2.20] Ключей в памяти может быть несколько: DB_KEYS[0] -- текущий (им шифруем),
+// остальные -- запасные, которыми ещё можно расшифровать. Это нужно для смены ключа
+// (/rekey): если перешифровка прервалась, уже переписанные записи читаются запасным
+// ключом, а не теряются. Пусто -- база открытая (как было до появления db_key).
+// db_key_prev -- запасные ключи: появляются автоматически, если смена ключа (/rekey)
+// прервалась и часть записей осталась под новым ключом. Ими ещё можно их расшифровать.
+// Если db_key пуст (открытая база), запасные ключи игнорируются: без основного ключа
+// они превращаются в «ключ без хозяина» и только путали бы состояние шифрования.
+const DB_KEYS = _key0
+    ? [_key0, ...(Array.isArray (db_key_prev) ? db_key_prev : []).map (dbKeyMake).filter (Boolean)]
+    : [];
 let _dbEncWarn = 0;// о проблемах расшифровки говорим пару раз, а не на каждой записи
+const dbRawStr = (_raw) => Buffer.isBuffer (_raw) ? _raw.toString ('utf8')
+    : String (_raw === undefined || _raw === null ? '' : _raw);
 
-function dbEnc (_text)
+function dbEncKey (_key, _text)
 {// -> 'enc1:<base64(iv | tag | шифртекст)>'
     const _iv = crypto.randomBytes (12);
-    const _c = crypto.createCipheriv ('aes-256-gcm', DB_KEY, _iv);
+    const _c = crypto.createCipheriv ('aes-256-gcm', _key, _iv);
     const _body = Buffer.concat ([_c.update (_text, 'utf8'), _c.final ()]);
     return DB_ENC_PREFIX + Buffer.concat ([_iv, _c.getAuthTag (), _body]).toString ('base64');
 }
-function dbDec (_text)
+function dbDecKey (_key, _text)
 {// -> строка или null (не тот ключ / запись испорчена). Не бросает: база важнее шума
     try
     {
         const _all = Buffer.from (String (_text).slice (DB_ENC_PREFIX.length), 'base64');
-        const _d = crypto.createDecipheriv ('aes-256-gcm', DB_KEY, _all.subarray (0, 12));
+        const _d = crypto.createDecipheriv ('aes-256-gcm', _key, _all.subarray (0, 12));
         _d.setAuthTag (_all.subarray (12, 28));
         return Buffer.concat ([_d.update (_all.subarray (28)), _d.final ()]).toString ('utf8');
     }
     catch (e) { return null; }
 }
+function dbEnc (_text) { return dbEncKey (DB_KEYS[0], _text); }// вызывать только при DB_KEYS.length
+function dbDec (_text)
+{// перебираем все известные ключи: текущий, потом запасные
+    for (const _k of DB_KEYS)
+    {
+        const _t = dbDecKey (_k, _text);
+        if (_t !== null) return _t;
+    }
+    return null;
+}
 function dbSerialize (_value)
 {
     const _json = JSON.stringify (_value);
-    return DB_KEY ? dbEnc (_json) : _json;
+    return DB_KEYS.length ? dbEnc (_json) : _json;
 }
 // ВАЖНО про формат: keyv v5 хранит не значение, а «конверт» {value, expires} -- и при
 // set, и в get, и в iterator (тот читает data.value и data.expires напрямую). Поэтому
@@ -334,11 +359,11 @@ function dbSerialize (_value)
 // ролей -- то есть база важнее аккуратности типа.
 function dbDeserialize (_raw)
 {
-    const _s = Buffer.isBuffer (_raw) ? _raw.toString ('utf8') : String (_raw);
+    const _s = dbRawStr (_raw);
     const empty = { value: undefined, expires: undefined };
     if (_s.startsWith (DB_ENC_PREFIX))
     {
-        if (!DB_KEY)
+        if (!DB_KEYS.length)
         {
             if (_dbEncWarn++ < 3) console.log ('[' + new Date ().toLocaleString () +
                 '] [db] запись зашифрована, а db_key в config.json пуст -- пропускаю её');
@@ -414,6 +439,16 @@ const OWNER_HOSTER =
     /^\d{17,20}$/.test (String (OWNER || ''))
         ? String (OWNER)
         : ((Array.isArray (STARTUP_DM) && /^\d{17,20}$/.test (STARTUP_DM[0] || '')) ? STARTUP_DM[0] : '');
+
+// [v2.22] Публичная политика конфиденциальности (верхний ключ privacy_url). Её показывают
+// /mydata и `/help`: человеку видно, что о нём лежит и где об этом прочитать. Пусто -- строки
+// просто нет (ничего не выдумываем и не даём ссылку «на словах»).
+const PRIVACY_URL = /^https?:\/\/\S+$/i.test (String (privacy_url || '').trim ())
+    ? String (privacy_url).trim () : '';
+
+// [v2.22] Владелец бота -- единственный, кому доступна /rekey (смена ключа шифрования базы):
+// операция идёт сразу по всем данным, и новый ключ после неё печатается в консоль.
+function isBotOwner (_id) { return !!OWNER_HOSTER && String (_id) === OWNER_HOSTER; }
 
 // Строка контактов для текста помощи (с учётом флагов сервера):
 function contactsText (server)
@@ -494,6 +529,8 @@ const STARTUP_DM_TEXT =
     '  Content для всего этого не нужен\n' +
     '• что бот помнит о человеке (роли, наказания и что вернёт при входе) --\n' +
     '  `/rolecheck user:@кто`: можно проверить и того, кто не на сервере\n' +
+    '• что бот помнит ЛИЧНО О ТЕБЕ (и сколько), как это удалить и где прочитать целиком --\n' +
+    '  `/mydata` (ответ виден только тебе; админы могут посмотреть и о другом)\n' +
     '• удалить сохранённое о человеке (роли и история) -- `/forget user:@кто` (staff)\n' +
     '\n' +
     '🧪 **Проверить на себе:** `/welcome` -- бот пришлёт в ЛС то же приветствие, что\n' +
@@ -508,7 +545,10 @@ const STARTUP_DM_TEXT =
 // экземпляров бота разные (см. contactsText). Тело -- одно на всех.
 function helpText (server)
 {
-    return STARTUP_DM_TEXT + contactsText (server) + '.';
+    // [v2.22] Ссылка на политику конфиденциальности -- если она есть в конфиге (privacy_url):
+    // человеку видно, где прочитать, что бот хранит и как это удалить.
+    return STARTUP_DM_TEXT + contactsText (server) + '.' +
+        (PRIVACY_URL ? '\n\n📄 **Что бот хранит и как это удалить:** ' + PRIVACY_URL : '');
 }
 
 // [v2.6] Инструкция одним объектом -- чтобы /help, `panda help` и стартовая ЛС
@@ -626,8 +666,8 @@ for (let _server in SERVERS)
 // [v2.20] Состояние шифрования базы -- одной строкой при старте (как остальные отчёты):
 // чтобы после перезапуска было видно, что база не вдруг стала открытой (или наоборот).
 console.log ('[' + new Date ().toLocaleString () + '] [db] шифрование записей: ' +
-    (DB_KEY ? 'ВКЛЮЧЕНО (db_key), AES-256-GCM -- не потеряй config.json: без ключа записи не прочитаются'
-            : 'выключено (нет db_key в config.json)'));
+    (DB_KEYS.length ? 'ВКЛЮЧЕНО (db_key), AES-256-GCM -- не потеряй config.json: без ключа записи не прочитаются'
+                    : 'выключено (нет db_key в config.json)'));
 
 // [v2.20] Перевод СТАРЫХ записей в шифрованный вид -- один раз при старте.
 // Зачем: шифрование не действует задним числом. Записи, сделанные до включения ключа
@@ -641,7 +681,7 @@ console.log ('[' + new Date ().toLocaleString () + '] [db] шифрование 
 // правки во время обхода могли бы сдвинуть строки под курсором.
 async function dbEncryptLegacy (_server)
 {
-    if (!DB_KEY) return { n: 0, bad: 0 };
+    if (!DB_KEYS.length) return { n: 0, bad: 0 };
     let n = 0, bad = 0;
     for (const _ns of Object.keys ($db[_server] || {}))
     {
@@ -652,8 +692,7 @@ async function dbEncryptLegacy (_server)
         {
             for await (const [_key, _raw] of _store.iterator (_ns))
             {
-                const _s = Buffer.isBuffer (_raw) ? _raw.toString ('utf8')
-                    : String (_raw === undefined || _raw === null ? '' : _raw);
+                const _s = dbRawStr (_raw);
                 if (_s && !_s.startsWith (DB_ENC_PREFIX)) _legacy.push ([_key, _s]);
             }
             for (const [_key, _s] of _legacy) { await _store.set (_key, dbEnc (_s)); n++; }
@@ -669,7 +708,7 @@ async function dbEncryptLegacy (_server)
 }
 (async () =>
 {
-    if (!DB_KEY) return;
+    if (!DB_KEYS.length) return;
     let _n = 0;
     for (const _s in $db)
     {
@@ -679,6 +718,101 @@ async function dbEncryptLegacy (_server)
     if (_n) console.log ('[' + new Date ().toLocaleString () + '] [db] перевёл на шифрование ' + _n +
         ' записей от прошлых версий -- открытого текста в базе больше нет');
 }) ();
+
+// ============================================================================
+// [v2.22] СМЕНА КЛЮЧА ШИФРОВАНИЯ БАЗЫ (слэш-команда /rekey, только владелец бота)
+// Что делает: перешифровывает ВСЕ записи всех серверов одним новым ключом.
+// Порядок важнее самого факта перешифровки, потому что ошибка тут -- это потеря ролей:
+//   * запись читается, расшифровывается известными ключами (текущим или запасным),
+//     шифруется новым и СРАЗУ проверяется чтением обратно;
+//   * записи, которые не расшифровались, не трогаются и честно считаются: они были
+//     нечитаемы и раньше (то же, что видит сам бот в своих свипах);
+//   * полностью успешный проход делает новый ключ основным и убирает запасные -- старый
+//     ключ больше не нужен; отчёт и ключ печатаются в консоль;
+//   * прерванный проход НЕ делает новый ключ основным: в config.json остаётся старый
+//     (db_key), а новый пишется в db_key_prev, чтобы уже переписанные записи читались
+//     и после перезапуска. Вот ради этого случая список ключей и сделан массивом.
+// Особый случай, который тоже поддержан: если база была открытой (db_key пуст), /rekey
+// просто ВКЛЮЧАЕТ шифрование -- это штатный способ зашифровать уже накопленные данные.
+// ============================================================================
+const fsMod = require ('fs');
+const CONFIG_PATH = __dirname + '/config.json';
+
+async function dbRekey (_newKey)
+{
+    const res = { enc: 0, plain: 0, bad: 0, ns: 0, abort: false, why: '' };
+    for (const _srv in $db)
+    {
+        for (const _ns of Object.keys ($db[_srv] || {}))
+        {
+            const _store = $db[_srv][_ns] && $db[_srv][_ns].store;
+            if (!_store || typeof _store.iterator !== 'function') continue;
+            const _rows = [];
+            try
+            {
+                // Сначала читаем и расшифровываем всё, потом пишем: пагинация стор-итератора
+                // идёт по OFFSET, и правки во время обхода могли бы сдвинуть строки.
+                for await (const [_key, _raw] of _store.iterator (_ns))
+                {
+                    const _s = dbRawStr (_raw);
+                    if (!_s) continue;
+                    if (_s.startsWith (DB_ENC_PREFIX))
+                    {
+                        const _t = dbDec (_s);
+                        if (_t === null) { res.bad++; continue; }// нечитаемое было нечитаемым и до нас
+                        _rows.push ([_key, _t, true]);
+                    }
+                    else _rows.push ([_key, _s, false]);
+                }
+                for (const [_key, _t, _wasEnc] of _rows)
+                {
+                    await _store.set (_key, dbEncKey (_newKey, _t));
+                    const _back = dbRawStr (await _store.get (_key));
+                    if (dbDecKey (_newKey, _back) !== _t) throw new Error ('проверка не сошлась: ' + _key);
+                    if (_wasEnc) res.enc++; else res.plain++;
+                }
+                res.ns++;
+            }
+            catch (e)
+            {
+                res.abort = true;
+                res.why = _ns + ': ' + String ((e && e.message) || e);
+                break;
+            }
+        }
+        if (res.abort) break;
+    }
+    return res;
+}
+
+// Новый (или запасный) ключ в config.json. Замена ТЕКСТОВАЯ: конфиг с его
+// ключами-комментариями не переформатируется (JSON.stringify убил бы подсказки).
+// Пишем через временный файл: обрыв записи не должен оставить конфиг битым.
+function dbKeysSaveToConfig (_primary, _prev)
+{
+    try
+    {
+        if (!fsMod.existsSync (CONFIG_PATH)) return false;
+        let _src = fsMod.readFileSync (CONFIG_PATH, 'utf8');
+        if (!/"db_key"\s*:/.test (_src)) return false;
+        const _hex = _primary ? _primary.toString ('hex') : '';
+        const _prevJson = JSON.stringify ((_prev || []).map (k => k.toString ('hex')));
+        _src = _src.replace (/("db_key"\s*:\s*)"[^"]*"/, '$1"' + _hex + '"');
+        if (/"db_key_prev"\s*:/.test (_src))
+            _src = _src.replace (/("db_key_prev"\s*:\s*)\[[^\]]*\]/, '$1' + _prevJson);
+        else
+            _src = _src.replace (/"db_key"\s*:\s*"[^"]*"/, '$&,\n  "db_key_prev": ' + _prevJson);
+        fsMod.writeFileSync (CONFIG_PATH + '.tmp', _src, 'utf8');
+        fsMod.renameSync (CONFIG_PATH + '.tmp', CONFIG_PATH);
+        return true;
+    }
+    catch (e)
+    {
+        console.log ('[' + new Date ().toLocaleString () + '] [db] новый ключ не удалось вписать в config.json: ' +
+            String ((e && e.message) || e));
+        return false;
+    }
+}
 
 async function db (server, namespace, id, value = undefined, item = undefined)
 {
@@ -3630,6 +3764,98 @@ async function rolecheckReport (server, target)
     return out.join ('\n');
 }
 
+// ============================================================================
+// [v2.22] /mydata -- «что бот помнит обо мне». Доступна КАЖДОМУ (о себе), о другом
+// человеке -- только staff (иначе это была бы разведка чужих данных).
+// Зачем: человек видит ровно то, что о нём лежит, сколько этого, сколько хранится,
+// как это удалить и где прочитать целиком. Прятать нечего: ни текстов сообщений,
+// ни профилей, ни чего-либо ещё, кроме id-roles/счётчиков/очереди, в базе нет.
+// ============================================================================
+async function myDataReport (server, target, self)
+{
+    const out = [];
+    const bytesOf = (_v) => { try { return Buffer.byteLength (JSON.stringify (_v), 'utf8'); } catch (e) { return 0; } };
+    const guild = client.guilds.cache.get (server);
+    const nameOf = _id => '«' + ((guild && guild.roles.cache.get (_id) || {}).name || _id) + '»';
+    let rec = 0, bytes = 0;
+
+    out.push ('🗂 **' + (self ? 'Что бот помнит о тебе' : 'Что бот помнит о ' + target.username) + '**');
+    out.push ('Ключ записи -- твой id `' + target.id + '`. Ни имён, ни профилей, ни текстов сообщений бот не хранит.');
+
+    // --- 1. роли для возврата ---
+    const saved = await db (server, 'memberRoles', target.id).catch (() => null);
+    const savedN = (saved && Array.isArray (saved.roles)) ? saved.roles.length : 0;
+    if (savedN)
+    {
+        rec++; bytes += bytesOf (saved);
+        out.push ('\n**1. Роли, чтобы вернуть при входе** (`memberRoles`)');
+        out.push ('• ' + savedN + ' ' + plural (savedN, 'роль', 'роли', 'ролей') + ', записано ' +
+            (Number (saved.at) ? d (saved.at, true) : 'без даты (старый формат)'));
+        out.push ('• ' + saved.roles.map (nameOf).join (', '));
+        out.push ('• хранение: ' + roleSaveLabel (server) + '; запись весит ~' + bytesOf (saved) + ' байт');
+        if (!roleSaveOn (server)) out.push ('• но сейчас функция выключена (`save_roles: false`) -- при входе роли не вернутся');
+    }
+    else
+    {
+        out.push ('\n**1. Роли, чтобы вернуть при входе:** записи нет' +
+            (roleSaveOn (server) ? '' : ' (и функция выключена: `save_roles: false`)'));
+    }
+
+    // --- 2. история наказаний ---
+    const hist = await db (server, 'banHistory', target.id).catch (() => null);
+    const ev = (hist && Array.isArray (hist.events)) ? hist.events.filter (e => e && Number (e.at)) : [];
+    if (ev.length)
+    {
+        const cnt = (_k) => ev.filter (_e => _e.kind === _k).length;
+        const ats = ev.map (_e => Number (_e.at));
+        rec++; bytes += bytesOf (hist);
+        out.push ('\n**2. История наказаний** (`banHistory`)');
+        out.push ('• ' + ev.length + ' ' + plural (ev.length, 'событие', 'события', 'событий') + 
+            ': выходов ' + cnt ('exit') + ', таймаутов ' + cnt ('timeout') + 
+            ', банов ' + cnt ('ban') + ', снятий ' + cnt ('unban'));
+        out.push ('• первое ' + d (Math.min (...ats), true) + ', последнее ' + d (Math.max (...ats), true) +
+            ' (хранение: ' + banHistoryLabel (server) + ')');
+    }
+    else out.push ('\n**2. История наказаний:** ничего не записано');
+
+    // --- 3. таймер выхода (живёт, пока идёт таймаут) ---
+    const until = await db (server, 'membersBanTimeout', target.id).catch (() => null);
+    if (until)
+    {
+        rec++; bytes += 8;
+        out.push ('\n**3. Таймер выхода** (`membersBanTimeout`): ' + (until > Date.now ()
+            ? 'активен до `' + d (until, true) + '` -- осталось `' + dd (until) + '`'
+            : 'запись просрочена, её снимет свип'));
+    }
+
+    // --- 4. очередь музыки ---
+    const m = musicOf (server);
+    const inQ = (m.queue || []).filter (_t => String ((_t && _t.byId) || '') === target.id).length;
+    const cur = !!(m.current && String (m.current.byId || '') === target.id);
+    if (inQ || cur)
+    {
+        out.push ('\n**4. Музыка** (`musicState`): ' + (inQ
+            ? 'в очереди ' + inQ + ' ' + plural (inQ, 'трек', 'трека', 'треков') + ', которые добавил' + (self ? 'а' : '') + ' ' + (self ? 'ты' : 'он')
+            : 'в очереди треков нет') + (cur ? ', и сейчас играет трек ' + (self ? 'твой' : 'его') : ''));
+        out.push ('• хранятся только название, ссылка и автор трека; список живёт до `/stop` или конца очереди');
+    }
+    else out.push ('\n**4. Музыка:** ничего не записано');
+
+    // --- итог, сроки, удаление ---
+    out.push ('\n**Итого в базе:** ' + rec + ' ' + plural (rec, 'запись', 'записи', 'записей') + ', ~' + bytes +
+        ' байт -- всё в одном локальном файле SQLite на машине владельца бота, никуда не отправляется' +
+        (DB_KEYS.length ? '; записи зашифрованы (AES-256-GCM)' : '') + '.');
+    out.push ('**Чего там никогда не бывает:** текстов и истории сообщений, ников и аватаров, e-mail и телефонов, IP-адресов, платежных данных, записей голоса.');
+    out.push ('**Сроки:** роли и история -- ' + (banHistoryLabel (server) === roleSaveLabel (server)
+        ? roleSaveLabel (server) : 'роли: ' + roleSaveLabel (server) + ', история: ' + banHistoryLabel (server)) +
+        '; таймер выхода -- до окончания наказания; очередь музыки -- до `/stop` или конца очереди.');
+    out.push ('**Как удалить:** попроси staff -- `/forget user:' + (self ? '@ты' : '@' + target.username) +
+        '` стирает роли и историю сразу; либо напиши владельцу бота (контакт есть в `/help`).\n' +
+        '_Активное наказание `/forget` не трогает: это уже не хранение данных, а действие модерации -- его снимает `/unban`._');
+    if (PRIVACY_URL) out.push ('📄 Полная политика конфиденциальности: ' + PRIVACY_URL);
+    return out.join ('\n');
+}
+
 // [v2.2.3] РЕСТАРТ-БЕЗОПАСНАЯ сверка тегов 🔑: события, случившиеся пока бот был выключен
 // (выдача прав, вход в канал), событиями уже не догнать -- поллер сам сверяет всех,
 // кто сейчас в голосовых каналах: есть оверрайд с правами -> тег, нет -> снять:
@@ -6015,6 +6241,22 @@ const musicCommands =
             o.setName ('user')
              .setDescription ('Кого проверить (можно любого, не только участника сервера)')
              .setRequired (true)),
+    // [v2.22] /mydata -- «что бот помнит обо мне»: о себе может каждый, о другом -- staff.
+    // Это и прозрачность для людей, и понятный ответ на вопрос «как человек видит и
+    // удаляет свои данные» (в форме интентов такой вопрос есть).
+    new SlashCommandBuilder ()
+        .setName ('mydata')
+        .setDescription ('Что бот помнит лично о тебе (роли, наказания, очередь) и как это удалить')
+        .addUserOption (o =>
+            o.setName ('user')
+             .setDescription ('О ком посмотреть (только админ/модер; без него -- о себе)')),
+    // [v2.22] /rekey -- смена ключа шифрования базы. Только владелец бота (id в OWNER):
+    // операция идёт по ВСЕМ данным сразу, а новый ключ печатается в консоль.
+    // В списке команд видят только админы (иначе она мозолила бы глаза всем).
+    new SlashCommandBuilder ()
+        .setName ('rekey')
+        .setDescription ('Сменить ключ шифрования базы (только владелец бота)')
+        .setDefaultMemberPermissions (PermissionsBitField.Flags.Administrator),
     new SlashCommandBuilder ()
         .setName ('queue')
         .setDescription ('Показать очередь треков')
@@ -6412,6 +6654,74 @@ client.on ('interactionCreate', async (interaction) =>
             ' \`' + target.id + '\`: ' + (had.length ? had.join (', ') : 'нечего было удалять'));
         return interaction.editReply ('🧽 Данные ' + u (target.id) + ' удалены: ' +
             (had.length ? had.join (', ') : 'нечего было удалять') + '.' + active);
+    }
+    // [v2.22] /mydata -- человек видит, что бот о нём помнит. О себе -- любой, о другом -- staff.
+    if (name === 'mydata')
+    {
+        const opt0 = interaction.options.getUser ('user');
+        const target = opt0 || interaction.user;
+        const self = String (target.id) === String (interaction.user.id);
+        if (!self && !isStaffInteraction (interaction))
+            return interaction.reply ({ content: '🚫 О другом человеке -- только админ или модер.\n' +
+                'О себе -- всегда: просто `/mydata`.', flags: MessageFlags.Ephemeral });
+        await interaction.deferReply ({ flags: MessageFlags.Ephemeral });
+        const user = self ? interaction.user : (await client.users.fetch (target.id).catch (() => target));
+        let text = '';
+        try { text = await myDataReport (interaction.guildId, user, self); }
+        catch (e) { return interaction.editReply ('⚠️ Не смог собрать отчёт: `' + oneLine (e.message, 150) + '`'); }
+        console.log ('[' + (d()) + '] [data] (кто: ' +
+            (interaction.member ? uuu (interaction.member) : interaction.user.username) +
+            ') посмотрел, что бот помнит о ' + user.username + (self ? ' (о себе)' : '') + ' -- отчёт выдан');
+        return interaction.editReply ({ content: clipText (text, 1900) });
+    }
+    // [v2.22] /rekey -- смена ключа шифрования базы: ТОЛЬКО владелец бота (id в OWNER).
+    if (name === 'rekey')
+    {
+        if (!isBotOwner (interaction.user.id))
+            return interaction.reply ({ content: '🚫 Команда только для владельца бота (id в ключе `OWNER` конфига)' +
+                (OWNER_HOSTER ? '' : '; сейчас `OWNER` не заполнен -- команда недоступна никому') + '.',
+                flags: MessageFlags.Ephemeral });
+        await interaction.deferReply ({ flags: MessageFlags.Ephemeral });
+        const who = interaction.member ? uuu (interaction.member) : interaction.user.username;
+        const oldKeys = DB_KEYS.slice ();
+        console.log ('[' + (d()) + '] [db] (кто: ' + who + ') /rekey: перешифровываю базу новым ключом');
+        const newKey = crypto.randomBytes (32);
+        const res = await dbRekey (newKey);
+        const sum = 'перешифровано ' + (res.enc + res.plain) + ' ' +
+            plural (res.enc + res.plain, 'запись', 'записи', 'записей') +
+            ' (открытыми до этого были: ' + res.plain + ')' +
+            (res.bad ? ', пропущено нечитаемых: ' + res.bad : '') + ', неймспейсов: ' + res.ns;
+        if (res.abort)
+        {
+            // Новый ключ основным НЕ делаем: часть записей уже под ним -- держим его запасным
+            DB_KEYS.length = 0;
+            for (const k of oldKeys) DB_KEYS.push (k);
+            if (!DB_KEYS.some (k => k.equals (newKey))) DB_KEYS.push (newKey);
+            const saved = dbKeysSaveToConfig (oldKeys[0] || null, [newKey]);
+            console.log ('[' + (d()) + '] [db] /rekey ПРЕРВАН (' + res.why + '): ' + sum +
+                '; основной ключ -- прежний, новый записан запасным (' +
+                (saved ? 'config.json обновлён' : 'config.json НЕ обновлён -- впиши вручную') + ')');
+            return interaction.editReply ('⚠️ Перешифровка прервана: `' + oneLine (res.why, 120) + '`.\n' + sum +
+                '\nНовый ключ **не** стал основным: в `config.json` остался прежний `db_key`, а новый лежит в `db_key_prev` -- данные читаются' +
+                (saved ? ' и переживут перезапуск' : '; в конфиг записать не удалось, возьми ключ из консоли бота') +
+                '.\nПовтори `/rekey`, когда будет время.');
+        }
+        DB_KEYS.length = 0;
+        DB_KEYS.push (newKey);
+        if (oldKeys[0]) DB_KEYS.push (oldKeys[0]);// старый -- только на этот сеанс
+        const saved2 = dbKeysSaveToConfig (newKey, []);
+        // Ключ печатаем ТОЛЬКО в консоль: в Discord он ушёл бы на серверы Discord.
+        console.log ('\n' + '='.repeat (62));
+        console.log (' [db] НОВЫЙ КЛЮЧ ШИФРОВАНИЯ БАЗЫ (ключ db_key): ' + newKey.toString ('hex'));
+        console.log (' [db] ' + (saved2 ? 'уже вписан в config.json' : 'ВПИСАТЬ В config.json НЕ УДАЛОСЬ -- сделай вручную'));
+        console.log (' [db] сохрани его отдельно: без этого ключа записи базы не читаются.');
+        console.log ('='.repeat (62) + '\n');
+        console.log ('[' + (d()) + '] [db] (кто: ' + who + ') /rekey готов: ' + sum);
+        return interaction.editReply ('🔐 База перешифрована новым ключом.\n' + sum +
+            '\nНовый ключ ' + (saved2 ? 'уже вписан в `config.json` (`db_key`), старый убран'
+                : '**вписать в `config.json` не удалось** -- возьми его из консоли бота') +
+            '; ключ также напечатан **в консоли бота** (в Discord не отправляю: оттуда он ушёл бы на серверы Discord).' +
+            '\nСохрани его отдельно от config.json -- без него записи базы не читаются. Перезапуск не нужен.');
     }
     if (!['play','join','stop','skip','pause','resume','queue','leave','remove','clear','jump','move'].includes (name)) return;
     const guildId = interaction.guildId;
