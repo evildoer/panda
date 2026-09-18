@@ -18,6 +18,16 @@
 //   * channelCreate/channelUpdate: в v14 каналы приходят без guild -> берём через .guild ?? client.guilds.cache.get
 //   * [FIX v2] NaN-баг в логе переименования: скобки вокруг 'Владельцы канала: ' + (owners.size ? ... : ...)
 //   * [FIX v2] e.message там, где e не существует (users.fetch .catch(() => null))
+// CHANGELOG v2.13 (приветствие новичкам + лог бан-таймаута по факту):
+//   * [v2.13] ПРИВЕТ-ЛС НОВИЧКАМ ВЕРНУЛИСЬ: при входе на сервер бот пишет в личку
+//     приветствие со ссылкой на сообщение из `welcome_message` (канал `welcome_channel`).
+//     Нет id сообщения -- даём ссылку на канал. Пустой welcome_channel = выключено.
+//     Перезаходы в таймауте приветствия НЕ получают (у них другой путь -- бан-таймаут).
+//   * [FIX] лог бан-таймаута больше не врёт: при onLeaveBanRealy: false писалось
+//     «banned on N min.», хотя бана не было -- ставился только таймаут (бан прилетает
+//     при перезаходе, onEnterBanRealy). Теперь: 'timeout on N min. (ban -- only if
+//     re-enters earlier)' и 'timeout expired after N min. (did not come back)'.
+//     У настоящего бана в логе появились пометки '(on leave)' и '(re-enter during timeout)'.
 // CHANGELOG v2.12.2 (управление длинными плейлистами + живучесть при перезапуске):
 //   * [/move номер to номер] -- переставить трек в очереди (номера те же, что в
 //     /queue). Ждущий продолжения трек после /leave/обрыва переставляется вместе с
@@ -81,7 +91,7 @@
 //   * интент GuildMembers УБРАН (привилегированный; после 09.10.2026 без одобрения
 //     бот не запустился бы). Вход/выход участников ловим REST-поллингом
 //     (см. pollMembers в конце файла) -- разрешено всем приложениям.
-//   * Welcome-ЛС новичкам отключены (по решению владельца).
+//   * Welcome-ЛС новичкам были отключены на время миграции -- [v2.13] включены снова.
 //   * Логи входов/выходов в журнал -- сохранены.
 //   * Причины банов -- как было: 'Забанен ботом на N мин.'
 //   * [БОНУС] ban-таймауты теперь рестарт-безопасны: при старте и в каждом тике
@@ -145,7 +155,10 @@ const STARTUP_DM_TEXT =
     '  вернёшься -- мут на месте; жалоба -- зайди в общий канал 🆘\n' +
     '• если в канале никого -- музыка встаёт на паузу (не играет в пустоту)\n' +
     '• выдаёт права владельцу канала и ставит тег 🔑 в ник\n' +
-    '• бан на 20 минут за выход с сервера (таймаут на перезаход)\n' +
+    '• новичку при входе приходит приветствие в личку: правила и знакомство\n' +
+    '  (ссылка на сообщение из `welcome_message` в канале знакомства)\n' +
+    '• за выход с сервера ставится таймаут (в этом конфиге 20 мин): перезаход\n' +
+    '  раньше срока = бан до его конца\n' +
     '\n' +
     '🔑 **Тег 🔑 в нике** -- права в этом канале есть. У ADM/MOD тега нет: у них права и так.\n' +
     '\n' +
@@ -2059,8 +2072,74 @@ async function fetchAllMembersRest (guildId)
     return members;
 }
 
+// ============================================================================
+// [v2.13] ПРИВЕТСТВЕННАЯ ЛС НОВИЧКУ (возвращена по просьбе владельца).
+// Ключи config.json: welcome_channel -- канал знакомства (там правила и знакомство),
+// welcome_message -- id сообщения в нём. Бот присылает приветствие со ссылкой ровно на
+// это сообщение (нет id -- на сам канал). Кому: всем, кто заходит НЕ в таймауте за
+// выход (перезаходы идут своим путём, см. handleMemberJoin). Выключить приветствие --
+// пустой welcome_channel (или неверный id).
+// ============================================================================
+function welcomeLink (server)
+{
+    const s = SERVERS[server] || {};
+    const channel = String (s.welcome_channel || '');
+    const message = String (s.welcome_message || '');
+    if (!/^\d{17,20}$/.test (channel)) return null;
+    return 'https://discord.com/channels/' + server + '/' + channel +
+        (/^\d{17,20}$/.test (message) ? '/' + message : '');
+}
+
+async function welcomeDM (server, uid, raw)
+{
+    const s = SERVERS[server] || {};
+    const link = welcomeLink (server);
+    if (!link) return; // welcome_channel не задан -- приветствие выключено
+    const name = (raw && raw.user && raw.user.username) || uid;
+    try
+    {
+        const user = await client.users.fetch (uid).catch (() => null);
+        if (!user || typeof user.send !== 'function')
+        {
+            console.error ('[welcome] ЛС новичку ' + name + ' не отправить: пользователь недоступен');
+            return;
+        }
+        // название канала знакомства: «зайди в #канал» понятнее одной ссылки
+        let chName = '';
+        try
+        {
+            let ch = client.channels.cache.get (s.welcome_channel) ||
+                     await client.channels.fetch (s.welcome_channel);
+            if (ch && ch.name) chName = '#' + ch.name;
+        }
+        catch (e) { /* канал не отдался -- обойдёмся ссылкой */ }
+        const embed =
+        {
+            color: 0x00CCFF,
+            title: '🐼 Добро пожаловать на ' + (s.name || 'сервер') + '!',
+            description:
+                `${user}, привет! 👋\n` +
+                `\n📜 **Правила и знакомство**` + (chName ? ' -- в канале ' + code (chName) : '') + `:\n` +
+                `${link}\n` +
+                `\n🎵 **Музыка:** \`/play ссылка или запрос\`, очередь -- \`/queue\`,\n` +
+                `выйти боту из канала -- \`/leave\` (управляют админы, модеры и роль DJ).\n` +
+                `📌 Инструкция по боту -- в любой момент \`/help\`.\n` +
+                `\nЕсли что-то непонятно или не работает -- напиши администрации.`,
+            timestamp: dt(),
+        };
+        if (s.name) embed.footer = { text: s.name };
+        await user.send ({ embeds: [embed] });
+        console.log ('[' + (d()) + '] [welcome] ЛС новичку ' + name + ' отправлена (' + link + ')');
+    }
+    catch (e)
+    {
+        // «личка закрыта» -- обычное дело, это не ошибка бота: пишем причину и живём
+        console.error ('[welcome] ЛС новичку ' + name + ' не ушла: ' + oneLine (e.message));
+    }
+}
+
 // Обработка ВХОДА (бывший guildMemberAdd): бан-таймаут при перезаходе.
-// [v2.1] Welcome-ЛС отключены (по решению владельца).
+// [v2.13] Привет-ЛС новичкам снова включены (welcome_channel/welcome_message в конфиге).
 async function handleMemberJoin (server, uid, raw)
 {
     const guild = client.guilds.cache.get (server);
@@ -2119,7 +2198,8 @@ async function handleMemberJoin (server, uid, raw)
                     async () =>
                     {
                         let username = raw && raw.user ? raw.user.username : uid;
-                        console.log ('[' + (d()) + '] member ' + username + ' banned on ~' + Math.round (plusTimeout / 1000 / 60) + ' min.');
+                        // [v2.13] честная формулировка: бан выдан ПО ПЕРЕЗАХОДУ, на остаток срока
+                        console.log ('[' + (d()) + '] member ' + username + ' banned on ~' + Math.round (plusTimeout / 1000 / 60) + ' min. (re-enter during timeout)');
                         setTimeout
                         (
                             async () =>
@@ -2139,6 +2219,11 @@ async function handleMemberJoin (server, uid, raw)
                 .catch (e => console.error ('[memberJoin] ban error: ' + e.message));
             }
         }
+    }
+    else
+    {
+        // [v2.13] не в таймауте -- обычный вход: приветственная ЛС новичку
+        await welcomeDM (server, uid, raw);
     }
 }
 
@@ -2172,7 +2257,8 @@ async function handleMemberLeave (server, uid, raw)
             async () =>
             {
                 await db (server, 'membersBanTimeout', uid, Date.now() + onLeaveBanTimeout * 60 * 1000);
-                console.log ('[' + (d()) + '] member ' + username + ' banned on ' + onLeaveBanTimeout + ' min.');
+                // [v2.13] бан выдан сразу при выходе (onLeaveBanRealy: true)
+                console.log ('[' + (d()) + '] member ' + username + ' banned on ' + onLeaveBanTimeout + ' min. (on leave)');
                 setTimeout
                 (
                     async () =>
@@ -2193,14 +2279,18 @@ async function handleMemberLeave (server, uid, raw)
     }
     else
     {
+        // [FIX v2.13] Бан здесь НЕ выдаётся (onLeaveBanRealy: false) -- ставится только
+        // таймаут: бан прилетит, если человек зайдёт раньше срока (handleMemberJoin,
+        // onEnterBanRealy). Раньше в логе писалось «banned on N min.», хотя никакого
+        // бана не было -- теперь написано ровно то, что сделано.
         await db (server, 'membersBanTimeout', uid, Date.now() + onLeaveBanTimeout * 60 * 1000);
-        console.log ('[' + (d()) + '] member ' + username + ' banned on ' + onLeaveBanTimeout + ' min.');
+        console.log ('[' + (d()) + '] member ' + username + ' timeout on ' + onLeaveBanTimeout + ' min. (ban -- only if re-enters earlier)');
         setTimeout
         (
             async () =>
             {
                 await db (server, 'membersBanTimeout', uid, null);
-                console.log ('[' + (d()) + '] member ' + username + ' unbanned after ' + onLeaveBanTimeout + ' min.');
+                console.log ('[' + (d()) + '] member ' + username + ' timeout expired after ' + onLeaveBanTimeout + ' min. (did not come back)');
             },
             onLeaveBanTimeout * 60 * 1000
         );
