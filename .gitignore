@@ -3,8 +3,10 @@ config.json
 *.sqlite
 *.sqlite-journal
 logs/
-# заявка на интенты: там id и цифры реального сервера, публиковать не нужно
+# заявка на интенты и шпаргалка к ней: там id и цифры реального сервера,
+# публиковать не нужно
 intents-request.md
+intents-cheatsheet.md
 
 # Зависимости и рантайм
 node_modules/
