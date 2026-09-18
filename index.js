@@ -18,6 +18,29 @@
 //   * channelCreate/channelUpdate: в v14 каналы приходят без guild -> берём через .guild ?? client.guilds.cache.get
 //   * [FIX v2] NaN-баг в логе переименования: скобки вокруг 'Владельцы канала: ' + (owners.size ? ... : ...)
 //   * [FIX v2] e.message там, где e не существует (users.fetch .catch(() => null))
+// CHANGELOG v2.17 (интенты по факту, /rolecheck, руками двигать очередь):
+//   * [intents] ОТЧЁТ ПРИ СТАРТЕ: что РЕАЛЬНО доступно приложению -- Message Content
+//     (по интенту в гейтвее), Guild Members (события), полный список участников
+//     (проверяется ФАКТОМ -- пришёл ли список) и журнал аудита (пробный запрос).
+//   * [intents] Guild Members ПОДКЛЮЧЁН в гейтвее ("GUILD_MEMBERS": true в config.json):
+//     вход/выход теперь мгновенные (guildMemberAdd/Remove), а опрос раз в 45 сек
+//     остаётся резервным путём. Один и тот же переход они не обрабатывают дважды
+//     (отметка на 5 минут -- иначе только что вошедший «выходил» бы по устаревшему
+//     REST-списку и получал таймаут). Интент может быть ОТОЗВАН -- тогда login падает
+//     'Used disallowed intents', бот сам снимает интент и стартует без него.
+//   * [/rolecheck user:@кто] -- что бот помнит о человеке: роли (save_roles), что
+//     вернёт при входе, текущее наказание с точным сроком и историю за окно.
+//     Работает и для того, кто НЕ на сервере (одиночный REST-запрос без интента).
+//   * [/queue] 25 треков на страницу (было 10) + защита от лимита сообщения 2000
+//     символов (страница собирается по бюджету, листание идёт по показанным номерам).
+//   * [/queue] КНОПКИ-СТРЕЛКИ: меню «🎚 Двигать трек» + «⬆ Выше» / «⬇ Ниже» / «✖ Готово».
+//     Логика перестановки -- общая с /move (queueMove), авторство -- в логе.
+//   * [welcome] в ЛС переносится ТЕКСТ и КАРТИНКА из сообщения с правилами
+//     (раньше была только ссылка, а Discord рисовал её как название сервера).
+//     Нужны ОБА ключа: welcome_channel -- где искать, welcome_message -- что именно
+//     (поиска сообщения по id без канала в API нет).
+//   * [лог] уборка старых записей больше не пишет «убрал N» -- пишет про СРОК ХРАНЕНИЯ
+//     (понятно, что данные старше окна, а не что-то потерялось).
 // CHANGELOG v2.16 (точные роли, кнопки под /queue, защита от пустого списка):
 //   * [роли] ТОЧНОСТЬ: снимок поллера бывает до 45 секунд старым, поэтому роль,
 //     снятая за секунды до выхода человека, попадала в базу и возвращалась при входе.
@@ -167,9 +190,10 @@
 //   * Пересылка: сперва отправка, потом удаление оригинала (иначе при ошибке
 //     отправки сообщение терялось). Пустое сообщение больше НЕ удаляется.
 // CHANGELOG v2.1 (работа БЕЗ привилегированных интентов -- заявку Discord подавать не надо!):
-//   * интент GuildMembers УБРАН (привилегированный; после 09.10.2026 без одобрения
-//     бот не запустился бы). Вход/выход участников ловим REST-поллингом
-//     (см. pollMembers в конце файла) -- разрешено всем приложениям.
+//   * [УСТАРЕЛО в v2.17] интент GuildMembers был убран (привилегированный). Оказалось,
+//     что приложение И ТАК им владеет: полный список участников (REST) -- как раз та
+//     возможность, которую даёт этот интент, без него опрос не работал бы. В v2.17
+//     интент снова подключён как основной путь, а опрос (pollMembers) -- резервный.
 //   * Welcome-ЛС новичкам были отключены на время миграции -- [v2.13] включены снова.
 //   * Логи входов/выходов в журнал -- сохранены.
 //   * Причины банов -- как было: 'Забанен ботом на N мин.'
@@ -181,6 +205,10 @@ const
     ID, TOKEN, PREFIX, SERVERS,
     ERROR, DEBUG, NOTICE, STARTUP_DM,
     MESSAGE_CONTENT,
+    // [v2.17] Интент Guild Members (привилегированный): мгновенные события входа/выхода.
+    // Поставь "GUILD_MEMBERS": false в config.json, если Discord его отзовёт -- тогда
+    // вход/выход снова ловятся только опросом раз в 45 сек (и то, пока дают список).
+    GUILD_MEMBERS,
     // [v2.14] Новые верхние ключи (все необязательные):
     //   OWNER -- id владельца ХОСТИНГА бота (кто его крутит): идёт в текст помощи
     //            как контакт «если бот выключен»; если его нет -- берётся STARTUP_DM[0].
@@ -209,6 +237,14 @@ for (const _key of Object.keys (SERVERS))
 // Он нужен двум вещам: пересылке из пандалогии и текстовым командам 'panda ...'.
 // Поставь в config.json "MESSAGE_CONTENT": false -- если Discord его отзовёт.
 const USE_MESSAGE_CONTENT = MESSAGE_CONTENT !== false;
+
+// [v2.17] Привилегированный интент Guild Members (в портале приложения включён).
+// Даёт ДВЕ вещи: мгновенные события GUILD_MEMBER_ADD/REMOVE (вход/выход -- без
+// опроса раз в 45 сек) и полный список участников (наш поллер и так требует этот
+// интент -- «без интента» он жил только потому, что приложение уже им владеет).
+// Discord может забрать доступ (см. письмо от 10.09.2026, срок 09.10.2026): тогда
+// вход с этим интентом падает 'Used disallowed intents' -- откатываемся автоматически.
+const USE_GUILD_MEMBERS = GUILD_MEMBERS !== false;
 
 // [v2.14] КТО В КОНТАКТАХ. Контактов теперь два, и оба необязательны:
 //   * владелец ХОСТИНГА бота -- кто его запускает и следит (верхний ключ OWNER,
@@ -248,10 +284,11 @@ const STARTUP_DM_TEXT =
     '  Добавляется В КОНЕЦ очереди. Стоять в голосовом канале не обязательно:\n' +
     '  DJ может просто собирать плейлист -- бот зайдёт, когда позовёшь.\n' +
     '`/queue` -- что играет и что дальше: номера, автор каждого трека, сколько уже\n' +
-    '  играет текущий и сколько ещё ждать до конца плейлиста целиком. У длинных\n' +
-    '  очередей есть кнопки «◀ Назад / Вперёд ▶», а `from:11` -- сразу нужная страница.\n' +
-    '  Под очередью -- быстрые кнопки: «⏭ Пропустить», «🧹 Очистить» и меню\n' +
-    '  «🗑 Убрать трек» (номера те же, что в `/remove`) -- жмёт тот, у кого права DJ\n' +
+    '  играет текущий и сколько ещё ждать до конца плейлиста целиком. На странице\n' +
+    '  25 треков, у длинных очередей есть кнопки «◀ Назад / Вперёд ▶» (и `from:26`).\n' +
+    '  Под очередью -- быстрые кнопки: «⏭ Пропустить», «🧹 Очистить», меню\n' +
+    '  «🗑 Убрать трек» и «🎚 Двигать трек» (после выбора появляются «⬆ Выше»/«⬇ Ниже»,\n' +
+    '  а номер виден в списке) -- номера те же, что в `/remove`, жмёт тот, у кого права DJ\n' +
     '`/remove number` -- убрать трек, `/move number to` -- переставить его,\n' +
     '`/jump number` -- прыгнуть к треку, `/clear` -- очистить всю очередь,\n' +
     '`/clear author:@кто` -- убрать только треки этого человека\n' +
@@ -278,8 +315,8 @@ const STARTUP_DM_TEXT =
     '  вернёшься -- мут на месте; жалоба -- зайди в общий канал 🆘\n' +
     '• если в канале никого -- музыка встаёт на паузу (не играет в пустоту)\n' +
     '• выдаёт права владельцу канала и ставит тег 🔑 в ник\n' +
-    '• новичку при входе приходит приветствие в личку: правила и знакомство\n' +
-    '  (ссылка на сообщение из `welcome_message` в канале знакомства)\n' +
+    '• новичку при входе приходит приветствие в личку: ТЕКСТ и картинка из\n' +
+    '  сообщения с правилами (`welcome_message` в канале знакомства) плюс ссылка\n' +
     '• роли помнятся: выходя с сервера, человек не теряет свои роли -- при\n' +
     '  возврате бот вернёт их обратно (выключается `save_roles: false`)\n' +
     '• за выход с сервера ставится таймаут (в этом конфиге 20 мин): перезаход\n' +
@@ -287,6 +324,8 @@ const STARTUP_DM_TEXT =
     '• кто сейчас в наказании -- у админов и модеров есть `/bans`: имя, точный\n' +
     '  срок, причина и сводка за месяц (кто сколько раз выходил и был наказан);\n' +
     '  снять наказание досрочно -- `/unban user:@кто` (ответ виден только staff)\n' +
+    '• что бот помнит о человеке (роли, наказания и что вернёт при входе) --\n' +
+    '  `/rolecheck user:@кто`: можно проверить и того, кто не на сервере\n' +
     '\n' +
     '🧪 **Проверить на себе** (в чате, без `/`): `panda welcome` -- бот пришлёт\n' +
     'тебе такую же ЛС, что видят новички (`panda welcome @юзер` -- для другого).\n' +
@@ -332,9 +371,10 @@ const
     ActivityType,  // [v2.8] профильный статус бота (слушает/смотрит/играет)
 } = require ('discord.js');
 
-// [v2.1] GuildMembers интент УБРАН -- он привилегированный, без одобрения Discord
-// бот после 09.10.2026 просто не запустился бы ('Used disallowed intents').
-// Вход/выход участников теперь ловим БЕЗ интента -- REST-поллингом (см. pollMembers).
+// [v2.17] Guild Members ПОДКЛЮЧАЕМ (раньше он был убран по [v2.1]). Даёт мгновенные
+// вход/выход вместо опроса раз в 45 сек. Резервный путь сохранён: если Discord интент
+// не даёт, login упадёт 'Used disallowed intents' -- снимем интент и поедем как раньше
+// (см. цикл входа ниже), а опрос участников остаётся включённым всегда.
 const INTENTS =
 [
     GatewayIntentBits.Guilds,
@@ -345,6 +385,8 @@ const INTENTS =
     GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.DirectMessages,
 ];
+if (USE_GUILD_MEMBERS)
+    INTENTS.push (GatewayIntentBits.GuildMembers);
 // [v2.5] ТЕКСТ сообщений: без этого интента Discord присылает события с пустым content
 // (пересылка из пандалогии и команды 'panda ...' молчат). Интент привилегированный,
 // но в портале приложения Peka он включён -- заявку подавать не надо (проверено).
@@ -466,10 +508,18 @@ async function messageContentAllowed ()
     catch (e) { return true; }
 }
 
+// [v2.17] Человеческие имена интентов -- для строк в логе:
+const INTENT_NAMES = new Map
+([
+    [GatewayIntentBits.GuildMembers, 'Guild Members (мгновенные вход/выход)'],
+    [GatewayIntentBits.MessageContent, 'Message Content (текст сообщений и команды "panda ...")'],
+]);
+
 // Heavy GO! +D
 // here you go...
 (async () =>
 {
+    // Message Content можно проверить ЗАРАНЕЕ (флаги приложения), чтобы не тратить вход:
     if (USE_MESSAGE_CONTENT && !(await messageContentAllowed ()))
     {
         console.error ('[' + (d()) + '] [login] Message Content у приложения ОТКЛЮЧЁН -- запускаю без него' +
@@ -478,21 +528,34 @@ async function messageContentAllowed ()
     }
     if (!client.options.intents.has (GatewayIntentBits.MessageContent))
         console.log ('[' + (d()) + '] [login] без интента Message Content: текст сообщений недоступен');
-    try
+    // [v2.17] Guild Members проверить заранее нечем -- узнаём по отказу Discord
+    // ('Used disallowed intents', закрытие 4014). До двух отказов: снимаем по одному
+    // привилегированному интенту и пробуем снова. Бот ОБЯЗАН запуститься в любом случае.
+    const PRIVILEGED = [GatewayIntentBits.GuildMembers, GatewayIntentBits.MessageContent];
+    for (let attempt = 0; attempt <= PRIVILEGED.length; attempt++)
     {
-        await client.login (TOKEN);
-    }
-    catch (e)
-    {
-        const msg = String ((e && e.message) || e);
-        if (/disallowed intent/i.test (msg) && client.options.intents.has (GatewayIntentBits.MessageContent))
+        try
         {
-            console.error ('[' + (d()) + '] [login] Discord запретил Message Content -- переподключаюсь без него');
-            client.options.intents.remove (GatewayIntentBits.MessageContent);
-            await client.login (TOKEN).catch (e2 => console.error ('[login] error: ' + ((e2 && e2.message) || e2)));
+            await client.login (TOKEN);
+            break;
         }
-        else
-            console.error ('[login] error: ' + msg);
+        catch (e)
+        {
+            const msg = String ((e && e.message) || e);
+            const drop = /disallowed intent/i.test (msg) ? PRIVILEGED.find (i => client.options.intents.has (i)) : null;
+            if (!drop)
+            {
+                console.error ('[login] error: ' + msg);
+                break;
+            }
+            client.options.intents.remove (drop);
+            const isMembers = drop === GatewayIntentBits.GuildMembers;
+            console.error ('[' + (d()) + '] [login] Discord запретил интент ' + (INTENT_NAMES.get (drop) || 'привилегированный') +
+                ' -- переподключаюсь без него (это не сбой бота: так работает откат)' +
+                (isMembers
+                    ? ' [вход/выход придётся ловить опросом -- а он требует тот же интент: без него приветствие, таймаут за выход и возврат ролей работать не будут]'
+                    : ' [пересылка из пандалогии и команды "panda ..." работать не будут]'));
+        }
     }
 })();
 
@@ -979,9 +1042,14 @@ client.on ('messageCreate', async message =>
                         .catch (console.error);
                     try
                     {
+                        // [v2.17] refresh: правишь welcome_message и сразу видишь результат
+                        // (без ожидания 10-минутного кэша этого сообщения).
+                        const src = await welcomeSource (server, true);
                         await user.send ({ embeds: [await welcomeEmbed (server, user)] });
                         console.log ('[' + (d()) + '] [welcome] проверка: ' +
-                            (message.member ? uuu (message.member) : message.author.username) + ' -> ' + uu (user));
+                            (message.member ? uuu (message.member) : message.author.username) + ' -> ' + uu (user) +
+                            (src ? ' -- с текстом' + (src.images.length ? ' и картинкой' : '') + ' из сообщения с правилами'
+                                 : ' -- только ссылка (сообщение с правилами не прочиталось)'));
                         message.channel.send ({ content: '✅ Приветствие отправлено в ЛС: ' + u (user.id) }).catch (console.error);
                         message.delete ().catch (console.error);
                     }
@@ -2189,10 +2257,14 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
 
 // [v14] мёртвый обработчик 'voiceStateUpdate_OFFed' из v13 удалён (был unreachable).
 // ============================================================================
-// [v2.1] REST-ПОЛЛЕР УЧАСТНИКОВ (замена guildMemberAdd/guildMemberRemove):
+// [v2.1] REST-ПОЛЛЕР УЧАСТНИКОВ -- замена guildMemberAdd/guildMemberRemove.
+// [v2.17] ВАЖНО: полный список участников (REST) -- это как раз одна из вещей,
+// которую даёт интент Guild Members. Без интента он не работает, поэтому поллер
+// теперь РЕЗЕРВНЫЙ путь (на случаи «бот запустился без интента» и «бот был выключен»),
+// а основной -- мгновенные события гейтвея (см. handleMemberEvent).
 // ============================================================================
 
-const POLL_PERIOD = 45 * 1000; // раз в 45 сек (REST без интента; лимиты не трогаем)
+const POLL_PERIOD = 45 * 1000; // раз в 45 сек (лимиты REST не трогаем)
 
 // Снапшоты участников по серверам: server_id -> Map<user_id, {user, member}>
 var $membersSnapshot = {};
@@ -2220,6 +2292,99 @@ async function resolveUser (uid, raw)
     };
     return stub;
 }
+
+// ============================================================================
+// [v2.17] МГНОВЕННЫЕ ВХОД/ВЫХОД (интент Guild Members) + РЕЗЕРВНЫЙ ОПРОС.
+// Работают оба пути, но один и тот же переход они не обрабатывают дважды: отметка
+// «уже разобрано событием» живёт 5 минут (поллер тикает раз в 45 сек). Отметка
+// нужна в ОБЕ стороны: REST-список Discord отстаёт от гейтвея, поэтому без неё
+// только что вошедший в следующем тике выглядел бы как вышедший и получил
+// таймаут за выход (а он рядом -> бан).
+// ============================================================================
+const MEMBER_EVENT_TTL = 5 * 60 * 1000;
+var $memberEvent = {}; // server -> Map<uid, { at, join }>
+
+function memberEventMark (server, uid, isJoin)
+{
+    if (!$memberEvent[server]) $memberEvent[server] = new Map ();
+    const map = $memberEvent[server];
+    map.set (uid, { at: Date.now (), join: !!isJoin });
+    if (map.size > 300) // старые отметки больше не нужны -- не копим
+        for (const [id, rec] of map)
+            if (Date.now () - rec.at > MEMBER_EVENT_TTL) map.delete (id);
+}
+
+// true -- этот же переход уже разобран событием (значит, поллеру делать нечего)
+function memberEventFresh (server, uid, isJoin)
+{
+    const map = $memberEvent[server];
+    if (!map) return false;
+    const rec = map.get (uid);
+    if (!rec) return false;
+    return (rec.join === !!isJoin) && (Date.now () - rec.at <= MEMBER_EVENT_TTL);
+}
+
+// Участник из гейтвея -- в том же виде, в каком его отдаёт REST-поллер (raw):
+// роли у события уже на руках, их и запоминаем (joined_at нам не нужен).
+function rawOfMember (member)
+{
+    return {
+        user: { id: member.id, username: (member.user && member.user.username) || member.id },
+        roles: member.roles ? [...member.roles.cache.keys ()] : null,
+        nick: member.nickname || null,
+    };
+}
+
+async function handleMemberEvent (member, isJoin)
+{
+    try
+    {
+        const server = member && member.guild ? member.guild.id : null;
+        if (!server || !(server in SERVERS) || !SERVERS[server].allow) return;
+        if (member.user && member.user.bot) return; // боты: ни приветствия, ни наказаний
+        const uid = member.id;
+        if (memberEventFresh (server, uid, isJoin)) return; // поллер уже разобрался
+        memberEventMark (server, uid, isJoin);
+        // У guildMemberRemove объект бывает частичным -- дотягиваем, чтобы знать роли
+        if (member.partial)
+        {
+            try { await member.fetch (); }
+            catch (e) { /* не отдали -- роли просто не запомним */ }
+        }
+        const raw = rawOfMember (member);
+        const who = (member.user && member.user.username) ? member.user : await resolveUser (uid, raw);
+        console.log ('[' + (d()) + '] member ' + who.username + (isJoin ? ' JOINED ' : ' LEFT ') +
+            SERVERS[server].name + ' (мгновенно)');
+        if (isJoin)
+        {
+            await logMemberJoinLeave (server, who, true);
+            await restoreMemberRoles (server, uid, raw); // роли -- до таймаутов
+            await handleMemberJoin (server, uid, raw);
+        }
+        else
+        {
+            await logMemberJoinLeave (server, who, false);
+            // since = сейчас: снимок актуален, правки ролей достраивать не надо
+            await handleMemberLeave (server, uid, raw, Date.now ());
+        }
+        // Снимок поллера подтягиваем к реальности (если REST отстаёт -- спасёт отметка):
+        const snap = $membersSnapshot[server];
+        if (snap)
+        {
+            if (isJoin) snap.set (uid, raw); else snap.delete (uid);
+            $membersSnapshotAt[server] = Date.now ();
+        }
+    }
+    catch (e)
+    {
+        console.error ('[memberEvent] ' + (isJoin ? 'join' : 'leave') + ': ' + oneLine (e.message));
+    }
+}
+
+// Эти два события приходят ТОЛЬКО с интентом Guild Members. Нет интента -- просто
+// молчат, и всё делает опрос (это и есть автоматический откат).
+client.on ('guildMemberAdd',    member => { void handleMemberEvent (member, true); });
+client.on ('guildMemberRemove', member => { void handleMemberEvent (member, false); });
 
 // Лог входа/выхода участника в журнал (как было на событиях):
 async function logMemberJoinLeave (server, memberUser, isJoin)
@@ -2436,9 +2601,12 @@ async function sweepBanHistory (server)
         for (const key of keys) await db (server, 'banHistory', key, null);
     }
     catch (e) { console.error ('[ban] уборка истории: ' + oneLine (e.message)); return; }
+    // [v2.17] Формулировка -- про СРОК ХРАНЕНИЯ, а не «убрал»: видно, что данные
+    // старше окна (bans_history_days) удалены из базы и что актуального в них нет.
     if (keys.length)
-        console.log ('[' + (d()) + '] [ban] история за ' + banHistoryDays (server) + ' дн: убрал ' + keys.length +
-            ' ' + plural (keys.length, 'запись', 'записи', 'записей') + ' без событий');
+        console.log ('[' + (d()) + '] [ban] истёк срок хранения истории ' + banHistoryDays (server) +
+            ' дн (bans_history_days): удалено из базы ' + keys.length + ' ' +
+            plural (keys.length, 'запись', 'записи', 'записей') + ' -- событий в них уже не было, активные наказания не тронуты');
 }
 
 // Имена наказанных: у забаненного нет объекта участника (он не на сервере) -- берём
@@ -2621,11 +2789,17 @@ async function fetchAllMembersRest (guildId)
 // ============================================================================
 // [v2.13] ПРИВЕТСТВЕННАЯ ЛС НОВИЧКУ (возвращена по просьбе владельца).
 // Ключи config.json: welcome_channel -- канал знакомства (там правила и знакомство),
-// welcome_message -- id сообщения в нём. Бот присылает приветствие со ссылкой ровно на
-// это сообщение (нет id -- на сам канал). Кому: всем, кто заходит НЕ в таймауте за
-// выход (перезаходы идут своим путём, см. handleMemberJoin). Выключить приветствие --
-// пустой welcome_channel (или неверный id).
+// welcome_message -- id сообщения в нём. Нужны ОБА: в Discord НЕТ способа найти
+// сообщение по id без канала (поиск есть только по тексту внутри канала), поэтому
+// канал -- это «где искать», а message -- «что именно». Зато бот не просто даёт
+// ссылку: он читает это сообщение и переносит в ЛС его ТЕКСТ и КАРТИНКИ [v2.17].
+// Нет id сообщения -- ссылка на канал. Пустой/неверный welcome_channel -- приветствие
+// выключено целиком. Кому: всем, кто заходит НЕ в таймауте за выход (перезаходы идут
+// своим путём, см. handleMemberJoin).
 // ============================================================================
+const WELCOME_SRC_TTL = 10 * 60 * 1000; // не дёргать REST на каждый вход
+const $welcomeSrc = {};                 // server -> { at, data }
+
 function welcomeLink (server)
 {
     const s = SERVERS[server] || {};
@@ -2636,9 +2810,50 @@ function welcomeLink (server)
         (/^\d{17,20}$/.test (message) ? '/' + message : '');
 }
 
+// Прочитать само сообщение с правилами: текст, картинки и прочие вложения.
+// Не отдалось (удалили, нет прав, канал в архиве) -- null: приветствие отправится
+// со ссылкой, как раньше. refresh -- для `panda welcome`: владелец правит текст и
+// сразу смотрит результат, без ожидания кэша.
+async function welcomeSource (server, refresh = false)
+{
+    const s = SERVERS[server] || {};
+    const chId = String (s.welcome_channel || '');
+    const msgId = String (s.welcome_message || '');
+    if (!/^\d{17,20}$/.test (chId) || !/^\d{17,20}$/.test (msgId)) return null;
+    const cached = $welcomeSrc[server];
+    if (!refresh && cached && Date.now () - cached.at < WELCOME_SRC_TTL) return cached.data;
+    let data = null;
+    try
+    {
+        const ch = client.channels.cache.get (chId) || await client.channels.fetch (chId);
+        const msg = ch && ch.messages
+            ? (ch.messages.cache.get (msgId) || await ch.messages.fetch (msgId))
+            : null;
+        if (msg)
+        {
+            const atts = [...msg.attachments.values ()];
+            const isImg = a => /^image\//.test (a.contentType || '') ||
+                /\.(png|jpe?g|gif|webp|avif)$/i.test (a.name || '');
+            data = {
+                text: (msg.content || '').trim (),
+                images: atts.filter (isImg).map (a => a.url),
+                files: atts.filter (a => !isImg (a)).map (a => ({ url: a.url, name: a.name || 'файл' })),
+                embeds: (msg.embeds || []).length,
+            };
+        }
+    }
+    catch (e)
+    {
+        console.error ('[welcome] не смог прочитать сообщение ' + msgId + ' в канале ' + chId +
+            ': ' + oneLine (e.message, 120) + ' -- в приветствии будет только ссылка');
+    }
+    $welcomeSrc[server] = { at: Date.now (), data };
+    return data;
+}
+
 // Текст приветствия ОТДЕЛЬНОЙ функцией: его же показывает `panda welcome` (проверка
 // на себе -- владелец может посмотреть глазами новичка и поправить welcome_message).
-async function welcomeEmbed (server, user)
+async function welcomeEmbed (server, user, refresh = false)
 {
     const s = SERVERS[server] || {};
     const link = welcomeLink (server);
@@ -2651,20 +2866,35 @@ async function welcomeEmbed (server, user)
         if (ch && ch.name) chName = '#' + ch.name;
     }
     catch (e) { /* канал не отдался -- обойдёмся ссылкой */ }
+    // [v2.17] Текст сообщения с правилами переносим в ЛС (раньше была только ссылка,
+    // а Discord рисовал её как название сервера -- выглядело как будто текст потерялся).
+    const src = await welcomeSource (server, refresh);
+    let rules = '';
+    if (src && src.text)
+    {
+        const cut = clipText (src.text, 1200);
+        rules = '\n' + cut + (/\n$/.test (cut) ? '' : '\n');
+        if (cut.length < src.text.length) rules += '_(текст длинный -- целиком по ссылке ниже)_\n';
+    }
+    if (src && src.files.length)
+        rules += '📎 Вложение: ' + src.files.map (f => '[' + oneLine (f.name, 40) + '](' + f.url + ')').join (', ') + '\n';
     const embed =
     {
         color: 0x00CCFF,
         title: '🐼 Добро пожаловать на ' + (s.name || 'сервер') + '!',
         description:
             `${user}, привет! 👋\n` +
-            `\n📜 **Правила и знакомство**` + (chName ? ' -- в канале ' + code (chName) : '') + `:\n` +
-            `${link}\n` +
+            `\n📜 **Правила и знакомство**` + (chName ? ' -- в канале ' + code (chName) : '') + `:` +
+            (rules ? rules + '🔗 ' + link + '\n' : '\n' + link + '\n') +
             `\n🎵 **Музыка:** \`/play ссылка или запрос\`, очередь -- \`/queue\`,\n` +
             `выйти боту из канала -- \`/leave\` (управляют админы, модеры и роль DJ).\n` +
             `📌 Инструкция по боту -- в любой момент \`/help\`.\n` +
             `\nЕсли что-то непонятно или не работает -- напиши администрации.`,
         timestamp: dt(),
     };
+    // Картинка из сообщения с правилами -- прямо в письме (как и было задумано):
+    if (src && src.images.length)
+        embed.image = { url: src.images[0] };
     if (s.name) embed.footer = { text: s.name };
     return embed;
 }
@@ -2682,8 +2912,10 @@ async function welcomeDM (server, uid, raw)
             console.error ('[welcome] ЛС новичку ' + name + ' не отправить: пользователь недоступен');
             return;
         }
+        const src = await welcomeSource (server);
         await user.send ({ embeds: [await welcomeEmbed (server, user)] });
-        console.log ('[' + (d()) + '] [welcome] ЛС новичку ' + name + ' отправлена (' + link + ')');
+        console.log ('[' + (d()) + '] [welcome] ЛС новичку ' + name + ' отправлена (' + link + ')' +
+            (src ? ' -- текст и картинки взяты из сообщения с правилами' : ' -- только ссылка (сообщение с правилами не прочиталось)'));
     }
     catch (e)
     {
@@ -3020,9 +3252,91 @@ async function sweepSavedRoles (server)
         for (const key of keys) await db (server, 'memberRoles', key, null);
     }
     catch (e) { console.error ('[roles] уборка: ' + oneLine (e.message)); return; }
+    // [v2.17] Ясная формулировка: это истёк срок хранения (save_roles_days), а не потеря.
     if (keys.length)
-        console.log ('[' + (d()) + '] [roles] убрал ' + keys.length + ' старых ' +
-            plural (keys.length, 'запись', 'записи', 'записей') + ' о ролях (старше ' + days + ' дн)');
+        console.log ('[' + (d()) + '] [roles] истёк срок хранения ' + days + ' дн (save_roles_days): удалено из базы ' +
+            keys.length + ' ' + plural (keys.length, 'запись', 'записи', 'записей') +
+            ' о ролях -- эти роли всё равно не вернулись бы (запись просрочена)');
+}
+
+// ============================================================================
+// [v2.17] /rolecheck -- «что бот помнит о человеке»: роли, наказания и что именно
+// он вернёт при следующем входе. Работает и для НЕ-участника сервера: роли и
+// наказания лежат в базе по id, а для проверки самого человека хватает REST
+// «Get Guild Member» (одиночный запрос -- интента Guild Members не требует).
+// ============================================================================
+async function rolecheckReport (server, target)
+{
+    const s = SERVERS[server] || {};
+    const guild = client.guilds.cache.get (server);
+    const out = [];
+    out.push ('🔎 **' + target.username + '** `' + target.id + '`');
+    // --- есть ли человек на сервере и какие роли у него сейчас ---
+    let member = null, memberWhy = '';
+    try { member = await guild.members.fetch (target.id); }
+    catch (e) { memberWhy = oneLine (e.message, 90); }
+    const haveRoles = member ? new Set (member.roles.cache.keys ()) : null;
+    if (member)
+        out.push ('\n**На сервере:** да' + (member.nickname ? ' (ник: ' + member.nickname + ')' : '') +
+            '\nРоли сейчас (' + (member.roles.cache.size - 1) + '): ' +
+            (member.roles.cache.filter (r => r.id !== guild.id).map (r => '«' + r.name + '»').join (', ') || '--'));
+    else
+        out.push ('\n**На сервере:** нет' + (memberWhy ? ' _(проверить не смог: `' + memberWhy + '`)_' : ''));
+    // --- роли, которые бот помнит (save_roles) ---
+    let saved = null, saveWhy = '';
+    try { saved = await db (server, 'memberRoles', target.id); }
+    catch (e) { saveWhy = oneLine (e.message, 90); }
+    const nameOf = id => '«' + ((guild.roles.cache.get (id) || {}).name || id) + '»';
+    if (!roleSaveOn (server))
+        out.push ('\n**Роли при входе:** функция выключена (`save_roles: false`)');
+    else if (saveWhy)
+        out.push ('\n**Роли при входе:** база не прочиталась (`' + saveWhy + '`)');
+    else if (!saved || !Array.isArray (saved.roles) || !saved.roles.length)
+        out.push ('\n**Роли при входе:** записи нет -- возвращать нечего');
+    else
+    {
+        const days = roleSaveDays (server);
+        const age = Math.round ((Date.now () - (Number (saved.at) || 0)) / 86400000);
+        out.push ('\n**Роли при входе** (`save_roles`, хранение ' + days + ' дн): запомнено ' + saved.roles.length + ' ' +
+            plural (saved.roles.length, 'роль', 'роли', 'ролей') + ' (' + (Number (saved.at) ? d (saved.at, true) : '?') + ')');
+        out.push ('• помню: ' + saved.roles.map (nameOf).join (', '));
+        if (age > days)
+            out.push ('• ⏳ запись старше ' + days + ' дн -- при входе она забывается, роли возвращаться НЕ будут');
+        else
+        {
+            const want = saved.roles.filter (id => !(haveRoles && haveRoles.has (id)) && roleRestorable (server, guild, id));
+            out.push (want.length
+                ? '• ✅ вернётся при входе: ' + want.map (nameOf).join (', ')
+                : '• ✅ возвращать нечего: ' + (haveRoles ? 'все эти роли у человека уже есть'
+                    : 'роли уже есть / исключены в конфиге / их больше нет на сервере'));
+            const skip = saved.roles.filter (id => !want.includes (id));
+            if (skip.length)
+                out.push ('• вычеркнуто: ' + skip.map (id => nameOf (id) +
+                    (haveRoles && haveRoles.has (id) ? ' (уже есть)' :
+                        (!guild.roles.cache.get (id) ? ' (роли нет на сервере)' : ' (исключена в config)'))).join (', '));
+        }
+    }
+    // --- наказания: то же, что /bans, но по одному человеку (и с проверкой реального бана) ---
+    const until = await db (server, 'membersBanTimeout', target.id).catch (() => null);
+    const bans = await guildBans (server);
+    const isBan = bans.has (target.id);
+    const why = isBan && bans.get (target.id) ? ' (причина: ' + oneLine (bans.get (target.id), 200) + ')' : '';
+    if (until && until > Date.now ())
+        out.push ('\n**Сейчас в наказании:** ' + (isBan ? '🚫 бан' : '⏳ таймаут (бана в Discord нет)') +
+            ' до `' + d (until, true) + '` -- осталось `' + dd (until) + '`' + why);
+    else if (isBan)
+        out.push ('\n**Сейчас в наказании:** 🚫 бан в Discord' + why);
+    else
+        out.push ('\n**Сейчас в наказании:** нет' + (until ? ' _(запись о таймауте просрочена -- её снимет свип)_' : ''));
+    // --- история за окно (как в /bans) ---
+    const hist = await bansHistory (server);
+    const row = hist.find (h => h.id === target.id);
+    out.push ('\n**История за ' + banHistoryDays (server) + ' дн:** ' + (row
+        ? 'выходов ' + row.exit + ', таймаутов ' + row.timeout + ', банов ' + row.ban + ', снятий ' + row.unban +
+          ' _(последнее: ' + d (row.last, true) + ')_'
+        : 'ничего не записано'));
+    if (s.name) out.push ('\n—_' + s.name + '_');
+    return out.join ('\n');
 }
 
 // [v2.2.3] РЕСТАРТ-БЕЗОПАСНАЯ сверка тегов 🔑: события, случившиеся пока бот был выключен
@@ -3222,6 +3536,42 @@ async function checkConfigChannels (server)
     }
 }
 
+// ============================================================================
+// [v2.17] ЧТО РЕАЛЬНО ДОСТУПНО ПРИЛОЖЕНИЮ. Привилегированные интенты Discord может
+// отозвать (письмо от 10.09.2026, срок 09.10.2026) -- и тогда часть возможностей
+// тихо исчезнет. Поэтому при КАЖДОМ старте пишем по строке на возможность и ПО ФАКТУ
+// (доступна она сейчас), а не по настройке в конфиге
+// ============================================================================
+async function reportIntents (server)
+{
+    const name = SERVERS[server].name;
+    const has = i => client.options.intents.has (i);
+    const yes = ok => ok ? 'да' : 'НЕТ';
+    const msgContent = has (GatewayIntentBits.MessageContent);
+    const members    = has (GatewayIntentBits.GuildMembers);
+    console.log ('[' + (d()) + '] [intents] ' + name + ' | Message Content (текст сообщений, команды "panda ..."): ' +
+        yes (msgContent) + (msgContent ? '' : ' -- пересылка из пандалогии и текстовые команды молчат'));
+    console.log ('[' + (d()) + '] [intents] ' + name + ' | Guild Members (мгновенные вход/выход): ' +
+        yes (members) + (members ? '' : ' -- вход/выход только опросом раз в 45 сек'));
+    // Список участников: это и есть резервный путь. Проверяем ФАКТОМ -- пришёл ли список.
+    const n = $membersSnapshot[server] ? $membersSnapshot[server].size : 0;
+    console.log ('[' + (d()) + '] [intents] ' + name + ' | полный список участников (REST): ' +
+        (n ? 'да -- ' + n + ' участников' : 'НЕТ -- список не пришёл, вход/выход не работают') +
+        ' (от него зависят вход/выход, таймаут за выход и возврат ролей)');
+    // Журнал аудита (GuildModeration) -- не привилегированный, но без него не видно
+    // авторство мутов/переносов. Тоже проверяем запросом, а не настройкой.
+    let audit = false, why = '';
+    try
+    {
+        const guild = client.guilds.cache.get (server);
+        await guild.fetchAuditLogs ({limit: 1});
+        audit = true;
+    }
+    catch (e) { why = oneLine (e.message, 90); }
+    console.log ('[' + (d()) + '] [intents] ' + name + ' | журнал аудита (авторство мутов/переносов): ' +
+        (audit ? 'да' : 'НЕТ -- ' + why));
+}
+
 // Один тик поллера по серверу:
 async function pollMembers (server)
 {
@@ -3279,6 +3629,8 @@ async function pollMembers (server)
                 for (let [uid, raw] of current)
                 {
                     if (previous.has (uid)) continue;
+                    // [v2.17] событие гейтвея уже разобрало этот вход -- не повторяем
+                    if (memberEventFresh (server, uid, true)) continue;
                     try
                     {
                         let memberUser = await resolveUser (uid, raw);
@@ -3294,6 +3646,9 @@ async function pollMembers (server)
                 for (let [uid, raw] of previous)
                 {
                     if (current.has (uid)) continue;
+                    // [v2.17] либо событие уже разобрало выход, либо человек только что
+                    // вошёл (REST-список отстаёт) -- в обоих случаях никого не наказываем
+                    if (memberEventFresh (server, uid, false) || memberEventFresh (server, uid, true)) continue;
                     try
                     {
                         let memberUser = await resolveUser (uid, raw);
@@ -3336,6 +3691,8 @@ client.on
             $membersSnapshot[server] = await fetchAllMembersRest (server).catch (() => null);
             $membersSnapshotAt[server] = Date.now ();
             console.log ('[' + (d()) + '] [poll] snapshot ready: ' + ($membersSnapshot[server] ? $membersSnapshot[server].size : 'ERR') + ' members @ ' + SERVERS[server].name);
+            // [v2.17] Что реально доступно приложению (интенты могли отозвать):
+            await reportIntents (server);
             // [v2.5] заодно проверить id из config.json (молчит, если всё цело):
             await checkConfigChannels (server);
             // [v2.14] Сперва отчёт: сколько наказаний поднято из базы (пишется всегда),
@@ -4352,27 +4709,74 @@ function queueLeft (m)
     return { sec, curLeft, unknown, live };
 }
 
-// Кнопки и меню под ответом /queue. Страница зашита в customId кнопок листания,
-// поэтому никакого состояния между нажатиями держать не надо.
-//   ◀ Назад / Вперёд ▶ -- только у очередей длиннее страницы;
-//   ⏭ Пропустить / 🧹 Очистить -- частые действия;
-//   🗑 Убрать трек -- меню с номерами ТЕКУЩЕЙ страницы (те же номера, что в /remove).
-// Права проверяются при нажатии: сообщение очереди видит весь канал, а действия -- DJ.
-const QUEUE_PAGE = 10;
-function queueComponents (start, total, m)
+// [v2.17] 25 треков на страницу (в очереди часто по 50 заливают -- меньше листать).
+// 25 -- ещё и максимум пунктов в меню Discord, поэтому больше нельзя.
+const QUEUE_PAGE = 25;
+// Сколько символов списка можно занять: у сообщения лимит ~2000, а название трека
+// бывает длинным. Переполнение = отказ Discord (пустое сообщение или ошибка), поэтому
+// страница собирается по бюджету ОДИН раз (queuePage), и листание идёт по номерам,
+// которые реально показаны -- иначе кусок очереди был бы недоступен.
+const QUEUE_LINES_BUDGET = 1500;
+function queuePage (m, start)
 {
+    const total = m.tracks.length;
+    start = Math.min (Math.max (1, Math.round (start) || 1), Math.max (1, total));
+    const slice = m.tracks.slice (start - 1, start - 1 + QUEUE_PAGE);
+    const lines = [];
+    let used = 0;
+    for (let i = 0; i < slice.length; i++)
+    {
+        const t = slice[i];
+        const line = (start + i) + '. **' + clipText (t.title || 'трек', 120) + '** `' +
+            fmtDur (t.duration, t.isLive) + '`' + byLabel (t);
+        if (lines.length && used + line.length + 1 > QUEUE_LINES_BUDGET) break;
+        lines.push (line);
+        used += line.length + 1;
+    }
+    return { start, total, count: lines.length, list: lines.join ('\n') };
+}
+
+// Кнопки и меню под ответом /queue. Всё состояние -- в самих компонентах (customId),
+// поэтому между нажатиями держать ничего не надо.
+//   ◀ Назад / Вперёд ▶ -- только когда очередь не влезла в одну страницу (в customId --
+//       ЦЕЛЕВАЯ страница: если страницу срезало по длине, шаг остаётся верным);
+//   ⏭ Пропустить / 🧹 Очистить -- частые действия;
+//   🗑 Убрать трек -- меню с номерами ТЕКУЩЕЙ страницы (те же номера, что в /remove);
+//   🎚 Двигать трек -- выбираешь трек, и рядом появляются «⬆ Выше» / «⬇ Ниже» [v2.17]:
+//       перестановка руками, без /move по номерам. Ряд с ними -- пока трек выбран,
+//       «✖ Готово» убирает его.
+// Права проверяются при нажатии: сообщение очереди видит весь канал, а действия -- DJ.
+// На какой странице окажется номер n (страницы бывают короче 25 -- если названия
+// срезали список по длине). Идём теми же шагами, что и листание, поэтому трек
+// после перестановки виден там, куда ведёт страница, а не «между страницами».
+function queuePageOf (m, n)
+{
+    let start = 1;
+    for (let guard = 0; guard < 2000; guard++)
+    {
+        const p = queuePage (m, start);
+        if (!p.count) return 1;
+        if (n <= p.start + p.count - 1) return p.start;
+        start = p.start + p.count;
+    }
+    return 1;
+}
+
+function queueComponents (page, m, moveSel = 0)
+{
+    const { start, total, count } = page;
     const rows = [];
-    if (total > QUEUE_PAGE)
+    if (total > 0 && (start > 1 || start + count <= total))
         rows.push
         (
             new ActionRowBuilder ().addComponents
             (
                 new ButtonBuilder ()
-                    .setCustomId ('q:p:' + start).setLabel ('◀ Назад')
+                    .setCustomId ('q:p:' + Math.max (1, start - count)).setLabel ('◀ Назад')
                     .setStyle (ButtonStyle.Secondary).setDisabled (start <= 1),
                 new ButtonBuilder ()
-                    .setCustomId ('q:n:' + start).setLabel ('Вперёд ▶')
-                    .setStyle (ButtonStyle.Secondary).setDisabled (start + QUEUE_PAGE > total)
+                    .setCustomId ('q:n:' + (start + count)).setLabel ('Вперёд ▶')
+                    .setStyle (ButtonStyle.Secondary).setDisabled (start + count > total)
             )
         );
     // Действия не зависят от страницы -- отдельный ряд (одинаковый на всех страницах):
@@ -4388,21 +4792,40 @@ function queueComponents (start, total, m)
                 .setDisabled (!total)
         )
     );
-    const slice = m.tracks.slice (start - 1, start - 1 + QUEUE_PAGE);
-    if (slice.length)
+    if (count)
     {
-        const menu = new StringSelectMenuBuilder ()
-            .setCustomId ('q:rm')
+        const rm = new StringSelectMenuBuilder ()
+            .setCustomId ('q:rm:' + start)
             .setPlaceholder ('🗑 Убрать трек из очереди…');
-        for (let i = 0; i < slice.length; i++)
-            menu.addOptions
-            ([{
-                // label -- до 100 символов (лимит Discord), в value -- номер как в /queue:
-                label: ('№' + (start + i) + ' · ' + (slice[i].title || 'трек')).slice (0, 100),
-                value: String (start + i),
-            }]);
-        rows.push (new ActionRowBuilder ().addComponents (menu));
+        const mv = new StringSelectMenuBuilder ()
+            .setCustomId ('q:mv:' + start)
+            .setPlaceholder (moveSel ? ('🎚 Двигаю №' + moveSel + ' -- или выбери другой') : '🎚 Двигать трек в очереди…');
+        for (let i = 0; i < count; i++)
+        {
+            // label -- до 100 символов (лимит Discord), в value -- номер как в /queue:
+            const label = ('№' + (start + i) + ' · ' + (m.tracks[start - 1 + i].title || 'трек')).slice (0, 100);
+            rm.addOptions ([{ label: label, value: String (start + i) }]);
+            mv.addOptions ([{ label: label, value: String (start + i), default: (start + i) === moveSel }]);
+        }
+        rows.push (new ActionRowBuilder ().addComponents (rm));
+        rows.push (new ActionRowBuilder ().addComponents (mv));
     }
+    if (moveSel >= 1 && moveSel <= total)
+        rows.push
+        (
+            new ActionRowBuilder ().addComponents
+            (
+                new ButtonBuilder ()
+                    .setCustomId ('q:mu:' + moveSel).setLabel ('⬆ Выше')
+                    .setStyle (ButtonStyle.Primary).setDisabled (moveSel <= 1),
+                new ButtonBuilder ()
+                    .setCustomId ('q:md:' + moveSel).setLabel ('⬇ Ниже')
+                    .setStyle (ButtonStyle.Primary).setDisabled (moveSel >= total),
+                new ButtonBuilder ()
+                    .setCustomId ('q:mx:' + start).setLabel ('✖ Готово')
+                    .setStyle (ButtonStyle.Secondary)
+            )
+        );
     return rows;
 }
 
@@ -4456,17 +4879,50 @@ function queueRemove (guildId, n, who)
         (m.tracks.length ? ' (в очереди осталось ' + m.tracks.length + ')' : ' (очередь пуста)') };
 }
 
+// [v2.17] Перестановка трека в очереди: одна логика на /move и на кнопки «⬆/⬇»
+// (иначе ответы и лог со временем разъехались бы). Номера те же, что в /queue
+// (текущий трек в них не входит). Возвращает { ok, text, to }.
+function queueMove (guildId, n, to, who)
+{
+    const m = musicOf (guildId);
+    const total = m.tracks.length;
+    if (total < 2)
+        return { ok: false, text: '↔️ Для перестановки нужно хотя бы два трека в очереди' +
+            (m.current ? ' (сейчас играет только **' + (m.current.title || 'трек') + '**).' : '.') };
+    if (!Number.isInteger (n) || !Number.isInteger (to) || n < 1 || n > total || to < 1 || to > total)
+        return { ok: false, text: '🤔 В очереди ' + total + ' ' + plural (total, 'трек', 'трека', 'треков') +
+            ' -- номера от 1 до ' + total + '.' };
+    if (n === to) return { ok: false, text: '↔️ №' + n + ' уже на этом месте.' };
+    const moved = m.tracks.splice (n - 1, 1)[0];
+    m.tracks.splice (to - 1, 0, moved);
+    // ждущий продолжения трек (после /leave, обрыва или попытки продолжить) -- тот же
+    // самый объект в очереди, так что место в нём едет вместе с ним: m.seekTrack/m.seekSec
+    // указывают на ТРЕК, а не на номер.
+    dropPreload (m);   // следующий трек мог смениться -- заготовка была не та
+    startPreload (guildId);
+    saveMusicState (guildId);
+    scheduleVoiceStatus (guildId, true);
+    schedulePresence (true);
+    console.log ('[' + (d()) + '] [music] ' + whoText (who) + 'переставил в очереди №' + n + ' -> №' + to + ': ' + (moved.title || 'трек'));
+    return {
+        ok: true,
+        to: to,
+        text: '↔️ **' + (moved.title || 'трек') + '**: №' + n + ' -> №' + to +
+            (m.current ? ' (сейчас играет **' + (m.current.title || 'трек') + '**)' : '') +
+            '\n' + queuePreview (m),
+    };
+}
+
 // Одна страница очереди: номера (те же, что в /remove,/move,/jump), автор каждого
 // трека, позиция внутри текущего трека и ОБЩИЙ остаток по времени.
-function queueView (m, start)
+// moveSel -- номер выбранного для перестановки трека (0 -- ничего не выбрано):
+// тогда внизу появляются кнопки «⬆ Выше» / «⬇ Ниже».
+function queueView (m, start, moveSel = 0)
 {
-    const total = m.tracks.length;
-    start = Math.min (Math.max (1, Math.round (start) || 1), Math.max (1, total));
-    const slice = m.tracks.slice (start - 1, start - 1 + QUEUE_PAGE);
-    const list = slice.map ((t, i) =>
-        (start + i) + '. **' + (t.title || 'трек') + '** `' + fmtDur (t.duration, t.isLive) + '`' + byLabel (t)
-    ).join ('\n');
-    const rest = total - (start - 1 + slice.length);
+    const page = queuePage (m, start);
+    const total = page.total;
+    const list = page.list;
+    const rest = total - (page.start - 1 + page.count);
     const q = queueLeft (m);
     let wait = '⏳ **До конца очереди:** ' + (q.sec ? fmtAgo (q.sec * 1000) : '0 сек');
     if (q.curLeft) wait += ' (с учётом `' + fmtDur (q.curLeft) + '` текущего)';
@@ -4488,16 +4944,21 @@ function queueView (m, start)
         head = '⏸ Музыка ждёт слушателя -- позови `/join` (очередь помнится)';
     else
         head = '🎵 **Сейчас:** —';
+    // выбраный для перестановки трек -- строкой внизу (видно, что именно двигаешь):
+    let move = '';
+    if (moveSel >= 1 && moveSel <= total)
+        move = '\n\n🎚 **Двигаю №' + moveSel + ':** **' + (m.tracks[moveSel - 1].title || 'трек') +
+            '** -- жми «⬆ Выше» / «⬇ Ниже» под списком.';
     return {
         content: head +
             (total
-                ? '\n\n**Очередь (' + total + ')**' + (start > 1 ? ' с №' + start : '') + ':\n' + list +
-                  (rest > 0 ? '\n*...и ещё ' + rest + ': `/queue from:' + (start + QUEUE_PAGE) + '`*' : '') +
-                  '\n\n' + wait +
-                  '\n_Убрать -- `/remove`, переставить -- `/move`, прыгнуть -- `/jump`; чистить всё -- `/clear`,_\n' +
+                ? '\n\n**Очередь (' + total + ')**' + (page.start > 1 ? ' с №' + page.start : '') + ':\n' + list +
+                  (rest > 0 ? '\n*...и ещё ' + rest + ': `/queue from:' + (page.start + page.count) + '`*' : '') +
+                  '\n\n' + wait + move +
+                  '\n_Убрать -- `/remove`, переставить -- `/move` или кнопками ниже, прыгнуть -- `/jump`; чистить всё -- `/clear`,_\n' +
                   '_а только треки одного человека -- `/clear author:@кто`._'
                 : ''),
-        components: queueComponents (start, total, m),
+        components: queueComponents (page, m, moveSel),
     };
 }
 
@@ -4972,12 +5433,22 @@ const musicCommands =
         .addStringOption (o =>
             o.setName ('reason')
              .setDescription ('Причина снятия (уйдёт в журнал и в аудит Discord)')),
+    // [v2.17] /rolecheck -- что бот помнит о человеке: роли, наказания и что именно
+    // он вернёт при следующем входе (админы/модеры). Работает и для того, кто не
+    // на сервере: данные лежат в базе по id.
+    new SlashCommandBuilder ()
+        .setName ('rolecheck')
+        .setDescription ('Что бот помнит о человеке: роли, наказания и что вернёт при входе (staff)')
+        .addUserOption (o =>
+            o.setName ('user')
+             .setDescription ('Кого проверить (можно любого, не только участника сервера)')
+             .setRequired (true)),
     new SlashCommandBuilder ()
         .setName ('queue')
         .setDescription ('Показать очередь треков')
         .addIntegerOption (o =>
             o.setName ('from')
-             .setDescription ('С какого номера показать (в очереди бывает >10 треков)')
+             .setDescription ('С какого номера показать (на странице 25, в очереди бывает и больше)')
              .setMinValue (1)),
     new SlashCommandBuilder ()
         .setName ('leave')
@@ -5020,12 +5491,16 @@ client.on ('interactionCreate', async (interaction) =>
         const guildId = interaction.guildId;
         if (!(guildId in SERVERS)) return;
         const m = musicOf (guildId);
-        const replyView = () =>
+        // Страница, на которой сейчас это сообщение: она зашита в customId меню и
+        // «✖ Готово» (между нажатиями состояние не держим). Нет её -- считаем первой.
+        const mOwn = /^(?:q:rm|q:mv|q:mx):(\d+)$/.exec (cid);
+        const page = mOwn ? (parseInt (mOwn[1], 10) || 1) : 1;
+        const replyView = (at = page, moveSel = 0) =>
         {
-            const view = queueView (m, 1);
+            const view = queueView (m, at, moveSel);
             return interaction.update ({ content: view.content, components: view.components });
         };
-        // --- листание: чужие нажатия не трогают чужое сообщение ---
+        // --- листание: в customId -- ЦЕЛЕВАЯ страница; чужие нажатия не трогают чужое сообщение ---
         const mPage = /^q:([pn]):(\d+)$/.exec (cid);
         if (mPage)
         {
@@ -5037,13 +5512,10 @@ client.on ('interactionCreate', async (interaction) =>
                 (
                     { content: '📜 Эту очередь открыл другой человек -- вызови `/queue` сам.', flags: MessageFlags.Ephemeral }
                 );
-            const cur = parseInt (mPage[2], 10) || 1;
-            const next = mPage[1] === 'p' ? cur - QUEUE_PAGE : cur + QUEUE_PAGE;
-            const view = queueView (m, next);
-            return interaction.update ({ content: view.content, components: view.components });
+            return replyView (parseInt (mPage[2], 10) || 1);
         }
         // --- действия: как и слэш-команды, только для админов/модеров и роли DJ ---
-        if (!/^q:(skip|clear|rm)$/.test (cid)) return;
+        if (!/^q:(skip|clear|rm|mv|mu|md|mx)(:|$)/.test (cid)) return;
         if (!isDJ (interaction))
         {
             const role_dj = SERVERS[guildId].role_dj || '';
@@ -5056,13 +5528,37 @@ client.on ('interactionCreate', async (interaction) =>
             );
         }
         const who = interaction.member ? uuu (interaction.member) : interaction.user.username;
+        // [v2.17] «⬆ Выше» / «⬇ Ниже» -- перестановка того трека, что выбран в меню
+        // «🎚 Двигать трек». Логика общая с /move (queueMove).
+        const mStep = /^q:m([ud]):(\d+)$/.exec (cid);
+        if (mStep)
+        {
+            const n = parseInt (mStep[2], 10) || 0;
+            const res = queueMove (guildId, n, mStep[1] === 'u' ? n - 1 : n + 1, who);
+            if (!res.ok)
+                return interaction.reply ({ content: res.text, flags: MessageFlags.Ephemeral });
+            // Показываем ту страницу, где трек оказался, и оставляем его выбранным --
+            // так его можно двигать дальше, не выбирая заново.
+            const at = queuePageOf (m, res.to);
+            await replyView (at, res.to);
+            return interaction.followUp ({ content: res.text, flags: MessageFlags.Ephemeral });
+        }
+        // Выбор трека для перестановки и «✖ Готово» -- состояние только в сообщении:
+        if (/^q:mx(:|$)/.test (cid)) return replyView (page, 0);
+        if (/^q:mv(:|$)/.test (cid))
+        {
+            const sel = parseInt ((interaction.values || [])[0], 10) || 0;
+            if (!sel)
+                return interaction.reply ({ content: '🤔 Не понял, какой трек двигать.', flags: MessageFlags.Ephemeral });
+            return replyView (page, sel);
+        }
         let res;
         if (cid === 'q:skip') res = queueSkip (guildId, who);
         else if (cid === 'q:clear') res = queueClear (guildId, who);
         else res = queueRemove (guildId, parseInt ((interaction.values || [])[0], 10), who);
         // Сообщение очереди обновляем для ВСЕХ (видно результат) и коротко
         // подтверждаем нажавшему -- ответ виден только ему.
-        await replyView ();
+        await replyView (page);
         return interaction.followUp ({ content: res.text, flags: MessageFlags.Ephemeral });
     }
     if (!interaction.isChatInputCommand ()) return;
@@ -5166,6 +5662,18 @@ client.on ('interactionCreate', async (interaction) =>
             '✅ С **' + target.username + '** снято: ' + what + till + '.' +
             '\nВ журнале отмечено (кто и когда).'
         );
+    }
+    // [v2.17] /rolecheck -- отчёт о человеке (только staff, ответ виден вызвавшему).
+    // Работает с ЛЮБЫМ человеком, в том числе не состоящим на сервере.
+    if (name === 'rolecheck')
+    {
+        if (!isStaffInteraction (interaction))
+            return interaction.reply ({ content: '🚫 Команда только для админов и модеров.', flags: MessageFlags.Ephemeral });
+        const target = interaction.options.getUser ('user', true);
+        await interaction.deferReply ({ flags: MessageFlags.Ephemeral });
+        const text = await rolecheckReport (interaction.guildId, target);
+        console.log ('[' + (d()) + '] [roles] /rolecheck: ' + target.username + ' -- отчёт выдан');
+        return interaction.editReply ({ content: clipText (text, 1900) });
     }
     if (!['play','join','stop','skip','pause','resume','queue','leave','remove','clear','jump','move'].includes (name)) return;
     const guildId = interaction.guildId;
@@ -5310,41 +5818,12 @@ client.on ('interactionCreate', async (interaction) =>
         {
             // [v2.12.2] перестановка внутри очереди. Номера -- те же, что в /queue
             // (текущий трек в них не входит: он показан отдельной строкой «Сейчас»).
-            const n = interaction.options.getInteger ('number');
-            const to = interaction.options.getInteger ('to');
-            const total = m.tracks.length;
-            if (total < 2)
-                return interaction.reply
-                ({
-                    content: '↔️ Для перестановки нужно хотя бы два трека в очереди' +
-                        (m.current ? ' (сейчас играет только **' + (m.current.title || 'трек') + '**).' : '.'),
-                    flags: MessageFlags.Ephemeral,
-                });
-            if (n < 1 || n > total || to < 1 || to > total)
-                return interaction.reply
-                ({
-                    content: '🤔 В очереди ' + total + ' треков -- номера от 1 до ' + total + '.',
-                    flags: MessageFlags.Ephemeral,
-                });
-            if (n === to)
-                return interaction.reply ({ content: '↔️ №' + n + ' уже на этом месте.', flags: MessageFlags.Ephemeral });
-            const moved = m.tracks.splice (n - 1, 1)[0];
-            m.tracks.splice (to - 1, 0, moved);
-            // ждущий продолжения трек (после /leave, обрыва или попытки продолжить) --
-            // тот же самый объект в очереди, так что место в нём едет вместе с ним:
-            // m.seekTrack/m.seekSec указывают на трек, а не на номер.
-            dropPreload (m);   // следующий трек мог смениться -- заготовка была не та
-            startPreload (guildId);
-            saveMusicState (guildId);
-            scheduleVoiceStatus (guildId, true);
-            schedulePresence (true);
-            console.log ('[' + (d()) + '] [music] переставил в очереди №' + n + ' -> №' + to + ': ' + (moved.title || 'трек'));
-            return interaction.reply
-            (
-                '↔️ **' + (moved.title || 'трек') + '**: №' + n + ' -> №' + to +
-                (m.current ? ' (сейчас играет **' + (m.current.title || 'трек') + '**)' : '') +
-                '\n' + queuePreview (m)
-            );
+            // [v2.17] Логика -- общая с кнопками «⬆/⬇» под /queue (queueMove).
+            const res = queueMove (guildId,
+                interaction.options.getInteger ('number'),
+                interaction.options.getInteger ('to'),
+                interaction.member ? uuu (interaction.member) : interaction.user.username);
+            return interaction.reply (res.ok ? res.text : { content: res.text, flags: MessageFlags.Ephemeral });
         }
         else if (name === 'clear')
         {
