@@ -70,7 +70,8 @@
 //   * [/rolecheck user:@кто] -- что бот помнит о человеке: роли (save_roles), что
 //     вернёт при входе, текущее наказание с точным сроком и историю за окно.
 //     Работает и для того, кто НЕ на сервере (одиночный REST-запрос без интента).
-//   * [/queue] до 25 треков на страницу (было 10) + защита от лимита сообщения 2000
+//   * [/queue] треков на страницу -- из конфига (queue_page, по умолчанию 15; было 10)
+//     + защита от лимита сообщения 2000
 //     символов (страница собирается по бюджету, листание идёт по показанным номерам).
 //   * [/queue] КНОПКИ-СТРЕЛКИ: меню «🎚 Двигать трек» + «⬆ Выше» / «⬇ Ниже» / «✖ Готово».
 //     Логика перестановки -- общая с /move (queueMove), авторство -- в логе.
@@ -348,8 +349,9 @@ const STARTUP_DM_TEXT =
     '  DJ может просто собирать плейлист -- бот зайдёт, когда позовёшь.\n' +
     '`/queue` -- что играет и что дальше: номера, автор каждого трека, сколько уже\n' +
     '  играет текущий и сколько ещё ждать до конца плейлиста целиком. На странице\n' +
-    '  до 25 треков (у одного автора подряд он не повторяется), у длинных очередей\n' +
-    '  есть кнопки «◀ Назад / Вперёд ▶» (и `from:26`).\n' +
+    '  по 15 треков (у одного автора подряд он не повторяется), у длинных очередей\n' +
+    '  есть кнопки «◀ Назад / Вперёд ▶» (и `from:16`). Сколько на странице --\n' +
+    '  настройка `queue_page` в конфиге (до 25).\n' +
     '  Под очередью -- быстрые кнопки: «⏭ Пропустить», «🧹 Очистить», меню\n' +
     '  «🗑 Убрать трек» и «🎚 Двигать трек» (после выбора появляются «⬆ Выше»/«⬇ Ниже»,\n' +
     '  а номер виден в списке) -- номера те же, что в `/remove`, жмёт тот, у кого права DJ\n' +
@@ -4067,7 +4069,12 @@ function musicOf (guildId)
             // чтобы их глушить: player.stop() сам поток НЕ закрывает, и без этого
             // yt-dlp/ffmpeg оставались висеть в памяти после /skip, /stop, /leave.
             streamHandle: null,
+            // [v2.19] какому серверу принадлежит это состояние: по нему берём настройки
+            // (например queue_page -- сколько треков показывать на странице /queue),
+            // потому что queuePage получает только m, а не guildId.
+            guildId: guildId,
         };
+    if (!$music[guildId].guildId) $music[guildId].guildId = guildId;
     return $music[guildId];
 }
 
@@ -4939,13 +4946,25 @@ function queueLeft (m)
     return { sec, curLeft, unknown, live };
 }
 
-// [v2.17] До 25 треков на страницу (в очереди часто по 50 заливают -- меньше листать).
-// 25 -- ещё и максимум пунктов в меню Discord, поэтому больше нельзя.
-const QUEUE_PAGE = 25;
-// Лимит сообщения Discord -- ~2000 символов. Страница заполняется ДО КОНЦА: бюджет
-// списка считается от РЕАЛЬНОГО текста всего остального (шапка, «до конца очереди»,
-// подсказка внизу). Раньше здесь стоял фиксированный бюджет 1500, и страница
-// обрезалась до 22 треков, хотя в лимит влезало больше.
+// [v2.17-v2.19] Сколько треков на страницу: ключ queue_page в конфиге, по умолчанию 15
+// (25 -- максимум ещё и потому, что больше пунктов меню Discord не принимает).
+// [v2.19] Сколько треков показывать на странице /queue -- из конфига (queue_page),
+// по умолчанию 15. Так надёжнее: длинные названия и длинные ники больше не упирают
+// сообщение в лимит Discord (раньше стояло жёсткое 25 и страница то и дело
+// обрезалась). 25 -- абсолютный максимум: больше пунктов меню Discord не принимает.
+const QUEUE_PAGE_DEFAULT = 15;
+const QUEUE_PAGE_MAX = 25;
+// Лимит сообщения Discord -- ~2000 символов. Бюджет списка считается от РЕАЛЬНОГО
+// текста всего остального (шапка, «до конца очереди», подсказка) и служит ТОЛЬКО
+// страховкой: при настройке по умолчанию страница в него влезает с запасом, а если
+// названия совсем огромные -- мы сначала укорачиваем их, и только в крайнем случае
+// показываем меньше строк (лучше это, чем отказ Discord).
+function queuePageSize (m)
+{
+    const n = Number ((SERVERS[(m && m.guildId) || ''] || {}).queue_page);
+    if (!Number.isFinite (n) || n <= 0) return QUEUE_PAGE_DEFAULT;
+    return Math.min (QUEUE_PAGE_MAX, Math.max (1, Math.floor (n)));
+}
 const QUEUE_MSG_LIMIT = 1980;
 // Запас на служебные строки: заголовок «Очередь (N)», переводы строк, хвост
 // «...и ещё N: /queue from:M» (самая длинная часть -- сам хвост).
@@ -4967,31 +4986,45 @@ function queueListBudget (m)
     return Math.max (200, QUEUE_MSG_LIMIT - chrome);
 }
 
+// Строки одной страницы при заданной обрезке названия (titleClip).
+// [v2.18] Автор у идущих ПОДРЯД треков одного человека пишется один раз (обычное
+// дело -- DJ залил плейлист), смена автора всегда видна.
+function queueLines (slice, start, titleClip)
+{
+    const lines = [];
+    let prevBy = null;
+    for (let i = 0; i < slice.length; i++)
+    {
+        const t = slice[i];
+        const by = (t && t.byName) ? String (t.byName) : '';
+        const label = (by && by !== prevBy) ? ' · 👤 ' + by : '';
+        prevBy = by;
+        lines.push ((start + i) + '. **' + clipText (t.title || 'трек', titleClip) + '** `' +
+            fmtDur (t.duration, t.isLive) + '`' + label);
+    }
+    return lines;
+}
+
 function queuePage (m, start)
 {
     const total = m.tracks.length;
     const budget = queueListBudget (m);
+    const size = queuePageSize (m);
     start = Math.min (Math.max (1, Math.round (start) || 1), Math.max (1, total));
-    const slice = m.tracks.slice (start - 1, start - 1 + QUEUE_PAGE);
-    const lines = [];
-    let used = 0;
-    let prevBy = null; // автор предыдущей строки: у одного автора подряд не повторяем
-    for (let i = 0; i < slice.length; i++)
+    const slice = m.tracks.slice (start - 1, start - 1 + size);
+    // [v2.19] Сначала пытаемся показать ВСЕ треки страницы с полными названиями, а если
+    // не влезло в лимит Discord -- укорачиваем названия (не выбрасываем треки):
+    // короткое имя с «…» лучше, чем трек, до которого не добраться.
+    let lines = null;
+    for (const clip of [120, 80, 60, 45, 30])
     {
-        const t = slice[i];
-        // [v2.18] Когда подряд идут треки одного человека (обычное дело -- DJ залил
-        // плейлист), автора пишем один раз: так на страницу влезает больше строк, а
-        // информация не теряется. Смена автора -- снова видно, кто что поставил.
-        const by = (t && t.byName) ? String (t.byName) : '';
-        const label = (by && by !== prevBy) ? ' · 👤 ' + by : '';
-        prevBy = by;
-        const line = (start + i) + '. **' + clipText (t.title || 'трек', 120) + '** `' +
-            fmtDur (t.duration, t.isLive) + '`' + label;
-        if (lines.length && used + line.length + 1 > budget) break;
-        lines.push (line);
-        used += line.length + 1;
+        lines = queueLines (slice, start, clip);
+        if (lines.join ('\n').length <= budget) break;
     }
-    return { start, total, count: lines.length, list: lines.join ('\n') };
+    // Крайняя страховка (совсем экзотические ники + названия): режем список, но
+    // листание идёт по показанным номерам, так что потерянного куска не будет.
+    while (lines.length > 1 && lines.join ('\n').length > budget) lines.pop ();
+    return { start, total, count: lines.length, list: lines.join ('\n'), size: size };
 }
 
 // Кнопки и меню под ответом /queue. Всё состояние -- в самих компонентах (customId),
@@ -5004,7 +5037,7 @@ function queuePage (m, start)
 //       перестановка руками, без /move по номерам. Ряд с ними -- пока трек выбран,
 //       «✖ Готово» убирает его.
 // Права проверяются при нажатии: сообщение очереди видит весь канал, а действия -- DJ.
-// На какой странице окажется номер n (страницы бывают короче 25 -- если названия
+// На какой странице окажется номер n (страницы бывают короче queue_page -- если названия
 // срезали список по длине). Идём теми же шагами, что и листание, поэтому трек
 // после перестановки виден там, куда ведёт страница, а не «между страницами».
 function queuePageOf (m, n)
@@ -5023,6 +5056,9 @@ function queuePageOf (m, n)
 function queueComponents (page, m, moveSel = 0)
 {
     const { start, total, count } = page;
+    // [v2.19] Назад листаем ровно на размер страницы (queue_page), а не на число
+    // показанных строк: страница может оказаться короче из-за длинных названий.
+    const step = page.size || count || 1;
     const rows = [];
     if (total > 0 && (start > 1 || start + count <= total))
         rows.push
@@ -5030,7 +5066,7 @@ function queueComponents (page, m, moveSel = 0)
             new ActionRowBuilder ().addComponents
             (
                 new ButtonBuilder ()
-                    .setCustomId ('q:p:' + Math.max (1, start - count)).setLabel ('◀ Назад')
+                    .setCustomId ('q:p:' + Math.max (1, start - step)).setLabel ('◀ Назад')
                     .setStyle (ButtonStyle.Secondary).setDisabled (start <= 1),
                 new ButtonBuilder ()
                     .setCustomId ('q:n:' + (start + count)).setLabel ('Вперёд ▶')
@@ -5814,7 +5850,7 @@ const musicCommands =
         .setDescription ('Показать очередь треков')
         .addIntegerOption (o =>
             o.setName ('from')
-             .setDescription ('С какого номера показать (на странице до 25, в очереди бывает и больше)')
+             .setDescription ('С какого номера показать (сколько на странице -- ключ queue_page, по умолчанию 15)')
              .setMinValue (1)),
     new SlashCommandBuilder ()
         .setName ('leave')
