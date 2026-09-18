@@ -18,6 +18,35 @@
 //   * channelCreate/channelUpdate: в v14 каналы приходят без guild -> берём через .guild ?? client.guilds.cache.get
 //   * [FIX v2] NaN-баг в логе переименования: скобки вокруг 'Владельцы канала: ' + (owners.size ? ... : ...)
 //   * [FIX v2] e.message там, где e не существует (users.fetch .catch(() => null))
+// CHANGELOG v2.12.1 (баг найден стендом при проверке памяти музыки):
+//   * [FIX] БАЗА СНОВА ПИШЕТ НА ДИСК. В keyv v5 конструктор со строкой-URI больше не
+//     подгружает адаптер: `new Keyv('sqlite://...')` молча уходил в стор по умолчанию
+//     (Map -- ПАМЯТЬ). Всё «работало» и даже читалось обратно тем же экземпляром, но
+//     на диск не попадало: бан-таймауты не переживали перезапуск, а восстанавливать
+//     музыку было не из чего (после 'перезапуска' очередь оказывалась пустой).
+//     Теперь адаптер передаётся явно (`store: new KeyvSqlite({uri})`), namespace -- у
+//     Keyv: ключи на диске те же ('membersBanTimeout:<id>'), уже сохранённые баны целы.
+//     Ошибки базы теперь видны в логе строкой '[db] <namespace>: ...' (раньше сбой
+//     записи не был виден вообще).
+//   * [FIX] при /leave и обрыве связи «текущий» трек попадал в базу ДВАЖДЫ (и как
+//     current, и первым в tracks): после перезапуска resumeMusic склеивал его сам с
+//     собой и трек играл бы ещё раз.
+//   * [/leave] очередь сохраняется сразу с местом в треке, а не с нулём.
+// CHANGELOG v2.12 (музыка как обещал основной пользователь: помнить всё и не бросать):
+//   * очередь НЕ устаревает (было: старше 10 минут -- забываем) и не теряется ни при
+//     перезапуске, ни при обрыве связи, ни по /leave. Забывает её только /stop и
+//     естественный конец (доиграли живым слушателям -- строка в логе).
+//   * в канале никого -- пауза (не играем в пустоту), слушатель вернулся -- продолжаем
+//     с того же места; ручная /pause при этом не отменяется.
+//   * обрыв потока у играющего трека -- продолжаем ТОТ ЖЕ трек с места обрыва
+//     (3 попытки, потом пропуск с предупреждением в канале).
+//   * после падения бот сам заходит в тот же канал, как только там появится человек
+//     (после /leave -- ждёт /join). Позиция восстанавливается с точностью до секунды.
+//   * /play: DJ может собирать плейлист, не находясь в голосовом канале; бот не
+//     перехватывает у живого канала («кто первый, тот и прав»), а если сидит один --
+//     переезжает к тому, кто позвал.
+//   * управление очередью: /queue (с номерами и from:), /remove, /clear, /jump.
+//   * Ctrl+C/закрытие окна сохраняют позицию сразу, а не «как успело за 20 секунд».
 // CHANGELOG v2.10 (по итогам разбора живого лога):
 //   * [FIX] ключ 🔑 больше не ставится повторно каждые 45 секунд: без интента GuildMembers
 //     кэш ников не обновляется (setNickname правит только копию), и свип считал, что ключа
@@ -77,17 +106,20 @@ const STARTUP_DM_TEXT =
     '📌 Вызвать эту инструкцию в любой момент: `/help` (видно только тебе)\n' +
     'или `panda help` (бот пришлёт её в ЛС).\n' +
     '\n' +
-    '🎵 **Музыка** (слэш-команды; сначала зайди в голосовой канал):\n' +
-    '`/play ссылка или запрос` -- трек или плейлист (YouTube, SoundCloud и др.)\n' +
+    '🎵 **Музыка** (слэш-команды):\n' +
+    '`/play ссылка или запрос` -- трек, плейлист или прямой эфир (YouTube и др.)\n' +
+    '  Добавляется В КОНЕЦ очереди. Стоять в голосовом канале не обязательно:\n' +
+    '  DJ может просто собирать плейлист -- бот зайдёт, когда позовёшь.\n' +
+    '`/queue` -- что играет и что дальше (долгие очереди: `/queue from:11`)\n' +
+    '`/remove номер` -- убрать трек, `/jump номер` -- прыгнуть к треку, `/clear` -- очистить\n' +
+    '`/skip` -- следующий • `/stop` -- стоп и забыть очередь совсем\n' +
+    '`/pause` / `/resume` -- пауза / продолжить\n' +
     '`/join` -- зайти в твой канал и остаться там (даже без музыки)\n' +
-    '`/skip` -- следующий • `/stop` -- стоп и очистить очередь\n' +
-    '`/pause` / `/resume` -- пауза / продолжить • `/queue` -- что играет\n' +
-    '`/leave` -- выйти из голосового канала\n' +
+    '`/leave` -- выйти из канала (очередь и место помню -- продолжу по `/join`)\n' +
     'Управлять музыкой могут админы, модеры и роль DJ (смотреть очередь -- всем).\n' +
-    'Сам бот никуда не уходит: кончилась песня или /stop -- он остаётся в канале,\n' +
-    'пока не позовёшь в другую комнату или не скажешь `/leave`.\n' +
-    'Пока сидит, он пишет в самом канале, что играет, сколько в очереди,\n' +
-    'сколько людей в комнате и сколько он тут.\n' +
+    '**Бот ничего не забывает:** очередь, текущий трек и место в треке живут в базе,\n' +
+    'поэтому перезапуск, обрыв связи и `/leave` музыку не сбрасывают. Если в канале\n' +
+    'никого -- пауза, а когда слушатель вернётся -- продолжит с того же места.\n' +
     '\n' +
     '💬 **Команды в чате** (префикс `panda `):\n' +
     '`panda ping` -- проверка связи (ответ: pong)\n' +
@@ -100,6 +132,7 @@ const STARTUP_DM_TEXT =
     '🛡️ **Что бот делает сам:**\n' +
     '• мут/глухота действуют только в своём канале: в других говорить можно,\n' +
     '  вернёшься -- мут на месте; жалоба -- зайди в общий канал 🆘\n' +
+    '• если в канале никого -- музыка встаёт на паузу (не играет в пустоту)\n' +
     '• выдаёт права владельцу канала и ставит тег 🔑 в ник\n' +
     '• бан на 20 минут за выход с сервера (таймаут на перезаход)\n' +
     '\n' +
@@ -169,15 +202,37 @@ const client = new Client
 // ## DB!:
 // keyv v5: именованный экспорт!
 const { Keyv } = require ('keyv');
+const { KeyvSqlite } = require ('@keyv/sqlite');
+
+// [FIX v2.12.1] ВАЖНО: в keyv v5 конструктор со строкой-URI больше НЕ подгружает
+// адаптер -- `new Keyv('sqlite://...')` молча уходит в стор по умолчанию (Map, т.е.
+// ПАМЯТЬ). Все записи "как бы" работали (и даже читались обратно из того же
+// экземпляра), но на диск не попадали: бан-таймауты не переживали перезапуск, а
+// восстановление музыки было нечем восстанавливать. Проверено стендом:
+//   store := Map (было)  ->  store := KeyvSqlite (стало)
+// Теперь адаптер передаётся явным store-объектом, а namespace остаётся у Keyv --
+// так ключи на диске остаются в прежнем виде ('membersBanTimeout:<id>'), то есть
+// уже сохранённые баны читаются по-старому.
+function dbMake (_server, _namespace)
+{
+    const kv = new Keyv
+    ({
+        store: new KeyvSqlite ({ uri: 'sqlite://' + __dirname + '/' + _server + '.sqlite' }),
+        namespace: _namespace,
+    });
+    // Ошибки базы не должны теряться: раньше сбой записи был не виден вообще.
+    kv.on ('error', e => console.error ('[db] ' + _namespace + ': ' + String ((e && e.message) || e).slice (0, 200)));
+    return kv;
+}
 
 var $db = {};// ALL SERVERS!
 for (let _server in SERVERS)
 {
     $db[_server] = {};
-    $db[_server]['membersBanTimeout'] = new Keyv ('sqlite://' + __dirname + '/' + _server + '.sqlite', {namespace: 'membersBanTimeout'});
-    $db[_server]['channelsBusy']      = new Keyv ('sqlite://' + __dirname + '/' + _server + '.sqlite', {namespace: 'channelsBusy'});
+    $db[_server]['membersBanTimeout'] = dbMake (_server, 'membersBanTimeout');
+    $db[_server]['channelsBusy']      = dbMake (_server, 'channelsBusy');
     // [v2.10] очередь и позиция музыки -- чтобы перезапуск бота не сбрасывал плейлист:
-    $db[_server]['musicState']        = new Keyv ('sqlite://' + __dirname + '/' + _server + '.sqlite', {namespace: 'musicState'});
+    $db[_server]['musicState']        = dbMake (_server, 'musicState');
 }
 
 async function db (server, namespace, id, value = undefined, item = undefined)
@@ -1385,6 +1440,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
     {
         logVoiceEvent (oldState, newState);
         scheduleVoiceStatus (server); // [v2.7] «в канале: N» в статусе канала (дебаунс)
+        checkListeners (server);     // [v2.12] никого -- пауза; вернулся -- продолжаем
         await modNick
         (
             server, newState.member
@@ -2584,6 +2640,15 @@ function musicOf (guildId)
             playingSince: null,
             seekTrack: null,
             seekSec: 0,
+            // [v2.12] Музыка не забывает ничего:
+            savedChannelId: null,   // канал, к которому относится сохранённая очередь
+            pending: false,         // очередь ждёт слушателя/подключения (бота в канала нет)
+            leftByUser: false,      // /leave: очередь помним, но сами обратно не заходим
+            pausedByNobody: false,  // пауза из-за отсутствия живых слушателей
+            playedToSomeone: false, // очередь реально кому-то играла
+            streamRetries: 0,       // попытки продолжить трек с места обрыва потока
+            lastErrorAt: 0,
+            playerWired: false,     // обработчики плеера вешаются ОДИН раз
         };
     return $music[guildId];
 }
@@ -2659,7 +2724,8 @@ async function createTrackStream (track, seekSec = 0)
     // [v2.10] продолжение с места после перезапуска: yt-dlp отдаёт поток с N-й секунды
     // (--download-sections, нужен ffmpeg). Если так не умеет -- процесс падает сразу,
     // и playNext берёт тот же трек с начала (см. failedFast).
-    const seek = (seekSec >= 10 && !track.isLive);
+    // [v2.12] продолжать с места -- всегда, когда есть с чего (даже с секунды)
+    const seek = (seekSec >= 1 && !track.isLive);
     const ytdlpStream = ytdlp.exec
     (
         track.url,
@@ -2674,7 +2740,7 @@ async function createTrackStream (track, seekSec = 0)
             // буфер под riff-сети:
             bufferSize: '4M',
             retries: 3,
-            ...(seek ? { ffmpegLocation: ffmpegPath, downloadSections: '*' + Math.floor (seekSec) + '-inf' } : {}),
+            ...(seek ? { ffmpegLocation: ffmpegPath, downloadSections: '*' + Math.max (0, Math.floor (seekSec) - 1) + '-inf' } : {}),
         }
     );
     // [FIX v2.2.1] yt-dlp может упасть (видео недоступно, сеть, прокси) -- его промис раньше
@@ -2707,10 +2773,23 @@ async function playNext (guildId)
     if (!m.tracks.length)
     {
         m.current = null;
+        m.playedMs = 0;
+        m.playingSince = null;
+        m.streamRetries = 0;
+        m.pausedByNobody = false;
+        // [v2.12] очередь доиграла до конца: её больше не надо помнить. Логируем как
+        // событие один раз (до этого такую строку в логе было не найти вовсе).
+        if (m.playedToSomeone)
+        {
+            console.log ('[' + (d()) + '] [music] очередь доиграна до конца -- вычеркиваю её из памяти');
+            m.playedToSomeone = false;
+            await clearMusicState (guildId);
+        }
         scheduleVoiceStatus (guildId); // [v2.7] «очередь: —» в статусе канала
         schedulePresence ();           // [v2.8] трек кончился -- «смотрит канал»
         return;
     }
+    if (m.seekTrack !== m.tracks[0]) m.streamRetries = 0; // новый трек -- счётчик попыток с нуля
     let track = m.tracks.shift ();
     m.current = track;
     console.log ('[' + (d()) + '] [music] играю: ' + (track.title || track.url || 'трек')); // [v2.4] активное событие в лог
@@ -2719,6 +2798,7 @@ async function playNext (guildId)
     try
     {
         let resource = null, viaProxy = false;
+        let startedAt = 0; // [v2.12] с какой секунды трек реально начал играть (0 -- с начала)
         const p = m.preload;
         if (p && p.track === track)
         {
@@ -2738,25 +2818,37 @@ async function playNext (guildId)
         {
             // [v2.10] этот трек может быть восстановлен после перезапуска -- тогда
             // пробуем начать с того же места, а не с начала:
+            // [v2.12] ВСЕГДА пробуем продолжить с места (даже с 1 секунды и даже если
+            // до конца трека оставалось 15 сек): не вышло -- тогда берём с начала.
             let seekSec = (m.seekTrack === track) ? (m.seekSec || 0) : 0;
             let opened = await createTrackStream (track, seekSec);
-            if (seekSec >= 10 && await failedFast (opened.proc))
+            if (seekSec >= 1 && await failedFast (opened.proc))
             {
                 killStream (opened); // сдвиг не сработал (нет ffmpeg / экстрактор не умеет)
                 console.error ('[' + (d()) + '] [music] продолжение с ' + fmtDur (seekSec) + ' не удалось -- беру трек с начала');
                 opened = await createTrackStream (track, 0);
+                seekSec = 0;
             }
             resource = opened.resource;
             viaProxy = opened.viaProxy;
+            startedAt = seekSec;
         }
         m.seekTrack = null;
         m.seekSec = 0;
-        m.playedMs = 0;                    // [v2.10] позиция этого трека -- с нуля
+        // [v2.12] если трек продолжается с места -- позиция считается от него, иначе
+        // следующее сохранение «теряло» уже прослушанное (было: всегда 0)
+        m.playedMs = startedAt * 1000;
         m.playingSince = Date.now ();
+        m.pausedByNobody = false;
         wireStreamErrors (m, track, resource, viaProxy, guildId);
         m.player.play (resource);
         startPreload (guildId); // [v2.9] пока играет -- готовим следующий трек
+        // [v2.12] играет кому-то живому? тогда естественный конец очереди = забыть её;
+        // и если слушателей нет -- сразу пауза (музыка не играет в пустоту)
+        const chId = m.connection ? m.connection.joinConfig.channelId : null;
+        if (chId && humansInChannel (guildId, chId)) m.playedToSomeone = true;
         saveMusicState (guildId); // [v2.10] очередь и позиция -- на диск (перезапуск не сбросит)
+        checkListeners (guildId);
     }
     catch (e)
     {
@@ -2846,22 +2938,42 @@ function wireStreamErrors (m, track, resource, viaProxy, guildId)
     resource.playStream.once ('error', e =>
     {
         const playing = m.current === track;
-        console.error ('[music] stream error (' + (playing ? 'skip track' : 'предзагрузка') + '): ' + e.message);
         // [v2.2.2] сеть упала при стриме через прокси -- следующие треки временно DIRECT:
-        if (viaProxy && isNetworkError (e))
-            proxyStreamDead = true;
-        if (playing)
+        if (viaProxy && isNetworkError (e)) proxyStreamDead = true;
+        if (!playing)
         {
+            console.error ('[music] stream error (предзагрузка): ' + oneLine (e.message));
+            if (m.preload && m.preload.track === track) m.preload = null; // сломанную заготовку не берём
+            return;
+        }
+        // [v2.12] ОБРЫВ ПОТОКА у играющего трека: трек НЕ выбрасываем -- пробуем
+        // продолжить его С МЕСТА обрыва (как просили: «всегда пытаться»).
+        const at = Math.round (playedMsOf (m) / 1000);
+        if (at > (m.lastErrorAt || 0) + 30) m.streamRetries = 0; // играл нормально -- счётчик с нуля
+        m.lastErrorAt = at;
+        const attempt = (m.streamRetries || 0) + 1;
+        if (attempt <= MUSIC_STREAM_RETRIES)
+        {
+            m.streamRetries = attempt;
+            m.playedMs = at * 1000;
+            m.playingSince = null;
             m.current = null;
-            let ch = m.textChannelId && client.channels.cache.get (m.textChannelId);
-            if (ch)
-                ch.send ('⚠️ **' + (track.title || 'Трек') + '** -- не удалось воспроизвести, пропускаю.').catch (() => {});
-            m.player.stop (true); // Idle -> playNext
+            m.tracks.unshift (track); // трек возвращается в начало очереди...
+            m.seekTrack = track;      // ...и playNext продолжит его с этой секунды
+            m.seekSec = at;
+            console.error ('[music] поток оборвался (' + (at ? 'на ' + fmtDur (at) : 'в самом начале') +
+                ', ' + oneLine (e.message) + ') -- продолжаю тот же трек, попытка ' + attempt + '/' + MUSIC_STREAM_RETRIES);
+            saveMusicState (guildId);
+            m.player.stop (true); // Idle -> playNext (с места обрыва)
+            return;
         }
-        else if (m.preload && m.preload.track === track)
-        {
-            m.preload = null; // сломанную заготовку даже не пробуем ставить
-        }
+        console.error ('[music] поток обрывается снова (' + attempt + ' раз) -- пропускаю: ' + (track.title || 'трек'));
+        m.streamRetries = 0;
+        m.current = null;
+        let ch = m.textChannelId && client.channels.cache.get (m.textChannelId);
+        if (ch)
+            ch.send ('⚠️ **' + (track.title || 'Трек') + '** -- не удалось воспроизвести, пропускаю.').catch (() => {});
+        m.player.stop (true); // Idle -> playNext
     });
 }
 
@@ -2918,8 +3030,13 @@ function voiceStatusText (guildId)
     let parts = [];
     // [v2.11] строка «что играет» общая с профильным статусом (см. nowPlayingLine):
     // у прямого эфира длительности нет -- там своя иконка 🔴 вместо 🎶
-    parts.push (nowPlayingLine (m.current, m.player.state.status === AudioPlayerStatus.Paused) ||
-        '😴 музыка не играет');
+    // [v2.12] отдельно показываем паузу «нет слушателей» -- видно, что бот не сломался
+    if (m.pausedByNobody && m.current)
+        parts.push ('😴 нет слушателей: ' + (m.current.title || 'трек') +
+            (m.current.isLive ? '' : ' — ' + fmtDur (m.current.duration)));
+    else
+        parts.push (nowPlayingLine (m.current, m.player.state.status === AudioPlayerStatus.Paused) ||
+            '😴 музыка не играет');
     parts.push ('📜 очередь: ' + (m.tracks.length ? m.tracks.length : '—'));
     parts.push ('🎧 в канале: ' + people);
     if (m.since) parts.push ('⏱ бот тут: ' + fmtAgo (Date.now () - m.since));
@@ -3040,20 +3157,50 @@ const musicSaveTick = setInterval
     () =>
     {
         for (let g in $music)
-            if ($music[g] && $music[g].connection) saveMusicState (g);
+            if ($music[g] && ($music[g].connection || $music[g].pending || $music[g].tracks.length))
+                saveMusicState (g);
     },
     20 * 1000
 );
 if (musicSaveTick.unref) musicSaveTick.unref ();
 
+// [v2.12] Ctrl+C / закрытие окна -- сохраняем музыку В МОМЕНТ выхода, а не «как успел
+// за 20 секунд»: после запуска позиция восстанавливается точнее.
+let $exiting = false;
+async function saveAllMusic ()
+{
+    const ids = Object.keys ($music).filter
+    (
+        g => $music[g] && ($music[g].current || $music[g].tracks.length || $music[g].connection)
+    );
+    await Promise.race
+    ([
+        Promise.all (ids.map (g => saveMusicState (g).catch (() => {}))),
+        new Promise (r => setTimeout (r, 1500)), // база не должна задерживать выход
+    ]);
+}
+for (let sig of ['SIGINT', 'SIGTERM'])
+    process.on (sig, () =>
+    {
+        if ($exiting) return;
+        $exiting = true;
+        console.log ('[' + (d()) + '] [music] сохраняю очередь перед выходом...');
+        saveAllMusic ().finally (() => process.exit (0));
+    });
+
 // ============================================================================
-// [v2.10] МУЗЫКА ПЕРЕЖИВАЕТ ПЕРЕЗАПУСК
-// Очередь, текущий трек и позиция лежат в SQLite (namespace musicState). После
-// старта бот возвращается в тот же канал и продолжает с того же места (если это
-// возможно -- иначе с начала трека); если сохранённая очередь старая или в канале
-// никого -- забываем её. `/leave` состояние очищает, `/stop` -- сохраняет пустое.
+// [v2.12] МУЗЫКА ПОМНИТ ВСЁ (очередь, текущий трек, позицию, канал)
+//   * очередь НЕ устаревает: бот обязан доиграть задуманное, когда бы его ни
+//     включили (раньше через 10 минут всё забывалось);
+//   * нет живых слушателей -- пауза, вернулся слушатель -- продолжаем;
+//   * после перезапуска/падения бот сам заходит в тот же канал, как только там
+//     появляется живой слушатель; после `/leave` -- ждёт `/join` (сам не лезет);
+//   * забывает очередь только `/stop` и естественный конец (доиграла до конца).
 // ============================================================================
-const MUSIC_RESUME_MAX_AGE = 10 * 60 * 1000; // старше 10 мин -- это уже не «перезапуск»
+
+// Предел попыток «продолжить с места обрыва» для одного трека (потом пропускаем,
+// а не бьёмся в мёртвый источник бесконечно):
+const MUSIC_STREAM_RETRIES = 3;
 
 function trackToJson (t)
 {
@@ -3066,75 +3213,185 @@ function playedMsOf (m)
     return (m.playedMs || 0) + (m.playingSince ? Date.now () - m.playingSince : 0);
 }
 
+// [v2.12] Музыка не забывает ничего: очередь, текущий трек, позиция и канал лежат в
+// базе и переживают и перезапуск, и падение, и /leave. Стирает состояние только /stop
+// и естественный конец очереди (когда она доиграла живым слушателям).
 async function saveMusicState (guildId)
 {
     try
     {
         const m = $music[guildId];
         if (!m || !guildId) return;
-        if (!m.connection) { await db (guildId, 'musicState', 'queue', null); return; }
+        if (!m.current && !m.tracks.length) // помнить нечего
+        {
+            await db (guildId, 'musicState', 'queue', null);
+            return;
+        }
+        const channelId = m.connection ? m.connection.joinConfig.channelId : (m.savedChannelId || null);
+        // [v2.12] «текущий» бывает играющим (m.current) или ЖДУЩИМ продолжения после
+        // /leave/обрыва (m.seekTrack): тогда позиция -- из seekSec, а не из часов.
+        // Иначе после перезапуска место в треке терялось (в базу уходил 0).
+        const playing = !!m.current;
+        const waiting = m.current || m.seekTrack || null;
+        let elapsed = 0;
+        if (m.current) elapsed = Math.round (playedMsOf (m) / 1000);
+        else if (m.seekTrack) elapsed = Math.max (0, Math.round (m.seekSec || 0));
+        // [v2.12-fix] ЖДУЩИЙ трек (после /leave, обрыва или попытки продолжить) лежит
+        // в НАЧАЛЕ m.tracks -- так его ждёт playNext. В базу он уходит полем current,
+        // и второй раз в tracks он не нужен: иначе после перезапуска resumeMusic
+        // склеивал его сам с собой и трек играл бы дважды (стенд: 'Дубликат' x2).
+        const rest = (waiting && !playing && m.tracks[0] === waiting) ? m.tracks.slice (1) : m.tracks;
         await db (guildId, 'musicState', 'queue',
         {
             at: Date.now (),
-            channelId: m.connection.joinConfig.channelId,
+            channelId: channelId,
             textChannelId: m.textChannelId || null,
-            current: m.current ? trackToJson (m.current) : null,
-            elapsed: m.current ? Math.round (playedMsOf (m) / 1000) : 0,
-            tracks: m.tracks.map (trackToJson),
+            current: waiting ? trackToJson (waiting) : null,
+            elapsed: elapsed,
+            tracks: rest.map (trackToJson),
+            left: !!m.leftByUser, // вышел по /leave -- сами не возвращаемся, ждём /join
         });
     }
     catch (e) { console.error ('[music] не смог сохранить очередь: ' + oneLine (e.message)); }
 }
 
-// Старт после перезапуска бота: вернуть очередь, зайти в тот же канал, продолжить трек.
+// Забыть очередь совсем (только /stop и естественный конец):
+async function clearMusicState (guildId)
+{
+    await db (guildId, 'musicState', 'queue', null)
+        .catch (e => console.error ('[music] не смог стереть очередь: ' + oneLine (e.message)));
+}
+
+// Сколько ещё треков в очереди после «текущего» (для красивых строк в логе):
+function restCount (m)
+{
+    return Math.max (0, m.tracks.length - (m.seekTrack ? 1 : 0));
+}
+
+// Старт после перезапуска/падения: вернуть в память очередь, текущий трек и позицию.
+// Сами заходим в тот же канал только если там уже есть живой слушатель; иначе очередь
+// ЖДЁТ (ничего не забываем): зайдём, как только человек появится, или по /join.
 async function resumeMusic (server)
 {
     try
     {
         let saved = await db (server, 'musicState', 'queue');
-        if (!saved || !saved.channelId) return;
-        const forget = async (reason) =>
-        {
-            await db (server, 'musicState', 'queue', null).catch (() => {});
-            console.log ('[' + (d()) + '] [music] ' + reason);
-        };
-        let age = Date.now () - (saved.at || 0);
-        if (age > MUSIC_RESUME_MAX_AGE)
-            return forget ('сохранённая очередь устарела (' + fmtAgo (age) + ' назад) -- забыл');
+        if (!saved) return;
+        const tracks = (saved.tracks || []).filter (t => t && t.url).map (jsonToTrack);
+        const current = saved.current ? jsonToTrack (saved.current) : null;
+        if (!current && !tracks.length) return;
         const guild = client.guilds.cache.get (server);
         if (!guild) return;
-        let ch = guild.channels.cache.get (saved.channelId) ||
-            await guild.channels.fetch (saved.channelId).catch (() => null);
-        if (!ch || typeof ch.isVoiceBased !== 'function' || !ch.isVoiceBased ())
-            return forget ('канал из прошлого запуска не найден -- очередь забыта');
-        let tracks = (saved.tracks || []).filter (t => t && t.url).map (jsonToTrack);
-        if (!saved.current && !tracks.length)
-            return forget ('очередь с прошлого запуска пуста -- забыл');
-        // если в канале никого -- молчим и очередь не трогаем: не стоит играть в пустоту
-        if (!humansInChannel (server, ch.id))
-            return forget ('в «' + ch.name + '» никого -- музыку с прошлого запуска не возобновляю');
-        const current = saved.current ? jsonToTrack (saved.current) : null;
-        // были в самом конце трека -- начинать с последних секунд смысла нет:
-        let elapsed = Math.max (0, Math.round (saved.elapsed || 0));
-        if (current && current.duration && elapsed > current.duration - 15) elapsed = 0;
-        const m = joinVoice (server, ch, guild);
-        if (!m) return;
+        const m = musicOf (server);
+        m.savedChannelId = saved.channelId || null;
         m.textChannelId = saved.textChannelId || m.textChannelId;
         m.tracks = current ? [current, ...tracks] : tracks;
         m.seekTrack = current;   // этому треку playNext попробует сдвиг на elapsed
-        m.seekSec = elapsed;
-        await db (server, 'musicState', 'queue', null).catch (() => {}); // старую запись убрали -- дальше пишет playNext
-        console.log
-        (
-            '[' + (d()) + '] [music] возобновляю после перезапуска: «' + ch.name + '» -- ' +
-            (current ? (current.title || 'трек') + (current.isLive ? ' (эфир)' :
-                (elapsed ? ' (с ' + fmtDur (elapsed) + ')' : '')) : 'очередь без текущего') +
-            (tracks.length ? ' + ещё ' + tracks.length + ' в очереди' : '')
-        );
-        schedulePresence (true);
-        playNext (server);
+        m.seekSec = Math.max (0, Math.round (saved.elapsed || 0));
+        m.leftByUser = !!saved.left;
+        m.pending = true;
+        // живо ли место: и трек, и место в треке, и очередь целиком остаются в памяти
+        let ch = m.savedChannelId
+            ? (guild.channels.cache.get (m.savedChannelId) ||
+               await guild.channels.fetch (m.savedChannelId).catch (() => null))
+            : null;
+        if (ch && (typeof ch.isVoiceBased !== 'function' || !ch.isVoiceBased ())) ch = null;
+        if (!ch) m.savedChannelId = null;
+        const where = (current ? (current.title || 'трек') +
+            (current.isLive ? ' (эфир)' : (m.seekSec ? ' (с ' + fmtDur (m.seekSec) + ')' : '')) :
+            'очередь без текущего') +
+            (tracks.length ? ' + ещё ' + tracks.length + ' в очереди' : '');
+        if (m.leftByUser)
+        {
+            console.log ('[' + (d()) + '] [music] очередь с прошлого раза на месте (выходили по /leave) -- ' + where + '; продолжу по /join');
+            return;
+        }
+        if (!ch)
+        {
+            console.log ('[' + (d()) + '] [music] канала из прошлого запуска нет -- очередь ждёт /join: ' + where);
+            return;
+        }
+        if (!humansInChannel (server, ch.id))
+        {
+            console.log ('[' + (d()) + '] [music] в «' + ch.name + '» пока никого -- очередь ждёт слушателя: ' + where);
+            return; // зайдём и продолжим, как только там появится живой человек
+        }
+        startRestored (server, ch, guild);
     }
     catch (e) { console.error ('[music] не смог возобновить очередь: ' + oneLine (e.message)); }
+}
+
+// Начать играть «отложенную» (сохранённую) очередь в указанном канале:
+function startRestored (server, ch, guild)
+{
+    const m = musicOf (server);
+    const current = m.seekTrack || null;
+    const seek = m.seekSec || 0;
+    const rest = restCount (m);
+    m.pending = false;
+    m.leftByUser = false;
+    if (!joinVoice (server, ch, guild) || !m.connection) return;
+    m.savedChannelId = ch.id;
+    console.log
+    (
+        '[' + (d()) + '] [music] возобновляю очередь в «' + ch.name + '»: ' +
+        (current ? (current.title || 'трек') + (current.isLive ? ' (эфир)' : (seek ? ' (с ' + fmtDur (seek) + ')' : '')) :
+            'очередь без текущего') +
+        (rest ? ' + ещё ' + rest + ' в очереди' : '')
+    );
+    schedulePresence (true);
+    playNext (server);
+}
+
+// ============================================================================
+// [v2.12] ЖИВЫЕ СЛУШАТЕЛИ: музыка не играет в пустоту и не теряет задуманное.
+//   * никого в канале -> пауза (позиция помнится и сохраняется);
+//   * слушатель вернулся (>0) -> продолжаем с того же места;
+//   * очередь ждёт слушателя (после перезапуска) -> сами заходим в тот же канал,
+//     когда там кто-то появился (кроме случая /leave -- тогда ждём /join).
+// ============================================================================
+function checkListeners (server)
+{
+    const m = $music[server];
+    if (!m) return;
+    if (m.connection)
+    {
+        const chId = m.connection.joinConfig.channelId;
+        const people = humansInChannel (server, chId);
+        const ch = client.channels.cache.get (chId);
+        const where = ch ? '«' + ch.name + '»' : chId;
+        // важно: трогаем только РЕАЛЬНО играющий трек -- если человек сам поставил /pause,
+        // уход и возврат слушателей его паузу не отменяет
+        const playing = m.player.state.status === AudioPlayerStatus.Playing;
+        if (!people && m.current && playing && !m.pausedByNobody)
+        {
+            m.pausedByNobody = true;
+            m.playedMs = playedMsOf (m);
+            m.playingSince = null;
+            try { m.player.pause (); } catch (e) { /* плеер мог быть пуст -- не страшно */ }
+            console.log ('[' + (d()) + '] [music] в ' + where + ' никого -- пауза (продолжу, когда вернётся слушатель)');
+            saveMusicState (server);
+            scheduleVoiceStatus (server, true);
+            schedulePresence (true);
+        }
+        else if (people > 0 && m.pausedByNobody)
+        {
+            m.pausedByNobody = false;
+            m.playingSince = Date.now ();
+            try { m.player.unpause (); } catch (e) { /* аналогично */ }
+            console.log ('[' + (d()) + '] [music] слушатель вернулся в ' + where + ' -- продолжаю');
+            saveMusicState (server);
+            scheduleVoiceStatus (server, true);
+            schedulePresence (true);
+        }
+        return;
+    }
+    // бота в канале нет, но есть ждущая очередь: заходим сами, если там появился человек
+    if (!m.pending || m.leftByUser || !m.savedChannelId) return;
+    const guild = client.guilds.cache.get (server);
+    const ch = guild && guild.channels.cache.get (m.savedChannelId);
+    if (!guild || !ch || !humansInChannel (server, ch.id)) return;
+    startRestored (server, ch, guild);
 }
 
 function jsonToTrack (t)
@@ -3172,8 +3429,10 @@ function presenceNow ()
         if (m.current)
         {
             // [v2.11] у прямого эфира своя иконка -- 🔴 вместо 🎶 (длительности у него нет):
-            const icon = m.player.state.status === AudioPlayerStatus.Paused ? '⏸ '
-                : (m.current.isLive ? '🔴 ' : '🎶 ');
+            // [v2.12] пауза «нет слушателей» -- 😴, чтобы по профилю было видно причину
+            const icon = m.pausedByNobody ? '😴 '
+                : (m.player.state.status === AudioPlayerStatus.Paused ? '⏸ '
+                    : (m.current.isLive ? '🔴 ' : '🎶 '));
             const suffix = ' — ' + where + tail;
             // 128 символов -- лимит поля активности: режем НАЗВАНИЕ, а не хвост с очередью
             playing = icon + clipText (m.current.title || 'трек', 128 - icon.length - suffix.length) + suffix;
@@ -3232,14 +3491,28 @@ function joinVoice (guildId, voiceChannel, guild)
         );
         console.log ('[' + (d()) + '] [music] подключился к «' + voiceChannel.name + '»'); // [v2.4] активное событие в лог
         m.since = Date.now (); // [v2.7] от этого считаем «бот тут N мин» в статусе
-        m.player.on (AudioPlayerStatus.Idle, () =>
+        // [v2.12] новый заход отменяет «уходим»/«ждём»: очередь снова играет
+        m.leaving = false;
+        m.pending = false;
+        m.leftByUser = false;
+        m.savedChannelId = voiceChannel.id;
+        // [v2.12] обработчики плеера -- ОДИН раз на плеер (раньше вешались при каждом
+        // новом подключении, а теперь состояние живёт дольше соединения)
+        if (!m.playerWired)
         {
-            if (m.leaving) return; // [v2.9] это Idle от нашего же выхода, а не конец трека
-            // трек кончился -- следующий:
-            m.current = null;
-            playNext (guildId);
-        });
-        m.player.on ('error', e => console.error ('[music] player error: ' + oneLine (e.message)));
+            m.playerWired = true;
+            m.player.on (AudioPlayerStatus.Idle, () =>
+            {
+                if (m.leaving) return; // [v2.9] это Idle от нашего же выхода, а не конец трека
+                // трек кончился -- следующий:
+                m.current = null;
+                m.playedMs = 0;
+                m.playingSince = null;
+                m.streamRetries = 0;
+                playNext (guildId);
+            });
+            m.player.on ('error', e => console.error ('[music] player error: ' + oneLine (e.message)));
+        }
         m.connection.subscribe (m.player);
         m.connection.on (VoiceConnectionStatus.Disconnected, async () =>
         {
@@ -3249,8 +3522,9 @@ function joinVoice (guildId, voiceChannel, guild)
             }
             catch
             {
-                // канал закрылся -- уходим:
-                destroyMusic (guildId);
+                // канал закрылся / связь не вернулась -- уходим из канала, но очередь
+                // НЕ теряем ([v2.12] unexpected: вернёмся сами, когда в канале появится слушатель)
+                destroyMusic (guildId, { unexpected: true });
             }
         });
         scheduleVoiceStatus (guildId, true); // [v2.7] показать статус сразу
@@ -3278,25 +3552,54 @@ function connectTo (interaction)
     return joinVoice (interaction.guildId, interaction.member.voice.channel, interaction.guild);
 }
 
-function destroyMusic (guildId)
+// Выход из канала. [v2.12] Очередь при этом НЕ стирается: забывает её только /stop
+// (forget: true) . По /leave бот запоминает и очередь, и место в треке и продолжит,
+// когда его позовут /join (или попросят /play); при обрыве связи -- попробует сам.
+function destroyMusic (guildId, opts = {})
 {
     const m = $music[guildId];
     if (!m) return;
-    // [v2.9] player.stop() синхронно шлёт Idle, а его обработчик запускает следующий трек.
-    // На выходе это означало лишний yt-dlp: ставим флаг и обнуляем очередь ДО stop().
-    m.leaving = true;
-    m.tracks = [];
-    m.current = null;
     // [v2.7] активное событие в лог: «вышел» раньше нигде не писалось,
     // а по логу должно быть видно и заход, и выход:
-    const chId = m.connection && m.connection.joinConfig ? m.connection.joinConfig.channelId : null;
+    const chId = (m.connection && m.connection.joinConfig ? m.connection.joinConfig.channelId : null) ||
+        m.savedChannelId || null;
     const ch = chId ? client.channels.cache.get (chId) : null;
+    // [v2.9] player.stop() синхронно шлёт Idle, а его обработчик запускает следующий трек.
+    // На выходе это означало лишний yt-dlp: ставим флаг и фиксируем позицию ДО stop().
+    const at = Math.round (playedMsOf (m) / 1000);
+    m.leaving = true;
+    m.playedMs = at * 1000;
+    m.playingSince = null;
     dropPreload (m); // [v2.9] убираем за собой: заготовка следующего трека тоже не нужна
     try { m.player.stop (true); } catch {}
     try { m.connection.destroy (); } catch {}
-    delete $music[guildId];
-    // [v2.10] вышли из канала -- возобновлять после перезапуска нечего:
-    db (guildId, 'musicState', 'queue', null).catch (() => {});
+    m.connection = null;
+    if (opts.forget) // /stop -- очередь больше не нужна
+    {
+        m.tracks = [];
+        m.current = null;
+        m.seekTrack = null;
+        m.seekSec = 0;
+        m.playedMs = 0;
+        m.pending = false;
+        m.pausedByNobody = false;
+        m.playedToSomeone = false;
+        clearMusicState (guildId);
+    }
+    else // /leave или обрыв: очередь, текущий трек и место -- в базу
+    {
+        if (m.current)
+        {
+            m.tracks.unshift (m.current); // «текущий» встаёт в начало очереди
+            m.seekTrack = m.current;      // ...и playNext продолжит его с этой позиции
+            m.seekSec = at;
+        }
+        m.current = null;
+        m.pending = true;
+        m.pausedByNobody = false;
+        m.leftByUser = !opts.unexpected; // /leave -- сами не возвращаемся; обрыв -- вернёмся
+        saveMusicState (guildId);
+    }
     // [v2.7] снимаем статус: иначе в канале останется старая строка
     clearVoiceStatus (chId);
     if ($voiceStatus[guildId] && $voiceStatus[guildId].timer)
@@ -3304,7 +3607,12 @@ function destroyMusic (guildId)
     delete $voiceStatus[guildId];
     schedulePresence (true); // [v2.8] вышел -- статус снова «свободен»
     if (chId)
-        console.log ('[' + (d()) + '] [music] вышел из «' + (ch ? ch.name : chId) + '»');
+        console.log ('[' + (d()) + '] [music] вышел из «' + (ch ? ch.name : chId) + '»' +
+            (opts.forget
+                ? ' (очередь очищена)'
+                : ' (очередь сохранена' + (opts.unexpected ? ', обрыв связи' : '') + ': ' +
+                  (m.seekTrack ? (m.seekTrack.title || 'трек') + ' ждёт, ' : '') +
+                  restCount (m) + ' далее)'));
 }
 
 // Форматирование длительности. isLive -- ПРЯМОЙ ЭФИР: у него длительности нет
@@ -3344,7 +3652,7 @@ const musicCommands =
         .setDescription ('Инструкция: как пользоваться ботом'),
     new SlashCommandBuilder ()
         .setName ('play')
-        .setDescription ('Включить музыку: ссылка (YouTube/плейлист) или поиск')
+        .setDescription ('Добавить в очередь: ссылка (YouTube/плейлист/эфир) или поиск')
         .addStringOption (o =>
             o.setName ('запрос')
              .setDescription ('Ссылка или название трека')
@@ -3359,6 +3667,26 @@ const musicCommands =
     new SlashCommandBuilder ()
         .setName ('skip')
         .setDescription ('Пропустить текущий трек'),
+    // [v2.12] управление очередью (DJ): убрать трек, очистить очередь, прыгнуть к номеру
+    new SlashCommandBuilder ()
+        .setName ('remove')
+        .setDescription ('Убрать трек из очереди по номеру')
+        .addIntegerOption (o =>
+            o.setName ('number')
+             .setDescription ('Номер трека в очереди (см. /queue)')
+             .setMinValue (1)
+             .setRequired (true)),
+    new SlashCommandBuilder ()
+        .setName ('clear')
+        .setDescription ('Очистить очередь (текущий трек доиграет; совсем остановить -- /stop)'),
+    new SlashCommandBuilder ()
+        .setName ('jump')
+        .setDescription ('Перейти сразу к треку под этим номером')
+        .addIntegerOption (o =>
+            o.setName ('number')
+             .setDescription ('Номер трека в очереди (см. /queue)')
+             .setMinValue (1)
+             .setRequired (true)),
     new SlashCommandBuilder ()
         .setName ('pause')
         .setDescription ('Пауза'),
@@ -3367,7 +3695,11 @@ const musicCommands =
         .setDescription ('Продолжить воспроизведение'),
     new SlashCommandBuilder ()
         .setName ('queue')
-        .setDescription ('Показать очередь треков'),
+        .setDescription ('Показать очередь треков')
+        .addIntegerOption (o =>
+            o.setName ('from')
+             .setDescription ('С какого номера показать (в очереди бывает >10 треков)')
+             .setMinValue (1)),
     new SlashCommandBuilder ()
         .setName ('leave')
         .setDescription ('Выйти из голосового канала'),
@@ -3414,7 +3746,7 @@ client.on ('interactionCreate', async (interaction) =>
     // [v2.6] /help -- всем и всегда: без DJ-роли и без голосового канала, ephemeral.
     if (name === 'help')
         return interaction.reply ({ embeds: [helpEmbed ()], flags: MessageFlags.Ephemeral });
-    if (!['play','join','stop','skip','pause','resume','queue','leave'].includes (name)) return;
+    if (!['play','join','stop','skip','pause','resume','queue','leave','remove','clear','jump'].includes (name)) return;
     const guildId = interaction.guildId;
     const m = musicOf (guildId);
 
@@ -3439,20 +3771,30 @@ client.on ('interactionCreate', async (interaction) =>
             connectTo (interaction);
             // [v2.7] куда писать уведомления (например «трек не воспроизвёлся»), если
             // /join был первым вызовом, а /play никто не делал:
-            if (!m.textChannelId) m.textChannelId = interaction.channelId;
+            m.textChannelId = interaction.channelId;
+            // [v2.12] у бота может быть сохранённая очередь (после /leave, обрыва или
+            // перезапуска) -- продолжаем её С МЕСТА, а не с чистого листа
+            let resume = '';
+            if (!m.current && m.tracks.length)
+            {
+                const next = m.tracks[0];
+                const at = (m.seekTrack === next && m.seekSec) ? (next.isLive ? '' : ' с ' + fmtDur (m.seekSec)) : '';
+                playNext (guildId);
+                resume = ' Продолжаю очередь: **' + (next.title || 'трек') + '**' + at +
+                    (m.tracks.length ? ' (далее ещё ' + m.tracks.length + ')' : '');
+            }
             return interaction.reply
             (
-                here
+                (here
                     ? '🎧 Я уже тут: **' + voiceChannel.name + '**. Выйти -- `/leave`.'
-                    : '🎧 Зашёл в **' + voiceChannel.name + '** и остаюсь. Выйти -- `/leave`.'
+                    : '🎧 Зашёл в **' + voiceChannel.name + '** и остаюсь. Выйти -- `/leave`.') +
+                resume
             );
         }
 
         if (name === 'play')
         {
-            if (!interaction.member.voice.channel)
-                return interaction.reply ({ content: '🔊 Сначала зайди в голосовой канал!', flags: MessageFlags.Ephemeral });
-
+            const callerVoice = interaction.member && interaction.member.voice ? interaction.member.voice.channel : null;
             await interaction.deferReply ();
             let query = interaction.options.getString ('запрос');
 
@@ -3468,35 +3810,128 @@ client.on ('interactionCreate', async (interaction) =>
             if (!tracks.length)
                 return interaction.editReply ('❌ Пустой результат.');
 
-            connectTo (interaction);
-            m.textChannelId = interaction.channelId;
-            let wasIdle = !m.current && !m.tracks.length;
+            // [v2.12] Куда играть. Правила:
+            //   * бот уже играет живым слушателям в другом канале -- НЕ перехватываем
+            //     («кто первый, тот и прав»): DJ просто пополняет очередь;
+            //   * бот сидит один (слушателей нет) -- переезжает к тому, кто позвал;
+            //   * бот никуда не подключён -- заходит к вызывающему, если он в канале,
+            //     иначе очередь просто копится (заиграет по /join). Т.е. DJ может
+            //     собирать плейлист бота, вообще не находясь в голосовом канале.
+            const mine = m.connection ? m.connection.joinConfig.channelId : null;
+            const mineCh = mine ? client.channels.cache.get (mine) : null;
+            const mineName = mineCh ? '«' + mineCh.name + '»' : 'другом канале';
+            const minePeople = mine ? humansInChannel (guildId, mine) : 0;
+            let note = '';
+            if (m.connection && callerVoice && callerVoice.id !== mine && minePeople > 0)
+                note = '\n🎧 Играю в ' + mineName + ' -- там и продолжу (кто первый, тот и прав).';
+            else if (callerVoice && (!m.connection || callerVoice.id !== mine))
+            {
+                const wasElsewhere = !!mine && mine !== callerVoice.id;
+                connectTo (interaction); // заходит к вызывающему (или переезжает, если сидел один)
+                if (wasElsewhere) note = '\n🚚 Переехал в «' + callerVoice.name + '».';
+            }
+
+            m.textChannelId = interaction.channelId; // куда писать уведомления
+            const shouldStart = !!m.connection && !m.current; // подключены и ничего не играет
             m.tracks.push (...tracks);
             scheduleVoiceStatus (guildId); // [v2.7] очередь изменилась -- обновим статус канала
             schedulePresence ();           // [v2.8] «ещё N в очереди»
-            if (!wasIdle) startPreload (guildId); // [v2.9] уже играет что-то -- готовим следующий
+            if (!shouldStart) startPreload (guildId); // [v2.9] уже играет что-то -- готовим следующий
             saveMusicState (guildId);             // [v2.10] очередь -- на диск
             await interaction.editReply
             (
                 '🎶 Добавлено: **' + (tracks[0].title || query) + '**' +
                 (tracks.length > 1 ? ' + ещё ' + (tracks.length - 1) + ' треков' : '') +
                 '\nИсточник: `' + tracks[0].author + '` | Длина: `' + fmtDur (tracks[0].duration, tracks[0].isLive) + '`' +
-                (wasIdle ? '\n▶️ Запускаю...' : '')
+                note +
+                (m.connection ? (shouldStart ? '\n▶️ Запускаю...' : '') :
+                    '\n⏳ Я не в канале -- заиграю, когда позовёшь `/join`.')
             );
-            if (wasIdle)
+            if (shouldStart)
                 playNext (guildId);
         }
         else if (name === 'stop')
         {
+            // [v2.12] /stop -- ЕДИНСТВЕННОЕ, что стирает очередь совсем (потому что бот её
+            // запускал -- люди знают, что не будет). /leave и обрывы -- только пауза/память.
+            const was = m.tracks.length;
             m.tracks = [];
             m.current = null;
+            m.pending = false;
+            m.seekTrack = null;
+            m.seekSec = 0;
+            m.pausedByNobody = false;
+            m.playedToSomeone = false;
             dropPreload (m); // [v2.9] очередь очищена -- заготовка больше не нужна
             m.player.stop (true);
             m.playedMs = 0; m.playingSince = null; // [v2.10] играть нечего
-            saveMusicState (guildId);              // [v2.10] пустая очередь -- тоже состояние
+            clearMusicState (guildId);              // [v2.12] из базы -- тоже вон
             scheduleVoiceStatus (guildId, true); // [v2.7] статус: тишина, очередь пустая
             schedulePresence (true);             // [v2.8] больше не «слушает»
-            return interaction.reply ('⏹ Остановлено, очередь очищена.');
+            return interaction.reply ('⏹ Остановлено. Очередь очищена' + (was ? ' (' + was + ' треков)' : '') + '.');
+        }
+        else if (name === 'remove')
+        {
+            // [v2.12] убрать один трек из очереди по номеру (каждый видит номера в /queue):
+            const n = interaction.options.getInteger ('number');
+            if (!m.tracks.length)
+                return interaction.reply ({ content: '🈳 В очереди нет треков (играет только текущий).', flags: MessageFlags.Ephemeral });
+            if (n < 1 || n > m.tracks.length)
+                return interaction.reply
+                (
+                    { content: '🤔 В очереди ' + m.tracks.length + ' треков -- номер от 1 до ' + m.tracks.length + '.', flags: MessageFlags.Ephemeral }
+                );
+            const gone = m.tracks.splice (n - 1, 1)[0];
+            dropPreload (m);       // заготовка была для другого трека
+            startPreload (guildId);
+            saveMusicState (guildId);
+            scheduleVoiceStatus (guildId, true);
+            schedulePresence (true);
+            console.log ('[' + (d()) + '] [music] убрал из очереди №' + n + ': ' + (gone.title || 'трек'));
+            return interaction.reply
+            (
+                '🗑 Убрал №' + n + ': **' + (gone.title || 'трек') + '**' +
+                (m.tracks.length ? ' (в очереди осталось ' + m.tracks.length + ')' : ' (очередь пуста)')
+            );
+        }
+        else if (name === 'clear')
+        {
+            if (!m.tracks.length)
+                return interaction.reply ({ content: '🈳 Очередь и так пуста -- чистить нечего.', flags: MessageFlags.Ephemeral });
+            const n = m.tracks.length;
+            m.tracks = [];
+            dropPreload (m);
+            saveMusicState (guildId);
+            scheduleVoiceStatus (guildId, true);
+            schedulePresence (true);
+            console.log ('[' + (d()) + '] [music] очередь очищена (' + n + ')');
+            return interaction.reply
+            (
+                '🧹 Очистил очередь (' + n + (n === 1 ? ' трек' : ' треков') + ').' +
+                (m.current ? ' Текущий **' + (m.current.title || 'трек') + '** доиграет -- остановить совсем: `/stop`.' : '')
+            );
+        }
+        else if (name === 'jump')
+        {
+            // [v2.12] сразу к треку под номером: всё перед ним выбрасывается
+            const n = interaction.options.getInteger ('number');
+            if (!m.tracks.length || n < 1 || n > m.tracks.length)
+                return interaction.reply
+                (
+                    {
+                        content: m.tracks.length
+                            ? '🤔 В очереди ' + m.tracks.length + ' треков -- номер от 1 до ' + m.tracks.length + '.'
+                            : '🈳 В очереди нет треков (играет только текущий).',
+                        flags: MessageFlags.Ephemeral,
+                    }
+                );
+            m.tracks.splice (0, n - 1); // всё до N-го -- вон
+            dropPreload (m);
+            const target = m.tracks[0];
+            console.log ('[' + (d()) + '] [music] прыжок к №' + n + ': ' + (target.title || 'трек'));
+            if (m.current) m.player.stop (true); // Idle-хэндлер запустит то, к чему прыгнули
+            else playNext (guildId);
+            return interaction.reply ('⏭ Перехожу к №' + n + ': **' + (target.title || 'трек') + '**');
         }
         else if (name === 'skip')
         {
@@ -3527,15 +3962,29 @@ client.on ('interactionCreate', async (interaction) =>
         }
         else if (name === 'queue')
         {
-            if (!m.current && !m.tracks.length)
+            // [v2.12] очередь бывает на 50 треков -- показываем по 10, с номерами
+            // (номера совпадают с /remove и /jump) и с возможностью листать: /queue from:11
+            const total = m.tracks.length;
+            if (!m.current && !total)
                 return interaction.reply ('🈳 Очередь пуста.');
-            // [v2.11] у прямого эфира вместо длины -- 🔴 LIVE (иначе это выглядело
-            // как трек без данных), у обычного трека без длительности -- '--:--'
-            let list = m.tracks.slice (0, 10).map ((t, i) => (i + 1) + '. **' + t.title + '** `' + fmtDur (t.duration, t.isLive) + '`').join ('\n');
+            const start = Math.min (Math.max (1, interaction.options.getInteger ('from') || 1), Math.max (1, total));
+            const list = m.tracks.slice (start - 1, start - 1 + 10)
+                .map ((t, i) => (start + i) + '. **' + t.title + '** `' + fmtDur (t.duration, t.isLive) + '`').join ('\n');
+            const left = total - (start - 1 + 10);
+            let head;
+            if (m.current)
+                head = '🎵 **Сейчас:** ' + (m.current.isLive ? '🔴 ' : '') + '**' + m.current.title + '** `' + fmtDur (m.current.duration, m.current.isLive) + '`' +
+                    (m.pausedByNobody ? ' _(пауза: нет слушателей)_' : '');
+            else if (m.pending && total)
+                head = '⏸ Музыка ждёт слушателя -- позови `/join` (очередь помнится)';
+            else
+                head = '🎵 **Сейчас:** —';
             return interaction.reply
             (
-                '🎵 **Сейчас:** ' + (m.current ? (m.current.isLive ? '🔴 ' : '') + '**' + m.current.title + '** `' + fmtDur (m.current.duration, m.current.isLive) + '`' : '—') +
-                (m.tracks.length ? '\n\n**Далее (' + m.tracks.length + '):**\n' + list : '')
+                head +
+                (total ? '\n\n**Очередь (' + total + '):**\n' + list +
+                    (left > 0 ? '\n*...и ещё ' + left + ': `/queue from:' + (start + 10) + '`*' : '') : '') +
+                (total ? '\n\n_Убрать -- `/remove`, прыгнуть -- `/jump`, очистить -- `/clear`._' : '')
             );
         }
         else if (name === 'leave')
@@ -3543,8 +3992,17 @@ client.on ('interactionCreate', async (interaction) =>
             // [v2.7] раньше бот отвечал «вышел», даже если нигде не сидел:
             if (!m.connection)
                 return interaction.reply ({ content: '🤷 Я и так не в голосовом канале.', flags: MessageFlags.Ephemeral });
-            destroyMusic (guildId);
-            return interaction.reply ('👋 Вышел из голосового канала.');
+            destroyMusic (guildId); // [v2.12] очередь при этом НЕ теряется
+            return interaction.reply
+            (
+                '👋 Вышел из голосового канала.' +
+                (m.tracks.length
+                    ? ' Очередь помню: ' + m.tracks.length + (m.tracks.length === 1 ? ' трек' : ' треков') +
+                      (m.seekTrack ? ' (начиная с **' + (m.seekTrack.title || 'трек') + '**' +
+                          (m.seekSec && !m.seekTrack.isLive ? ' с ' + fmtDur (m.seekSec) : '') + ')' : '') +
+                      ' -- продолжу по `/join`.'
+                    : '')
+            );
         }
     }
     catch (e)
