@@ -1988,6 +1988,16 @@ async function modNick (server, member/*, add = false*/)
                 // эмодзи в начале ника (💙, 🔊...) и срезал его, думая что это ключ:
                 if (!nick.startsWith (tag))
                 {
+                    // [v2.24] Ник в Discord -- до 32 символов, а тег 🔑 добавляется СВЕРХУ.
+                    // Если ник уже во всю длину, ключ физически не влезает: Discord отвечал
+                    // 'Invalid Form Body' (а в лог шла невнятная ошибка). Чужое имя ради
+                    // галочки не режем -- просто не трогаем ник и говорим, почему.
+                    if ([...tag, ...nick].length > 32)
+                    {
+                        console.log ('[' + (d()) + '] [nick] 🔑 не поставил: ник уже 32 символа (' +
+                            member.user.username + ')');
+                        return;
+                    }
                     let nickNew = tag + nick;
                     console.log ('[' + (d()) + '] [nick] +🔑 ' + member.user.username + ' in ' + member.voice.channel.name);
                     await setNickLogged (member, nickNew, server)
@@ -3445,6 +3455,28 @@ async function bansOverview (server)
     return { rows, expired, hist, histRows, histDays: banHistoryDays (server) };
 }
 
+// ============================================================================
+// [v2.24] ЛИМИТЫ DISCORD -- одной таблицей, чтобы не выяснять их опытным путём:
+//   * обычное сообщение (content): 2000 символов;
+//   * описание embed'а (description): 4096; в одном сообщении до 10 embed'ов и до 6000
+//     символов суммарно (поэтому /help и стартовая ЛС режутся на несколько -- см. helpEmbeds);
+//   * статус голосового канала: 500; название активности (профильный статус): 128;
+//     ник: 32; название канала: 100; причина в журнале аудита: 512.
+// Отчёты собираются из ЖИВЫХ данных (длинные причины наказаний, длинные списки ролей),
+// поэтому без проверки ответ уходил за лимит и Discord отклонял СООБЩЕНИЕ ЦЕЛИКОМ: вместо
+// списка человек видел «Ошибка: Invalid Form Body». Ниже -- общая страховка.
+// ============================================================================
+const MSG_TEXT_LIMIT = 2000;
+
+// Уложить текст в лимит сообщения по границе строки и честно сказать, что показано не всё.
+function fitMsgText (text, limit = MSG_TEXT_LIMIT)
+{
+    if (text.length <= limit) return text;
+    const cut = text.lastIndexOf ('\n', limit - 120);
+    return (cut > 0 ? text.slice (0, cut) : text.slice (0, limit - 120)) +
+        '\n_…показано не всё: ответ не влезает в лимит Discord (' + limit + ' символов)._ ';
+}
+
 // Текст отчёта для человека (ЛС/ответ на /bans): имена, сроки, причина + история.
 function bansReportText (o, max = 20)
 {
@@ -3686,17 +3718,24 @@ async function welcomeEmbed (server, user, refresh = false)
     const rulesPart =
         `📜 **Правила и знакомство**` + (chName ? ' -- в канале ' + code (chName) : '') + `:` +
         (rules ? rules + '🔗 ' + link + '\n' : '\n' + link + '\n');
+    // [v2.24] Описание embed'а -- до 4096 символов. Текст правил (до 1200) плюс список
+    // файлов-вложений могли упереться в лимит, и тогда Discord отклонял ЛС ЦЕЛИКОМ:
+    // новичок не получал вообще ничего. Страховка на всякий случай (в обычной жизни
+    // длина далека от лимита):
+    let desc = prefixOn
+        ? `${user}, привет! 👋\n\n` + rulesPart +
+          `\n🎵 **Музыка:** \`/play ссылка или запрос\`, очередь -- \`/queue\`,\n` +
+          `выйти боту из канала -- \`/leave\` (управляют админы, модеры и роль DJ).\n` +
+          `📌 Инструкция по боту -- в любой момент \`/help\`.\n` +
+          `\nЕсли что-то непонятно или не работает -- напиши администрации.`
+        : rulesPart;
+    if (desc.length > 4000)
+        desc = desc.slice (0, 3950) + '\n_(текст длинный -- целиком по ссылке в этом письме)_';
     const embed =
     {
         color: 0x00CCFF,
         title: '🐼 Добро пожаловать на ' + (s.name || 'сервер') + '!',
-        description: prefixOn
-            ? `${user}, привет! 👋\n\n` + rulesPart +
-              `\n🎵 **Музыка:** \`/play ссылка или запрос\`, очередь -- \`/queue\`,\n` +
-              `выйти боту из канала -- \`/leave\` (управляют админы, модеры и роль DJ).\n` +
-              `📌 Инструкция по боту -- в любой момент \`/help\`.\n` +
-              `\nЕсли что-то непонятно или не работает -- напиши администрации.`
-            : rulesPart,
+        description: desc,
         timestamp: dt(),
     };
     // Картинка из сообщения с правилами -- прямо в письме (как и было задумано):
@@ -6789,7 +6828,8 @@ const musicCommands =
              .setRequired (true))
         .addStringOption (o =>
             o.setName ('reason')
-             .setDescription ('Причина снятия (уйдёт в журнал и в аудит Discord)')),
+             .setDescription ('Причина снятия (уйдёт в журнал и в аудит Discord)')
+             .setMaxLength (400)), // [v2.24] в журнале аудита Discord -- до 512 символов
     // [v2.17] /rolecheck -- что бот помнит о человеке: роли, наказания и что именно
     // он вернёт при следующем входе (админы/модеры). Работает и для того, кто не
     // на сервере: данные лежат в базе по id.
@@ -6801,6 +6841,7 @@ const musicCommands =
         .addStringOption (o =>
             o.setName ('text')
              .setDescription ('Текст объявления')
+             .setMaxLength (2000) // [v2.24] лимит сообщения Discord -- пусть форма сама не даст превысить
              .setRequired (true))
         .addAttachmentOption (o =>
             o.setName ('file')
@@ -6817,7 +6858,8 @@ const musicCommands =
              .setRequired (true))
         .addStringOption (o =>
             o.setName ('text')
-             .setDescription ('Текст сообщения (можно без текста, если есть файл)'))
+             .setDescription ('Текст сообщения (можно без текста, если есть файл)')
+             .setMaxLength (2000)) // [v2.24] лимит сообщения Discord
         .addAttachmentOption (o =>
             o.setName ('file')
              .setDescription ('Вложение (картинка, файл)')),
@@ -7053,7 +7095,15 @@ client.on ('interactionCreate', async (interaction) =>
         const o = await bansOverview (interaction.guildId);
         console.log ('[' + (d()) + '] [ban] /bans: активных ' + o.rows.length +
             ', банов ' + o.rows.filter (r => r.isBan).length);
-        return interaction.editReply ({ content: bansReportText (o) });
+        // [v2.24] Причины наказаний бывают длинными, а записей -- десятки: показываем
+        // столько, сколько влезает в лимит (сначала 20, потом меньше), но ответ уходит ВСЕГДА.
+        let report = bansReportText (o, 20);
+        for (const max of [12, 8, 5, 3, 2, 1])
+        {
+            if (report.length <= MSG_TEXT_LIMIT) break;
+            report = bansReportText (o, max);
+        }
+        return interaction.editReply ({ content: fitMsgText (report) });
     }
     // [v2.15] /unban -- снять наказание вручную (только staff). Снимаем ровно то, что
     // реально есть: бан в Discord, запись таймаута в базе и отложенный таймер (иначе
@@ -7068,7 +7118,9 @@ client.on ('interactionCreate', async (interaction) =>
         const target = interaction.options.getUser ('user', true);
         const who = interaction.member ? uuu (interaction.member) : interaction.user.username;
         const why = (interaction.options.getString ('reason') || '').trim ();
-        const reason = 'Снято вручную (' + who + ')' + (why ? ': ' + why : '');
+        // [v2.24] Причина уходит в журнал аудита Discord, а там лимит 512 символов:
+        // длинная причина отклоняла бы снятие бана целиком.
+        const reason = ('Снято вручную (' + who + ')' + (why ? ': ' + why : '')).slice (0, 512);
         await interaction.deferReply ({ flags: MessageFlags.Ephemeral });
         // Что именно было: срок из базы, таймер из памяти и настоящий бан из Discord.
         const until = await db (server, 'membersBanTimeout', target.id).catch (() => null);
@@ -7141,6 +7193,11 @@ client.on ('interactionCreate', async (interaction) =>
         const target = interaction.options.getChannel ('channel') || interaction.channel;
         if (!text && !file)
             return interaction.reply ({ content: '🤔 Пустое объявление: нужен текст или вложение.', flags: MessageFlags.Ephemeral });
+        // [v2.24] Discord не примет текст длиннее 2000 символов: лучше сказать это сразу
+        // и внятно, чем получить «Не смог опубликовать: Invalid Form Body».
+        if (text.length > MSG_TEXT_LIMIT)
+            return interaction.reply ({ content: '❌ Текст объявления -- ' + text.length + ' символов, а Discord принимает до ' +
+                MSG_TEXT_LIMIT + '. Сократи или разбей на части.', flags: MessageFlags.Ephemeral });
         await interaction.deferReply ({ flags: MessageFlags.Ephemeral });
         const who = interaction.member ? uuu (interaction.member) : interaction.user.username;
         try
@@ -7176,6 +7233,10 @@ client.on ('interactionCreate', async (interaction) =>
         const file = interaction.options.getAttachment ('file');
         if (!text && !file)
             return interaction.reply ({ content: '🤔 Что отправить? Нужен текст или вложение.', flags: MessageFlags.Ephemeral });
+        // [v2.24] То же, что у /announce: 2000 символов -- лимит самого Discord.
+        if (text.length > MSG_TEXT_LIMIT)
+            return interaction.reply ({ content: '❌ Текст ЛС -- ' + text.length + ' символов, а Discord принимает до ' +
+                MSG_TEXT_LIMIT + '. Сократи или разбей на части.', flags: MessageFlags.Ephemeral });
         await interaction.deferReply ({ flags: MessageFlags.Ephemeral });
         const who = interaction.member ? uuu (interaction.member) : interaction.user.username;
         try
