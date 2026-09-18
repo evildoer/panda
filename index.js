@@ -423,6 +423,15 @@ function dmParse (content, mentions)
     return { id: id, letter: rest.trim () };
 }
 
+// [v2.11] Команда проверяется ПО ГРАНИЦЕ слова: `panda ping` -- да, `panda pingasd` -- нет.
+// Раньше было startsWith, поэтому любая фраза вроде «panda pingvin» срабатывала
+// как команда (а `panda helpme` -- как `panda help`).
+function isCmd (content, name)
+{
+    const full = PREFIX + name;
+    return content === full || content.startsWith (full + ' ');
+}
+
 // (node:16096) DeprecationWarning: The message event is deprecated. Use messageCreate instead
 client.on ('messageCreate', async message =>
 {
@@ -434,7 +443,7 @@ client.on ('messageCreate', async message =>
     if ([ChannelType.GuildText, ChannelType.DM].includes (message.channel.type))
     {
         // command 'ping' ## pong
-        if (message.content.startsWith (PREFIX + 'ping'))
+        if (isCmd (message.content, 'ping'))
         {
             message.channel.send
             (
@@ -450,7 +459,7 @@ client.on ('messageCreate', async message =>
 
         // command 'help' ## [v2.6] Инструкция в ЛС тому, кто спросил.
         // В чат её не льём (20 строк шума); саму команду в канале уберёт блок ниже.
-        if (message.content.startsWith (PREFIX + 'help'))
+        if (isCmd (message.content, 'help'))
         {
             message.author.send ({ embeds: [helpEmbed ()] })
             .then (() => console.log ('[' + (d()) + '] [dm] help -> ' + uu (message.author) + ' OK'))
@@ -463,7 +472,7 @@ client.on ('messageCreate', async message =>
         // command 'test' ## [v2.5] Самопроверка ЛС.
         // Раньше тут был зашит один uid (остался от тестов на себе) и красный эмбед
         // «оппозиция» -- команда писала ЕМУ, а не тому, кто её вызвал. Теперь -- вызывающему.
-        if (message.content.startsWith (PREFIX + 'test'))
+        if (isCmd (message.content, 'test'))
         {
             message.author.send ({ content: 'pong 🐼 ЛС работают.' })
             .then
@@ -579,7 +588,7 @@ client.on ('messageCreate', async message =>
                 // [v2.4] активное действие -- в лог: кто и какую команду написал
                 console.log ('[' + (d()) + '] [cmd] ' + (message.member ? uuu (message.member) : message.author.username) + ': ' + message.content.slice (0, 120));
                 // command 'file' ## return the attach...
-                if (message.content.startsWith (PREFIX + 'file'))
+                if (isCmd (message.content, 'file'))
                 {
                     let attach = attachOf (message);
                     message.channel.send
@@ -591,7 +600,7 @@ client.on ('messageCreate', async message =>
                     .catch (console.error);
                 }
                 // command 'pretty' ## test pretty embed ;D
-                else if (message.content.startsWith (PREFIX + 'pretty'))
+                else if (isCmd (message.content, 'pretty'))
                 {
                     message.channel.send
                     (
@@ -623,7 +632,7 @@ client.on ('messageCreate', async message =>
                     .catch (console.error);
                 }
                 // command 'dm' ## DM to specific @user...
-                else if (message.content.startsWith (PREFIX + 'dm'))
+                else if (isCmd (message.content, 'dm'))
                 {
                     // [v2.5] Раньше было три ловушки: цель только упоминанием (голый id
                     // игнорировался), команда удалялась ДО отправки (bulkDelete) и пользователь
@@ -717,13 +726,13 @@ client.on ('messageCreate', async message =>
                 }
                 // command 'test' ## в текстовом канале команда просто убирается из чата
                 // (само ЛС отправил блок выше -- см. 'test' / self-test)
-                else if (message.content.startsWith (PREFIX + 'test'))
+                else if (isCmd (message.content, 'test'))
                 {
                     message.delete ().catch (console.error); // delete command?
                 }
                 // command 'help' ## [v2.6] инструкция уже ушла в ЛС (блок выше) --
                 // в канале убираем саму команду:
-                else if (message.content.startsWith (PREFIX + 'help'))
+                else if (isCmd (message.content, 'help'))
                 {
                     message.delete ().catch (console.error);
                 }
@@ -825,7 +834,7 @@ async function modNick (server, member/*, add = false*/)
             let nick = member.nickname || member.user.username;
             // [v2.3.5] СМЫСЛ КЛЮЧА: гарантия «права в канале 100%» для обычных участников.
             // ADM/MOD -- исключение: права у них и так всегда есть, и все свои это знают,
-            // поэтому ключа у staff быть НЕ должно -- даже самодрисованный бот удаляет:
+            // поэтому ключа у staff быть НЕ должно -- даже самодорисованный бот удаляет:
             if (isStaff (server, member))
             {
                 if (nick.startsWith (tag))
@@ -989,7 +998,7 @@ client.on ('channelCreate', async (newChannel) =>
                             {
                                 // message to log channel:
                                 let log_text = `${owner.user}` + ' **получает** 💪 права на канал `' + code(cc(newChannel)) + '` 🟩';
-                                client.channels.resolve(log_channel).send
+                                logTo (log_channel).send
                                 (
                                     {
                                         embeds:
@@ -1051,7 +1060,7 @@ client.on ('channelUpdate', async (oldChannel, newChannel) =>
                 {
                     // message to log channel:
                     let log_text = 'Канал `' + code(cc(oldChannel)) + '` **переименован** ➡️ в `' + code(cc(newChannel)) + '` 🟦';
-                    client.channels.resolve(log_channel).send
+                    logTo (log_channel).send
                     (
                         {
                             embeds:
@@ -1114,7 +1123,7 @@ client.on ('channelUpdate', async (oldChannel, newChannel) =>
                                 {
                                     // message to log channel:
                                     let log_text = `${owner.user}` + ' **получает** 💪 права на канал `' + code(cc(newChannel)) + '` 🟩';
-                                    client.channels.resolve(log_channel).send
+                                    logTo (log_channel).send
                                     (
                                         {
                                             embeds:
@@ -1251,6 +1260,70 @@ function whoText (who)
     return '(кто: ' + ((client.user && who === client.user.username) ? 'бот' : who) + ') ';
 }
 
+// [v2.11] Запись в канал журнала БЕЗ падений. Раньше везде стояло
+// `logTo (log_channel).send(...)`: если лог-канал удалили,
+// Discord не отдал его или в конфиге оказался не текстовый канал, resolve
+// возвращал undefined -- и вместо внятной строки в консоль уходил
+// unhandledRejection (а запись терялась). Теперь причина всегда видна в логе.
+function logTo (channelId)
+{
+    return {
+        send: async (payload) =>
+        {
+            if (!channelId) return;
+            try
+            {
+                let ch = client.channels.cache.get (channelId);
+                if (!ch) ch = await client.channels.fetch (channelId);
+                if (!ch || typeof ch.send !== 'function')
+                {
+                    console.error ('[log] канал журнала ' + channelId + ' недоступен -- запись пропущена');
+                    return;
+                }
+                await ch.send (payload);
+            }
+            catch (e)
+            {
+                console.error ('[log] запись в журнал ' + channelId + ' не удалась: ' + e.message);
+            }
+        },
+    };
+}
+
+// [v2.11] «Жалоба»: человек попал в общий канал (channel_common), а это канал жалоб --
+// мут/деф там снимаются, чтобы он мог сказать, за что его наказали. Пишем в журнал.
+function appealLog (server, state)
+{
+    let log_channel = SERVERS[server].log_channel || '';
+    if (log_channel)
+    {
+        let log_text = 'На ' + `${state.member}` + ' поступила 🚫 **жалоба** в канале ' + code (cc (state.channel)) + ' 🆘';
+        logTo (log_channel).send
+        (
+            {
+                embeds:
+                [
+                    {
+                        author:
+                        {
+                            name: uuu (state.member),
+                            icon_url: state.member.user.displayAvatarURL ({extension: 'png', forceStatic: false, size: 1024}),
+                        },
+                        color: 0xFF0000, // 'RED',
+                        description: log_text,
+                        footer:
+                        {
+                            text: SERVERS[server].name,
+                        },
+                        timestamp: dt(),
+                    },
+                ]
+            }
+        );
+    }
+    console.log ('[' + (d()) + '] ' + state.member.user.username + ' get appeal in ' + state.channel.name);
+}
+
 // строка действия + автор (мут/разглухота и т.п.) -- ждём запись журнала, потом пишем одной строкой
 function logAction (guild, action, targetId, text)
 {
@@ -1343,13 +1416,12 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
         }
         if (newState.channel && newState.channel.id)
         {
-            // let admin = SERVERS[server].admins.includes (newState.member.id);
-            let admin = newState.member._roles.includes (SERVERS[server].role_admin);
-            let moder = newState.member._roles.includes (SERVERS[server].role_moder);
-            let log_channel = SERVERS[server].log_channel || ''; // log_channel_temp ?
+            // [v2.11] Отсюда убраны мёртвые строки: локальные admin/moder никто не читал
+            // (роли проверяются там, где реально нужны), `admins` из конфига не
+            // используется вообще (его заменили роли role_admin/role_moder), а
+            // afkLikeChannels только собирался и никуда не шёл.
+            let log_channel = SERVERS[server].log_channel || '';
             let channel_common = SERVERS[server].channel_common || '';
-            let afkLikeChannels = [newState.guild.afkChannelId] // [v14] afkChannelId (camelCase)
-                .concat (SERVERS[server].afkLikeChannels || []);
             // [?!] https://stackoverflow.com/questions/43010642/checking-who-issued-a-server-mute-on-another-user
             // mute || deaf || unmute || undeaf: let action = ''; // ...
             if (!newState.member.user.bot)
@@ -1361,7 +1433,30 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                     oldState.serverMute = newState.serverMute;
                 if (oldState.serverDeaf === null) // undefined
                     oldState.serverDeaf = newState.serverDeaf;
-                if (newState.channel.id === channel_common) return; //!
+                // [v2.11] ОБЩИЙ КАНАЛ (channel_common) -- это канал жалоб: пер-канальные мут/деф
+                // тут НЕ ставятся (иначе человеку нечем пожаловаться), зато снимаются
+                // серверные ограничения, с которыми он сюда пришёл. Схема «мут помнится по
+                // каналу» не ломается: пер-канальные запреты остаются на своих каналах и
+                // вернутся, когда человек туда зайдёт (GARANTEEs ниже).
+                // Раньше на этом месте стоял ранний return -- из-за него ветка
+                // «unMUTE for Appeal!» была НЕДОСТИЖИМА: замученный заходил в общий канал
+                // и оставался замученным (как и дефнутый -- оставался глухим).
+                if (newState.channel.id === channel_common)
+                {
+                    if (newState.serverMute)
+                    {
+                        newState.setMute (false)
+                        .catch (e => console.error ('[voiceStateUpdate] общий канал, unmute: ' + e.message));
+                        appealLog (server, newState);
+                    }
+                    if (newState.serverDeaf)
+                    {
+                        newState.setDeaf (false)
+                        .catch (e => console.error ('[voiceStateUpdate] общий канал, undeaf: ' + e.message));
+                        console.log ('[' + (d()) + '] [voice] общий канал: снят деф с ' + uuu (newState.member));
+                    }
+                    return;
+                }
                 if (!oldState.serverMute && newState.serverMute) // MUTE
                 {
                     // [v14] allow/deny -- PermissionsBitField:
@@ -1371,43 +1466,11 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                         !newState.channel.permissionOverwrites.cache.get(newState.id).deny.has(PermissionsBitField.Flags.Speak)
                     )
                     {
-                        // /*You are not Admin|moder and */in Common channel...
-                        if (newState.channel.id === channel_common) // unMUTE for Appeal!
-                        {
-                            newState.setMute (false)
-                            .catch (console.error);
-                            if (log_channel)
-                            {
-                                // message to log channel:
-                                let log_text = 'На ' + `${newState.member}` + ' поступила 🚫 **жалоба** в канале `' + code(cc(newState.channel)) + '` 🆘';
-                                client.channels.resolve(log_channel).send
-                                (
-                                    {
-                                        embeds:
-                                        [
-                                            {
-                                                author:
-                                                {
-                                                    name: uuu (newState.member), // uu (newState.member.user),
-                                                    icon_url: newState.member.user.displayAvatarURL ({extension: 'png', forceStatic: false, size: 1024}),
-                                                },
-                                                color: 0xFF0000, // 'RED',
-                                                description: log_text,
-                                                footer:
-                                                {
-                                                    text: SERVERS[server].name,
-                                                },
-                                                timestamp: dt(),
-                                            },
-                                        ]
-                                    }
-                                )
-                                .catch (console.error);
-                            }
-                            console.log ('[' + (d()) + '] ' + newState.member.user.username + ' get appeal in ' + newState.channel.name);
-                        }
-                        // /*You are Admin|moder or */not in Common channel...
-                        else
+                        // [v2.11] Раньше здесь была ветка «unMUTE for Appeal!» для общего
+                        // канала -- НЕДОСТИЖИМАЯ (общий канал отсекался ранним return выше).
+                        // Теперь он обрабатывается в начале voiceStateUpdate: там снимаются
+                        // мут/деф и уходит «жалоба» в журнал, а здесь -- обычная
+                        // пер-канальная блокировка голоса (мут помнится по каналу).
                         {
                             newState.channel.permissionOverwrites.edit
                             (
@@ -1445,7 +1508,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                                             `${newState.member} **запрещено** 🗣️ говорить в канале \`${code(cc(channel))}\` 🟨\n` +
                                             `Владельцы канала: ` + (owners.size ? owners.map (owner => uuu (owner)).join (', ') : '*offline*') + `\n` +
                                             `Подробности смотрите в журнале аудита.`;
-                                        client.channels.resolve(log_channel).send
+                                        logTo (log_channel).send
                                         (
                                             {
                                                 embeds:
@@ -1545,7 +1608,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                                         `${newState.member}, **запрещено** 🔌 подключаться в канал \`${code(cc(channel))}\` 🟥\n` +
                                         `Владельцы канала: ` + (owners.size ? owners.map (owner => uuu (owner)).join (', ') : '*offline*') + `\n` +
                                         `Подробности смотрите в журнале аудита.`;
-                                    client.channels.resolve(log_channel).send
+                                    logTo (log_channel).send
                                     (
                                         {
                                             embeds:
@@ -1619,7 +1682,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                                         `${newState.member} **разрешено** 🗣️ говорить в канале \`${code(cc(channel))}\` 🟩\n` +
                                         `Владельцы канала: ` + (owners.size ? owners.map (owner => uuu (owner)).join (', ') : '*offline*') + `\n` +
                                         `Подробности смотрите в журнале аудита.`;
-                                    client.channels.resolve(log_channel).send
+                                    logTo (log_channel).send
                                     (
                                         {
                                             embeds:
@@ -1695,7 +1758,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                                         `${newState.member}, **разрешено** 🔌 подключаться в канал \`${code(cc(channel))}\` 🟩\n` +
                                         `Владельцы канала: ` + (owners.size ? owners.map (owner => uuu (owner)).join (', ') : '*offline*') + `\n` +
                                         `Подробности смотрите в журнале аудита.`;
-                                    client.channels.resolve(log_channel).send
+                                    logTo (log_channel).send
                                     (
                                         {
                                             embeds:
@@ -2110,7 +2173,7 @@ async function sweepNicks (server)
             // (vs.user_id -- сырого API-поля в v14 нет, fetch(undefined) вечно падал):
             // [FIX v2.3.6] ник берём СВЕЖИМ: без GuildMembers-интента бот не получает
             // события GUILD_MEMBER_UPDATE (смена ника), кэш знает ник старым --
-            // самодрисованный ключ для свипа невидим (срабатывал только войс-статус).
+            // самодорисованный ключ для свипа невидим (срабатывал только войс-статус).
             // REST fetch всегда возвращает актуальные данные:
             let member = await guild.members.fetch (vs.id).catch (() => null)
                              || vs.member;
@@ -2121,7 +2184,7 @@ async function sweepNicks (server)
             // (💙, 🔊...) и свип срезал их, думая что это ключ. Точная проверка:
             let hasTag = nick.startsWith ('🔑'); // 🔑
             // [v2.3.5] ADM/MOD: ключ = права для обычных, у staff его быть не должно --
-            // даже самодрисованный удаляем (и это единственное, что бот делает с их никами):
+            // даже самодорисованный удаляем (и это единственное, что бот делает с их никами):
             if (isStaff (server, member))
             {
                 if (hasTag)
@@ -2853,15 +2916,47 @@ function voiceStatusText (guildId)
     const chId = m.connection.joinConfig.channelId;
     const people = humansInChannel (guildId, chId);
     let parts = [];
-    if (m.current)
-        parts.push ((m.player.state.status === AudioPlayerStatus.Paused ? '⏸ ' : '🎶 ') +
-            (m.current.title || 'трек') + ' — ' + fmtDur (m.current.duration));
-    else
-        parts.push ('😴 музыка не играет');
+    // [v2.11] строка «что играет» общая с профильным статусом (см. nowPlayingLine):
+    // у прямого эфира длительности нет -- там своя иконка 🔴 вместо 🎶
+    parts.push (nowPlayingLine (m.current, m.player.state.status === AudioPlayerStatus.Paused) ||
+        '😴 музыка не играет');
     parts.push ('📜 очередь: ' + (m.tracks.length ? m.tracks.length : '—'));
     parts.push ('🎧 в канале: ' + people);
     if (m.since) parts.push ('⏱ бот тут: ' + fmtAgo (Date.now () - m.since));
     return parts.join (' • ').slice (0, 500); // 500 -- лимит поля статуса
+}
+
+// [v2.11] Записи статуса уходят в Discord ПО ОЧЕРЕДИ (своя на каждый канал).
+// Раньше была гонка: если «что играет» уже летит в REST, а /leave в этот момент снимает
+// статус, ответы могли прийти в обратном порядке -- и в канале оставалась старая строка
+// до следующего захода. В очереди порядок строгий: последний запрос = итоговое состояние.
+// ВАЖНО (проверено живым запросом к API): прочитать прежний статус канала НЕЛЬЗЯ --
+// Discord не отдаёт его ни в объекте канала, ни отдельным роутом (405 Method Not Allowed),
+// роут только пишущий. Поэтому «вернуть значение создателя канала» технически невозможно;
+// взамен бот всегда снимает СВОЙ статус при выходе/переезде и пишет его только при
+// реальном изменении -- лишний раз чужую строку не затрёт.
+const $statusChain = {}; // channelId -> Promise (хвост очереди записей)
+
+function voiceStatusPush (channelId, status)
+{
+    if (!channelId) return Promise.resolve ();
+    const prev = $statusChain[channelId] || Promise.resolve ();
+    const next = prev
+        .catch (() => {}) // прошлая ошибка не должна ломать очередь
+        .then (() => musicRest.put (Routes.channelVoiceStatus (channelId), { body: { status: status } }))
+        .catch (e =>
+        {
+            console.error ('[' + (d()) + '] [music] статус канала не ' +
+                (status === null ? 'снялся: ' : 'записался: ') + e.message);
+            throw e; // вызывающий решает, что делать (writeVoiceStatus откатит состояние)
+        });
+    // когда очередь отпустила канал -- убираем хвост из памяти (но не глушим ошибку):
+    next.catch (() => {}).then
+    (
+        () => { if ($statusChain[channelId] === next) delete $statusChain[channelId]; }
+    );
+    $statusChain[channelId] = next;
+    return next;
 }
 
 // Снять статус с канала (при выходе/переезде) -- иначе в нём останется старая строка:
@@ -2869,8 +2964,7 @@ function clearVoiceStatus (channelId)
 {
     if (!channelId) return;
     // status: null -- это именно «снять статус» (по документации Discord):
-    musicRest.put (Routes.channelVoiceStatus (channelId), { body: { status: null } })
-        .catch (e => console.error ('[' + (d()) + '] [music] статус канала не снялся: ' + e.message));
+    voiceStatusPush (channelId, null).catch (() => {});
 }
 
 // Записать текущий статус в канал, где сидит бот:
@@ -2895,7 +2989,7 @@ async function writeVoiceStatus (guildId)
     st.last = Date.now ();
     try
     {
-        await musicRest.put (Routes.channelVoiceStatus (channelId), { body: { status: text } });
+        await voiceStatusPush (channelId, text);
     }
     catch (e)
     {
@@ -3033,7 +3127,8 @@ async function resumeMusic (server)
         console.log
         (
             '[' + (d()) + '] [music] возобновляю после перезапуска: «' + ch.name + '» -- ' +
-            (current ? (current.title || 'трек') + (elapsed ? ' (с ' + fmtDur (elapsed) + ')' : '') : 'очередь без текущего') +
+            (current ? (current.title || 'трек') + (current.isLive ? ' (эфир)' :
+                (elapsed ? ' (с ' + fmtDur (elapsed) + ')' : '')) : 'очередь без текущего') +
             (tracks.length ? ' + ещё ' + tracks.length + ' в очереди' : '')
         );
         schedulePresence (true);
@@ -3076,7 +3171,9 @@ function presenceNow ()
             (people ? ' · в канале ' + people : '');
         if (m.current)
         {
-            const icon = m.player.state.status === AudioPlayerStatus.Paused ? '⏸ ' : '🎶 ';
+            // [v2.11] у прямого эфира своя иконка -- 🔴 вместо 🎶 (длительности у него нет):
+            const icon = m.player.state.status === AudioPlayerStatus.Paused ? '⏸ '
+                : (m.current.isLive ? '🔴 ' : '🎶 ');
             const suffix = ' — ' + where + tail;
             // 128 символов -- лимит поля активности: режем НАЗВАНИЕ, а не хвост с очередью
             playing = icon + clipText (m.current.title || 'трек', 128 - icon.length - suffix.length) + suffix;
@@ -3210,12 +3307,25 @@ function destroyMusic (guildId)
         console.log ('[' + (d()) + '] [music] вышел из «' + (ch ? ch.name : chId) + '»');
 }
 
-// Форматирование длительности:
-function fmtDur (sec)
+// Форматирование длительности. isLive -- ПРЯМОЙ ЭФИР: у него длительности нет
+// и быть не может, поэтому показываем 🔴 LIVE. Если же длительность просто
+// неизвестна (yt-dlp не отдал число), это НЕ эфир -- показываем '--:--'
+// (раньше такое превращалось в «🔴 LIVE» и путало обычный трек с трансляцией).
+function fmtDur (sec, isLive = false)
 {
-    if (!sec || sec <= 0) return '🔴 LIVE';
+    if (isLive) return '🔴 LIVE';
+    if (!sec || sec <= 0) return '--:--';
     let h = sec / 3600 | 0, m = sec % 3600 / 60 | 0, s = sec % 60 | 0;
     return (h ? h + ':' + pad(m) : pad(m)) + ':' + pad(s);
+}
+
+// «Что играет» одной строкой: «🎶 Название — 03:35» / «🔴 Название» (эфир, у него
+// иконка уже сама всё говорит) / «⏸ Название — 03:35» (пауза).
+function nowPlayingLine (t, paused = false)
+{
+    if (!t) return null;
+    return (paused ? '⏸ ' : (t.isLive ? '🔴 ' : '🎶 ')) + (t.title || 'трек') +
+        (t.isLive ? '' : ' — ' + fmtDur (t.duration));
 }
 
 // Определение: ссылка или текстовый поиск:
@@ -3370,7 +3480,7 @@ client.on ('interactionCreate', async (interaction) =>
             (
                 '🎶 Добавлено: **' + (tracks[0].title || query) + '**' +
                 (tracks.length > 1 ? ' + ещё ' + (tracks.length - 1) + ' треков' : '') +
-                '\nИсточник: `' + tracks[0].author + '` | Длина: `' + fmtDur (tracks[0].duration) + '`' +
+                '\nИсточник: `' + tracks[0].author + '` | Длина: `' + fmtDur (tracks[0].duration, tracks[0].isLive) + '`' +
                 (wasIdle ? '\n▶️ Запускаю...' : '')
             );
             if (wasIdle)
@@ -3419,10 +3529,12 @@ client.on ('interactionCreate', async (interaction) =>
         {
             if (!m.current && !m.tracks.length)
                 return interaction.reply ('🈳 Очередь пуста.');
-            let list = m.tracks.slice (0, 10).map ((t, i) => (i + 1) + '. **' + t.title + '** `' + fmtDur (t.duration) + '`').join ('\n');
+            // [v2.11] у прямого эфира вместо длины -- 🔴 LIVE (иначе это выглядело
+            // как трек без данных), у обычного трека без длительности -- '--:--'
+            let list = m.tracks.slice (0, 10).map ((t, i) => (i + 1) + '. **' + t.title + '** `' + fmtDur (t.duration, t.isLive) + '`').join ('\n');
             return interaction.reply
             (
-                '🎵 **Сейчас:** ' + (m.current ? '**' + m.current.title + '** `' + fmtDur (m.current.duration) + '`' : '—') +
+                '🎵 **Сейчас:** ' + (m.current ? (m.current.isLive ? '🔴 ' : '') + '**' + m.current.title + '** `' + fmtDur (m.current.duration, m.current.isLive) + '`' : '—') +
                 (m.tracks.length ? '\n\n**Далее (' + m.tracks.length + '):**\n' + list : '')
             );
         }

@@ -14,9 +14,7 @@
       "allow": true,
       "name": "НАЗВАНИЕ_СЕРВЕРА",
       "logo": "images/pandamia.png",
-      "admins": ["ID_АДМИНА"],
       "log_channel": "ID_КАНАЛА_ЖУРНАЛА",
-      "log_channel_temp": "ID_ВРЕМЕННОГО_КАНАЛА",
       "pipe_channel_source": "ID_КАНАЛА_ИСТОЧНИКА",
       "pipe_channel_target": "ID_КАНАЛА_ПРИЁМНИКА",
       "channel_common": "ID_ОБЩЕГО_КАНАЛА",
@@ -35,8 +33,7 @@
       "welcome_message": "ID_СООБЩЕНИЯ",
       "onLeaveBanTimeout": 20,
       "onLeaveBanRealy": false,
-      "onEnterBanRealy": true,
-      "afkLikeChannels": []
+      "onEnterBanRealy": true
     }
   }
 }
