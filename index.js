@@ -18,6 +18,20 @@
 //   * channelCreate/channelUpdate: в v14 каналы приходят без guild -> берём через .guild ?? client.guilds.cache.get
 //   * [FIX v2] NaN-баг в логе переименования: скобки вокруг 'Владельцы канала: ' + (owners.size ? ... : ...)
 //   * [FIX v2] e.message там, где e не существует (users.fetch .catch(() => null))
+// CHANGELOG v2.15 (управление наказаниями, история за месяц, чистый лог событий):
+//   * [/unban user:@кто reason:...] -- снять таймаут/бан вручную (админ/модер): снимается
+//     и запись таймаута в базе, и бан в Discord, и отложенный таймер разбона (иначе он
+//     позже написал бы «unbanned» уже после ручного снятия). Кто снял и почему -- в журнал,
+//     в лог и в историю (/bans).
+//   * ИСТОРИЯ НАКАЗАНИЙ (bans_history_days, по умолчанию 30 дн): /bans показывает, кто
+//     сколько раз выходил с сервера, получал таймаут/бан и у кого наказание снимали.
+//     Пишутся события exit/timeout/ban/unban, окно -- bans_history_days, старые записи
+//     убираются свипом вместе с остальными (база не растёт бесконечно).
+//   * [FIX] СПАМ В ЛОГЕ «[nick] +🔑 (sweep)» каждые 45 секунд: fetch(id) БЕЗ force
+//     возвращал КЭШ (а в кэше ник старый -- discord.js без интента GuildMembers его не
+//     обновляет), поэтому свип заново «ставил» уже стоящий ключ и писал ту же строку.
+//     Теперь ник читается из REST (force: true) и только когда состояние неизвестно, а
+//     что бот поставил сам -- помнится в памяти процесса ($nickSet).
 // CHANGELOG v2.14 (по просьбам владельца: видеть наказания, помнить роли, удобная очередь):
 //   * [ban] ОТЧЁТ ПРИ СТАРТЕ: сколько банов/таймаутов поднято из базы -- пишется ВСЕГДА,
 //     в том числе когда наказаний нет ('поднято 0: активных банов/таймаутов нет').
@@ -254,7 +268,8 @@ const STARTUP_DM_TEXT =
     '• за выход с сервера ставится таймаут (в этом конфиге 20 мин): перезаход\n' +
     '  раньше срока = бан до его конца\n' +
     '• кто сейчас в наказании -- у админов и модеров есть `/bans`: имя, точный\n' +
-    '  срок и причина (ответ виден только вызвавшему)\n' +
+    '  срок, причина и сводка за месяц (кто сколько раз выходил и был наказан);\n' +
+    '  снять наказание досрочно -- `/unban user:@кто` (ответ виден только staff)\n' +
     '\n' +
     '🧪 **Проверить на себе** (в чате, без `/`): `panda welcome` -- бот пришлёт\n' +
     'тебе такую же ЛС, что видят новички (`panda welcome @юзер` -- для другого).\n' +
@@ -367,6 +382,9 @@ for (let _server in SERVERS)
     // [v2.14] роли участников -- чтобы человек не терял их, выходя с сервера
     // (ключ -- id участника: возврат идёт именно по нему, см. restoreMemberRoles):
     $db[_server]['memberRoles']       = dbMake (_server, 'memberRoles');
+    // [v2.15] история наказаний -- для отчёта «кто сколько раз выходил и попадал»
+    // (ключ -- id участника, значение -- {at, events:[{at, kind}]}):
+    $db[_server]['banHistory']        = dbMake (_server, 'banHistory');
 }
 
 async function db (server, namespace, id, value = undefined, item = undefined)
@@ -1050,10 +1068,20 @@ function isStaff (server, member)
 // 45 секунд заново «ставил» уже поставленный ключ -- в логе одна и та же строка без конца,
 // а ключ у людей «появлялся только после перезахода». Меняем ник одной функцией: она и
 // ставит ник, и сразу правит локальное состояние, не дожидаясь события от Discord.
-async function setNickLogged (member, newNick)
+// [v2.15] И запоминаем его для свипа: если свежий ник прочитать не удалось, сверяться
+// будем с тем, что бот поставил сам, а не ставить одно и то же каждые 45 секунд.
+const $nickSet = {}; // server -> Map<uid, true|false>  (есть ли ключ, что поставил бот)
+function nickSetMark (server, uid, hasTag)
+{
+    if (!server) return;
+    const map = $nickSet[server] = $nickSet[server] || new Map ();
+    map.set (uid, !!hasTag);
+}
+async function setNickLogged (member, newNick, server)
 {
     await member.setNickname (newNick);
     member.nickname = newNick;
+    nickSetMark (server, member.user.id, newNick.startsWith ('🔑'));
 }
 
 async function modNick (server, member/*, add = false*/)
@@ -1072,7 +1100,7 @@ async function modNick (server, member/*, add = false*/)
                 if (nick.startsWith (tag))
                 {
                     console.log ('[' + (d()) + '] [nick] -🔑 (staff) ' + member.user.username);
-                    await setNickLogged (member, nick.slice (tag.length))
+                    await setNickLogged (member, nick.slice (tag.length), server)
                         .catch (e => console.error ('[nick] error on setNickname: ' + e.message));
                 }
                 return;
@@ -1095,7 +1123,7 @@ async function modNick (server, member/*, add = false*/)
                 {
                     let nickNew = tag + nick;
                     console.log ('[' + (d()) + '] [nick] +🔑 ' + member.user.username + ' in ' + member.voice.channel.name);
-                    await setNickLogged (member, nickNew)
+                    await setNickLogged (member, nickNew, server)
                         .catch (e => console.error ('[nick] error on setNickname: ' + e.message)); // [!] при ошибке прав -- видно в логе
                 }
             }
@@ -1106,7 +1134,7 @@ async function modNick (server, member/*, add = false*/)
                 if (nickNew !== nick)
                 {
                     console.log ('[' + (d()) + '] [nick] -🔑 ' + member.user.username);
-                    await setNickLogged (member, nickNew)
+                    await setNickLogged (member, nickNew, server)
                         .catch (e => console.error ('[nick] error on setNickname: ' + e.message));
                 }
             }
@@ -2238,12 +2266,126 @@ async function guildBans (server)
     return map;
 }
 
+// ============================================================================
+// [v2.15] ИСТОРИЯ НАКАЗАНИЙ: кто сколько раз выходил с сервера и сколько раз
+// получал таймаут/бан. Текущее наказание в базе -- одно число (до какого срока),
+// истории из него не видно, поэтому пишем отдельные события:
+//   exit    -- человек вышел с сервера (видит поллер)
+//   timeout -- за выход записан таймаут
+//   ban     -- реально выдан бан (сразу при выходе или при перезаходе в таймаут)
+//   unban   -- наказание снято (само по сроку или вручную через /unban)
+// Храним не больше save_roles-овских сроков: своё окно -- bans_history_days (30).
+// ============================================================================
+
+// Таймеры снятия наказаний: server -> Map<uid, timeout>. Нужны, чтобы можно было
+// ОТМЕНИТЬ снятие (/unban): иначе старый таймер сработает позже и попытается снять
+// то, что уже снято вручную (в лог попало бы «unbanned» после снятия).
+const $banTimers = {};
+function banTimerSet (server, uid, ms, fn)
+{
+    const map = $banTimers[server] = $banTimers[server] || new Map ();
+    banTimerClear (server, uid);
+    const t = setTimeout
+    (
+        () =>
+        {
+            if (map.get (uid) === t) map.delete (uid);
+            try { fn (); } catch (e) { console.error ('[ban] таймер ' + uid + ': ' + oneLine (e.message)); }
+        },
+        ms
+    );
+    map.set (uid, t);
+    return t;
+}
+function banTimerFor (server, uid)
+{
+    const map = $banTimers[server];
+    return !!(map && map.get (uid));
+}
+function banTimerClear (server, uid)
+{
+    const map = $banTimers[server];
+    if (!map) return false;
+    const t = map.get (uid);
+    if (!t) return false;
+    clearTimeout (t);
+    map.delete (uid);
+    return true;
+}
+
+function banHistoryDays (server)
+{
+    const days = Number ((SERVERS[server] || {}).bans_history_days);
+    return (days > 0) ? days : 30;
+}
+
+// Записать событие по человеку. Окно истории -- bans_history_days, плюс жёсткий
+// предел на длину списка (200), чтобы база не росла бесконечно.
+async function banHistoryAdd (server, uid, kind)
+{
+    if (!uid || !(kind in { exit: 1, timeout: 1, ban: 1, unban: 1 })) return;
+    try
+    {
+        const cut = Date.now () - banHistoryDays (server) * 86400000;
+        let rec = await db (server, 'banHistory', uid);
+        let events = (rec && Array.isArray (rec.events)) ? rec.events : [];
+        events.push ({ at: Date.now (), kind: kind });
+        events = events.filter (e => e && typeof e.at === 'number' && e.at >= cut).slice (-200);
+        await db (server, 'banHistory', uid, { at: Date.now (), events: events });
+    }
+    catch (e) { console.error ('[ban] не смог записать историю ' + uid + ': ' + oneLine (e.message)); }
+}
+
+// Сводка по истории за окно: кто сколько раз выходил, сколько таймаутов и банов.
+async function bansHistory (server)
+{
+    const cut = Date.now () - banHistoryDays (server) * 86400000;
+    const rows = [];
+    try
+    {
+        for await (const [id, rec] of $db[server]['banHistory'].iterator())
+        {
+            const events = (rec && Array.isArray (rec.events))
+                ? rec.events.filter (e => e && typeof e.at === 'number' && e.at >= cut)
+                : [];
+            if (!events.length) continue;
+            const c = k => events.filter (e => e.kind === k).length;
+            rows.push ({ id: id, exit: c ('exit'), timeout: c ('timeout'), ban: c ('ban'),
+                         unban: c ('unban'), last: Math.max (...events.map (e => e.at)) });
+        }
+    }
+    catch (e) { console.error ('[ban] история не прочиталась: ' + oneLine (e.message)); }
+    // Сначала те, у кого были баны, потом по выходам, потом по свежести:
+    rows.sort ((a, b) => (b.ban - a.ban) || (b.exit - a.exit) || (b.last - a.last));
+    return rows;
+}
+
+// Уборка: записи, где за окно не осталось ни одного события, больше не нужны.
+async function sweepBanHistory (server)
+{
+    const cut = Date.now () - banHistoryDays (server) * 86400000;
+    let keys = [];
+    try
+    {
+        for await (const [id, rec] of $db[server]['banHistory'].iterator())
+        {
+            const events = (rec && Array.isArray (rec.events)) ? rec.events : [];
+            if (!events.some (e => e && typeof e.at === 'number' && e.at >= cut)) keys.push (id);
+        }
+        for (const key of keys) await db (server, 'banHistory', key, null);
+    }
+    catch (e) { console.error ('[ban] уборка истории: ' + oneLine (e.message)); return; }
+    if (keys.length)
+        console.log ('[' + (d()) + '] [ban] история за ' + banHistoryDays (server) + ' дн: убрал ' + keys.length +
+            ' ' + plural (keys.length, 'запись', 'записи', 'записей') + ' без событий');
+}
+
 // Имена наказанных: у забаненного нет объекта участника (он не на сервере) -- берём
 // пользователя по REST. Если и его не отдали -- остаётся id (падать из-за этого нельзя).
 async function namesFor (ids)
 {
     const map = new Map ();
-    for (const id of ids.slice (0, 25))
+    for (const id of [...new Set (ids)].slice (0, 40))
     {
         let user = client.users.cache.get (id);
         if (!user) user = await client.users.fetch (id).catch (() => null);
@@ -2252,12 +2394,14 @@ async function namesFor (ids)
     return map;
 }
 
-// Одна сводка для старта и для /bans: строки -- по людям, каждая уже с точным сроком.
+// Одна сводка для старта и для /bans: строки -- по людям, каждая уже с точным сроком,
+// плюс история за окно bans_history_days.
 async function bansOverview (server)
 {
     const { active, expired } = await storedBans (server);
     const bans = await guildBans (server);
-    const names = await namesFor (active.map (a => a.id));
+    const hist = await bansHistory (server);
+    const names = await namesFor ([...active.map (a => a.id), ...hist.map (h => h.id)]);
     const rows = active.map (a =>
     ({
         id: a.id,
@@ -2268,28 +2412,50 @@ async function bansOverview (server)
         left: dd (a.until),
         at: d (a.until, true),
     }));
-    return { rows, expired };
+    const histRows = hist.slice (0, 10).map (h => Object.assign ({}, h, { name: names.get (h.id) || h.id }));
+    return { rows, expired, hist, histRows, histDays: banHistoryDays (server) };
 }
 
-// Текст отчёта для человека (ЛС/ответ на /bans): имена, сроки, причина.
+// Текст отчёта для человека (ЛС/ответ на /bans): имена, сроки, причина + история.
 function bansReportText (o, max = 20)
 {
     const banned = o.rows.filter (r => r.isBan).length;
+    let text;
     if (!o.rows.length)
-        return '✅ Активных банов и таймаутов нет' +
+        text = '✅ Активных банов и таймаутов нет' +
             (o.expired.length
                 ? ' (просроченных записей в базе: ' + o.expired.length + ' -- бот снимет их в ближайшем тике)'
                 : '') + '.';
-    const lines = o.rows.slice (0, max).map (r =>
-        '• **' + r.name + '** -- ' + (r.isBan ? '🚫 бан' : '⏳ таймаут') +
-        ', снимется `' + r.at + '` (через `' + r.left + '`)' +
-        (r.reason ? '\n  причина: `' + clipText (oneLine (r.reason, 160), 160) + '`' : ''))
-        .join ('\n');
-    return '🛡️ **Наказания сейчас (' + o.rows.length + ': ' + banned + ' ' + plural (banned, 'бан', 'бана', 'банов') +
-        ', ' + (o.rows.length - banned) + ' ' + plural (o.rows.length - banned, 'таймаут', 'таймаута', 'таймаутов') + ')**\n' +
-        lines +
-        (o.rows.length > max ? '\n*...и ещё ' + (o.rows.length - max) + '*' : '') +
-        (o.expired.length ? '\n_Просроченных записей в базе: ' + o.expired.length + ' -- снимутся сами._' : '');
+    else
+    {
+        const lines = o.rows.slice (0, max).map (r =>
+            '• **' + r.name + '** -- ' + (r.isBan ? '🚫 бан' : '⏳ таймаут') +
+            ', снимется `' + r.at + '` (через `' + r.left + '`)' +
+            (r.reason ? '\n  причина: `' + clipText (oneLine (r.reason, 160), 160) + '`' : ''))
+            .join ('\n');
+        text = '🛡️ **Наказания сейчас (' + o.rows.length + ': ' + banned + ' ' + plural (banned, 'бан', 'бана', 'банов') +
+            ', ' + (o.rows.length - banned) + ' ' + plural (o.rows.length - banned, 'таймаут', 'таймаута', 'таймаутов') + ')**\n' +
+            lines +
+            (o.rows.length > max ? '\n*...и ещё ' + (o.rows.length - max) + '*' : '') +
+            (o.expired.length ? '\n_Просроченных записей в базе: ' + o.expired.length + ' -- снимутся сами._' : '');
+    }
+    // [v2.15] История за окно: кто сколько раз выходил и сколько раз получал наказание.
+    // Она копится с этой версии -- у более старых событий данных просто нет.
+    if (o.hist)
+    {
+        const days = o.histDays || 30;
+        if (!o.hist.length)
+            text += '\n\n📊 За ' + days + ' дн наказаний не было (история ведётся с этой версии).';
+        else
+            text += '\n\n📊 **За ' + days + ' дн (' + o.hist.length + ' ' +
+                plural (o.hist.length, 'человек', 'человека', 'человек') + '):**\n' +
+                o.histRows.map (h =>
+                    '• **' + h.name + '** -- выходов ' + h.exit + ', таймаутов ' + h.timeout +
+                    ', банов ' + h.ban + (h.unban ? ', снято ' + h.unban : '') +
+                    ' _(последнее: ' + d (h.last, true) + ')_').join ('\n') +
+                (o.hist.length > o.histRows.length ? '\n*...и ещё ' + (o.hist.length - o.histRows.length) + '*' : '');
+    }
+    return text;
 }
 
 // [v2.14] Строка при СТАРТЕ: сколько наказаний поднято из базы. Пишется ВСЕГДА --
@@ -2529,17 +2695,19 @@ async function handleMemberJoin (server, uid, raw)
                 // сколько оставалось и до какого момента (по секундам, без «~»).
                 console.log ('[' + (d()) + '] member ' + username + ' banned until ' + d (until, true) +
                     ' (left ' + dd (until) + ', re-enter during timeout)');
-                setTimeout
-                (
-                    async () =>
+                banHistoryAdd (server, uid, 'ban');
+                // [v2.15] таймер снятия -- через реестр, чтобы /unban мог его отменить
+                banTimerSet (server, uid, left, async () =>
+                {
+                    await db (server, 'membersBanTimeout', uid, null);
+                    guild.members.unban (uid)
+                    .then (u =>
                     {
-                        await db (server, 'membersBanTimeout', uid, null);
-                        guild.members.unban (uid)
-                        .then (u => console.log ('[' + (d()) + '] member ' + (u ? u.username : uid) + ' unbanned (timeout over)'))
-                        .catch (e => console.error ('[memberJoin] unban: ' + e.message + ' -- unbanned already ?'));
-                    },
-                    left // остаток срока (а не весь таймаут заново)
-                );
+                        banHistoryAdd (server, uid, 'unban');
+                        console.log ('[' + (d()) + '] member ' + (u ? u.username : uid) + ' unbanned (timeout over)');
+                    })
+                    .catch (e => console.error ('[memberJoin] unban: ' + e.message + ' -- unbanned already ?'));
+                });
             }
         )
         .catch (e => console.error ('[memberJoin] ban error: ' + e.message));
@@ -2563,6 +2731,9 @@ async function handleMemberLeave (server, uid, raw)
     // [v2.14] Сначала запоминаем роли выходящего -- ДО таймаута и до любых банов.
     // Это делает сама PANDAMIA (раньше это умел только сторонний бот), см. saveMemberRoles.
     await saveMemberRoles (server, uid, raw);
+    // [v2.15] Сам выход записываем в историю ВСЕГДА (даже если таймаут-механизм выключен):
+    // /bans показывает «кто сколько раз выходил с сервера» именно по этим событиям.
+    await banHistoryAdd (server, uid, 'exit');
     if (await db (server, 'membersBanTimeout', uid))
     {
         // Уже в таймауте (перезаход) -- банить повторно не надо.
@@ -2587,23 +2758,24 @@ async function handleMemberLeave (server, uid, raw)
             async () =>
             {
                 await db (server, 'membersBanTimeout', uid, untilLeave);
+                banHistoryAdd (server, uid, 'ban');
                 // [v2.13] бан выдан сразу при выходе (onLeaveBanRealy: true)
                 console.log ('[' + (d()) + '] member ' + username + ' banned until ' + d (untilLeave, true) +
                     ' (' + onLeaveBanTimeout + ' min., on leave)');
-                setTimeout
-                (
-                    async () =>
-                    {
-                        await db (server, 'membersBanTimeout', uid, null);
-                        guild.members.unban (uid)
-                        .then
-                        (
-                            user => console.log ('[' + (d()) + '] member ' + (user ? user.username : uid) + ' unbanned (timeout over)')
-                        )
-                        .catch (e => console.error ('[memberLeave] unban: ' + e.message + ' -- unbanned already ?'));
-                    },
-                    onLeaveBanTimeout * 60 * 1000
-                );
+                banTimerSet (server, uid, onLeaveBanTimeout * 60 * 1000, async () =>
+                {
+                    await db (server, 'membersBanTimeout', uid, null);
+                    guild.members.unban (uid)
+                    .then
+                    (
+                        user =>
+                        {
+                            banHistoryAdd (server, uid, 'unban');
+                            console.log ('[' + (d()) + '] member ' + (user ? user.username : uid) + ' unbanned (timeout over)');
+                        }
+                    )
+                    .catch (e => console.error ('[memberLeave] unban: ' + e.message + ' -- unbanned already ?'));
+                });
             }
         )
         .catch (e => console.error ('[memberLeave] ban error: ' + e.message));
@@ -2616,18 +2788,15 @@ async function handleMemberLeave (server, uid, raw)
         // бана не было -- теперь написано ровно то, что сделано.
         const untilTimeout = Date.now () + onLeaveBanTimeout * 60 * 1000;
         await db (server, 'membersBanTimeout', uid, untilTimeout);
+        banHistoryAdd (server, uid, 'timeout');
         console.log ('[' + (d()) + '] member ' + username + ' timeout until ' + d (untilTimeout, true) +
             ' (' + onLeaveBanTimeout + ' min., ban -- only if re-enters earlier)');
-        setTimeout
-        (
-            async () =>
-            {
-                await db (server, 'membersBanTimeout', uid, null);
-                console.log ('[' + (d()) + '] member ' + username + ' timeout expired after ' + onLeaveBanTimeout +
-                    ' min. (did not come back)');
-            },
-            onLeaveBanTimeout * 60 * 1000
-        );
+        banTimerSet (server, uid, onLeaveBanTimeout * 60 * 1000, async () =>
+        {
+            await db (server, 'membersBanTimeout', uid, null);
+            console.log ('[' + (d()) + '] member ' + username + ' timeout expired after ' + onLeaveBanTimeout +
+                ' min. (did not come back)');
+        });
     }
 }
 
@@ -2776,37 +2945,41 @@ async function sweepNicks (server)
                 ow.allow.has (PermissionsBitField.Flags.MuteMembers)
             );
             // [FIX v2.3.2] VoiceState несёт member из гейтвея (vs.member) даже без
-            // GuildMembers-интента; fetch по id нужен только как страховка.
-            // (vs.user_id -- сырого API-поля в v14 нет, fetch(undefined) вечно падал):
-            // [FIX v2.3.6] ник берём СВЕЖИМ: без GuildMembers-интента бот не получает
-            // события GUILD_MEMBER_UPDATE (смена ника), кэш знает ник старым --
-            // самодорисованный ключ для свипа невидим (срабатывал только войс-статус).
-            // REST fetch всегда возвращает актуальные данные:
-            let member = await guild.members.fetch (vs.id).catch (() => null)
-                             || vs.member;
-            if (!member || member.user.bot) continue;
+            // GuildMembers-интента; REST нужен только чтобы прочитать СВЕЖИЙ ник
+            // (без интента кэш не обновляется на смену ника -- [FIX v2.3.6]).
+            const base = vs.member || guild.members.cache.get (vs.id);
+            if (!base || base.user.bot) continue;
             checked++;
+            // Каким ник ДОЛЖЕН быть: 🔑 -- всем, у кого права в канале, кроме ADM/MOD
+            // ([v2.3.5]: у staff ключа нет, даже самодорисованный бот снимает).
+            const wantTag = hasRights && !isStaff (server, base);
+            // [FIX v2.15] Уже знаем, что ник такой, каким должен быть? Тогда сверять нечего.
+            // Раньше здесь был REST-запрос и ПОВТОРНАЯ запись того же 🔑 каждые 45 сек, и в
+            // лог шла одна и та же строка «+🔑 (sweep)» -- тот самый спам. Теперь сверяемся
+            // с состоянием, которое бот поставил сам.
+            const known = $nickSet[server] ? $nickSet[server].get (vs.id) : undefined;
+            if (known === wantTag) continue;
+            // Не знаем -- читаем РЕАЛЬНЫЙ ник из REST. fetch(id) БЕЗ force вернул бы кэш
+            // (discord.js: «есть в кэше -- в REST не идём»), а в кэше ник старый.
+            let member = await guild.members.fetch ({user: vs.id, force: true}).catch (() => null);
+            const fresh = !!member; // прочитали из REST, а не из кэша/войс-события
+            if (!member) member = base;
+            if (!member || member.user.bot) continue;
             let nick = member.nickname || member.user.username;
             // [FIX v2.3.3] charCodeAt (0xD83D) ловит ЛЮБОЙ эмодзи в начале ника
             // (💙, 🔊...) и свип срезал их, думая что это ключ. Точная проверка:
-            let hasTag = nick.startsWith ('🔑'); // 🔑
-            // [v2.3.5] ADM/MOD: ключ = права для обычных, у staff его быть не должно --
-            // даже самодорисованный удаляем (и это единственное, что бот делает с их никами):
-            if (isStaff (server, member))
-            {
-                if (hasTag)
-                    await setNickLogged (member, nick.slice (tag.length))
-                        .then (() => { removed++; console.log ('[' + (d()) + '] [nick] -🔑 (staff) ' + member.user.username); })
-                        .catch (e => console.error ('[nick][sweep] error for ' + member.user.username + ': ' + e.message));
-                continue;
-            }
-            if (hasRights && !hasTag)
-                await setNickLogged (member, tag + nick)
+            let hasTag = nick.startsWith (tag); // 🔑
+            // Свежий ник не прочитался (REST не отдал, сети нет)? Тогда верим тому, что
+            // бот поставил сам: повторная установка -- не событие и не должна шуметь.
+            if (!fresh && known !== undefined) hasTag = known;
+            if (hasTag === wantTag) { nickSetMark (server, vs.id, hasTag); continue; } // уже так
+            if (wantTag)
+                await setNickLogged (member, tag + nick, server)
                     .then (() => { added++; console.log ('[' + (d()) + '] [nick] +🔑 (sweep) ' + member.user.username + ' in ' + channel.name); })
                     .catch (e => console.error ('[nick][sweep] error for ' + member.user.username + ': ' + e.message));
-            else if (!hasRights && hasTag)
-                await setNickLogged (member, nick.slice (tag.length))
-                    .then (() => { removed++; console.log ('[' + (d()) + '] [nick] -🔑 (sweep) ' + member.user.username); })
+            else
+                await setNickLogged (member, nick.slice (tag.length), server)
+                    .then (() => { removed++; console.log ('[' + (d()) + '] [nick] -🔑 ' + (isStaff (server, member) ? '(staff) ' : '(sweep) ') + member.user.username); })
                     .catch (e => console.error ('[nick][sweep] error for ' + member.user.username + ': ' + e.message));
         }
         // [v2.4] итог свипа -- только в DEBUG (периодический шум в логе ни к чему):
@@ -2875,7 +3048,7 @@ async function tempCreateFor (server, member)
         let nick = member.nickname || member.user.username;
         // [FIX v2.3.3] точная проверка ключа (см. комментарий в sweepNicks):
         if (!nick.startsWith ('🔑'))
-            await setNickLogged (member, '🔑' + nick)
+            await setNickLogged (member, '🔑' + nick, server)
                 .then (() => console.log ('[' + (d()) + '] [nick] +🔑 (temp) ' + member.user.username))
                 .catch (e => console.error ('[temp] error on setNickname: ' + e.message));
     }
@@ -3026,6 +3199,8 @@ client.on
             await sweepExpiredBans (server);
             // [v2.14] убрать слишком старые записи о ролях (save_roles_days):
             await sweepSavedRoles (server);
+            // [v2.15] история наказаний: старые события (bans_history_days) убираются сами.
+            await sweepBanHistory (server);
             // [v2.3] почистить пустые личные каналы после рестарта:
             await tempSweep (server);
             // [v2.10] вернуть музыку с прошлого запуска (очередь + тот же канал):
@@ -3044,6 +3219,7 @@ client.on
                             () => pollMembers (server),
                             () => sweepExpiredBans (server),
                             () => sweepSavedRoles (server),   // [v2.14] старые записи о ролях
+                            () => sweepBanHistory (server),   // [v2.15] старая история наказаний
                             () => sweepNicks (server),        // ключи 🔑
                             () => tempSweep (server),         // пустые кабинеты
                             () => tempLobbyCheck (server),    // лобби -> кабинет
@@ -4551,6 +4727,18 @@ const musicCommands =
     new SlashCommandBuilder ()
         .setName ('bans')
         .setDescription ('Активные баны и таймауты: кто, до какого времени и за что (админы/модеры)'),
+    // [v2.15] /unban -- снять наказание вручную (админы/модеры). Ответ виден только
+    // вызвавшему; снятие попадает и в журнал, и в историю (/bans).
+    new SlashCommandBuilder ()
+        .setName ('unban')
+        .setDescription ('Снять таймаут или бан с человека (админы/модеры)')
+        .addUserOption (o =>
+            o.setName ('user')
+             .setDescription ('С кого снять наказание')
+             .setRequired (true))
+        .addStringOption (o =>
+            o.setName ('reason')
+             .setDescription ('Причина снятия (уйдёт в журнал и в аудит Discord)')),
     new SlashCommandBuilder ()
         .setName ('queue')
         .setDescription ('Показать очередь треков')
@@ -4644,6 +4832,80 @@ client.on ('interactionCreate', async (interaction) =>
         console.log ('[' + (d()) + '] [ban] /bans: активных ' + o.rows.length +
             ', банов ' + o.rows.filter (r => r.isBan).length);
         return interaction.editReply ({ content: bansReportText (o) });
+    }
+    // [v2.15] /unban -- снять наказание вручную (только staff). Снимаем ровно то, что
+    // реально есть: бан в Discord, запись таймаута в базе и отложенный таймер (иначе
+    // он позже сработает и напишет в лог «unbanned» уже после ручного снятия).
+    // Кто снял и почему -- в журнал и в историю (/bans).
+    if (name === 'unban')
+    {
+        if (!isStaffInteraction (interaction))
+            return interaction.reply ({ content: '🚫 Команда только для админов и модеров.', flags: MessageFlags.Ephemeral });
+        const server = interaction.guildId;
+        const guild = client.guilds.cache.get (server);
+        const target = interaction.options.getUser ('user', true);
+        const who = interaction.member ? uuu (interaction.member) : interaction.user.username;
+        const why = (interaction.options.getString ('reason') || '').trim ();
+        const reason = 'Снято вручную (' + who + ')' + (why ? ': ' + why : '');
+        await interaction.deferReply ({ flags: MessageFlags.Ephemeral });
+        // Что именно было: срок из базы, таймер из памяти и настоящий бан из Discord.
+        const until = await db (server, 'membersBanTimeout', target.id).catch (() => null);
+        const hasRecord = (until !== null && until !== undefined);
+        let hadBan = false, banErr = '';
+        try { await guild.bans.fetch (target.id); hadBan = true; }
+        catch (e) { if (!/Unknown Ban|10026/i.test (e.message)) banErr = oneLine (e.message); }
+        if (!hadBan && !hasRecord && !banTimerFor (server, target.id))
+            return interaction.editReply
+            (
+                'ℹ️ У **' + target.username + '** нет ни таймаута, ни бана -- снимать нечего.' +
+                (banErr ? '\n_Бан не проверился: `' + banErr + '`._' : '')
+            );
+        // [!!!] Сначала СНИМАЕМ бан и только потом чистим запись и таймер (как в
+        // sweepExpiredBans): если снять не удалось по-настоящему (нет прав, сеть),
+        // запись остаётся -- иначе бот «забудет» о человеке, который всё ещё в бане.
+        if (hadBan)
+        {
+            try { await guild.members.unban (target.id, reason); }
+            catch (e) { return interaction.editReply ('⚠️ Не смог снять бан с **' + target.username + '**: `' + oneLine (e.message) + '`'); }
+        }
+        banTimerClear (server, target.id);
+        if (hasRecord)
+            await db (server, 'membersBanTimeout', target.id, null).catch (() => {});
+        banHistoryAdd (server, target.id, 'unban');
+        // Что было снято (одной фразой; таймер без записи -- тоже повод отчитаться):
+        const what = hadBan ? ('бан' + (hasRecord ? ' и таймаут' : ''))
+                            : (hasRecord ? 'таймаут' : 'таймер разбана');
+        const till = until ? ', срок был до `' + d (until, true) + '`' : '';
+        console.log ('[' + (d()) + '] [ban] ' + who + ' снял наказание с ' + target.username +
+            ' (' + what + till + (why ? ', причина: ' + oneLine (why, 120) : '') + ')');
+        logTo (SERVERS[server].log_channel).send
+        (
+            {
+                embeds:
+                [
+                    {
+                        author:
+                        {
+                            name: uu (target),
+                            icon_url: target.displayAvatarURL ({extension: 'png', forceStatic: false, size: 1024}),
+                        },
+                        color: 0x00FF00, // 'GREEN'
+                        description: '**' + uu (target) + '** снято наказание: ' + what + till + ' 🕊️\n' +
+                            'Снял: **' + who + '**' + (why ? '\nПричина: `' + clipText (oneLine (why, 300), 300) + '`' : ''),
+                        footer:
+                        {
+                            text: SERVERS[server].name,
+                        },
+                        timestamp: dt(),
+                    },
+                ]
+            }
+        );
+        return interaction.editReply
+        (
+            '✅ С **' + target.username + '** снято: ' + what + till + '.' +
+            '\nВ журнале отмечено (кто и когда).'
+        );
     }
     if (!['play','join','stop','skip','pause','resume','queue','leave','remove','clear','jump','move'].includes (name)) return;
     const guildId = interaction.guildId;
