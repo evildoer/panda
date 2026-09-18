@@ -70,7 +70,7 @@
 //   * [/rolecheck user:@кто] -- что бот помнит о человеке: роли (save_roles), что
 //     вернёт при входе, текущее наказание с точным сроком и историю за окно.
 //     Работает и для того, кто НЕ на сервере (одиночный REST-запрос без интента).
-//   * [/queue] 25 треков на страницу (было 10) + защита от лимита сообщения 2000
+//   * [/queue] до 25 треков на страницу (было 10) + защита от лимита сообщения 2000
 //     символов (страница собирается по бюджету, листание идёт по показанным номерам).
 //   * [/queue] КНОПКИ-СТРЕЛКИ: меню «🎚 Двигать трек» + «⬆ Выше» / «⬇ Ниже» / «✖ Готово».
 //     Логика перестановки -- общая с /move (queueMove), авторство -- в логе.
@@ -100,10 +100,10 @@
 //     и запись таймаута в базе, и бан в Discord, и отложенный таймер разбона (иначе он
 //     позже написал бы «unbanned» уже после ручного снятия). Кто снял и почему -- в журнал,
 //     в лог и в историю (/bans).
-//   * ИСТОРИЯ НАКАЗАНИЙ (bans_history_days, по умолчанию 30 дн): /bans показывает, кто
-//     сколько раз выходил с сервера, получал таймаут/бан и у кого наказание снимали.
-//     Пишутся события exit/timeout/ban/unban, окно -- bans_history_days, старые записи
-//     убираются свипом вместе с остальными (база не растёт бесконечно).
+//   * ИСТОРИЯ НАКАЗАНИЙ (bans_history_days, по умолчанию НАВСЕГДА): /bans показывает,
+//     кто сколько раз выходил с сервера, получал таймаут/бан и у кого наказание
+//     снимали. Пишутся события exit/timeout/ban/unban. Ключ = 0 (или не задан) --
+//     копим всю статистику; задано число дней -- старые события убирает свип.
 //   * [FIX] СПАМ В ЛОГЕ «[nick] +🔑 (sweep)» каждые 45 секунд: fetch(id) БЕЗ force
 //     возвращал КЭШ (а в кэше ник старый -- discord.js без интента GuildMembers его не
 //     обновляет), поэтому свип заново «ставил» уже стоящий ключ и писал ту же строку.
@@ -121,7 +121,7 @@
 //     кладутся в базу (ключ -- id), на входе ДОБАВЛЯЮТСЯ недостающие -- ничего не
 //     снимаем, поэтому это мирно сосуществует с другим ботом-хранителем ролей.
 //     Не храним @everyone/роли интеграций/удалённые роли; список исключений --
-//     save_roles_exclude, срок хранения -- save_roles_days (30 дн, чистится свипом).
+//     save_roles_exclude, срок хранения -- save_roles_days (0 = НАВСЕГДА, по умолчанию).
 //   * ОЧЕРЕДЬ ГЛАЗАМИ DJ: в /queue виден автор каждого трека ('· 👤 ник'), сколько
 //     уже играет текущий и СКОЛЬКО ВСЕГО ждать до конца плейлиста (с учётом позиции
 //     в текущем треке; эфиры и треки без длины -- отдельно); у длинных очередей --
@@ -142,7 +142,13 @@
 //   * КОНТАКТЫ В ПОМОЩИ: OWNER (владелец ХОСТИНГА) + owner_server (владелец сервера),
 //     каждый показывается по своему флагу show_owner_hoster / show_owner_server.
 //   * [panda welcome] -- посмотреть глазами новичка, какое приветствие уходит в ЛС
-//     (без аргумента -- себе; другому -- только админ).
+//     (без аргумента -- себе; другому -- только админ). С v2.18 то же умеет слэш
+//     /welcome -- она останется, даже если Discord заберёт интент Message Content.
+//   * [welcome_prefix] (по умолчанию true): false -- в ЛС уходит ТОЛЬКО текст и
+//     картинки из сообщения с правилами (+ссылка), без описания бота.
+//   * [v2.18] /queue: страница заполняется ДО ЛИМИТА Discord (было жёстко 1500
+//     символов = 22 трека), автор у идущих подряд треков одного человека -- один раз.
+//   * [v2.18] /forget (staff): удалить сохранённое о человеке (роли + история).
 //   * лог трека -- ОДНА строка: 'играю: X (из предзагрузки, без паузы)' вместо
 //     отдельной строки 'предзагрузка сыграла: X', которую читали как «прошлый отыграл».
 // CHANGELOG v2.13 (приветствие новичкам + лог бан-таймаута по факту):
@@ -342,7 +348,8 @@ const STARTUP_DM_TEXT =
     '  DJ может просто собирать плейлист -- бот зайдёт, когда позовёшь.\n' +
     '`/queue` -- что играет и что дальше: номера, автор каждого трека, сколько уже\n' +
     '  играет текущий и сколько ещё ждать до конца плейлиста целиком. На странице\n' +
-    '  25 треков, у длинных очередей есть кнопки «◀ Назад / Вперёд ▶» (и `from:26`).\n' +
+    '  до 25 треков (у одного автора подряд он не повторяется), у длинных очередей\n' +
+    '  есть кнопки «◀ Назад / Вперёд ▶» (и `from:26`).\n' +
     '  Под очередью -- быстрые кнопки: «⏭ Пропустить», «🧹 Очистить», меню\n' +
     '  «🗑 Убрать трек» и «🎚 Двигать трек» (после выбора появляются «⬆ Выше»/«⬇ Ниже»,\n' +
     '  а номер виден в списке) -- номера те же, что в `/remove`, жмёт тот, у кого права DJ\n' +
@@ -392,9 +399,11 @@ const STARTUP_DM_TEXT =
     '  Content для всего этого не нужен\n' +
     '• что бот помнит о человеке (роли, наказания и что вернёт при входе) --\n' +
     '  `/rolecheck user:@кто`: можно проверить и того, кто не на сервере\n' +
+    '• удалить сохранённое о человеке (роли и история) -- `/forget user:@кто` (staff)\n' +
     '\n' +
-    '🧪 **Проверить на себе** (в чате, без `/`): `panda welcome` -- бот пришлёт\n' +
-    'тебе такую же ЛС, что видят новички (`panda welcome @юзер` -- для другого).\n' +
+    '🧪 **Проверить на себе:** `/welcome` -- бот пришлёт в ЛС то же приветствие, что\n' +
+    'видят новички (`/welcome user:@юзер` -- другому, staff). В чате то же самое\n' +
+    'делает `panda welcome` (работает, пока Discord не забрал Message Content).\n' +
     '\n' +
     '🔑 **Тег 🔑 в нике** -- права в этом канале есть. У ADM/MOD тега нет: у них права и так.\n' +
     '\n' +
@@ -1106,24 +1115,17 @@ client.on ('messageCreate', async message =>
                     if (!user)
                         return message.channel.send ({ content: '🤔 Пользователь `' + targetId + '` не найден.' })
                         .catch (console.error);
-                    try
+                    // [v2.18] Логика переехала в welcomeCheckSend -- та же, что у
+                    // слэш-команды /welcome (без интента Message Content она останется).
+                    const who = message.member ? uuu (message.member) : message.author.username;
+                    const res = await welcomeCheckSend (server, user, who);
+                    if (res.ok)
                     {
-                        // [v2.17] refresh: правишь welcome_message и сразу видишь результат
-                        // (без ожидания 10-минутного кэша этого сообщения).
-                        const src = await welcomeSource (server, true);
-                        await user.send ({ embeds: [await welcomeEmbed (server, user)] });
-                        console.log ('[' + (d()) + '] [welcome] проверка: ' +
-                            (message.member ? uuu (message.member) : message.author.username) + ' -> ' + uu (user) +
-                            (src ? ' -- с текстом' + (src.images.length ? ' и картинкой' : '') + ' из сообщения с правилами'
-                                 : ' -- только ссылка (сообщение с правилами не прочиталось)'));
                         message.channel.send ({ content: '✅ Приветствие отправлено в ЛС: ' + u (user.id) }).catch (console.error);
                         message.delete ().catch (console.error);
                     }
-                    catch (e)
-                    {
-                        console.error ('[' + (d()) + '] [welcome] проверка: ЛС не ушло (' + e.message + ')');
-                        message.channel.send ({ content: '⚠️ ЛС не ушло: `' + code (e.message) + '`' }).catch (console.error);
-                    }
+                    else
+                        message.channel.send ({ content: '⚠️ ' + res.why }).catch (console.error);
                 }
                 // command 'test' ## в текстовом канале команда просто убирается из чата
                 // (само ЛС отправил блок выше -- см. 'test' / self-test)
@@ -2566,7 +2568,8 @@ async function guildBans (server)
 //   timeout -- за выход записан таймаут
 //   ban     -- реально выдан бан (сразу при выходе или при перезаходе в таймаут)
 //   unban   -- наказание снято (само по сроку или вручную через /unban)
-// Храним не больше save_roles-овских сроков: своё окно -- bans_history_days (30).
+// Срок хранения -- bans_history_days: 0 (по умолчанию) -- копим всегда, число -- окно.
+// Плюс жёсткий предел на длину списка событий (200), чтобы одна запись не росла вечно.
 // ============================================================================
 
 // Таймеры снятия наказаний: server -> Map<uid, timeout>. Нужны, чтобы можно было
@@ -2605,10 +2608,20 @@ function banTimerClear (server, uid)
     return true;
 }
 
+// [v2.18] Срок хранения истории наказаний. 0 (или не задано) -- НАВСЕГДА: статистика
+// за годы ценнее, чем съезжающее окно. Свип в этом случае вообще ничего не удаляет.
 function banHistoryDays (server)
 {
     const days = Number ((SERVERS[server] || {}).bans_history_days);
-    return (days > 0) ? days : 30;
+    if (!Number.isFinite (days)) return 0; // не задано -- храним всегда
+    return (days > 0) ? Math.floor (days) : 0;
+}
+
+// Окно истории в человеческом виде: «за 30 дн» или «за всё время».
+function banHistoryLabel (server)
+{
+    const days = banHistoryDays (server);
+    return days ? ('за ' + days + ' дн') : 'за всё время';
 }
 
 // Записать событие по человеку. Окно истории -- bans_history_days, плюс жёсткий
@@ -2618,7 +2631,8 @@ async function banHistoryAdd (server, uid, kind)
     if (!uid || !(kind in { exit: 1, timeout: 1, ban: 1, unban: 1 })) return;
     try
     {
-        const cut = Date.now () - banHistoryDays (server) * 86400000;
+        const days = banHistoryDays (server);
+        const cut = days ? Date.now () - days * 86400000 : 0;
         let rec = await db (server, 'banHistory', uid);
         let events = (rec && Array.isArray (rec.events)) ? rec.events : [];
         events.push ({ at: Date.now (), kind: kind });
@@ -2631,7 +2645,8 @@ async function banHistoryAdd (server, uid, kind)
 // Сводка по истории за окно: кто сколько раз выходил, сколько таймаутов и банов.
 async function bansHistory (server)
 {
-    const cut = Date.now () - banHistoryDays (server) * 86400000;
+    const days = banHistoryDays (server);
+    const cut = days ? Date.now () - days * 86400000 : 0;
     const rows = [];
     try
     {
@@ -2655,6 +2670,8 @@ async function bansHistory (server)
 // Уборка: записи, где за окно не осталось ни одного события, больше не нужны.
 async function sweepBanHistory (server)
 {
+    // История хранится навсегда (bans_history_days: 0) -- убирать нечего.
+    if (!banHistoryDays (server)) return;
     const cut = Date.now () - banHistoryDays (server) * 86400000;
     let keys = [];
     try
@@ -2738,11 +2755,12 @@ function bansReportText (o, max = 20)
     // Она копится с этой версии -- у более старых событий данных просто нет.
     if (o.hist)
     {
-        const days = o.histDays || 30;
+        const days = o.histDays;
+        const window = days ? ('За ' + days + ' дн') : 'За всё время';
         if (!o.hist.length)
-            text += '\n\n📊 За ' + days + ' дн наказаний не было (история ведётся с этой версии).';
+            text += '\n\n📊 ' + window + ' наказаний не было (история ведётся с этой версии).';
         else
-            text += '\n\n📊 **За ' + days + ' дн (' + o.hist.length + ' ' +
+            text += '\n\n📊 **' + window + ' (' + o.hist.length + ' ' +
                 plural (o.hist.length, 'человек', 'человека', 'человек') + '):**\n' +
                 o.histRows.map (h =>
                     '• **' + h.name + '** -- выходов ' + h.exit + ', таймаутов ' + h.timeout +
@@ -2944,18 +2962,24 @@ async function welcomeEmbed (server, user, refresh = false)
     }
     if (src && src.files.length)
         rules += '📎 Вложение: ' + src.files.map (f => '[' + oneLine (f.name, 40) + '](' + f.url + ')').join (', ') + '\n';
+    // [v2.18] welcome_prefix (по умолчанию true): добавлять ли к сообщению с правилами
+    // СВОЙ текст -- приветствие и краткое описание возможностей бота. Поставь false --
+    // и в ЛС уйдёт ТОЛЬКО текст и картинки из сообщения с правилами (+ ссылка).
+    const prefixOn = s.welcome_prefix !== false;
+    const rulesPart =
+        `📜 **Правила и знакомство**` + (chName ? ' -- в канале ' + code (chName) : '') + `:` +
+        (rules ? rules + '🔗 ' + link + '\n' : '\n' + link + '\n');
     const embed =
     {
         color: 0x00CCFF,
         title: '🐼 Добро пожаловать на ' + (s.name || 'сервер') + '!',
-        description:
-            `${user}, привет! 👋\n` +
-            `\n📜 **Правила и знакомство**` + (chName ? ' -- в канале ' + code (chName) : '') + `:` +
-            (rules ? rules + '🔗 ' + link + '\n' : '\n' + link + '\n') +
-            `\n🎵 **Музыка:** \`/play ссылка или запрос\`, очередь -- \`/queue\`,\n` +
-            `выйти боту из канала -- \`/leave\` (управляют админы, модеры и роль DJ).\n` +
-            `📌 Инструкция по боту -- в любой момент \`/help\`.\n` +
-            `\nЕсли что-то непонятно или не работает -- напиши администрации.`,
+        description: prefixOn
+            ? `${user}, привет! 👋\n\n` + rulesPart +
+              `\n🎵 **Музыка:** \`/play ссылка или запрос\`, очередь -- \`/queue\`,\n` +
+              `выйти боту из канала -- \`/leave\` (управляют админы, модеры и роль DJ).\n` +
+              `📌 Инструкция по боту -- в любой момент \`/help\`.\n` +
+              `\nЕсли что-то непонятно или не работает -- напиши администрации.`
+            : rulesPart,
         timestamp: dt(),
     };
     // Картинка из сообщения с правилами -- прямо в письме (как и было задумано):
@@ -2963,6 +2987,29 @@ async function welcomeEmbed (server, user, refresh = false)
         embed.image = { url: src.images[0] };
     if (s.name) embed.footer = { text: s.name };
     return embed;
+}
+
+// [v2.18] Проверочное приветствие для `panda welcome` и `/welcome`: одна логика на
+// текстовую команду и на слэш (иначе ответы и лог со временем разъехались бы).
+// refresh: правишь welcome_message и сразу видишь результат (без 10-минутного кэша).
+async function welcomeCheckSend (server, user, whoLabel)
+{
+    if (!welcomeLink (server))
+        return { ok: false, why: 'Приветствие выключено: в `config.json` не задан `welcome_channel` (или он неверный).' };
+    try
+    {
+        const src = await welcomeSource (server, true);
+        await user.send ({ embeds: [await welcomeEmbed (server, user)] });
+        console.log ('[' + (d()) + '] [welcome] проверка: ' + whoLabel + ' -> ' + uu (user) +
+            (src ? ' -- с текстом' + (src.images.length ? ' и картинкой' : '') + ' из сообщения с правилами'
+                 : ' -- только ссылка (сообщение с правилами не прочиталось)'));
+        return { ok: true, src: src };
+    }
+    catch (e)
+    {
+        console.error ('[' + (d()) + '] [welcome] проверка: ЛС не ушло (' + e.message + ')');
+        return { ok: false, why: 'ЛС не ушло: `' + code (e.message) + '`' };
+    }
 }
 
 async function welcomeDM (server, uid, raw)
@@ -2981,7 +3028,8 @@ async function welcomeDM (server, uid, raw)
         const src = await welcomeSource (server);
         await user.send ({ embeds: [await welcomeEmbed (server, user)] });
         console.log ('[' + (d()) + '] [welcome] ЛС новичку ' + name + ' отправлена (' + link + ')' +
-            (src ? ' -- текст и картинки взяты из сообщения с правилами' : ' -- только ссылка (сообщение с правилами не прочиталось)'));
+            (src ? ' -- текст и картинки взяты из сообщения с правилами' : ' -- только ссылка (сообщение с правилами не прочиталось)') +
+            (((SERVERS[server] || {}).welcome_prefix === false) ? ' [welcome_prefix: false -- без описания бота]' : ''));
     }
     catch (e)
     {
@@ -3171,10 +3219,11 @@ async function handleMemberLeave (server, uid, raw, since = 0)
 //     вернул, второй просто ничего не меняет (у нас -- add-only);
 //   * ненужное в базу не пишем: @everyone, роли интеграций (managed -- их нельзя
 //     выдать) и роли, которых на сервере уже нет; свой список -- save_roles_exclude;
-//   * записи старше save_roles_days (по умолчанию 30 дней) убираются сами.
+//   * [v2.18] записи хранятся НАВСЕГДА (save_roles_days: 0 -- значение по
+//     умолчанию). Можно задать число дней -- тогда старое убирает свип.
 // Выключить совсем: "save_roles": false у сервера.
 // ============================================================================
-const ROLE_SAVE_DAYS_DEFAULT = 30;
+const ROLE_SAVE_DAYS_DEFAULT = 0; // 0 = не забывать никогда
 
 function roleSaveOn (server)
 {
@@ -3192,10 +3241,21 @@ function roleRestorable (server, guild, id)
     return !!(role && !role.managed && role.id !== guild.id);
 }
 
+// [v2.18] Срок хранения записей о ролях. 0 (или не задано) -- НАВСЕГДА: роли --
+// основная задача бота, и терять их из-за «срока давности» незачем. Но кому нужно
+// ограничить базу -- ставит любое число дней, и старое убирает свип.
 function roleSaveDays (server)
 {
     const d = Number ((SERVERS[server] || {}).save_roles_days);
-    return (d > 0) ? d : ROLE_SAVE_DAYS_DEFAULT;
+    if (!Number.isFinite (d)) return ROLE_SAVE_DAYS_DEFAULT; // не задано (0)
+    return (d > 0) ? Math.floor (d) : 0;
+}
+
+// Подпись срока для логов и отчётов: «навсегда» или «N дн».
+function roleSaveLabel (server)
+{
+    const days = roleSaveDays (server);
+    return days ? (days + ' дн') : 'навсегда';
 }
 
 // [v2.15] Роли с учётом правок, случившихся ПОСЛЕ снимка поллера (since -- время
@@ -3277,7 +3337,7 @@ async function restoreMemberRoles (server, uid, raw)
     catch (e) { console.error ('[roles] не смог прочитать роли ' + name + ': ' + oneLine (e.message)); return 0; }
     if (!saved || !Array.isArray (saved.roles) || !saved.roles.length) return 0;
     const days = roleSaveDays (server);
-    if (Date.now () - (Number (saved.at) || 0) > days * 86400000)
+    if (days && Date.now () - (Number (saved.at) || 0) > days * 86400000)
     {
         await db (server, 'memberRoles', uid, null).catch (() => {});
         console.log ('[' + (d()) + '] [roles] запись о ролях ' + name + ' старше ' + days + ' дн -- забываю');
@@ -3302,7 +3362,9 @@ async function restoreMemberRoles (server, uid, raw)
     }
 }
 
-// Уборка старых записей о ролях (чтобы база не росла бесконечно).
+// Уборка старых записей о ролях. Записи без даты (старый формат) убираются всегда --
+// у них нет возраста, вернуть они ничего не могут. При хранении «навсегда» (0) свип
+// роли не трогает вообще.
 async function sweepSavedRoles (server)
 {
     if (!roleSaveOn (server)) return;
@@ -3312,17 +3374,22 @@ async function sweepSavedRoles (server)
     {
         for await (const [key, value] of $db[server]['memberRoles'].iterator())
         {
-            if (!value || typeof value.at !== 'number' || Date.now () - value.at > days * 86400000)
+            if (!value || typeof value.at !== 'number' ||
+                (days && Date.now () - value.at > days * 86400000))
                 keys.push (key);
         }
         for (const key of keys) await db (server, 'memberRoles', key, null);
     }
     catch (e) { console.error ('[roles] уборка: ' + oneLine (e.message)); return; }
     // [v2.17] Ясная формулировка: это истёк срок хранения (save_roles_days), а не потеря.
+    // [v2.18] При хранении «навсегда» тут могут быть только записи без даты.
     if (keys.length)
-        console.log ('[' + (d()) + '] [roles] истёк срок хранения ' + days + ' дн (save_roles_days): удалено из базы ' +
+        console.log ('[' + (d()) + '] [roles] ' + (days
+            ? 'истёк срок хранения ' + days + ' дн (save_roles_days)'
+            : 'в базе записи без даты') + ': удалено из базы ' +
             keys.length + ' ' + plural (keys.length, 'запись', 'записи', 'записей') +
-            ' о ролях -- эти роли всё равно не вернулись бы (запись просрочена)');
+            ' о ролях -- эти роли всё равно не вернулись бы (' +
+            (days ? 'запись просрочена' : 'в старой записи нет даты') + ')');
 }
 
 // ============================================================================
@@ -3363,10 +3430,11 @@ async function rolecheckReport (server, target)
     {
         const days = roleSaveDays (server);
         const age = Math.round ((Date.now () - (Number (saved.at) || 0)) / 86400000);
-        out.push ('\n**Роли при входе** (`save_roles`, хранение ' + days + ' дн): запомнено ' + saved.roles.length + ' ' +
-            plural (saved.roles.length, 'роль', 'роли', 'ролей') + ' (' + (Number (saved.at) ? d (saved.at, true) : '?') + ')');
+        out.push ('\n**Роли при входе** (`save_roles`, хранение ' + roleSaveLabel (server) + '): запомнено ' +
+            saved.roles.length + ' ' + plural (saved.roles.length, 'роль', 'роли', 'ролей') +
+            ' (' + (Number (saved.at) ? d (saved.at, true) : '?') + ')');
         out.push ('• помню: ' + saved.roles.map (nameOf).join (', '));
-        if (age > days)
+        if (days && age > days)
             out.push ('• ⏳ запись старше ' + days + ' дн -- при входе она забывается, роли возвращаться НЕ будут');
         else
         {
@@ -3397,7 +3465,7 @@ async function rolecheckReport (server, target)
     // --- история за окно (как в /bans) ---
     const hist = await bansHistory (server);
     const row = hist.find (h => h.id === target.id);
-    out.push ('\n**История за ' + banHistoryDays (server) + ' дн:** ' + (row
+    out.push ('\n**История ' + banHistoryLabel (server) + ':** ' + (row
         ? 'выходов ' + row.exit + ', таймаутов ' + row.timeout + ', банов ' + row.ban + ', снятий ' + row.unban +
           ' _(последнее: ' + d (row.last, true) + ')_'
         : 'ничего не записано'));
@@ -4871,27 +4939,55 @@ function queueLeft (m)
     return { sec, curLeft, unknown, live };
 }
 
-// [v2.17] 25 треков на страницу (в очереди часто по 50 заливают -- меньше листать).
+// [v2.17] До 25 треков на страницу (в очереди часто по 50 заливают -- меньше листать).
 // 25 -- ещё и максимум пунктов в меню Discord, поэтому больше нельзя.
 const QUEUE_PAGE = 25;
-// Сколько символов списка можно занять: у сообщения лимит ~2000, а название трека
-// бывает длинным. Переполнение = отказ Discord (пустое сообщение или ошибка), поэтому
-// страница собирается по бюджету ОДИН раз (queuePage), и листание идёт по номерам,
-// которые реально показаны -- иначе кусок очереди был бы недоступен.
-const QUEUE_LINES_BUDGET = 1500;
+// Лимит сообщения Discord -- ~2000 символов. Страница заполняется ДО КОНЦА: бюджет
+// списка считается от РЕАЛЬНОГО текста всего остального (шапка, «до конца очереди»,
+// подсказка внизу). Раньше здесь стоял фиксированный бюджет 1500, и страница
+// обрезалась до 22 треков, хотя в лимит влезало больше.
+const QUEUE_MSG_LIMIT = 1980;
+// Запас на служебные строки: заголовок «Очередь (N)», переводы строк, хвост
+// «...и ещё N: /queue from:M» (самая длинная часть -- сам хвост).
+const QUEUE_GLUE = 60;
+// Подсказка внизу. Короткая -- когда очередь не влезла в одну страницу (все действия
+// и так есть кнопками), полная -- когда всё видно сразу.
+const QUEUE_HINT_SHORT = '_Действия -- кнопками ниже._';
+const QUEUE_HINT_FULL =
+    '_Убрать -- `/remove`, переставить -- `/move` или кнопками ниже, прыгнуть -- `/jump`; ' +
+    'чистить всё -- `/clear`,_\n_а только треки одного человека -- `/clear author:@кто`._';
+
+// Сколько символов остаётся на СПИСОК: лимит минус шапка, «до конца очереди»,
+// подсказка и служебные строки. Считается по живым строкам, поэтому бюджет один и тот
+// же при отрисовке страницы и в queuePageOf (там и там -- один и тот же m).
+function queueListBudget (m)
+{
+    const chrome = queueHeadText (m).length + queueWaitText (m).length +
+        QUEUE_GLUE + QUEUE_HINT_SHORT.length;
+    return Math.max (200, QUEUE_MSG_LIMIT - chrome);
+}
+
 function queuePage (m, start)
 {
     const total = m.tracks.length;
+    const budget = queueListBudget (m);
     start = Math.min (Math.max (1, Math.round (start) || 1), Math.max (1, total));
     const slice = m.tracks.slice (start - 1, start - 1 + QUEUE_PAGE);
     const lines = [];
     let used = 0;
+    let prevBy = null; // автор предыдущей строки: у одного автора подряд не повторяем
     for (let i = 0; i < slice.length; i++)
     {
         const t = slice[i];
+        // [v2.18] Когда подряд идут треки одного человека (обычное дело -- DJ залил
+        // плейлист), автора пишем один раз: так на страницу влезает больше строк, а
+        // информация не теряется. Смена автора -- снова видно, кто что поставил.
+        const by = (t && t.byName) ? String (t.byName) : '';
+        const label = (by && by !== prevBy) ? ' · 👤 ' + by : '';
+        prevBy = by;
         const line = (start + i) + '. **' + clipText (t.title || 'трек', 120) + '** `' +
-            fmtDur (t.duration, t.isLive) + '`' + byLabel (t);
-        if (lines.length && used + line.length + 1 > QUEUE_LINES_BUDGET) break;
+            fmtDur (t.duration, t.isLive) + '`' + label;
+        if (lines.length && used + line.length + 1 > budget) break;
         lines.push (line);
         used += line.length + 1;
     }
@@ -5079,49 +5175,62 @@ function queueMove (guildId, n, to, who)
 // трека, позиция внутри текущего трека и ОБЩИЙ остаток по времени.
 // moveSel -- номер выбранного для перестановки трека (0 -- ничего не выбрано):
 // тогда внизу появляются кнопки «⬆ Выше» / «⬇ Ниже».
-function queueView (m, start, moveSel = 0)
+// Шапка «что играет сейчас» (с позицией внутри трека). Чистая функция от m -- её же
+// для бюджета страницы зовёт queueListBudget, поэтому текст в сообщении и расчёт
+// длины всегда совпадают.
+function queueHeadText (m)
 {
-    const page = queuePage (m, start);
-    const total = page.total;
-    const list = page.list;
-    const rest = total - (page.start - 1 + page.count);
-    const q = queueLeft (m);
-    let wait = '⏳ **До конца очереди:** ' + (q.sec ? fmtAgo (q.sec * 1000) : '0 сек');
-    if (q.curLeft) wait += ' (с учётом `' + fmtDur (q.curLeft) + '` текущего)';
-    if (q.live) wait += ' + ' + q.live + ' 🔴 ' + plural (q.live, 'эфир', 'эфира', 'эфиров') + ' (без конца)';
-    if (q.unknown) wait += ' + ' + q.unknown + ' ' + plural (q.unknown, 'трек', 'трека', 'треков') + ' без длительности';
-    let head;
     if (m.current)
     {
-        // позиция внутри играющего трека -- «сколько уже играет / сколько всего»:
         const pos = m.current.isLive ? '' :
             (m.current.duration > 0
                 ? ' `' + fmtDur (Math.min (Math.floor (playedMsOf (m) / 1000), m.current.duration)) + ' / ' + fmtDur (m.current.duration) + '`'
                 : '');
-        head = '🎵 **Сейчас:** ' + (m.current.isLive ? '🔴 ' : '') + '**' + (m.current.title || 'трек') + '**' + pos +
+        return '🎵 **Сейчас:** ' + (m.current.isLive ? '🔴 ' : '') + '**' + (m.current.title || 'трек') + '**' + pos +
             byLabel (m.current) +
             (m.pausedByNobody ? ' _(пауза: нет слушателей)_' : '');
     }
-    else if (m.pending && total)
-        head = '⏸ Музыка ждёт слушателя -- позови `/join` (очередь помнится)';
+    if (m.pending && m.tracks.length)
+        return '⏸ Музыка ждёт слушателя -- позови `/join` (очередь помнится)';
+    return '🎵 **Сейчас:** —';
+}
+
+// «Сколько ещё ждать до конца очереди целиком» (учитывая место в текущем треке).
+function queueWaitText (m)
+{
+    const q = queueLeft (m);
+    let wait = '⏳ **До конца очереди:** ' + (q.sec ? fmtAgo (q.sec * 1000) : '0 сек');
+    if (q.curLeft) wait += ' (включая `' + fmtDur (q.curLeft) + '` текущего)';
+    if (q.live) wait += ' + ' + q.live + ' 🔴 ' + plural (q.live, 'эфир', 'эфира', 'эфиров') + ' (без конца)';
+    if (q.unknown) wait += ' + ' + q.unknown + ' ' + plural (q.unknown, 'трек', 'трека', 'треков') + ' без длительности';
+    return wait;
+}
+
+function queueView (m, start, moveSel = 0)
+{
+    const page = queuePage (m, start);
+    const total = page.total;
+    const rest = total - (page.start - 1 + page.count);
+    // выбранный для перестановки трек -- строкой внизу (видно, что именно двигаешь):
+    const move = (moveSel >= 1 && moveSel <= total)
+        ? '\n\n🎚 **Двигаю №' + moveSel + ':** **' + (m.tracks[moveSel - 1].title || 'трек') +
+          '** -- жми «⬆ Выше» / «⬇ Ниже» под списком.'
+        : '';
+    const build = hint => queueHeadText (m) +
+        '\n\n**Очередь (' + total + ')**' + (page.start > 1 ? ' с №' + page.start : '') + ':\n' + page.list +
+        (rest > 0 ? '\n*...и ещё ' + rest + ': `/queue from:' + (page.start + page.count) + '`*' : '') +
+        '\n\n' + queueWaitText (m) + move + '\n' + hint;
+    // Очереди нет -- только шапка (подсказка про действия тогда не нужна).
+    // Иначе берём ПОЛНУЮ подсказку, а если она не влезла в лимит Discord -- короткую
+    // (бюджет списка считался по короткой, поэтому длинную проверяем по факту).
+    let content;
+    if (!total) content = queueHeadText (m);
     else
-        head = '🎵 **Сейчас:** —';
-    // выбраный для перестановки трек -- строкой внизу (видно, что именно двигаешь):
-    let move = '';
-    if (moveSel >= 1 && moveSel <= total)
-        move = '\n\n🎚 **Двигаю №' + moveSel + ':** **' + (m.tracks[moveSel - 1].title || 'трек') +
-            '** -- жми «⬆ Выше» / «⬇ Ниже» под списком.';
-    return {
-        content: head +
-            (total
-                ? '\n\n**Очередь (' + total + ')**' + (page.start > 1 ? ' с №' + page.start : '') + ':\n' + list +
-                  (rest > 0 ? '\n*...и ещё ' + rest + ': `/queue from:' + (page.start + page.count) + '`*' : '') +
-                  '\n\n' + wait + move +
-                  '\n_Убрать -- `/remove`, переставить -- `/move` или кнопками ниже, прыгнуть -- `/jump`; чистить всё -- `/clear`,_\n' +
-                  '_а только треки одного человека -- `/clear author:@кто`._'
-                : ''),
-        components: queueComponents (page, m, moveSel),
-    };
+    {
+        content = build (QUEUE_HINT_FULL);
+        if (content.length > QUEUE_MSG_LIMIT) content = build (QUEUE_HINT_SHORT);
+    }
+    return { content: content, components: queueComponents (page, m, moveSel) };
 }
 
 // Старт после перезапуска/падения: вернуть в память очередь, текущий трек и позицию.
@@ -5668,6 +5777,24 @@ const musicCommands =
         .addAttachmentOption (o =>
             o.setName ('file')
              .setDescription ('Вложение (картинка, файл)')),
+    // [v2.18] /welcome -- замена текстовой `panda welcome` (та требовала интента
+    // Message Content): присылает в ЛС ровно то приветствие, которое видят новички.
+    new SlashCommandBuilder ()
+        .setName ('welcome')
+        .setDescription ('Проверить приветствие: бот пришлёт в ЛС то, что видят новички')
+        .addUserOption (o =>
+            o.setName ('user')
+             .setDescription ('Кому прислать проверку (без него -- себе; другому -- админ/модер)')),
+    // [v2.18] /forget -- удаление всего, что бот помнит о человеке (роли, история
+    // наказаний). Нужен и по делу, и как ответ в форме интентов на вопрос «как
+    // запросить удаление данных о своих действиях».
+    new SlashCommandBuilder ()
+        .setName ('forget')
+        .setDescription ('Удалить сохранённые данные о человеке: роли и история наказаний (staff)')
+        .addUserOption (o =>
+            o.setName ('user')
+             .setDescription ('Чьи данные удалить')
+             .setRequired (true)),
     // [v2.18] Правый клик по сообщению -> «Переслать в общий»: то же, что делает мост
     // из пандалогии, но БЕЗ интента Message Content (Discord отдаёт выбранное сообщение
     // целиком, вместе с текстом и вложениями). Работает и как основная замена мосту,
@@ -5687,7 +5814,7 @@ const musicCommands =
         .setDescription ('Показать очередь треков')
         .addIntegerOption (o =>
             o.setName ('from')
-             .setDescription ('С какого номера показать (на странице 25, в очереди бывает и больше)')
+             .setDescription ('С какого номера показать (на странице до 25, в очереди бывает и больше)')
              .setMinValue (1)),
     new SlashCommandBuilder ()
         .setName ('leave')
@@ -6023,6 +6150,62 @@ client.on ('interactionCreate', async (interaction) =>
         const text = await rolecheckReport (interaction.guildId, target);
         console.log ('[' + (d()) + '] [roles] /rolecheck: ' + target.username + ' -- отчёт выдан');
         return interaction.editReply ({ content: clipText (text, 1900) });
+    }
+    // [v2.18] /welcome -- проверка приветствия (ответ виден только вызвавшему).
+    if (name === 'welcome')
+    {
+        const target = interaction.options.getUser ('user') || interaction.user;
+        if (target.id !== interaction.user.id && !isStaffInteraction (interaction))
+            return interaction.reply ({ content: '🚫 Другому -- только админ или модер.', flags: MessageFlags.Ephemeral });
+        await interaction.deferReply ({ flags: MessageFlags.Ephemeral });
+        const user = await client.users.fetch (target.id).catch (() => null);
+        if (!user || typeof user.send !== 'function')
+            return interaction.editReply ('⚠️ Пользователь ' + u (target.id) + ' недоступен.');
+        const res = await welcomeCheckSend (interaction.guildId, user,
+            interaction.member ? uuu (interaction.member) : interaction.user.username);
+        return interaction.editReply (res.ok
+            ? ('✅ Приветствие отправлено в ЛС: ' + u (target.id))
+            : ('⚠️ ' + res.why));
+    }
+    // [v2.18] /forget -- удалить то, что бот помнит о человеке (роли + история
+    // наказаний). Активное наказание НЕ трогаем: оно снимается /unban.
+    if (name === 'forget')
+    {
+        if (!isStaffInteraction (interaction))
+            return interaction.reply ({ content: '🚫 Команда только для админов и модеров.', flags: MessageFlags.Ephemeral });
+        const target = interaction.options.getUser ('user', true);
+        await interaction.deferReply ({ flags: MessageFlags.Ephemeral });
+        const server = interaction.guildId;
+        const had = [];
+        try
+        {
+            const roles = await db (server, 'memberRoles', target.id);
+            if (roles)
+            {
+                await db (server, 'memberRoles', target.id, null);
+                had.push ('роли (' + ((roles.roles || []).length) + ')');
+            }
+            const hist = await db (server, 'banHistory', target.id);
+            if (hist)
+            {
+                await db (server, 'banHistory', target.id, null);
+                had.push ('история наказаний (' + ((hist.events || []).length) + ' ' +
+                    plural ((hist.events || []).length, 'событие', 'события', 'событий') + ')');
+            }
+        }
+        catch (e)
+        {
+            console.error ('[forget] не смог удалить данные ' + target.id + ': ' + oneLine (e.message));
+            return interaction.editReply ('⚠️ Не смог удалить: `' + oneLine (e.message, 150) + '`');
+        }
+        const until = await db (server, 'membersBanTimeout', target.id).catch (() => null);
+        const active = (until && until > Date.now ())
+            ? ' Активное наказание НЕ тронуто -- снять его можно `/unban`.' : '';
+        const who = interaction.member ? uuu (interaction.member) : interaction.user.username;
+        console.log ('[' + (d()) + '] [forget] (кто: ' + who + ') удалил данные ' + target.username +
+            ' \`' + target.id + '\`: ' + (had.length ? had.join (', ') : 'нечего было удалять'));
+        return interaction.editReply ('🧽 Данные ' + u (target.id) + ' удалены: ' +
+            (had.length ? had.join (', ') : 'нечего было удалять') + '.' + active);
     }
     if (!['play','join','stop','skip','pause','resume','queue','leave','remove','clear','jump','move'].includes (name)) return;
     const guildId = interaction.guildId;
