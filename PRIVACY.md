@@ -94,7 +94,8 @@ running machine under the operator's own account.
 Any member can request deletion of everything the bot stores about them, in two ways:
 
 1. **In Discord:** ask the staff of the server where the bot runs. They have the command
-   `/forget user:@who`, which immediately deletes the stored role IDs and the punishment counters for
+   `/forget user:@who`, which immediately deletes the stored role IDs, the punishment counters and the
+   queue entries (track titles/links and the author tag) added by that member for
    that member. The command is available to server administrators/moderators only, the reply is visible
    only to them, and the deletion is written to the bot log. An active punishment is not affected by
    this command — it is lifted with `/unban`.
@@ -148,6 +149,7 @@ _Полная версия -- выше по-английски; здесь -- т
 вообще, база одна и лежит локально.
 
 **Удалить свои данные:** попросить staff сервера -- у них есть команда `/forget user:@кто`, она сразу
-стирает id ролей и счётчики наказаний этого человека (активное наказание не трогает: его снимает
-`/unban`); либо написать владельцу (контакт есть и здесь, и в `/help`), и те же записи удаляют вручную.
+стирает id ролей, счётчики наказаний и добавленные этим человеком треки в очереди музыки
+(активное наказание не трогает: его снимает `/unban`); либо написать владельцу (контакт есть и здесь,
+и в `/help`), и те же записи удаляют вручную.
 

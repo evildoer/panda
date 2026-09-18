@@ -477,7 +477,11 @@ function dbDumpFmt (_ns, _key, _value)
         return _head + ' -- в очереди ' + _tr.length +
             (_cur ? ', играет «' + clipText (String (_cur), 60) + '»' : ', играющего нет') +
             ' | канал ' + (_value.channelId || '--') +
-            (Number (_value.elapsed) ? ', позиция ' + Math.floor (Number (_value.elapsed) / 1000) + ' сек' : '') +
+            // [v2.25] elapsed в базе хранится в СЕКУНДАХ (saveMusicState округляет
+            // playedMsOf/1000), а тут его делили ещё на 1000 -- в дампе позиция
+            // показывалась как «0 сек» вместо настоящей. Это то же тело бага, что был
+            // в /mydata: отчёт показывал меньше, чем бот реально помнит.
+            (Number (_value.elapsed) ? ', позиция ' + Math.floor (Number (_value.elapsed)) + ' сек' : '') +
             (_value.left ? ' | вышел по /leave' : '');
     }
     return _head + ' -- ' + clipText (JSON.stringify (_value), 300);
@@ -4320,7 +4324,8 @@ async function myDataReport (server, target, self)
         : 'роли -- ' + roleSaveLabel (server) + '; история -- ' + banHistoryLabel (server)) +
         '; таймер выхода -- до окончания наказания; очередь музыки -- до `/stop` или конца очереди.');
     out.push ('**Как удалить:** попроси staff -- `/forget user:' + (self ? '@ты' : '@' + target.username) +
-        '` стирает роли и историю сразу; либо напиши владельцу бота (контакт есть в `/help`).\n' +
+        '` стирает сразу роли, историю и треки из очереди (авторство играющего трека тоже стирается); ' +
+        'либо напиши владельцу бота (контакт есть в `/help`).\n' +
         '_Активное наказание `/forget` не трогает: это уже не хранение данных, а действие модерации -- его снимает `/unban`._');
     if (PRIVACY_URL) out.push ('📄 Полная политика конфиденциальности: ' + PRIVACY_URL);
     return out.join ('\n');
@@ -7344,6 +7349,35 @@ client.on ('interactionCreate', async (interaction) =>
                 await db (server, 'banHistory', target.id, null);
                 had.push ('история наказаний (' + ((hist.events || []).length) + ' ' +
                     plural ((hist.events || []).length, 'событие', 'события', 'событий') + ')');
+            }
+            // [v2.25] Очередь музыки тоже хранит данные о человеке (byId/byName, /mydata
+            // считает эти треки его данными), а раньше /forget их не трогал -- то есть
+            // удалялось меньше, чем бот помнит. Убираем его треки из очереди (тем же
+            // путём, что `/clear author`) и стираем авторство у трека, который играет
+            // или ждёт продолжения: он доканчивается уже как «ничей», а не как его.
+            {
+                const m = musicOf (server);
+                const same = t => t && String (t.byId || '') === String (target.id);
+                const goneQ = (m.tracks || []).filter (same).length;
+                if (goneQ)
+                {
+                    m.tracks = m.tracks.filter (t => !same (t));
+                    dropPreload (m);
+                    startPreload (server);
+                    had.push ('очередь музыки (' + goneQ + ' ' + plural (goneQ, 'трек', 'трека', 'треков') + ')');
+                }
+                let deowned = 0;
+                for (const t of [m.current, m.seekTrack])
+                {
+                    if (!same (t)) continue;
+                    t.byId = null; t.byName = ''; deowned++;
+                }
+                if (goneQ || deowned)
+                {
+                    saveMusicState (server);
+                    scheduleVoiceStatus (server, true);
+                    schedulePresence (true);
+                }
             }
         }
         catch (e)
