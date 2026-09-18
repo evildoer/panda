@@ -18,6 +18,32 @@
 //   * channelCreate/channelUpdate: в v14 каналы приходят без guild -> берём через .guild ?? client.guilds.cache.get
 //   * [FIX v2] NaN-баг в логе переименования: скобки вокруг 'Владельцы канала: ' + (owners.size ? ... : ...)
 //   * [FIX v2] e.message там, где e не существует (users.fetch .catch(() => null))
+// CHANGELOG v2.18 (бот играет там, где слушает автор трека; /announce и /dm без интентов):
+//   * ПОЕХАЛИ К АВТОРУ ТРЕКА: перед стартом трека бот смотрит, в каком голосовом канале
+//     сидит тот, кто этот трек добавил, и переезжает туда (если он вообще в голосовом).
+//     Так каждый трек играет там, где его слушает автор; бот остаётся в этом канале до
+//     трека другого автора или до /leave. Автор вне голосового -- бот не двигается.
+//     Сам он по-прежнему никогда не заходит и не выходит: переезд возможен только когда
+//     он уже где-то играет, и не сразу после явного /join|/play (m.justJoinedAt), чтобы
+//     не уехать от человека, который только что его позвал. В логе видно причину:
+//     '[music] перешёл в «X» -- автор трека Y слушает здесь'.
+//     Тот же смысл и у паузы: если бот стоит ОДИН (пауза, слушателей нет), а автор
+//     текущего/следующего трека зашёл в другой голосовой канал -- бот едет туда и
+//     продолжает с того же места ('здесь никого, а автор трека ... слушает здесь').
+//     Логика паузы/продолжения не дублируется: после переезда checkListeners
+//     вызывается заново и сам снимает паузу обычным путём.
+//   * /announce и /dm -- слэш-команды вместо текстовых (мост из пандалогии и `panda dm`):
+//     текст и вложение приходят в самой команде, то есть интент Message Content им НЕ
+//     нужен, а Discord именно это и советует вместо запроса этого интента.
+//   * «Переслать в общий» -- команда-контекстное меню (правый клик по сообщению):
+//     Discord отдаёт выбранное сообщение ЦЕЛИКОМ (текст + вложения) без интента
+//     Message Content, поэтому это замена мосту из пандалогии, если интент отзовут.
+//     Оригинал удаляется только в канале-источнике (как у моста); если staff
+//     переслал сообщение из другого канала, оригинал остаётся (чужое не удаляем).
+//     Отправка у моста и у меню -- ОДНА функция relayPipe (поведение не разъезжается).
+//   * [music] Stage-каналы: бот заходит и туда, а в лог пишется подсказка, что для
+//     слышимости Stage Moderator должен сделать его спикером (Discord иначе не
+//     пускает бота вещать в эфир).
 // CHANGELOG v2.17 (интенты по факту, /rolecheck, руками двигать очередь):
 //   * [intents] ОТЧЁТ ПРИ СТАРТЕ: что РЕАЛЬНО доступно приложению -- Message Content
 //     (по интенту в гейтвее), Guild Members (события), полный список участников
@@ -316,6 +342,10 @@ const STARTUP_DM_TEXT =
     '`/join` -- зайти в твой канал и остаться там (даже без музыки)\n' +
     '`/leave` -- выйти из канала (очередь и место помню -- продолжу по `/join`)\n' +
     'Управлять музыкой могут админы, модеры и роль DJ (смотреть очередь -- всем).\n' +
+    '**Бот играет там, где слушает автор трека:** если тот, кто добавил трек, сидит\n' +
+    'в голосовом канале, в момент начала этого трека бот сам переезжает к нему и\n' +
+    'остаётся там до трека другого автора (или до `/leave`). Автора в голосе нет --\n' +
+    'бот никуда не идёт; сам он не заходит и не выходит никогда.\n' +
     '**Бот ничего не забывает:** очередь, текущий трек и место в треке живут в базе,\n' +
     'поэтому перезапуск, обрыв связи и `/leave` музыку не сбрасывают. Если в канале\n' +
     'никого -- пауза, а когда слушатель вернётся -- продолжит с того же места.\n' +
@@ -342,6 +372,11 @@ const STARTUP_DM_TEXT =
     '• кто сейчас в наказании -- у админов и модеров есть `/bans`: имя, точный\n' +
     '  срок, причина и сводка за месяц (кто сколько раз выходил и был наказан);\n' +
     '  снять наказание досрочно -- `/unban user:@кто` (ответ виден только staff)\n' +
+    '• объявление от имени бота -- `/announce text:... file:... channel:...` (staff);\n' +
+    '  личное сообщение человеку -- `/dm user:@кто text:...` (админы); переслать\n' +
+    '  чужое сообщение в общий канал -- правый клик по нему -> «Переслать в общий»\n' +
+    '  (staff). Текст и файл берутся из самой команды, поэтому интент Message\n' +
+    '  Content для всего этого не нужен\n' +
     '• что бот помнит о человеке (роли, наказания и что вернёт при входе) --\n' +
     '  `/rolecheck user:@кто`: можно проверить и того, кто не на сервере\n' +
     '\n' +
@@ -387,6 +422,8 @@ const
     Collection,
     AuditLogEvent, // [v2.4] авторство действий: кто замутил/перенёс (из журнала аудита)
     ActivityType,  // [v2.8] профильный статус бота (слушает/смотрит/играет)
+    ContextMenuCommandBuilder, // [v2.18] правый клик по сообщению -> «Переслать в общий»
+    ApplicationCommandType,    // [v2.18] тип команды-контекстного меню (Message)
 } = require ('discord.js');
 
 // [v2.17] Guild Members ПОДКЛЮЧАЕМ (раньше он был убран по [v2.1]). Даёт мгновенные
@@ -706,6 +743,31 @@ function attachOf (message)
     };
 }
 
+// [v2.18] Пересылка сообщения в канал-приёмник ОТ ИМЕНИ БОТА -- одна функция на два входа:
+//   * мост из пандалогии (событие messageCreate) -- ему нужен интент Message Content,
+//     иначе Discord присылает событие с ПУСТЫМ content и вложение не забрать;
+//   * команда-контекстное меню «Переслать в общий» (правый клик по сообщению) -- ей
+//     Message Content НЕ нужен: Discord отдаёт выбранное сообщение ЦЕЛИКОМ, вместе с
+//     текстом и вложениями (так советует и сам Discord в гайде «You Might Not Need a
+//     Privileged Intent»: message context menu command).
+// Возвращает { ok, channel, text, files } либо { ok:false, empty | notFound | error }.
+async function relayPipe (targetId, message)
+{
+    const attach = attachOf (message);
+    const text = message.content ? message.content : '';
+    const files = attach.files ? attach.files.length : 0;
+    if (!text && !files) return { ok: false, empty: true };
+    let channel = client.channels.cache.get (targetId);
+    if (!channel) channel = await client.channels.fetch (targetId).catch (() => null);
+    if (!channel || typeof channel.send !== 'function') return { ok: false, notFound: true };
+    try
+    {
+        await channel.send ({ content: text ? text : undefined, ...attach });
+    }
+    catch (e) { return { ok: false, error: e.message }; }
+    return { ok: true, channel: channel, text: text, files: files };
+}
+
 // [v2.5] Разбор `panda dm`: кому -- упоминание ИЛИ просто id (17-20 цифр).
 // Раньше целью было ТОЛЬКО упоминание, поэтому `panda dm <id> текст`
 // молча ничего не делал (а команда при этом удалялась).
@@ -815,10 +877,13 @@ client.on ('messageCreate', async message =>
                 /* [v2.5] Пересылка источник -> приёмник ОТ ИМЕНИ БОТА.
                    Важен порядок: сперва ОТПРАВКА, только потом удаление оригинала --
                    иначе при любой ошибке отправки сообщение теряется навсегда. */
-                const attach = attachOf (message);
-                const text  = message.content ? message.content : '';
-                const files = attach.files ? attach.files.length : 0;
-                if (!text && !files)
+                // [v2.18] Сама отправка -- общей функцией relayPipe (тот же путь у
+                // контекстного меню «Переслать в общий»): логика одна, поведение не разъезжается.
+                const relay = await relayPipe (_pipe_channel_target, message);
+                const _shown = relay.text
+                    ? '"' + relay.text + '"' + (relay.files ? ' + <ATTACH>' : '')
+                    : '<ATTACH>';
+                if (relay.empty)
                 {
                     // Текст сюда попадает только с интентом Message Content: без него Discord
                     // присылает событие с пустым content. Удалять такое НЕЛЬЗЯ -- потеряем сообщение.
@@ -828,65 +893,35 @@ client.on ('messageCreate', async message =>
                         ' НЕ переслано: Discord не отдал ни текст, ни файлы' +
                         ' (нужен интент Message Content -- см. config.json / README)'
                     );
-                    return;
                 }
-                // [v14] channels.resolve асинхронный: сперва кэш, затем запрос к Discord:
-                let pipe_channel_target = client.channels.cache.get (_pipe_channel_target);
-                if (!pipe_channel_target)
-                    pipe_channel_target = await client.channels.fetch (_pipe_channel_target).catch (() => null);
-                if (pipe_channel_target) // check!
+                else if (relay.ok)
                 {
-                    pipe_channel_target.send
+                    console.log
                     (
-                        {
-                            content: text
-                                ? text
-                                : undefined,
-                            ...attach // || {}
-                        }
-                    )
-                    .then
+                        '[' + (d()) + '] [pipe] ' +
+                        'message from bot (by ' + message.author.username + '): ' + _shown
+                    );
+                    // оригинал убираем ТОЛЬКО после успешной пересылки:
+                    await message.delete ().catch
                     (
-                        () =>
-                        {
-                            console.log
-                            (
-                                '[' + (d()) + '] [pipe] ' +
-                                'message from bot (by ' + message.author.username + '): ' +
-                                (
-                                    text
-                                        ? '"' + text + '"' + (files ? ' + <ATTACH>' : '')
-                                        : '<ATTACH>'
-                                )
-                            );
-                            // оригинал убираем ТОЛЬКО после успешной пересылки:
-                            return message.delete ().catch
-                            (
-                                e => console.error ('[' + (d()) + '] [pipe] не смог удалить оригинал: ' + e.message)
-                            );
-                        }
-                    )
-                    .catch
-                    (
-                        e => console.error
-                        (
-                            '[' + (d()) + '] [pipe] НЕ переслано (' + e.message +
-                            ') -- сообщение оставлено в источнике'
-                        )
+                        e => console.error ('[' + (d()) + '] [pipe] не смог удалить оригинал: ' + e.message)
                     );
                 }
-                else
+                else if (relay.notFound)
                 {
                     console.log
                     (
                         '[' + (d()) + '] ' +
                         '[_CHANNEL_NOT_FOUND_] ' +
-                        'message from bot (by ' + message.author.username + '): ' +
-                        (
-                            text
-                                ? '"' + text + '"' + (files ? ' + <ATTACH>' : '')
-                                : '<ATTACH>'
-                        )
+                        'message from bot (by ' + message.author.username + '): ' + _shown
+                    );
+                }
+                else
+                {
+                    console.error
+                    (
+                        '[' + (d()) + '] [pipe] НЕ переслано (' + relay.error +
+                        ') -- сообщение оставлено в источнике'
                     );
                 }
             }
@@ -3924,6 +3959,9 @@ function musicOf (guildId)
             pausedByNobody: false,  // пауза из-за отсутствия живых слушателей
             playedToSomeone: false, // очередь реально кому-то играла
             streamRetries: 0,       // попытки продолжить трек с места обрыва потока
+            // [v2.18] когда бот подключился по просьбе человека (/join, /play): сразу после
+            // этого к автору трека НЕ переезжаем (иначе уехали бы от того, кто позвал)
+            justJoinedAt: 0,
             lastErrorAt: 0,
             playerWired: false,     // обработчики плеера вешаются ОДИН раз
             // [v2.14] Ссылка на поток ИГРАЮЩЕГО трека (yt-dlp + наш ffmpeg). Нужна,
@@ -3948,6 +3986,22 @@ function isStaffInteraction (interaction)
         (member.roles && member.roles.cache ? [...member.roles.cache.keys ()] : []);
     return !!((s.role_admin && roles.includes (s.role_admin)) ||
               (s.role_moder && roles.includes (s.role_moder)));
+}
+
+// [v2.18] Админ ли вызывающий (то же правило, что у текстовой `panda dm`: только
+// role_admin). Отдельно от isStaffInteraction: /dm и /announce -- админские и staff
+// соответственно, и это видно в одном месте.
+function isAdminInteraction (interaction)
+{
+    const server = interaction.guildId;
+    if (!(server in SERVERS)) return false;
+    const role_admin = SERVERS[server].role_admin;
+    if (!role_admin) return false;
+    const member = interaction.member;
+    if (!member) return false;
+    const roles = member._roles ||
+        (member.roles && member.roles.cache ? [...member.roles.cache.keys ()] : []);
+    return roles.includes (role_admin);
 }
 
 function isDJ (interaction)
@@ -4145,6 +4199,63 @@ async function createTrackStream (track, seekSec = 0)
 }
 
 // Воспроизведение следующего трека:
+// ============================================================================
+// [v2.18] ИГРАЕМ ТАМ, ГДЕ СЛУШАЕТ АВТОР ТРЕКА.
+// Если человек, который добавил трек, сейчас сидит в голосовом канале -- бот в момент
+// старта этого трека переезжает туда и остаётся там до трека другого автора (или до
+// /leave). Автора в голосе нет -- никуда не едем.
+// Своей инициативы у бота нет: переезжаем ТОЛЬКО когда он уже где-то играет (сам он
+// по-прежнему не заходит -- только /join, /play или человек, который его позвал), и не
+// переезжаем сразу после явного /join|/play (см. m.justJoinedAt в joinVoice).
+// ============================================================================
+function authorVoiceId (guildId, track)
+{
+    if (!track || !track.byId) return null;
+    const guild = client.guilds.cache.get (guildId);
+    if (!guild || !guild.voiceStates) return null;
+    if (client.user && track.byId === client.user.id) return null; // «автор» -- сам бот
+    const vs = guild.voiceStates.cache.get (track.byId);
+    const chId = vs ? (vs.channelId || (vs.channel && vs.channel.id) || null) : null;
+    if (!chId) return null;
+    const ch = client.channels.cache.get (chId) ||
+        (guild.channels && guild.channels.cache ? guild.channels.cache.get (chId) : null);
+    if (!ch) return null;
+    if (typeof ch.isVoiceBased === 'function' && !ch.isVoiceBased ()) return null;
+    return ch.id;
+}
+
+// Переехать к автору трека. Возвращает название канала, куда переехали (или null).
+function followTrackAuthor (guildId, track)
+{
+    const m = musicOf (guildId);
+    if (!m.connection) return null;                             // бот нигде -- сам не заходит
+    if (m.leaving) return null;                                 // бот уже уходит
+    if (Date.now () - (m.justJoinedAt || 0) < 5000) return null; // только что позвали -- остаёмся
+    const chId = authorVoiceId (guildId, track);
+    if (!chId) return null;
+    if (m.connection.joinConfig && m.connection.joinConfig.channelId === chId) return null; // уже там
+    const guild = client.guilds.cache.get (guildId);
+    const ch = client.channels.cache.get (chId) ||
+        (guild && guild.channels && guild.channels.cache ? guild.channels.cache.get (chId) : null);
+    if (!ch) return null;
+    const who = track.byName || '<@' + track.byId + '>';
+    try
+    {
+        // тот же путь, что у /play и /join (умеет и переезд, и первый заход)
+        joinVoice (guildId, ch, guild, 'автор трека ' + who + ' слушает здесь');
+        m.savedChannelId = ch.id; // после перезапуска продолжаем там же
+        if (ch.type === ChannelType.GuildStageVoice)
+            console.log ('[' + (d()) + '] [music] «' + ch.name + '» -- Stage-канал: чтобы музыку было слышно, ' +
+                'Stage Moderator должен сделать бота спикером');
+        return ch.name;
+    }
+    catch (e)
+    {
+        console.error ('[music] к автору трека не переехал: ' + oneLine (e.message));
+        return null;
+    }
+}
+
 async function playNext (guildId)
 {
     const m = musicOf (guildId);
@@ -4175,6 +4286,8 @@ async function playNext (guildId)
     if (m.seekTrack !== m.tracks[0]) m.streamRetries = 0; // новый трек -- счётчик попыток с нуля
     let track = m.tracks.shift ();
     m.current = track;
+    // [v2.18] перед стартом переезжаем туда, где слушает автор ЭТОГО трека (если он в голосовом):
+    followTrackAuthor (guildId, track);
     // [v2.14] ОДНА строка на запуск трека. Раньше рядом появлялась отдельная
     // «предзагрузка сыграла: X (без паузы)» -- по логу это читалось как «предыдущий
     // ролик уже отыграл». Теперь всё в строке «играю»: это просто пометка, что трек
@@ -5099,6 +5212,32 @@ function checkListeners (server)
             scheduleVoiceStatus (server, true);
             schedulePresence (true);
         }
+        else if (!people && m.pausedByNobody)
+        {
+            // [v2.18] Бот один и на паузе, а автор следующего (или не доигранного) трека
+            // сидит в другом голосовом канале -- едем к нему: кто поставил трек, тот его и
+            // слушает. Логика паузы/продолжения тут НЕ дублируется: после переезда
+            // checkListeners вызывается заново и сам снимает паузу обычным путём
+            // (ветка выше). Если человек успел уйти или он бот -- просто ничего не делаем.
+            const next = m.current || m.tracks[0];
+            const authorCh = next ? authorVoiceId (server, next) : null;
+            const guildMove = authorCh ? client.guilds.cache.get (server) : null;
+            const bc = authorCh ? client.channels.cache.get (authorCh) : null;
+            if (bc && guildMove && bc.id !== chId)
+            {
+                try
+                {
+                    joinVoice (server, bc, guildMove, 'здесь никого, а автор трека ' +
+                        (next.byName || u (next.byId)) + ' слушает здесь');
+                    m.savedChannelId = bc.id;
+                    return checkListeners (server);
+                }
+                catch (e)
+                {
+                    console.error ('[music] к автору трека не переехал: ' + oneLine (e.message));
+                }
+            }
+        }
         return;
     }
     // бота в канале нет, но есть ждущая очередь: заходим сами, если там появился человек
@@ -5190,10 +5329,12 @@ function schedulePresence (immediate = false)
 // Подключение к голосовому каналу.
 // [v2.10] Вынесено из connectTo: этим же путём пользуется возобновление музыки после
 // перезапуска (там нет ни interaction, ни голосового канала участника -- есть id из базы).
-function joinVoice (guildId, voiceChannel, guild)
+// [v2.18] reason -- зачем переехали: попадает в строку лога («перешёл в «X» -- автор трека ...»).
+function joinVoice (guildId, voiceChannel, guild, reason = '')
 {
     const m = musicOf (guildId);
     if (!voiceChannel) return m;
+    m.justJoinedAt = Date.now (); // позвали -- к автору трека сразу не уезжаем (см. followTrackAuthor)
     if (!m.connection)
     {
         m.connection = joinVoiceChannel
@@ -5257,8 +5398,9 @@ function joinVoice (guildId, voiceChannel, guild)
     {
         const oldChId = m.connection.joinConfig.channelId;
         m.connection.rejoin ({ channelId: voiceChannel.id });
+        m.savedChannelId = voiceChannel.id;
         // [v2.7] активное событие в лог: переезд раньше нигде не писался
-        console.log ('[' + (d()) + '] [music] перешёл в «' + voiceChannel.name + '»');
+        console.log ('[' + (d()) + '] [music] перешёл в «' + voiceChannel.name + '»' + (reason ? ' -- ' + reason : ''));
         // [v2.7] статус живёт в канале: из старого снимаем, в новом пишем заново
         clearVoiceStatus (oldChId);
         scheduleVoiceStatus (guildId, true);
@@ -5454,6 +5596,41 @@ const musicCommands =
     // [v2.17] /rolecheck -- что бот помнит о человеке: роли, наказания и что именно
     // он вернёт при следующем входе (админы/модеры). Работает и для того, кто не
     // на сервере: данные лежат в базе по id.
+    // [v2.18] /announce и /dm -- замена текстовым командам, ради которых раньше был нужен
+    // интент Message Content: слэш-команды не требуют привилегированных интентов.
+    new SlashCommandBuilder ()
+        .setName ('announce')
+        .setDescription ('Опубликовать объявление от имени бота (админы/модеры)')
+        .addStringOption (o =>
+            o.setName ('text')
+             .setDescription ('Текст объявления')
+             .setRequired (true))
+        .addAttachmentOption (o =>
+            o.setName ('file')
+             .setDescription ('Вложение к объявлению (картинка, файл)'))
+        .addChannelOption (o =>
+            o.setName ('channel')
+             .setDescription ('Куда опубликовать (по умолчанию -- в этот канал)')),
+    new SlashCommandBuilder ()
+        .setName ('dm')
+        .setDescription ('Отправить человеку личное сообщение от имени бота (только админы)')
+        .addUserOption (o =>
+            o.setName ('user')
+             .setDescription ('Кому')
+             .setRequired (true))
+        .addStringOption (o =>
+            o.setName ('text')
+             .setDescription ('Текст сообщения (можно без текста, если есть файл)'))
+        .addAttachmentOption (o =>
+            o.setName ('file')
+             .setDescription ('Вложение (картинка, файл)')),
+    // [v2.18] Правый клик по сообщению -> «Переслать в общий»: то же, что делает мост
+    // из пандалогии, но БЕЗ интента Message Content (Discord отдаёт выбранное сообщение
+    // целиком, вместе с текстом и вложениями). Работает и как основная замена мосту,
+    // если Discord отзовёт интент 9 октября 2026.
+    new ContextMenuCommandBuilder ()
+        .setName ('Переслать в общий')
+        .setType (ApplicationCommandType.Message),
     new SlashCommandBuilder ()
         .setName ('rolecheck')
         .setDescription ('Что бот помнит о человеке: роли, наказания и что вернёт при входе (staff)')
@@ -5487,7 +5664,7 @@ async function registerMusicCommands ()
                 Routes.applicationGuildCommands (ID, server),
                 { body: musicCommands }
             );
-            console.log ('[' + (d()) + '] [music] slash-commands registered @ ' + SERVERS[server].name);
+            console.log ('[' + (d()) + '] [music] команды зарегистрированы (слэш + «Переслать в общий» на сообщении) @ ' + SERVERS[server].name);
         }
         catch (e)
         {
@@ -5578,6 +5755,46 @@ client.on ('interactionCreate', async (interaction) =>
         // подтверждаем нажавшему -- ответ виден только ему.
         await replyView (page);
         return interaction.followUp ({ content: res.text, flags: MessageFlags.Ephemeral });
+    }
+    // [v2.18] КОМАНДА-КОНТЕКСТНОЕ МЕНЮ на сообщении (правый клик -> Приложения ->
+    // «Переслать в общий»). Интент Message Content ей НЕ нужен: Discord отдаёт
+    // выбранное сообщение целиком -- и текст, и вложения. Это замена мосту из
+    // пандалогии на случай, если интент отзовут 9 октября 2026.
+    // Оригинал удаляем только в канале-источнике (как это делал мост): если staff
+    // переслал сообщение откуда-то ещё, мы его не трогаем -- чужое сообщение удалять
+    // по одному клику нельзя.
+    if (typeof interaction.isMessageContextMenuCommand === 'function' && interaction.isMessageContextMenuCommand ())
+    {
+        if (!isStaffInteraction (interaction))
+            return interaction.reply ({ content: '🚫 Команда только для админов и модеров.', flags: MessageFlags.Ephemeral });
+        const server = interaction.guildId;
+        const s = SERVERS[server];
+        const to = s && s.pipe_channel_target;
+        const msg = interaction.targetMessage;
+        if (!to)
+            return interaction.reply ({ content: '⚠️ У этого сервера в config.json не задан `pipe_channel_target` -- пересылать некуда.', flags: MessageFlags.Ephemeral });
+        if (!msg)
+            return interaction.reply ({ content: '⚠️ Не вижу сообщение -- попробуй ещё раз.', flags: MessageFlags.Ephemeral });
+        await interaction.deferReply ({ flags: MessageFlags.Ephemeral });
+        const who = interaction.member ? uuu (interaction.member) : interaction.user.username;
+        const relay = await relayPipe (to, msg);
+        if (relay.empty)
+            return interaction.editReply ('🤔 В сообщении нет ни текста, ни вложений -- пересылать нечего.\n' +
+                '_(если это была картинка -- значит Discord не отдал её вместе с сообщением)_');
+        if (!relay.ok)
+            return interaction.editReply (relay.notFound
+                ? '⚠️ Канал <#' + to + '> недоступен -- не могу туда написать.'
+                : '⚠️ Не смог переслать: `' + oneLine (relay.error, 150) + '`');
+        const fromSource = s.pipe_channel_source && msg.channel && msg.channel.id === s.pipe_channel_source;
+        if (fromSource)
+            await msg.delete ().catch (e => console.error ('[' + (d()) + '] [pipe] не смог удалить оригинал: ' + e.message));
+        console.log ('[' + (d()) + '] [pipe] (кто: ' + who + ') переслал сообщение ' +
+            (msg.author ? msg.author.username : '?') + ' -> ' + (relay.channel.name ? '#' + relay.channel.name : to) +
+            (relay.files ? ' + вложение' : '') + (relay.text ? ': ' + oneLine (relay.text, 120) : '') +
+            (fromSource ? ' (оригинал удалён)' : ' (оригинал оставлен)'));
+        return interaction.editReply ('📣 Переслал в <#' + to + '>.' + (fromSource
+            ? ' Оригинал в этом канале удалён.'
+            : ' Оригинал оставил на месте -- удали его сам, если не нужен.'));
     }
     if (!interaction.isChatInputCommand ()) return;
     const name = interaction.commandName;
@@ -5680,6 +5897,76 @@ client.on ('interactionCreate', async (interaction) =>
             '✅ С **' + target.username + '** снято: ' + what + till + '.' +
             '\nВ журнале отмечено (кто и когда).'
         );
+    }
+    // [v2.18] /announce -- публикация от имени бота (staff). Заменяет мост из пандалогии,
+    // который требовал интент Message Content (без него текст и вложения приходят пустыми).
+    // Публикуем в указанный канал (по умолчанию -- в тот, где вызвали), без удаления чего-либо.
+    if (name === 'announce')
+    {
+        if (!isStaffInteraction (interaction))
+            return interaction.reply ({ content: '🚫 Команда только для админов и модеров.', flags: MessageFlags.Ephemeral });
+        const text = (interaction.options.getString ('text') || '').trim ();
+        const file = interaction.options.getAttachment ('file');
+        const target = interaction.options.getChannel ('channel') || interaction.channel;
+        if (!text && !file)
+            return interaction.reply ({ content: '🤔 Пустое объявление: нужен текст или вложение.', flags: MessageFlags.Ephemeral });
+        await interaction.deferReply ({ flags: MessageFlags.Ephemeral });
+        const who = interaction.member ? uuu (interaction.member) : interaction.user.username;
+        try
+        {
+            const ch = client.channels.cache.get (target.id) || await client.channels.fetch (target.id);
+            if (!ch || typeof ch.send !== 'function')
+                return interaction.editReply ('⚠️ Канал <#' + target.id + '> недоступен -- не могу туда написать.');
+            await ch.send
+            ({
+                content: text || undefined,
+                files: file ? [{ attachment: file.url, name: file.name || 'файл' }] : [],
+            });
+            console.log ('[' + (d()) + '] [pipe] (кто: ' + who + ') объявление -> ' + (ch.name ? '#' + ch.name : target.id) +
+                (file ? ' + вложение' : '') + (text ? ': ' + oneLine (text, 120) : ''));
+            return interaction.editReply ('📣 Опубликовано ' + (target.id === interaction.channelId
+                ? 'в этом канале'
+                : 'в <#' + target.id + '>') + '.');
+        }
+        catch (e)
+        {
+            console.error ('[pipe] объявление не ушло: ' + oneLine (e.message));
+            return interaction.editReply ('⚠️ Не смог опубликовать: `' + oneLine (e.message, 150) + '`');
+        }
+    }
+    // [v2.18] /dm -- личное сообщение от имени бота (только админы, как и `panda dm`).
+    // Тоже без интента Message Content: текст приходит в самой слэш-команде.
+    if (name === 'dm')
+    {
+        if (!isAdminInteraction (interaction))
+            return interaction.reply ({ content: '🚫 Команда только для админов.', flags: MessageFlags.Ephemeral });
+        const target = interaction.options.getUser ('user', true);
+        const text = (interaction.options.getString ('text') || '').trim ();
+        const file = interaction.options.getAttachment ('file');
+        if (!text && !file)
+            return interaction.reply ({ content: '🤔 Что отправить? Нужен текст или вложение.', flags: MessageFlags.Ephemeral });
+        await interaction.deferReply ({ flags: MessageFlags.Ephemeral });
+        const who = interaction.member ? uuu (interaction.member) : interaction.user.username;
+        try
+        {
+            const user = await client.users.fetch (target.id);
+            if (!user || typeof user.send !== 'function')
+                return interaction.editReply ('⚠️ Пользователь ' + u (target.id) + ' недоступен.');
+            await user.send
+            ({
+                content: text || undefined,
+                files: file ? [{ attachment: file.url, name: file.name || 'файл' }] : [],
+            });
+            console.log ('[' + (d()) + '] [dm] (кто: ' + who + ') ЛС -> ' + uu (target) +
+                (file ? ' + вложение' : '') + (text ? ': ' + oneLine (text, 120) : ''));
+            return interaction.editReply ('✉️ Отправил ЛС: ' + u (target.id));
+        }
+        catch (e)
+        {
+            console.error ('[dm] ЛС -> ' + uu (target) + ' не ушло: ' + oneLine (e.message));
+            return interaction.editReply ('⚠️ ЛС не ушло: `' + oneLine (e.message, 150) + '`.\n' +
+                '_(частая причина -- у него закрыта личка)_');
+        }
     }
     // [v2.17] /rolecheck -- отчёт о человеке (только staff, ответ виден вызвавшему).
     // Работает с ЛЮБЫМ человеком, в том числе не состоящим на сервере.
