@@ -120,8 +120,24 @@ last change is at the top.
 
 ## Contact
 
-The operator of this bot and the contact for any privacy request: **<контакт владельца: Discord-ник или e-mail>**
-(see also `/help` in the server where the bot runs).
+The operator of this bot and the contact for any privacy request:
+
+- **Discord: `lapulya666`** (user ID `247110936115150848`) -- direct messages are open, so this works
+  for anyone, including people who are not in the server where the bot runs;
+
+<!--
+  СТРОКА ПРО E-MAIL (решение владельца, поэтому закомментирована: в опубликованном файле этот блок
+  не виден, а напоминание остаётся здесь). Хочешь второй контакт, доступный тому, кто вообще не в
+  Discord, -- заведи адрес только для бота и верни строку в список выше:
+
+- **E-mail:** pandamia.bot@example.com
+
+  Заводить НЕ личный ящик: этот адрес станет публичным. Если не хочешь вообще -- блок можно удалить,
+  Discord-ника достаточно (ни одного "<...>" в файле остаться не должно).
+-->
+
+The bot also prints this contact by itself in the `/help` message on every server it runs on, so the
+contact can be found without opening this page (it is configured by the operator, not hard-coded).
 
 ---
 
@@ -143,4 +159,5 @@ The operator of this bot and the contact for any privacy request: **<конта�
 
 **Удалить свои данные:** попросить staff сервера -- у них есть команда `/forget user:@кто`, она сразу
 стирает id ролей и счётчики наказаний этого человека (активное наказание не трогает: его снимает
-`/unban`); либо написать владельцу (контакт есть в `/help`), и те же записи удаляют вручную.
+`/unban`); либо написать владельцу (контакт есть и здесь, и в `/help`), и те же записи удаляют вручную.
+
