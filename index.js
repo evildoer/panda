@@ -4294,8 +4294,11 @@ async function myDataReport (server, target, self)
     }
 
     // --- 4. очередь музыки ---
+    // [v2.24] Очередь живёт в m.tracks (поля m.queue в состоянии музыки нет). Из-за опечатки
+    // этот раздел ВСЕГДА писал «в очереди треков нет», даже когда треки человека стояли
+    // в очереди -- то есть отчёт о хранении показывал меньше, чем бот реально помнит.
     const m = musicOf (server);
-    const inQ = (m.queue || []).filter (_t => String ((_t && _t.byId) || '') === target.id).length;
+    const inQ = (m.tracks || []).filter (_t => String ((_t && _t.byId) || '') === target.id).length;
     const cur = !!(m.current && String (m.current.byId || '') === target.id);
     if (inQ || cur)
     {
@@ -4311,8 +4314,9 @@ async function myDataReport (server, target, self)
         ' байт -- всё в одном локальном файле SQLite на машине владельца бота, никуда не отправляется' +
         (DB_KEYS.length ? '; записи зашифрованы (AES-256-GCM)' : '') + '.');
     out.push ('**Чего там никогда не бывает:** текстов и истории сообщений, ников и аватаров, e-mail и телефонов, IP-адресов, платежных данных, записей голоса.');
-    out.push ('**Сроки:** роли и история -- ' + (banHistoryLabel (server) === roleSaveLabel (server)
-        ? roleSaveLabel (server) : 'роли: ' + roleSaveLabel (server) + ', история: ' + banHistoryLabel (server)) +
+    out.push ('**Сроки:** ' + (banHistoryLabel (server) === roleSaveLabel (server)
+        ? 'роли и история -- ' + roleSaveLabel (server)
+        : 'роли -- ' + roleSaveLabel (server) + '; история -- ' + banHistoryLabel (server)) +
         '; таймер выхода -- до окончания наказания; очередь музыки -- до `/stop` или конца очереди.');
     out.push ('**Как удалить:** попроси staff -- `/forget user:' + (self ? '@ты' : '@' + target.username) +
         '` стирает роли и историю сразу; либо напиши владельцу бота (контакт есть в `/help`).\n' +
