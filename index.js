@@ -745,22 +745,42 @@ function helpText (server)
 }
 
 // [v2.6] Инструкция одним объектом -- чтобы /help, `panda help` и стартовая ЛС
-// никогда не разъезжались по тексту:
-function helpEmbed (server)
+// никогда не разъезжались по тексту.
+// [v2.23] Текст вырос за 4096 символов -- это лимит описания ОДНОГО embed'а, и Discord
+// отклонял стартовую ЛС целиком ('BASE_TYPE_MAX_LENGTH: Must be 4096 or fewer in length',
+// в логе это выглядело как 'startup DM error' -- то есть бот запускался, а инструкцию
+// владельцу не слал). Поэтому текст режется на несколько embed'ов по границам строк:
+// в одном сообщении их может быть до 10 и до 6000 символов суммарно.
+const HELP_EMBED_MAX = 3900;
+function helpEmbeds (server)
 {
     const s = SERVERS[server];
     const first = server && s ? server : Object.keys (SERVERS)[0];
-    return {
-        color: 0x00CCFF,
-        title: '🐼 PANDAMIA Bot: инструкция',
-        description: helpText (first),
-        footer:
+    const parts = [];
+    let cur = '';
+    for (const line of helpText (first).split ('\n'))
+    {
+        if (cur && cur.length + line.length + 1 > HELP_EMBED_MAX) { parts.push (cur); cur = ''; }
+        cur += (cur ? '\n' : '') + line;
+    }
+    if (cur) parts.push (cur);
+    return parts.map ((part, i) =>
+    {
+        const last = i === parts.length - 1;
+        const emb = { color: 0x00CCFF, description: part };
+        if (i === 0) emb.title = '🐼 PANDAMIA Bot: инструкция';
+        // Подпись и время -- только у последнего куска: это одна инструкция, а не несколько.
+        if (last)
         {
-            text: (first && SERVERS[first]) ? SERVERS[first].name : 'PANDAMIA Bot',
-        },
-        timestamp: dt(), // [v14] только Date/number (locale-строка кидала 'Invalid time value'),
-    };
+            emb.footer = { text: (first && SERVERS[first]) ? SERVERS[first].name : 'PANDAMIA Bot' };
+            emb.timestamp = dt(); // [v14] только Date/number (locale-строка кидала 'Invalid time value'),
+        }
+        return emb;
+    });
 }
+
+// Первый кусок -- для случаев, когда нужен ровно один embed (совместимость).
+function helpEmbed (server) { return helpEmbeds (server)[0]; }
 
 const
 {
@@ -886,17 +906,23 @@ function dbCopyAndVerify (_src, _dst, _expectRows)
     }
 }
 
-// Обновление копии с двумя предосторожностями: (1) неудачная копия не подменяет целую
-// (см. dbCopyAndVerify), (2) база с МЕНЬШИМ числом записей, чем в копии, копию не
-// перезаписывает -- иначе уменьшившаяся (или полупустая) база затёрла бы целую копию.
-// В обычной жизни записи то прибавляются (кто-то вышел -- сохранились роли), то
-// уменьшаются (вернулся -- запись больше не нужна), так что копия всё равно обновляется.
+// Обновление копии. Предосторожностей две:
+//   (1) неудачная копия не подменяет целую -- копируем через временный файл и проверяем
+//       ЕГО чтением (см. dbCopyAndVerify);
+//   (2) пустая база при непустой копии копию не перезаписывает -- это уже признак потери
+//       данных, и на нём бот вообще не запускается (см. dbStartupGuard).
+// [v2.23] А вот уменьшение числа записей копию БОЛЬШЕ НЕ останавливает: в обычной жизни
+// записи и вправду уменьшаются (вернулся -- запись roles больше не нужна; /forget стёр
+// роли и историю; таймаут истёк), и копия начинала отставать -- в логе висело «копия НЕ
+// обновлена» с советом удалить файл руками, а копия при восстановлении возвращала бы уже
+// ненужное. Уменьшение видно в логе строкой «было N -- записи уменьшились», то есть не
+// молча. SQLite при этом атомарен: незакрывшаяся транзакция откатывается целиком, а
+// половины записей не теряет.
 function dbBackupRefresh (_file, _bak, _rows, _old)
 {
-    if (_old.exists && _rows < _old.rows)
-        return { ok: false, why: 'в базе ' + _rows + ', а в копии ' + _old.rows +
-            ' ' + plural (_old.rows, 'запись', 'записи', 'записей') +
-            ' -- оставил копию как есть (если так и надо, удали ' + _bak.split ('/').pop () + ' и запусти `node . backup`)' };
+    if (_rows === 0 && _old.exists && _old.rows > 0)
+        return { ok: false, why: 'в базе 0 записей, а в копии ' + _old.rows +
+            ' ' + plural (_old.rows, 'запись', 'записи', 'записей') + ' -- оставил копию как есть' };
     return dbCopyAndVerify (_file, _bak, _rows);
 }
 
@@ -922,7 +948,10 @@ function dbStartupGuard ()
         {
             const _res = dbBackupRefresh (_file, _bak, _cur.rows, _old);
             _tail = ' -- ' + _cur.rows + ' ' + plural (_cur.rows, 'запись', 'записи', 'записей') +
-                (_res.ok ? ', копия обновлена' : ', копия НЕ обновлена: ' + _res.why);
+                (_res.ok
+                    ? ', копия обновлена' + (_old.exists && _old.rows > _cur.rows
+                        ? ' (было ' + _old.rows + ' -- записи уменьшились)' : '')
+                    : ', копия НЕ обновлена: ' + _res.why);
             if (_f.existsSync (_file + '-journal') || _f.existsSync (_file + '-wal'))
                 _tail += ', был аварийный выход (журнал на диске -- SQLite откатит сам)';
         }
@@ -1346,7 +1375,7 @@ client.on
             .then
             (
                 user =>
-                user.send ({ embeds: [helpEmbed (Object.keys (SERVERS)[0])] }) // [v2.6] тот же текст, что у /help
+                user.send ({ embeds: helpEmbeds (Object.keys (SERVERS)[0]) }) // [v2.6] тот же текст, что у /help
             )
             .then (() => console.log ('[' + (d()) + '] startup DM sent to ' + uid))
             .catch (e => console.error ('[' + (d()) + '] startup DM error for ' + uid + ': ' + e.message));
@@ -1542,7 +1571,7 @@ client.on ('messageCreate', async message =>
         // В чат её не льём (20 строк шума); саму команду в канале уберёт блок ниже.
         if (isCmd (message.content, 'help'))
         {
-            message.author.send ({ embeds: [helpEmbed (message.guild ? message.guild.id : null)] })
+            message.author.send ({ embeds: helpEmbeds (message.guild ? message.guild.id : null) })
             .then (() => console.log ('[' + (d()) + '] [dm] help -> ' + uu (message.author) + ' OK'))
             .catch (e => console.error
             (
@@ -6918,7 +6947,7 @@ client.on ('interactionCreate', async (interaction) =>
     );
     // [v2.6] /help -- всем и всегда: без DJ-роли и без голосового канала, ephemeral.
     if (name === 'help')
-        return interaction.reply ({ embeds: [helpEmbed (interaction.guildId)], flags: MessageFlags.Ephemeral });
+        return interaction.reply ({ embeds: helpEmbeds (interaction.guildId), flags: MessageFlags.Ephemeral });
     // [v2.14] /bans -- до всего остального (это не музыка, а модерация): ответ
     // виден только вызвавшему, права -- админ/модер.
     if (name === 'bans')
