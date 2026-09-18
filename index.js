@@ -260,9 +260,102 @@ const
     //            как контакт «если бот выключен»; если его нет -- берётся STARTUP_DM[0].
     //   MUSIC -- настройки музыки: proxy (socks5), normalize (громкость), filter.
     OWNER, MUSIC,
+    // [v2.20] Ключ шифрования базы (необязательный): 64 hex-символа или парольная фраза.
+    // Пусто или ключа нет -- записи хранятся как раньше, открытым текстом.
+    // Новый ключ: `node . keygen` (или node.cmd keygen в папке бота).
+    db_key,
 }
 = require ('./config.json');
 const space = ' ';
+
+// ============================================================================
+// [v2.20] ШИФРОВАНИЕ СОХРАНЁННЫХ ДАННЫХ (AES-256-GCM)
+// Зачем: в форме заявки на привилегированные интенты Discord есть вопрос, шифрует ли
+// приложение данные, которые хранит вне платформы (база бота -- как раз такой случай).
+// Ключ -- db_key в config.json.
+// Честно про границы (подробнее в PRIVACY.md): ключ лежит в config.json, то есть РЯДОМ
+// с базой, поэтому от того, кто скопировал папку целиком, это не спасает. Спасает от
+// другого: файл базы, попавший куда-то сам по себе (бэкап, облако, копия на другой
+// машине), внутри нечитаем -- вместо списка id ролей и наказаний там мусор.
+// Записи, сделанные ДО включения шифрования, читаются как есть (формат распознаётся по
+// префиксу), так что история и очередь не теряются.
+// Новый ключ: `node . keygen`; поставить или сменить -- строкой db_key в config.json.
+// ============================================================================
+const crypto = require ('crypto');
+const DB_ENC_PREFIX = 'enc1:';// маркер формата: нет префикса -- значение открытое
+const DB_ENC_SALT = 'pandamia-db-v1';
+const DB_ENC_HEX = /^[0-9a-fA-F]{64}$/;
+
+if (process.argv.slice (2).some (_a => /^keygen$/i.test (_a)))
+{
+    console.log ('новый db_key (вставь его в config.json в строку "db_key"):');
+    console.log (crypto.randomBytes (32).toString ('hex'));
+    process.exit (0);
+}
+
+function dbKeyMake (_raw)
+{
+    const _s = String (_raw === undefined || _raw === null ? '' : _raw).trim ();
+    if (!_s) return null;
+    if (DB_ENC_HEX.test (_s)) return Buffer.from (_s, 'hex');// 64 hex -- ключ как есть
+    return crypto.scryptSync (_s, DB_ENC_SALT, 32);// парольная фраза -- тоже годится
+}
+const DB_KEY = dbKeyMake (db_key);
+let _dbEncWarn = 0;// о проблемах расшифровки говорим пару раз, а не на каждой записи
+
+function dbEnc (_text)
+{// -> 'enc1:<base64(iv | tag | шифртекст)>'
+    const _iv = crypto.randomBytes (12);
+    const _c = crypto.createCipheriv ('aes-256-gcm', DB_KEY, _iv);
+    const _body = Buffer.concat ([_c.update (_text, 'utf8'), _c.final ()]);
+    return DB_ENC_PREFIX + Buffer.concat ([_iv, _c.getAuthTag (), _body]).toString ('base64');
+}
+function dbDec (_text)
+{// -> строка или null (не тот ключ / запись испорчена). Не бросает: база важнее шума
+    try
+    {
+        const _all = Buffer.from (String (_text).slice (DB_ENC_PREFIX.length), 'base64');
+        const _d = crypto.createDecipheriv ('aes-256-gcm', DB_KEY, _all.subarray (0, 12));
+        _d.setAuthTag (_all.subarray (12, 28));
+        return Buffer.concat ([_d.update (_all.subarray (28)), _d.final ()]).toString ('utf8');
+    }
+    catch (e) { return null; }
+}
+function dbSerialize (_value)
+{
+    const _json = JSON.stringify (_value);
+    return DB_KEY ? dbEnc (_json) : _json;
+}
+// ВАЖНО про формат: keyv v5 хранит не значение, а «конверт» {value, expires} -- и при
+// set, и в get, и в iterator (тот читает data.value и data.expires напрямую). Поэтому
+// шифруем/расшифровываем конверт целиком, а при НЕУДАЧЕ отдаём пустой конверт, а не
+// undefined: iterator на undefined упал бы с TypeError («Cannot read properties of
+// undefined (reading 'expires')»), а через iterator работают свипы таймаутов и возврат
+// ролей -- то есть база важнее аккуратности типа.
+function dbDeserialize (_raw)
+{
+    const _s = Buffer.isBuffer (_raw) ? _raw.toString ('utf8') : String (_raw);
+    const empty = { value: undefined, expires: undefined };
+    if (_s.startsWith (DB_ENC_PREFIX))
+    {
+        if (!DB_KEY)
+        {
+            if (_dbEncWarn++ < 3) console.log ('[' + new Date ().toLocaleString () +
+                '] [db] запись зашифрована, а db_key в config.json пуст -- пропускаю её');
+            return empty;
+        }
+        const _t = dbDec (_s);
+        if (_t === null)
+        {
+            if (_dbEncWarn++ < 3) console.log ('[' + new Date ().toLocaleString () +
+                '] [db] запись не расшифровалась (db_key изменился?) -- пропускаю её');
+            return empty;
+        }
+        try { return JSON.parse (_t); } catch (e) { return empty; }
+    }
+    try { return JSON.parse (_s); }// запись до включения шифрования -- открытая
+    catch (e) { return empty; }
+}
 
 // [v2.14] КОММЕНТАРИИ В КОНФИГЕ. В JSON комментариев нет, поэтому подсказки лежат
 // обычными ключами с окончанием _comment (идея владельца). Читает их только человек.
@@ -498,12 +591,17 @@ const { KeyvSqlite } = require ('@keyv/sqlite');
 // так ключи на диске остаются в прежнем виде ('membersBanTimeout:<id>'), то есть
 // уже сохранённые баны читаются по-старому.
 function dbMake (_server, _namespace)
-{
-    const kv = new Keyv
-    ({
-        store: new KeyvSqlite ({ uri: 'sqlite://' + __dirname + '/' + _server + '.sqlite' }),
-        namespace: _namespace,
-    });
+{    const kv = new Keyv
+    (
+        {
+            store: new KeyvSqlite ({ uri: 'sqlite://' + __dirname + '/' + _server + '.sqlite' }),
+            namespace: _namespace,
+            // [v2.20] шифрование значений в базе (см. блок DB_ENC в начале файла):
+            // ключ -- db_key в config.json; без ключа -- как было, открытым текстом
+            serialize: dbSerialize,
+            deserialize: dbDeserialize,
+        }
+    );
     // Ошибки базы не должны теряться: раньше сбой записи был не виден вообще.
     kv.on ('error', e => console.error ('[db] ' + _namespace + ': ' + String ((e && e.message) || e).slice (0, 200)));
     return kv;
@@ -524,6 +622,12 @@ for (let _server in SERVERS)
     // (ключ -- id участника, значение -- {at, events:[{at, kind}]}):
     $db[_server]['banHistory']        = dbMake (_server, 'banHistory');
 }
+
+// [v2.20] Состояние шифрования базы -- одной строкой при старте (как остальные отчёты):
+// чтобы после перезапуска было видно, что база не вдруг стала открытой (или наоборот).
+console.log ('[' + new Date ().toLocaleString () + '] [db] шифрование записей: ' +
+    (DB_KEY ? 'ВКЛЮЧЕНО (db_key), AES-256-GCM -- не потеряй config.json: без ключа записи не прочитаются'
+            : 'выключено (нет db_key в config.json)'));
 
 async function db (server, namespace, id, value = undefined, item = undefined)
 {

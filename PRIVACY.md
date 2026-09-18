@@ -61,6 +61,24 @@ The bot runs on the operator's own computer/hosting; there is no external databa
 any service other than Discord itself. Access to the machine and to the file is limited to the
 operator. The bot token and the configuration file are never published.
 
+### Encryption
+
+Every value written to that database is encrypted with **AES-256-GCM** (random IV per record, tag
+checked on read). The key is a setting in the bot's own configuration file (`db_key`) on the same
+machine; if the setting is empty, the bot stores values unencrypted and says so in its log. Records
+written before encryption was enabled are still read; nothing is lost when it is switched on.
+
+Honest scope of that protection: the key sits next to the database, so a copy of the **whole folder**
+stays readable — this protects the case where the **database file alone** ends up somewhere (a backup,
+a cloud-synced folder, a copy on another machine): its content is unreadable ciphertext rather than a
+list of role IDs and moderation counters. Nothing here protects against a person who has access to the
+running machine under the operator's own account.
+
+По-русски: записи в базе шифруются AES-256-GCM, ключ -- в `config.json` (`db_key`). Ключ лежит рядом
+с базой, поэтому копия папки целиком читается; защищён случай, когда утекает **только файл базы** --
+там нечитаемый шифртекст. Против человека за тем же включённым компьютером под учётной записью
+владельца это, разумеется, не помогает.
+
 ## Retention
 
 | Data | Default | Configurable |
@@ -115,6 +133,8 @@ The operator of this bot and the contact for any privacy request: **<конта�
 кто поставил) и настройки сервера из конфига. По умолчанию роли и счётчики **не имеют срока давности**
 -- так и задумано: человек, вернувшийся через месяцы, всё равно получает свои роли. Владелец может
 поставить срок в днях в файле конфигурации.
+
+**Шифрование:** записи в базе -- AES-256-GCM, ключ в `config.json` (`db_key`); без ключа файл базы нечитаем.
 
 **Не хранится:** текст сообщений (он используется только для команд staff и пересылки объявления),
 ники, аватары, e-mail, история сообщений, записи голоса, IP-адреса, платежные данные. Никакой
