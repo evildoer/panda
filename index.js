@@ -1338,7 +1338,7 @@ const INTENT_NAMES = new Map
             const drop = /disallowed intent/i.test (msg) ? PRIVILEGED.find (i => client.options.intents.has (i)) : null;
             if (!drop)
             {
-                console.error ('[login] error: ' + msg);
+                console.error ('[login] ошибка: ' + msg);
                 break;
             }
             client.options.intents.remove (drop);
@@ -1381,8 +1381,8 @@ client.on
                 user =>
                 user.send ({ embeds: helpEmbeds (Object.keys (SERVERS)[0]) }) // [v2.6] тот же текст, что у /help
             )
-            .then (() => console.log ('[' + (d()) + '] startup DM sent to ' + uid))
-            .catch (e => console.error ('[' + (d()) + '] startup DM error for ' + uid + ': ' + e.message));
+            .then (() => console.log ('[' + (d()) + '] стартовая ЛС отправлена ' + uid))
+            .catch (e => console.error ('[' + (d()) + '] стартовая ЛС не ушла ' + uid + ': ' + e.message));
         }
     }
 );
@@ -1576,7 +1576,7 @@ client.on ('messageCreate', async message =>
         if (isCmd (message.content, 'help'))
         {
             message.author.send ({ embeds: helpEmbeds (message.guild ? message.guild.id : null) })
-            .then (() => console.log ('[' + (d()) + '] [dm] help -> ' + uu (message.author) + ' OK'))
+            .then (() => console.log ('[' + (d()) + '] [dm] help -> ' + uu (message.author) + ' -- отправлено'))
             .catch (e => console.error
             (
                 '[' + (d()) + '] [dm] help -> ' + uu (message.author) + ': ЛС не ушло (' + e.message + ')'
@@ -1591,7 +1591,7 @@ client.on ('messageCreate', async message =>
             message.author.send ({ content: 'pong 🐼 ЛС работают.' })
             .then
             (
-                () => console.log ('[' + (d()) + '] [dm] self-test -> ' + message.author.username + ' OK')
+                () => console.log ('[' + (d()) + '] [dm] self-test -> ' + message.author.username + ' -- отправлено')
             )
             .catch
             (
@@ -1972,7 +1972,7 @@ async function modNick (server, member/*, add = false*/)
                 {
                     console.log ('[' + (d()) + '] [nick] -🔑 (staff) ' + member.user.username);
                     await setNickLogged (member, nick.slice (tag.length), server)
-                        .catch (e => console.error ('[nick] error on setNickname: ' + e.message));
+                        .catch (e => console.error ('[nick] ошибка смены ника: ' + e.message));
                 }
                 return;
             }
@@ -2003,9 +2003,9 @@ async function modNick (server, member/*, add = false*/)
                         return;
                     }
                     let nickNew = tag + nick;
-                    console.log ('[' + (d()) + '] [nick] +🔑 ' + member.user.username + ' in ' + member.voice.channel.name);
+                    console.log ('[' + (d()) + '] [nick] +🔑 ' + member.user.username + ' в ' + member.voice.channel.name);
                     await setNickLogged (member, nickNew, server)
-                        .catch (e => console.error ('[nick] error on setNickname: ' + e.message)); // [!] при ошибке прав -- видно в логе
+                        .catch (e => console.error ('[nick] ошибка смены ника: ' + e.message)); // [!] при ошибке прав -- видно в логе
                 }
             }
             else
@@ -2016,7 +2016,7 @@ async function modNick (server, member/*, add = false*/)
                 {
                     console.log ('[' + (d()) + '] [nick] -🔑 ' + member.user.username);
                     await setNickLogged (member, nickNew, server)
-                        .catch (e => console.error ('[nick] error on setNickname: ' + e.message));
+                        .catch (e => console.error ('[nick] ошибка смены ника: ' + e.message));
                 }
             }
         }
@@ -2051,7 +2051,7 @@ client.on ('channelCreate', async (newChannel) =>
                 }
                 // [v14] setBitrate принимает число bps (строка '64000' -- INVALID_TYPE):
                 newChannel.setBitrate (bitrate * 1000) // bitrate: int value should be less than or equal to 256000.
-                .catch (e => console.error ('[channelCreate] error on setBitrate: ' + e.message));
+                .catch (e => console.error ('[channelCreate] ошибка битрейта: ' + e.message));
                 // panda: ['🚫NO VIDEO🚫']
                 if (SERVERS[server].role_for_no_stream)
                 {
@@ -2163,10 +2163,10 @@ client.on ('channelCreate', async (newChannel) =>
                                 )
                                 .catch (console.error);
                             }
-                            console.log ('[' + (d()) + '] ' + owner.user.username + ' get rights1 in ' + newChannel.name);
+                            console.log ('[' + (d()) + '] ' + owner.user.username + ' получил права в ' + newChannel.name);
                         }
                     )
-                    .catch (e => console.error ('[channelUpdate] error on updateOverwrite: ' + e.message));
+                    .catch (e => console.error ('[channelUpdate] ошибка прав канала: ' + e.message));
                 }
             }
         }
@@ -2226,7 +2226,7 @@ client.on ('channelUpdate', async (oldChannel, newChannel) =>
                     )
                     .catch (console.error);
                 }
-                console.log ('[' + (d()) + '] channel ' + oldChannel.name + ' renamed to ' + newChannel.name);
+                console.log ('[' + (d()) + '] канал ' + oldChannel.name + ' переименован в ' + newChannel.name);
             }
             // channel:permissions:add/edit/...
             let all = new Map([...newChannel.members, ...owners, ...oldOwners]);
@@ -2288,10 +2288,10 @@ client.on ('channelUpdate', async (oldChannel, newChannel) =>
                                     )
                                     .catch (console.error);
                                 }
-                                console.log ('[' + (d()) + '] ' + owner.user.username + ' get rights2 in ' + newChannel.name);
+                                console.log ('[' + (d()) + '] ' + owner.user.username + ' получил права в ' + newChannel.name);
                             }
                         )
-                        .catch (e => console.error ('[channelUpdate] error on updateOverwrite: ' + e.message));
+                        .catch (e => console.error ('[channelUpdate] ошибка прав канала: ' + e.message));
                     }
                     else
                     {
@@ -2400,7 +2400,7 @@ client.on ('guildAuditLogEntryCreate', (entry, guild) =>
         });
         if ($audit.length > 300) $audit.splice (0, $audit.length - 300);
     }
-    catch (e) { console.error ('[audit] error: ' + e.message); }
+    catch (e) { console.error ('[audit] ошибка: ' + e.message); }
 });
 
 // кто совершил action над targetId. targetId === null -- цель в журнале не указана
@@ -2501,7 +2501,7 @@ function appealLog (server, state)
             }
         );
     }
-    console.log ('[' + (d()) + '] ' + state.member.user.username + ' get appeal in ' + state.channel.name);
+    console.log ('[' + (d()) + '] ' + state.member.user.username + ' подал апелляцию в ' + state.channel.name);
 }
 
 // строка действия + автор (мут/разглухота и т.п.) -- ждём запись журнала, потом пишем одной строкой
@@ -2555,7 +2555,7 @@ function logVoiceEvent (oldState, newState)
         if (oldState.selfVideo  !== newState.selfVideo  && newState.selfVideo)
             console.log ('[' + (d()) + '] [voice] камера ВКЛ: '   + who + ' ' + nm (newState));
     }
-    catch (e) { console.error ('[voice] log error: ' + e.message); }
+    catch (e) { console.error ('[voice] ошибка записи в лог: ' + e.message); }
 }
 
 client.on ('voiceStateUpdate', async (oldState, newState) =>
@@ -2656,13 +2656,13 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                     if (newState.serverMute)
                     {
                         newState.setMute (false)
-                        .catch (e => console.error ('[voiceStateUpdate] общий канал, unmute: ' + e.message));
+                        .catch (e => console.error ('[voiceStateUpdate] общий канал, снятие мута: ' + e.message));
                         appealLog (server, newState);
                     }
                     if (newState.serverDeaf)
                     {
                         newState.setDeaf (false)
-                        .catch (e => console.error ('[voiceStateUpdate] общий канал, undeaf: ' + e.message));
+                        .catch (e => console.error ('[voiceStateUpdate] общий канал, снятие глухоты: ' + e.message));
                         console.log ('[' + (d()) + '] [voice] общий канал: снят деф с ' + uuu (newState.member));
                     }
                     return;
@@ -2710,7 +2710,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                                             ]
                                         }
                                     )
-                                    .catch (e => console.error ('[voiceStateUpdate] error on newState.member.send: ' + e.message));
+                                    .catch (e => console.error ('[voiceStateUpdate] ошибка ЛС участнику: ' + e.message));
                                     if (log_channel)
                                     {
                                         // message to log channel:
@@ -2791,7 +2791,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                                 else
                                 {
                                     newState.kick()
-                                    .catch (e => console.error ('[voiceStateUpdate] error on newState.kick: ' + e.message));
+                                    .catch (e => console.error ('[voiceStateUpdate] ошибка кика: ' + e.message));
                                 }
                                 // notify from bot:
                                 let notify_text =
@@ -2810,7 +2810,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                                         ]
                                     }
                                 )
-                                .catch (e => console.error ('[voiceStateUpdate] error on newState.member.send: ' + e.message));
+                                .catch (e => console.error ('[voiceStateUpdate] ошибка ЛС участнику: ' + e.message));
                                 if (log_channel)
                                 {
                                     // message to log channel:
@@ -2884,7 +2884,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                                         ]
                                     }
                                 )
-                                .catch (e => console.error ('[voiceStateUpdate] error on newState.member.send: ' + e.message));
+                                .catch (e => console.error ('[voiceStateUpdate] ошибка ЛС участнику: ' + e.message));
                                 if (log_channel)
                                 {
                                     // message to log channel:
@@ -2960,7 +2960,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                                         ]
                                     }
                                 )
-                                .catch (e => console.error ('[voiceStateUpdate] error on newState.member.send: ' + e.message));
+                                .catch (e => console.error ('[voiceStateUpdate] ошибка ЛС участнику: ' + e.message));
                                 if (log_channel)
                                 {
                                     // message to log channel:
@@ -3152,7 +3152,7 @@ async function handleMemberEvent (member, isJoin)
         }
         const raw = rawOfMember (member);
         const who = (member.user && member.user.username) ? member.user : await resolveUser (uid, raw);
-        console.log ('[' + (d()) + '] member ' + who.username + (isJoin ? ' JOINED ' : ' LEFT ') +
+        console.log ('[' + (d()) + '] участник ' + who.username + (isJoin ? ' ЗАШЁЛ на ' : ' ВЫШЕЛ с ') +
             SERVERS[server].name + ' (мгновенно)');
         if (isJoin)
         {
@@ -3176,7 +3176,7 @@ async function handleMemberEvent (member, isJoin)
     }
     catch (e)
     {
-        console.error ('[memberEvent] ' + (isJoin ? 'join' : 'leave') + ': ' + oneLine (e.message));
+        console.error ('[memberEvent] ' + (isJoin ? 'вход' : 'выход') + ': ' + oneLine (e.message));
     }
 }
 
@@ -3234,7 +3234,7 @@ async function logMemberJoinLeave (server, memberUser, isJoin)
     {
         // Ошибка лога НЕ должна ронять поллер (иначе снапшот не обновится и
         // один и тот же человек будет 'входить' на каждом тике).
-        console.error ('[member] logMemberJoinLeave: ' + e.message);
+        console.error ('[member] запись входа/выхода: ' + e.message);
     }
 }
 
@@ -3578,7 +3578,7 @@ async function sweepExpiredBans (server)
                 const user = await members.unban (id, 'Таймаут истёк (снято при проверке)');
                 await db (server, 'membersBanTimeout', id, null);
                 unbannedAny = true;
-                console.log ('[' + (d()) + '] member ' + (user ? user.username : id) + ' unbanned (sweep)');
+                console.log ('[' + (d()) + '] участник ' + (user ? user.username : id) + ' разбанен (свип по базе)');
             }
             catch (e)
             {
@@ -3596,7 +3596,7 @@ async function sweepExpiredBans (server)
     }
     catch (e)
     {
-        console.error ('[sweepExpiredBans] error: ' + e.message);
+        console.error ('[sweepExpiredBans] ошибка: ' + e.message);
     }
     return unbannedAny;
 }
@@ -3860,8 +3860,8 @@ async function handleMemberJoin (server, uid, raw)
             {
                 // [v2.13] в лог -- ровно то, что произошло: бан выдан за перезаход,
                 // сколько оставалось и до какого момента (по секундам, без «~»).
-                console.log ('[' + (d()) + '] member ' + username + ' banned until ' + d (until, true) +
-                    ' (left ' + dd (until) + ', re-enter during timeout)');
+                console.log ('[' + (d()) + '] участник ' + username + ' забанен до ' + d (until, true) +
+                    ' (оставалось ' + dd (until) + ', перезаход во время таймаута)');
                 banHistoryAdd (server, uid, 'ban');
                 // [v2.15] таймер снятия -- через реестр, чтобы /unban мог его отменить
                 banTimerSet (server, uid, left, async () =>
@@ -3871,19 +3871,19 @@ async function handleMemberJoin (server, uid, raw)
                     .then (u =>
                     {
                         banHistoryAdd (server, uid, 'unban');
-                        console.log ('[' + (d()) + '] member ' + (u ? u.username : uid) + ' unbanned (timeout over)');
+                        console.log ('[' + (d()) + '] участник ' + (u ? u.username : uid) + ' разбанен (срок истёк)');
                     })
-                    .catch (e => console.error ('[memberJoin] unban: ' + e.message + ' -- unbanned already ?'));
+                    .catch (e => console.error ('[memberJoin] разбан: ' + e.message + ' -- возможно, уже разбанен'));
                 });
             }
         )
-        .catch (e => console.error ('[memberJoin] ban error: ' + e.message));
+        .catch (e => console.error ('[memberJoin] ошибка бана: ' + e.message));
         return;
     }
     // [v2.13] Таймаут записан, но бана по конфигу нет (onEnterBanRealy выключен):
     // сообщаем ровно это -- без выдуманного «ограничения входа» и без письма.
-    console.log ('[' + (d()) + '] member ' + username + ' came back during timeout, but no ban' +
-        ' (onEnterBanRealy is off, left ' + dd (until) + ')');
+    console.log ('[' + (d()) + '] участник ' + username + ' вернулся во время таймаута, но бан не выдан' +
+        ' (onEnterBanRealy выключен, оставалось ' + dd (until) + ')');
 }
 
 // Обработка ВЫХОДА (бывший guildMemberRemove): бан-за-выход.
@@ -3929,8 +3929,8 @@ async function handleMemberLeave (server, uid, raw, since = 0)
                 await db (server, 'membersBanTimeout', uid, untilLeave);
                 banHistoryAdd (server, uid, 'ban');
                 // [v2.13] бан выдан сразу при выходе (onLeaveBanRealy: true)
-                console.log ('[' + (d()) + '] member ' + username + ' banned until ' + d (untilLeave, true) +
-                    ' (' + onLeaveBanTimeout + ' min., on leave)');
+                console.log ('[' + (d()) + '] участник ' + username + ' забанен до ' + d (untilLeave, true) +
+                    ' (' + onLeaveBanTimeout + ' мин., при выходе)');
                 banTimerSet (server, uid, onLeaveBanTimeout * 60 * 1000, async () =>
                 {
                     await db (server, 'membersBanTimeout', uid, null);
@@ -3940,14 +3940,14 @@ async function handleMemberLeave (server, uid, raw, since = 0)
                         user =>
                         {
                             banHistoryAdd (server, uid, 'unban');
-                            console.log ('[' + (d()) + '] member ' + (user ? user.username : uid) + ' unbanned (timeout over)');
+                            console.log ('[' + (d()) + '] участник ' + (user ? user.username : uid) + ' разбанен (срок истёк)');
                         }
                     )
-                    .catch (e => console.error ('[memberLeave] unban: ' + e.message + ' -- unbanned already ?'));
+                    .catch (e => console.error ('[memberLeave] разбан: ' + e.message + ' -- возможно, уже разбанен'));
                 });
             }
         )
-        .catch (e => console.error ('[memberLeave] ban error: ' + e.message));
+        .catch (e => console.error ('[memberLeave] ошибка бана: ' + e.message));
     }
     else
     {
@@ -3958,13 +3958,13 @@ async function handleMemberLeave (server, uid, raw, since = 0)
         const untilTimeout = Date.now () + onLeaveBanTimeout * 60 * 1000;
         await db (server, 'membersBanTimeout', uid, untilTimeout);
         banHistoryAdd (server, uid, 'timeout');
-        console.log ('[' + (d()) + '] member ' + username + ' timeout until ' + d (untilTimeout, true) +
-            ' (' + onLeaveBanTimeout + ' min., ban -- only if re-enters earlier)');
+        console.log ('[' + (d()) + '] участник ' + username + ' таймаут до ' + d (untilTimeout, true) +
+            ' (' + onLeaveBanTimeout + ' мин., бан -- только если вернётся раньше)');
         banTimerSet (server, uid, onLeaveBanTimeout * 60 * 1000, async () =>
         {
             await db (server, 'membersBanTimeout', uid, null);
-            console.log ('[' + (d()) + '] member ' + username + ' timeout expired after ' + onLeaveBanTimeout +
-                ' min. (did not come back)');
+            console.log ('[' + (d()) + '] участник ' + username + ' таймаут истёк спустя ' + onLeaveBanTimeout +
+                ' мин. (не вернулся)');
         });
     }
 }
@@ -4390,12 +4390,12 @@ async function sweepNicks (server)
             if (hasTag === wantTag) { nickSetMark (server, vs.id, hasTag); continue; } // уже так
             if (wantTag)
                 await setNickLogged (member, tag + nick, server)
-                    .then (() => { added++; console.log ('[' + (d()) + '] [nick] +🔑 (sweep) ' + member.user.username + ' in ' + channel.name); })
-                    .catch (e => console.error ('[nick][sweep] error for ' + member.user.username + ': ' + e.message));
+                    .then (() => { added++; console.log ('[' + (d()) + '] [nick] +🔑 (sweep) ' + member.user.username + ' в ' + channel.name); })
+                    .catch (e => console.error ('[nick][sweep] ошибка для ' + member.user.username + ': ' + e.message));
             else
                 await setNickLogged (member, nick.slice (tag.length), server)
                     .then (() => { removed++; console.log ('[' + (d()) + '] [nick] -🔑 ' + (isStaff (server, member) ? '(staff) ' : '(sweep) ') + member.user.username); })
-                    .catch (e => console.error ('[nick][sweep] error for ' + member.user.username + ': ' + e.message));
+                    .catch (e => console.error ('[nick][sweep] ошибка для ' + member.user.username + ': ' + e.message));
         }
         // [v2.4] итог свипа -- только в DEBUG (периодический шум в логе ни к чему):
         if (DEBUG && checked > 0 && (added > 0 || removed > 0))
@@ -4403,7 +4403,7 @@ async function sweepNicks (server)
     }
     catch (e)
     {
-        console.error ('[nick][sweep] error: ' + e.message);
+        console.error ('[nick][sweep] ошибка: ' + e.message);
     }
 }
 
@@ -4451,12 +4451,12 @@ async function tempCreateFor (server, member)
             ],
         }
     )
-    .catch (e => { console.error ('[temp] error on create: ' + e.message); return null; });
+    .catch (e => { console.error ('[temp] ошибка создания: ' + e.message); return null; });
     if (!created) return;
-    console.log ('[' + (d()) + '] [temp] created ' + created.name + ' for ' + member.user.username);
+    console.log ('[' + (d()) + '] [temp] создал ' + created.name + ' для ' + member.user.username);
     if (member.voice.channelId === lobbyId)
         await member.voice.setChannel (created.id)
-            .catch (e => console.error ('[temp] error on setChannel: ' + e.message));
+            .catch (e => console.error ('[temp] ошибка перевода: ' + e.message));
     // ключ владельцу (он в своём канале -- права есть; ADM/MOD -- не трогаем):
     if ((SERVERS[server].addTag || false) && !isStaff (server, member))
     {
@@ -4465,7 +4465,7 @@ async function tempCreateFor (server, member)
         if (!nick.startsWith ('🔑'))
             await setNickLogged (member, '🔑' + nick, server)
                 .then (() => console.log ('[' + (d()) + '] [nick] +🔑 (temp) ' + member.user.username))
-                .catch (e => console.error ('[temp] error on setNickname: ' + e.message));
+                .catch (e => console.error ('[temp] ошибка смены ника: ' + e.message));
     }
     await tempSweep (server); // заодно убрать осиротевшие
 }
@@ -4487,8 +4487,8 @@ async function tempSweep (server)
             if (vs.channelId === ch.id) { busy = true; break; }
         if (busy) continue; // в канале кто-то есть -- живём
         await ch.delete ('PANDAMIA: pustoy lichny kanal')
-            .then (() => console.log ('[' + (d()) + '] [temp] deleted empty ' + ch.name))
-            .catch (e => console.error ('[temp] error on delete: ' + e.message));
+            .then (() => console.log ('[' + (d()) + '] [temp] удалил пустой ' + ch.name))
+            .catch (e => console.error ('[temp] ошибка удаления: ' + e.message));
     }
 }
 
@@ -4503,7 +4503,7 @@ async function tempLobbyCheck (server)
         if (vs.channelId !== lobbyId) continue;
         let member = vs.member || await guild.members.fetch (vs.id).catch (() => null);
         if (member && !member.user.bot)
-            await tempCreateFor (server, member).catch (e => console.error ('[temp] lobby error: ' + e.message));
+            await tempCreateFor (server, member).catch (e => console.error ('[temp] ошибка лобби: ' + e.message));
     }
 }
 
@@ -4708,13 +4708,13 @@ async function pollMembers (server)
                     try
                     {
                         let memberUser = await resolveUser (uid, raw);
-                        console.log ('[' + (d()) + '] member ' + memberUser.username + ' JOINED ' + SERVERS[server].name);
+                        console.log ('[' + (d()) + '] участник ' + memberUser.username + ' ЗАШЁЛ на ' + SERVERS[server].name);
                         await logMemberJoinLeave (server, memberUser, true);
                         // [v2.14] роли назад (до таймаутов: человек ещё точно на сервере)
                         await restoreMemberRoles (server, uid, raw);
                         await handleMemberJoin (server, uid, raw);
                     }
-                    catch (e) { console.error ('[pollMembers] join ' + uid + ': ' + e.message); }
+                    catch (e) { console.error ('[pollMembers] вход ' + uid + ': ' + e.message); }
                 }
                 // выходы:
                 for (let [uid, raw] of previous)
@@ -4726,11 +4726,11 @@ async function pollMembers (server)
                     try
                     {
                         let memberUser = await resolveUser (uid, raw);
-                        console.log ('[' + (d()) + '] member ' + memberUser.username + ' LEFT ' + SERVERS[server].name);
+                        console.log ('[' + (d()) + '] участник ' + memberUser.username + ' ВЫШЕЛ с ' + SERVERS[server].name);
                         await logMemberJoinLeave (server, memberUser, false);
                         await handleMemberLeave (server, uid, raw, prevAt);
                     }
-                    catch (e) { console.error ('[pollMembers] leave ' + uid + ': ' + e.message); }
+                    catch (e) { console.error ('[pollMembers] выход ' + uid + ': ' + e.message); }
                 }
             }
             finally
@@ -4747,7 +4747,7 @@ async function pollMembers (server)
     }
     catch (e)
     {
-        console.error ('[pollMembers] error: ' + e.message);
+        console.error ('[pollMembers] ошибка: ' + e.message);
     }
 }
 
@@ -4782,7 +4782,7 @@ client.on
             // чтобы рестарт бота не разбудил ложные "выходы":
             $membersSnapshot[server] = await fetchAllMembersRest (server).catch (() => null);
             $membersSnapshotAt[server] = Date.now ();
-            console.log ('[' + (d()) + '] [poll] snapshot ready: ' + ($membersSnapshot[server] ? $membersSnapshot[server].size : 'ERR') + ' members @ ' + SERVERS[server].name);
+            console.log ('[' + (d()) + '] [poll] снимок готов: ' + ($membersSnapshot[server] ? $membersSnapshot[server].size : 'ERR') + ' участников @ ' + SERVERS[server].name);
             // [v2.17] Что реально доступно приложению (интенты могли отозвать):
             await reportIntents (server);
             // [v2.5] заодно проверить id из config.json (молчит, если всё цело):
@@ -4976,7 +4976,7 @@ async function ytDlpRun (query, optsBase)
         catch (e)
         {
             lastErr = e;
-            console.error ('[music] ' + route + ' failed: ' + ytDlpErr (e, 150));
+            console.error ('[music] ' + route + ' не сработал: ' + ytDlpErr (e, 150));
             if (!isNetworkError (e)) throw e; // реальная ошибка YouTube -- повторять бессмысленно
         }
     }
@@ -5207,7 +5207,7 @@ async function createTrackStream (track, seekSec = 0, seekMode = 'sections')
     // никто не ловил, и НЕПОЙМАННЫЙ reject убивал весь процесс бота. Гасим здесь.
     // [v2.9.2] В лог -- одна строка (см. ytDlpErr): читаемая причина, без простыни.
     if (ytdlpStream && typeof ytdlpStream.catch === 'function')
-        ytdlpStream.catch (e => console.error ('[music] yt-dlp exited: ' + ytDlpErr (e)));
+        ytdlpStream.catch (e => console.error ('[music] yt-dlp завершился: ' + ytDlpErr (e)));
     // [v2.14] Громкость: yt-dlp -> ffmpeg(loudnorm) -> PCM 48k/stereo (StreamType.Raw).
     // Не смогли поднять ffmpeg -- тихо откатываемся к обычному пути (Arbitrary),
     // который сами конвертирует внутри @discordjs/voice.
@@ -5445,7 +5445,7 @@ async function playNext (guildId)
     }
     catch (e)
     {
-        console.error ('[music] play error: ' + oneLine (e.message));
+        console.error ('[music] ошибка воспроизведения: ' + oneLine (e.message));
         m.current = null;
         playNext (guildId); // пропустить битый трек
     }
@@ -5539,7 +5539,7 @@ function wireStreamErrors (m, track, resource, viaProxy, guildId)
         if (viaProxy && isNetworkError (e)) proxyStreamDead = true;
         if (!playing)
         {
-            console.error ('[music] stream error (предзагрузка): ' + oneLine (e.message));
+            console.error ('[music] обрыв потока (предзагрузка): ' + oneLine (e.message));
             if (m.preload && m.preload.track === track) m.preload = null; // сломанную заготовку не берём
             return;
         }
@@ -6641,7 +6641,7 @@ function joinVoiceNow (guildId, voiceChannel, guild, reason = '')
                 m.streamRetries = 0;
                 playNext (guildId);
             });
-            m.player.on ('error', e => console.error ('[music] player error: ' + oneLine (e.message)));
+            m.player.on ('error', e => console.error ('[music] ошибка плеера: ' + oneLine (e.message)));
         }
         m.connection.subscribe (m.player);
         m.connection.on (VoiceConnectionStatus.Disconnected, async () =>
@@ -6978,7 +6978,7 @@ async function registerMusicCommands ()
         }
         catch (e)
         {
-            console.error ('[music] register error @ ' + server + ': ' + e.message);
+            console.error ('[music] ошибка регистрации команд @ ' + server + ': ' + e.message);
         }
     }
 }
@@ -7768,7 +7768,7 @@ client.on ('interactionCreate', async (interaction) =>
     }
     catch (e)
     {
-        console.error ('[music] interaction error: ' + e.message);
+        console.error ('[music] ошибка обработки команды: ' + e.message);
         if (interaction.deferred || interaction.replied)
             interaction.editReply ('❌ Ошибка: ' + e.message.slice (0, 150)).catch (() => {});
         else
