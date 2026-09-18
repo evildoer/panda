@@ -18,6 +18,11 @@
 //   * channelCreate/channelUpdate: в v14 каналы приходят без guild -> берём через .guild ?? client.guilds.cache.get
 //   * [FIX v2] NaN-баг в логе переименования: скобки вокруг 'Владельцы канала: ' + (owners.size ? ... : ...)
 //   * [FIX v2] e.message там, где e не существует (users.fetch .catch(() => null))
+// CHANGELOG v2.9.1 (по итогам ревью всего кода):
+//   * [FIX] предзагрузка: один поток мог получить ДВА обработчика 'error' -- одна ошибка
+//     писала в лог две строки (вторая называла играющий трек «предзагрузкой»).
+//   * [FIX] громкость больше не берётся из фиктивной записи $music[''] (мусор в состоянии).
+//   * [FIX] запись входа/выхода в журнал: null-аватара больше не попадает в embed.
 // CHANGELOG v2.5 (пересылка из пандалогии + текст команд):
 //   * ИНТЕНТ Message Content теперь запрашивается (в портале приложения он ВКЛЮЧЁН).
 //     Без него Discord отдаёт события без текста (content пустой) -- поэтому НЕ работали
@@ -1802,8 +1807,12 @@ async function logMemberJoinLeave (server, memberUser, isJoin)
             ? `${memberUser} **зашёл** 👋 на сервер \`${SERVERS[server].name}\` 🟩`
             : `${memberUser} **вышел** 🚪 с сервера \`${SERVERS[server].name}\` 🟥`;
         let author = {name: memberUser.username}; // без icon_url, если аватара нет
-        if (typeof memberUser.displayAvatarURL === 'function')
-            author.icon_url = memberUser.displayAvatarURL ({extension: 'png', forceStatic: false, size: 1024});
+        // [FIX v2.9.1] у заглушки (пользователь недоступен) аватары нет -- null в icon_url
+        // Discord не примет, а записи о входе/выходе терять нельзя. Проверяем значение:
+        let icon = (typeof memberUser.displayAvatarURL === 'function')
+            ? memberUser.displayAvatarURL ({extension: 'png', forceStatic: false, size: 1024})
+            : null;
+        if (icon) author.icon_url = icon;
         channel.send
         (
             {
@@ -2444,7 +2453,8 @@ async function ytDlpRun (query, optsBase)
 }
 
 // Очереди по гильдиям: guild_id -> {connection, player, tracks:[], current, volume, textChannelId}
-const $music = {};
+const MUSIC_VOLUME = 0.5; // громкость (команды смены громкости нет -- это константа)
+const $music = {}; // guild_id -> состояние (см. musicOf)
 
 function musicOf (guildId)
 {
@@ -2455,7 +2465,7 @@ function musicOf (guildId)
             player: createAudioPlayer (),
             tracks: [],
             current: null,
-            volume: 0.5,
+            volume: MUSIC_VOLUME,
             textChannelId: null,
         };
     return $music[guildId];
@@ -2560,7 +2570,7 @@ async function createTrackStream (track)
         }
     );
     if (resource.volume)
-        resource.volume.setVolume (musicOf('').volume || 0.5);
+        resource.volume.setVolume (MUSIC_VOLUME); // [FIX v2.9.1] было musicOf('') -- создавало мусорную запись $music['']
     // [v2.9] source/proc отдаём наружу: у предзагрузки нужно уметь всё это глушить
     // (иначе непригодившийся трек оставил бы висеть yt-dlp, ждущий читателя в пайпе).
     return { resource, viaProxy, source: ytdlpStream.stdout, proc: ytdlpStream };
@@ -2685,6 +2695,13 @@ function startPreload (guildId)
 // или (б) только предзагруженным -- просто выбрасываем испорченную заготовку.
 function wireStreamErrors (m, track, resource, viaProxy, guildId)
 {
+    // [FIX v2.9.1] Заготовка подписывается на ошибки СРАЗУ (иначе 'error' у потока без
+    // слушателя уронил бы процесс), а когда трек начинает играть, playNext зовёт эту
+    // функцию ВТОРОЙ раз. Без проверки на один поток вешались ДВА обработчика: одна
+    // ошибка давала две строки в логе, причём вторая называла играющий трек
+    // «предзагрузкой» (проверено стендом: listeners=2).
+    if (resource.__errWired) return;
+    resource.__errWired = true;
     resource.playStream.once ('error', e =>
     {
         const playing = m.current === track;
