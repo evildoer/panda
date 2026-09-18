@@ -420,6 +420,183 @@ if (!_srvReal)
     console.log ('[' + new Date ().toLocaleString () + '] [config] рабочих серверов нет: бот запустится, ' +
         'но делать ничего не будет -- заполни config.json (образец: config.example.json)');
 
+// ============================================================================
+// [v2.23] `node . dump [id]` -- ПОСМОТРЕТЬ БАЗУ ГЛАЗАМИ (только чтение).
+// Зачем отдельной командой, а не «убрать db_key»: если ключ убрать, зашифрованные
+// записи не расшифруются (бот их просто пропускает), а новые начнут писаться открытым
+// текстом -- часть данных при этом перезапишется в открытом виде. Поэтому смотрим так:
+// файл базы открывается READ-ONLY (ни один байт не меняется, бот не запускается),
+// значения расшифровываются ключами из config.json (db_key и db_key_prev) и печатаются
+// по-человечески: роли, история наказаний, таймауты, очередь музыки.
+// Аргумент -- id участника: показать только его записи.
+// Формат хранения: одна таблица `keyv`, ключ -- '<неймспейс>:<ключ>', значение --
+// конверт {"value":...,"expires":...} (зашифрованный -- строкой 'enc1:...').
+// Нужен Node 23+ (встроенный node:sqlite) -- у портативного Node из папки бота он есть.
+// ============================================================================
+// Свои мелкие помощники: d()/dd() из основного кода опираются на `var pad`, который
+// на момент этой команды ещё не определён (она выполняется до остального файла).
+function dbDumpDate (_t) { return new Date (_t).toLocaleString (); }
+function dbDumpLeft (_until)
+{
+    let _s = Math.max (0, Math.round ((_until - Date.now ()) / 1000));
+    const _h = Math.floor (_s / 3600); _s -= _h * 3600;
+    const _m = Math.floor (_s / 60); _s -= _m * 60;
+    return (_h ? _h + ' ч ' : '') + (_h || _m ? _m + ' мин ' : '') + _s + ' сек';
+}
+
+function dbDumpFmt (_ns, _key, _value)
+{
+    const _head = '[' + _ns + '] ' + _key;
+    if (_value === undefined || _value === null) return _head + ' -- значение пустое';
+    if (_ns === 'memberRoles')
+    {
+        const _roles = Array.isArray (_value.roles) ? _value.roles : [];
+        return _head + ' -- ролей ' + _roles.length + ': ' + (_roles.join (', ') || '--') +
+            ' | записано ' + (_value.at ? dbDumpDate (_value.at) : 'без даты');
+    }
+    if (_ns === 'banHistory')
+    {
+        const _ev = Array.isArray (_value.events) ? _value.events : [];
+        const _cnt = _k => _ev.filter (_e => _e && _e.kind === _k).length;
+        const _last = _ev.length ? _ev[_ev.length - 1] : null;
+        return _head + ' -- событий ' + _ev.length + ': выходов ' + _cnt ('exit') +
+            ', таймаутов ' + _cnt ('timeout') + ', банов ' + _cnt ('ban') + ', снятий ' + _cnt ('unban') +
+            ' | последнее: ' + (_last && _last.at ? dbDumpDate (_last.at) + ' (' + _last.kind + ')' : '--');
+    }
+    if (_ns === 'membersBanTimeout')
+    {
+        const _until = Number (_value);
+        if (!Number.isFinite (_until)) return _head + ' -- ' + clipText (JSON.stringify (_value), 200);
+        return _head + ' -- до ' + dbDumpDate (_until) + ' (' +
+            (_until > Date.now () ? 'осталось ' + dbDumpLeft (_until) : 'срок истёк') + ')';
+    }
+    if (_ns === 'musicState')
+    {
+        const _tr = Array.isArray (_value.tracks) ? _value.tracks : [];
+        const _cur = _value.current && _value.current.title ? _value.current.title : '';
+        return _head + ' -- в очереди ' + _tr.length +
+            (_cur ? ', играет «' + clipText (String (_cur), 60) + '»' : ', играющего нет') +
+            ' | канал ' + (_value.channelId || '--') +
+            (Number (_value.elapsed) ? ', позиция ' + Math.floor (Number (_value.elapsed) / 1000) + ' сек' : '') +
+            (_value.left ? ' | вышел по /leave' : '');
+    }
+    return _head + ' -- ' + clipText (JSON.stringify (_value), 300);
+}
+
+function dbDumpCli ()
+{
+    let DatabaseSync = null;
+    try { ({ DatabaseSync } = require ('node:sqlite')); } catch (e) { /* старый Node */ }
+    if (!DatabaseSync)
+    {
+        console.log ('[dump] нужен Node 23+ (встроенный node:sqlite): запусти через node.cmd или портативный Node из папки бота');
+        return;
+    }
+    const _fs = require ('fs');
+    const _only = (process.argv.slice (2).filter (_a => !/^dump$/i.test (_a)).find (_a => /^\d{17,20}$/.test (_a)) || '');
+    console.log ('[dump] режим: только чтение, базы не меняются, бот не запускается');
+    console.log ('[dump] ключи шифрования из config.json: ' + (DB_KEYS.length
+        ? 'есть (' + DB_KEYS.length + ': db_key' + (DB_KEYS.length > 1 ? ' + db_key_prev' : '') + ')'
+        : 'НЕТ -- зашифрованные записи показать не смогу'));
+    if (_only) console.log ('[dump] фильтр по id участника: ' + _only);
+    const _servers = Object.keys (SERVERS).filter (_k => /^\d{17,20}$/.test (_k));
+    if (!_servers.length)
+    {
+        console.log ('[dump] в config.json нет ни одного id сервера');
+        return;
+    }
+    for (const _srv of _servers)
+    {
+        const _file = __dirname + '/' + _srv + '.sqlite';
+        console.log ('');
+        console.log ('[dump] === сервер ' + _srv +
+            ((SERVERS[_srv] || {}).name ? ' («' + SERVERS[_srv].name + '»)' : '') + ' ===');
+        if (!_fs.existsSync (_file))
+        {
+            console.log ('[dump] файла базы нет: ' + _file);
+            continue;
+        }
+        let _db = null, _rows = [];
+        try
+        {
+            _db = new DatabaseSync (_file, { readOnly: true });
+            _rows = _db.prepare ('SELECT key, value FROM keyv').all ();
+        }
+        catch (e)
+        {
+            console.log ('[dump] не смог прочитать базу: ' + ((e && e.message) || e));
+        }
+        try { if (_db) _db.close (); } catch (e) { /* уже закрыта */ }
+        const _byNs = new Map ();
+        let _plain = 0, _enc = 0, _bad = 0, _shown = 0;
+        for (const _r of _rows)
+        {
+            const _raw = dbRawStr (_r.value);
+            const _full = String (_r.key);
+            const _cut = _full.indexOf (':');
+            const _ns = _cut > 0 ? _full.slice (0, _cut) : '(без неймспейса)';
+            const _k = _cut > 0 ? _full.slice (_cut + 1) : _full;
+            let _json = null, _line = '';
+            if (_raw.startsWith (DB_ENC_PREFIX))
+            {
+                _enc++;
+                const _t = DB_KEYS.length ? dbDec (_raw) : null;
+                if (_t === null)
+                {
+                    _bad++;
+                    _line = '[' + _ns + '] ' + _k + ' -- зашифровано, ' + (DB_KEYS.length
+                        ? 'но ни одним ключом из config.json не открывается'
+                        : 'а db_key пуст -- показать нечего (данные целы, нужен прежний ключ)');
+                }
+                else
+                {
+                    try { _json = JSON.parse (_t); }
+                    catch (e) { _line = '[' + _ns + '] ' + _k + ' -- расшифровалось, но это не JSON'; }
+                }
+            }
+            else
+            {
+                _plain++;
+                try { _json = JSON.parse (_raw); }
+                catch (e) { _line = '[' + _ns + '] ' + _k + ' -- значение не JSON: ' + clipText (_raw, 120); }
+            }
+            if (!_line)
+                _line = dbDumpFmt (_ns, _k, (_json && typeof _json === 'object' && 'value' in _json) ? _json.value : _json);
+            if (_only && _k !== _only && !_k.includes (_only)) continue; // счётчики выше -- по всей базе
+            if (!_byNs.has (_ns)) _byNs.set (_ns, []);
+            _byNs.get (_ns).push (_line);
+            _shown++;
+        }
+        console.log ('[dump] записей ' + _rows.length + ': открытых ' + _plain + ', зашифрованных ' + _enc +
+            ', нечитаемых ' + _bad + (_only ? ' | по фильтру: ' + _shown + ' из ' + _rows.length : ''));
+        const _order = ['memberRoles', 'banHistory', 'membersBanTimeout', 'musicState', 'channelsBusy'];
+        const _nsKeys = [..._byNs.keys ()].sort ((a, b) =>
+        {
+            const _ia = _order.indexOf (a), _ib = _order.indexOf (b);
+            return ((_ia < 0 ? 99 : _ia) - (_ib < 0 ? 99 : _ib)) || a.localeCompare (b);
+        });
+        if (!_nsKeys.length)
+            console.log ('[dump] ' + (_only ? 'по этому id ничего не нашлось' : 'записей нет -- база пустая'));
+        for (const _ns of _nsKeys)
+        {
+            const _list = _byNs.get (_ns);
+            console.log ('[dump] --- ' + _ns + ' (' + _list.length + ') ---');
+            for (const _line of _list.slice (0, 40)) console.log ('[dump] ' + _line);
+            if (_list.length > 40)
+                console.log ('[dump] ...и ещё ' + (_list.length - 40) + ' (задай id участника, чтобы посмотреть одного)');
+        }
+    }
+}
+
+// `node . dump [id]` -- отдельный режим: печатаем и ВЫХОДИМ, иначе дальше запустился бы
+// второй бот (и это было бы хуже всего, что может сделать диагностическая команда).
+if (process.argv.slice (2).some (_a => /^dump$/i.test (_a)))
+{
+    try { dbDumpCli (); }
+    catch (e) { console.log ('[dump] ошибка: ' + ((e && e.message) || e)); }
+    process.exit (0);
+}
+
 // [v2.5] Привилегированный интент Message Content (в портале приложения включён).
 // Он нужен двум вещам: пересылке из пандалогии и текстовым командам 'panda ...'.
 // Поставь в config.json "MESSAGE_CONTENT": false -- если Discord его отзовёт.

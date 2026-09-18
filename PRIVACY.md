@@ -68,6 +68,11 @@ checked on read). The key is a setting in the bot's own configuration file (`db_
 machine; if the setting is empty, the bot stores values unencrypted and says so in its log. Records
 written before encryption was enabled are still read; nothing is lost when it is switched on.
 
+Nothing is ever decrypted on disk: to look at what is stored, the operator uses a read-only
+inspection command (`node . dump [user id]`), which opens the database file read-only, decrypts a copy
+in memory for display and does not change a single byte of it. Stored data in the database file stays
+encrypted whether or not anyone looks.
+
 Honest scope of that protection: the key sits next to the database, so a copy of the **whole folder**
 stays readable — this protects the case where the **database file alone** ends up somewhere (a backup,
 a cloud-synced folder, a copy on another machine): its content is unreadable ciphertext rather than a
@@ -150,7 +155,7 @@ contact can be found without opening this page (it is configured by the operator
 -- так и задумано: человек, вернувшийся через месяцы, всё равно получает свои роли. Владелец может
 поставить срок в днях в файле конфигурации.
 
-**Шифрование:** записи в базе -- AES-256-GCM, ключ в `config.json` (`db_key`); без ключа файл базы нечитаем.
+**Шифрование:** записи в базе -- AES-256-GCM, ключ в `config.json` (`db_key`); без ключа файл базы нечитаем. Наружу ничего не расшифровывается: посмотреть содержимое владелец может только командой чтения (`node . dump [id человека]`) -- файл открывается read-only, ни один байт не меняется, данные на диске остаются зашифрованными.
 
 **Не хранится:** текст сообщений (он используется только для команд staff и пересылки объявления),
 ники, аватары, e-mail, история сообщений, записи голоса, IP-адреса, платежные данные. Никакой
