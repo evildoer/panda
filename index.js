@@ -5163,14 +5163,24 @@ function probeNormalize ()
 
 // Аудио-ресурс: yt-dlp стримит в stdout -> ffmpeg ресемплирует в Opus для Discord:
 // [v2.2.2] стрим по той же стратегии, что и метаданные: прокси -> DIRECT:
-async function createTrackStream (track, seekSec = 0)
+// [v2.25] seekMode -- КАК продолжать с места:
+//   'sections' (по умолчанию) -- yt-dlp сам отдаёт поток с N-й секунды
+//     (--download-sections, требует ffmpeg у yt-dlp): быстро и точно, но не все
+//     источники это умеют;
+//   'ffseek' -- берём поток с начала и пропускаем N секунд УЖЕ в своём ffmpeg
+//     (-ss после -i): работает для любого источника (медленнее на старте, зато
+//     место не теряется -- это резервный путь, см. playNext);
+//   'none' -- с начала.
+async function createTrackStream (track, seekSec = 0, seekMode = 'sections')
 {
     let viaProxy = !proxyStreamDead && await pingProxy ();
     // [v2.10] продолжение с места после перезапуска: yt-dlp отдаёт поток с N-й секунды
     // (--download-sections, нужен ffmpeg). Если так не умеет -- процесс падает сразу,
-    // и playNext берёт тот же трек с начала (см. failedFast).
+    // и playNext пробует резервный путь (ffseek), а потом берёт трек с начала.
     // [v2.12] продолжать с места -- всегда, когда есть с чего (даже с секунды)
-    const seek = (seekSec >= 1 && !track.isLive);
+    const seek = (seekMode === 'sections' && seekSec >= 1 && !track.isLive);
+    // [v2.25] резервный путь: сдвиг делает НАШ ffmpeg (см. ниже)
+    const seekInFfmpeg = (seekMode === 'ffseek' && seekSec >= 1 && !track.isLive);
     const ytdlpStream = ytdlp.exec
     (
         track.url,
@@ -5196,19 +5206,23 @@ async function createTrackStream (track, seekSec = 0)
     // [v2.14] Громкость: yt-dlp -> ffmpeg(loudnorm) -> PCM 48k/stereo (StreamType.Raw).
     // Не смогли поднять ffmpeg -- тихо откатываемся к обычному пути (Arbitrary),
     // который сами конвертирует внутри @discordjs/voice.
+    // [v2.25] ffmpeg нужен либо для выравнивания громкости, либо для резервного сдвига:
     let ff = null, input = ytdlpStream.stdout, raw = false;
-    if (musicNormalizeReady)
+    if (musicNormalizeReady || seekInFfmpeg)
     {
         try
         {
-            ff = spawn (ffmpegPath,
-                ['-hide_banner', '-loglevel', 'error', '-i', 'pipe:0', '-af', MUSIC_NORMALIZE_FILTER,
-                 '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'],
-                { windowsHide: true });
+            // -ss ПОСЛЕ -i -- поток не seekable (пайп), поэтому ffmpeg декодирует и
+            // выбрасывает всё до нужной секунды (звук появится на ней, а не раньше).
+            const args = ['-hide_banner', '-loglevel', 'error', '-i', 'pipe:0'];
+            if (seekInFfmpeg) args.push ('-ss', String (Math.max (0, Math.floor (seekSec))));
+            if (musicNormalizeReady) args.push ('-af', MUSIC_NORMALIZE_FILTER);
+            args.push ('-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1');
+            ff = spawn (ffmpegPath, args, { windowsHide: true });
         }
         catch (e)
         {
-            console.error ('[music] ffmpeg (громкость) не поднялся: ' + oneLine (e.message) + ' -- играю без него');
+            console.error ('[music] ffmpeg не поднялся: ' + oneLine (e.message) + ' -- играю без него');
             ff = null;
         }
         if (ff)
@@ -5247,7 +5261,10 @@ async function createTrackStream (track, seekSec = 0)
         resource.volume.setVolume (MUSIC_VOLUME); // [FIX v2.9.1] было musicOf('') -- создавало мусорную запись $music['']
     // [v2.9] source/proc отдаём наружу: у предзагрузки нужно уметь всё это глушить
     // (иначе непригодившийся трек оставил бы висеть yt-dlp, ждущий читателя в пайпе).
-    return { resource, viaProxy, source: ytdlpStream.stdout, proc: ytdlpStream, ff: ff };
+    // [v2.25] seeked -- сработал ли ЗАПРОШЕННЫЙ сдвиг (playNext по этому решает,
+    // пробовать резервный путь или брать трек с начала):
+    return { resource, viaProxy, source: ytdlpStream.stdout, proc: ytdlpStream, ff: ff,
+             seeked: (seekMode === 'sections' && seek) || (seekMode === 'ffseek' && !!ff) };
 }
 
 // Воспроизведение следующего трека:
@@ -5375,13 +5392,23 @@ async function playNext (guildId)
             // [v2.12.2] если этот трек когда-то был «прерван» и ждёт в очереди не
             // первым (/move), его позиция приехала вместе с ним (track.seek)
             let seekSec = (m.seekTrack === track) ? (m.seekSec || 0) : (track.seek || 0);
-            let opened = await createTrackStream (track, seekSec);
-            if (seekSec >= 1 && await failedFast (opened.proc))
+            if (track.isLive) seekSec = 0; // у прямого эфира позиции нет
+            // [v2.25] продолжение с места в ДВА шага, чтобы место не терялось почти
+            // никогда: быстрый путь (--download-sections) -> резервный (сдвиг своим
+            // ffmpeg, работает для любого источника) -> и только потом с начала.
+            let opened = await createTrackStream (track, seekSec, seekSec >= 1 ? 'sections' : 'none');
+            if (seekSec >= 1 && (!opened.seeked || await failedFast (opened.proc)))
             {
-                killStream (opened); // сдвиг не сработал (нет ffmpeg / экстрактор не умеет)
-                console.error ('[' + (d()) + '] [music] продолжение с ' + fmtDur (seekSec) + ' не удалось -- беру трек с начала');
-                opened = await createTrackStream (track, 0);
-                seekSec = 0;
+                killStream (opened); // быстрый сдвиг не сработал (экстрактор не умеет)
+                console.error ('[' + (d()) + '] [music] сдвиг через --download-sections не сработал -- пробую через ffmpeg');
+                opened = await createTrackStream (track, seekSec, 'ffseek');
+                if (!opened.seeked || await failedFast (opened.proc))
+                {
+                    killStream (opened);
+                    console.error ('[' + (d()) + '] [music] продолжение с ' + fmtDur (seekSec) + ' не удалось -- беру трек с начала');
+                    opened = await createTrackStream (track, 0, 'none');
+                    seekSec = 0;
+                }
             }
             resource = opened.resource;
             viaProxy = opened.viaProxy;
