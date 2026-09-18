@@ -4952,11 +4952,25 @@ let proxyStreamDead = false;      // прокси отвечает по TCP, н�
 // (обычным путём), музыка из-за этого не встаёт.
 const MUSIC_NORMALIZE = MUSIC_CFG.normalize !== false;
 const MUSIC_NORMALIZE_FILTER = MUSIC_CFG.filter || 'loudnorm=I=-16:TP=-1.5:LRA=11';
+// [v2.26] СТАТУС ГОЛОСОВОГО КАНАЛА (шапка канала, где сидит бот). Пока бот в канале, он
+// писал туда свою строку («что играет • очередь • в канале человек • бот тут N мин»).
+// Проблема: роут у Discord ТОЛЬКО ПИШУЩИЙ -- прочитать прежнюю строку нельзя (проверено
+// живым запросом, 405), поэтому текст, который поставил АВТОР канала, восстановить
+// невозможно: бот затирает его на время и снимает при выходе.
+//   "channel_status": false -- бот не трогает шапку канала вообще (ни пишет, ни снимает);
+//   вся информация остаётся в ПРОФИЛЬНОМ статусе бота («Слушает: … · в очереди 2 …»),
+//   его видно везде, даже вне голосового.
+// Свою прежнюю строку можно снять разово: `node . clearstatus <id канала>`.
+const MUSIC_CHANNEL_STATUS = MUSIC_CFG.channel_status !== false;
 // [v2.23] Одна строка при старте о том, как бот ходит на YouTube: видно, что ключ
 // MUSIC.proxy действительно подхватился (промах в этом месте раньше не был заметен).
 console.log ('[' + (d()) + '] [music] YouTube: ' + (MUSIC_PROXY
     ? 'через прокси ' + MUSIC_PROXY + ' (не ответит за 3 сек -- иду напрямую)'
     : 'напрямую (DIRECT) -- прокси не задан'));
+// [v2.26] Одна строка при старте: трогаем ли мы шапку голосового канала (см. выше).
+console.log ('[' + (d()) + '] [music] статус голосового канала (шапка): ' + (MUSIC_CHANNEL_STATUS
+    ? 'пишу свой (что играет, очередь, люди) -- прежний текст автора канала вернуть нельзя, он затирается'
+    : 'НЕ трогаю (MUSIC.channel_status: false) -- в шапке остаётся только то, что поставил автор канала'));
 // Роль DJ -- задаётся в config.json сервера как role_dj.
 
 // [v2.2.2] Быстрая TCP-проверка прокси (коннект за timeoutMs, иначе -- мёртв):
@@ -5734,6 +5748,10 @@ function voiceStatusPush (channelId, status)
 // Снять статус с канала (при выходе/переезде) -- иначе в нём останется старая строка:
 function clearVoiceStatus (channelId)
 {
+    // [v2.26] Статус канала выключен в конфиге -- не трогаем шапку ВООБЩЕ, в том числе не
+    // снимаем её: там может быть текст автора канала, а не наш. Свою прежнюю строку (если
+    // бота убили и он не успел её снять) можно убрать разово: `node . clearstatus <id>`.
+    if (!MUSIC_CHANNEL_STATUS) return;
     if (!channelId) return;
     // status: null -- это именно «снять статус» (по документации Discord):
     voiceStatusPush (channelId, null).catch (() => {});
@@ -5777,6 +5795,7 @@ async function writeVoiceStatus (guildId)
 // прошлый запрос был достаточно давно по меркам лимита.
 function scheduleVoiceStatus (guildId, immediate = false)
 {
+    if (!MUSIC_CHANNEL_STATUS) return; // [v2.26] статус канала выключен -- шапка не наша
     if (!guildId || !(guildId in SERVERS)) return;
     if (!$music[guildId] || !$music[guildId].connection) return; // не сидим -- нечего показывать
     const st = $voiceStatus[guildId] = $voiceStatus[guildId] || {};
@@ -5791,6 +5810,26 @@ function scheduleVoiceStatus (guildId, immediate = false)
         },
         wait
     );
+}
+
+// [v2.26] `node . clearstatus <id канала>` -- снять СВОЮ строку статуса с голосового канала.
+// Зачем: если бот писал статус, а потом его убили (не дали выйти), строка остаётся в шапке
+// канала (Discord хранит её до изменения). Роут только ПИШУЩИЙ -- прочитать, что там
+// сейчас, нельзя, поэтому команда просто снимает статус с указанного канала.
+// При MUSIC.channel_status: false это единственное место, где бот вообще пишет в шапку.
+if (/^clearstatus$/i.test (String (process.argv[2] || '')))
+{
+    const _ch = String (process.argv[3] || '').trim ();
+    if (!/^\d{17,20}$/.test (_ch))
+    {
+        console.log ('[clearstatus] укажи id голосового канала:  node . clearstatus <id канала>\n' +
+            '[clearstatus] id виден при включённом режиме разработчика (ПКМ по каналу -> «Копировать ID»),\n' +
+            '[clearstatus] либо его печатает  node . dump  (строка musicState)');
+        process.exit (1);
+    }
+    voiceStatusPush (_ch, null)
+        .then (() => { console.log ('[clearstatus] статус (шапка) канала ' + _ch + ' снят'); process.exit (0); })
+        .catch (e => { console.error ('[clearstatus] не получилось: ' + oneLine (e && e.message || e)); process.exit (1); });
 }
 
 // Раз в минуту обновляем счётчик «бот тут N мин» (в лог не пишется -- там только события):
