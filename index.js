@@ -472,6 +472,12 @@ function dbDumpFmt (_ns, _key, _value)
     }
     if (_ns === 'musicState')
     {
+        // [v2.25] У присутствия (musicState/voice) очереди нет по устройству -- очередь
+        // лежит в отдельной записи (musicState/queue). Раньше дамп писал и про неё
+        // «в очереди 0, играющего нет», и это читалось как «бот ничего не помнит».
+        if (!Array.isArray (_value.tracks))
+            return _head + ' -- ' + (_value.left ? 'вышел по /leave' : 'сижу в канале ' + (_value.channelId || '--')) +
+                ' (присутствие; очередь и позиция -- в отдельной записи queue)';
         const _tr = Array.isArray (_value.tracks) ? _value.tracks : [];
         const _cur = _value.current && _value.current.title ? _value.current.title : '';
         return _head + ' -- в очереди ' + _tr.length +
@@ -790,6 +796,7 @@ const
 {
     Client,
     GatewayIntentBits,
+    IntentsBitField, // [v2.25] откат по интентам: options.intents ЗАМОРОЖЕН, .remove() молчит
     Partials,
     ChannelType,
     PermissionsBitField,
@@ -1301,6 +1308,40 @@ async function messageContentAllowed ()
     catch (e) { return true; }
 }
 
+// [v2.25] Доступ к Guild Members узнаём ЗАРАНЕЕ -- по флагам приложения (тем же
+// способом, что Message Content). Флаги берутся из GET /applications/@me:
+//   GATEWAY_GUILD_MEMBERS (1<<14) / GATEWAY_GUILD_MEMBERS_LIMITED (1<<15).
+// Если флага нет -- не просим интент вообще (иначе вход тратится на провальную
+// попытку и Discord отвечает 'Used disallowed intents'). Не смогли проверить --
+// просим как раньше, а откат ниже поймает отказ.
+async function guildMembersAllowed ()
+{
+    try
+    {
+        const r = await fetch
+        (
+            'https://discord.com/api/v10/applications/@me',
+            {headers: {Authorization: 'Bot ' + TOKEN}, signal: AbortSignal.timeout (5000)}
+        );
+        if (!r.ok) return true;
+        const app = await r.json ();
+        return Boolean ((app.flags || 0) & ((1 << 14) | (1 << 15)));
+    }
+    catch (e) { return true; }
+}
+
+// [v2.25] СНЯТЬ ИНТЕНТ НАДЁЖНО. Важно: client.options.intents -- ЗАМОРОЖЕННЫЙ
+// IntentsBitField (Object.isFrozen === true), поэтому .remove() МОЛЧА ничего не
+// делает: бит остаётся, вход снова падает 'Used disallowed intents', и цикл отката
+// крутится впустую -- бот так и не запускается (проверено живым запуском).
+// Собираем НОВЫЙ BitField без этого бита и присваиваем его -- только так откат работает.
+function dropIntent (bit)
+{
+    const bitfield = client.options.intents.bitfield & ~bit;
+    client.options.intents = new IntentsBitField (bitfield);
+    return !client.options.intents.has (bit);
+}
+
 // [v2.17] Человеческие имена интентов -- для строк в логе:
 const INTENT_NAMES = new Map
 ([
@@ -1317,10 +1358,19 @@ const INTENT_NAMES = new Map
     {
         console.error ('[' + (d()) + '] [login] Message Content у приложения ОТКЛЮЧЁН -- запускаю без него' +
             ' (пересылка из пандалогии и команды "panda ..." работать не будут)');
-        client.options.intents.remove (GatewayIntentBits.MessageContent);
+        dropIntent (GatewayIntentBits.MessageContent);
     }
     if (!client.options.intents.has (GatewayIntentBits.MessageContent))
         console.log ('[' + (d()) + '] [login] без интента Message Content: текст сообщений недоступен');
+    // [v2.25] Guild Members -- так же заранее по флагам приложения (проверить иначе
+    // было нечем): нет флага -- сразу запускаемся без него, не тратя вход на отказ.
+    if (USE_GUILD_MEMBERS && !(await guildMembersAllowed ()))
+    {
+        console.error ('[' + (d()) + '] [login] Guild Members у приложения ОТКЛЮЧЁН -- запускаю без него' +
+            ' (вход/выход только опросом раз в 45 сек)' +
+            ' [а полный список участников требует тот же интент: без него приветствие, таймаут за выход и возврат ролей работать не будут]');
+        dropIntent (GatewayIntentBits.GuildMembers);
+    }
     // [v2.17] Guild Members проверить заранее нечем -- узнаём по отказу Discord
     // ('Used disallowed intents', закрытие 4014). До двух отказов: снимаем по одному
     // привилегированному интенту и пробуем снова. Бот ОБЯЗАН запуститься в любом случае.
@@ -1341,7 +1391,7 @@ const INTENT_NAMES = new Map
                 console.error ('[login] ошибка: ' + msg);
                 break;
             }
-            client.options.intents.remove (drop);
+            dropIntent (drop);
             const isMembers = drop === GatewayIntentBits.GuildMembers;
             console.error ('[' + (d()) + '] [login] Discord запретил интент ' + (INTENT_NAMES.get (drop) || 'привилегированный') +
                 ' -- переподключаюсь без него (это не сбой бота: так работает откат)' +
@@ -4624,7 +4674,8 @@ async function reportIntents (server)
     const msgContent = has (GatewayIntentBits.MessageContent);
     const members    = has (GatewayIntentBits.GuildMembers);
     console.log ('[' + (d()) + '] [intents] ' + name + ' | Message Content (текст сообщений, команды "panda ..."): ' +
-        yes (msgContent) + (msgContent ? '' : ' -- пересылка из пандалогии и текстовые команды молчат'));
+        yes (msgContent) + (msgContent ? '' : ' -- пересылка из пандалогии и текстовые команды молчат' +
+            ' (вместо пересылки: правый клик по сообщению -> «Переслать в общий»)'));
     console.log ('[' + (d()) + '] [intents] ' + name + ' | Guild Members (мгновенные вход/выход): ' +
         yes (members) + (members ? '' : ' -- вход/выход только опросом раз в 45 сек'));
     // Список участников: это и есть резервный путь. Проверяем ФАКТОМ -- пришёл ли список.
@@ -4782,7 +4833,14 @@ client.on
             // чтобы рестарт бота не разбудил ложные "выходы":
             $membersSnapshot[server] = await fetchAllMembersRest (server).catch (() => null);
             $membersSnapshotAt[server] = Date.now ();
-            console.log ('[' + (d()) + '] [poll] снимок готов: ' + ($membersSnapshot[server] ? $membersSnapshot[server].size : 'ERR') + ' участников @ ' + SERVERS[server].name);
+            // [v2.25] Список участников требует интента Guild Members. Если Discord его
+            // отозвал -- не пишем непонятное 'ERR', а прямо говорим, что именно не работает.
+            if ($membersSnapshot[server])
+                console.log ('[' + (d()) + '] [poll] снимок готов: ' + $membersSnapshot[server].size + ' участников @ ' + SERVERS[server].name);
+            else
+                console.error ('[' + (d()) + '] [poll] снимок участников НЕ ПОЛУЧЕН @ ' + SERVERS[server].name +
+                    ': нет доступа к списку (интент Guild Members) -- вход/выход, приветствие новичку, таймаут за выход' +
+                    ' и возврат ролей работать не будут');
             // [v2.17] Что реально доступно приложению (интенты могли отозвать):
             await reportIntents (server);
             // [v2.5] заодно проверить id из config.json (молчит, если всё цело):
