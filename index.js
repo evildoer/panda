@@ -2567,6 +2567,9 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                     (newState.channel ? newState.channel.name : to) + '»');
                 clearVoiceStatus (from);
                 if (mSelf) { mSelf.savedChannelId = to; mSelf.pending = false; mSelf.leftByUser = false; }
+                // [v2.24] перенесли руками: запоминаем НОВЫЙ канал сразу (joinConfig
+                // обновляется позже, в этот момент он ещё показывает старый)
+                writeVoiceState (server, to, false);
                 scheduleVoiceStatus (server, true);
                 schedulePresence (true);
                 // joinConfig обновляется тем же пакетом, но чуть позже -- повторяем
@@ -5805,6 +5808,45 @@ async function clearMusicState (guildId)
         .catch (e => console.error ('[music] не смог стереть очередь: ' + oneLine (e.message)));
 }
 
+// ============================================================================
+// [v2.24] ПРИСУТСТВИЕ бота -- ОТДЕЛЬНО от очереди.
+// Бот может сидеть в канале и без единого трека (/join «посидеть с ботом», /stop,
+// доигравшая очередь), и это состояние тоже должно переживать перезапуск: «сам он
+// не отключается без /leave». Раньше присутствие жило внутри записи очереди, а та
+// стиралась, как только очередь пустела, -- после перезагрузки бот в канал не
+// возвращался вообще. Теперь это своя запись (musicState/voice).
+// ============================================================================
+async function writeVoiceState (guildId, channelId, left)
+{
+    try
+    {
+        if (!channelId) { await db (guildId, 'musicState', 'voice', null); return; }
+        await db (guildId, 'musicState', 'voice',
+            { at: Date.now (), channelId: channelId, left: !!left });
+    }
+    catch (e) { console.error ('[music] не смог сохранить, где сижу: ' + oneLine (e.message)); }
+}
+
+// Где бот сидит ПРЯМО СЕЙЧАС -- по живому соединению. Вызывается при каждом заходе
+// и переезде (обёртка над joinVoice); не в канале -- запись стирается.
+async function saveVoiceState (guildId)
+{
+    const m = $music[guildId];
+    const chId = (m && m.connection && m.connection.joinConfig)
+        ? m.connection.joinConfig.channelId : null;
+    await writeVoiceState (guildId, chId, !!(m && m.leftByUser));
+}
+
+async function readVoiceState (guildId)
+{
+    try
+    {
+        const v = await db (guildId, 'musicState', 'voice');
+        return (v && typeof v === 'object' && v.channelId) ? v : null;
+    }
+    catch (e) { return null; }
+}
+
 // Сколько ещё треков в очереди после «текущего» (для красивых строк в логе):
 function restCount (m)
 {
@@ -6183,22 +6225,45 @@ function queueView (m, start, moveSel = 0)
     return { content: content, components: queueComponents (page, m, moveSel) };
 }
 
-// Старт после перезапуска/падения: вернуть в память очередь, текущий трек и позицию.
-// Сами заходим в тот же канал только если там уже есть живой слушатель; иначе очередь
-// ЖДЁТ (ничего не забываем): зайдём, как только человек появится, или по /join.
+// Старт после перезапуска/падения: вернуть ПРИСУТСТВИЕ бота в канале, а также очередь,
+// текущий трек и позицию.
+// [v2.24] Порядок именно такой: состояние «сижу в канале» не зависит от очереди
+// (/join без музыки, /stop, доигравшая очередь) и должно переживать перезапуск.
+// Если в канале есть живой слушатель -- сразу играем; если пока никого -- заходим и
+// ЖДЁМ (музыка не играет в пустоту), а очередь начнётся, как только человек появится
+// (см. ветку в checkListeners).
 async function resumeMusic (server)
 {
     try
     {
+        const guild = client.guilds.cache.get (server);
+        if (!guild) return;
+        const m = musicOf (server);
+        // --- 1) ПРИСУТСТВИЕ: где бот сидел до перезапуска ---
+        const voice = await readVoiceState (server);
+        let vch = null;
+        if (voice && voice.channelId && !voice.left)
+        {
+            vch = guild.channels.cache.get (voice.channelId) ||
+                await guild.channels.fetch (voice.channelId).catch (() => null);
+            if (vch && (typeof vch.isVoiceBased !== 'function' || !vch.isVoiceBased ())) vch = null;
+            if (!vch) writeVoiceState (server, null, false); // канал удалили -- помнить нечего
+        }
+        if (vch)
+        {
+            joinVoice (server, vch, guild, 'вернулся туда, где сидел до перезапуска');
+            if (m.connection)
+                console.log ('[' + (d()) + '] [music] возвращаюсь в «' + vch.name +
+                    '» -- бот сидел там до перезапуска' +
+                    (humansInChannel (server, vch.id) ? '' : ' (пока никого в канале)'));
+        }
+        // --- 2) ОЧЕРЕДЬ с прошлого запуска ---
         let saved = await db (server, 'musicState', 'queue');
         if (!saved) return;
         const tracks = (saved.tracks || []).filter (t => t && t.url).map (jsonToTrack);
         const current = saved.current ? jsonToTrack (saved.current) : null;
         if (!current && !tracks.length) return;
-        const guild = client.guilds.cache.get (server);
-        if (!guild) return;
-        const m = musicOf (server);
-        m.savedChannelId = saved.channelId || null;
+        m.savedChannelId = vch ? vch.id : (saved.channelId || null);
         m.textChannelId = saved.textChannelId || m.textChannelId;
         // [v2.12.2] ждущий трек возвращается НА СВОЁ место из очереди (curIdx), а не
         // всегда в начало: если DJ переставил его через /move, порядок сохраняется
@@ -6206,7 +6271,8 @@ async function resumeMusic (server)
         m.tracks = current ? [...tracks.slice (0, at), current, ...tracks.slice (at)] : tracks;
         m.seekTrack = current;   // этому треку playNext попробует сдвиг на elapsed
         m.seekSec = Math.max (0, Math.round (saved.elapsed || 0));
-        m.leftByUser = !!saved.left;
+        // уже вернулись в канал (присутствие выше) -- значит точно не «выходили по /leave»
+        m.leftByUser = vch ? false : !!saved.left;
         m.pending = true;
         // живо ли место: и трек, и место в треке, и очередь целиком остаются в памяти
         let ch = m.savedChannelId
@@ -6231,8 +6297,9 @@ async function resumeMusic (server)
         }
         if (!humansInChannel (server, ch.id))
         {
+            // в канал мы уже могли зайти (присутствие) -- тогда просто ждём человека
             console.log ('[' + (d()) + '] [music] в «' + ch.name + '» пока никого -- очередь ждёт слушателя: ' + where);
-            return; // зайдём и продолжим, как только там появится живой человек
+            return;
         }
         startRestored (server, ch, guild);
     }
@@ -6341,6 +6408,19 @@ function checkListeners (server, _noFollow = false)
                 }
             }
         }
+        // [v2.24] Бот уже в канале (вернулся после перезапуска), но очередь ждала
+        // слушателя: человек зашёл -- начинаем с того же места, где остановились.
+        // Это НЕ продолжение цепочки выше, а отдельная проверка.
+        if (people > 0 && m.pending && !m.current && m.seekTrack)
+        {
+            const g = client.guilds.cache.get (server);
+            const chHere = client.channels.cache.get (chId);
+            if (g && chHere)
+            {
+                console.log ('[' + (d()) + '] [music] слушатель зашёл в ' + where + ' -- начинаю сохранённую очередь');
+                startRestored (server, chHere, g);
+            }
+        }
         return;
     }
     // бота в канале нет, но есть ждущая очередь: заходим сами, если там появился человек
@@ -6433,7 +6513,16 @@ function schedulePresence (immediate = false)
 // [v2.10] Вынесено из connectTo: этим же путём пользуется возобновление музыки после
 // перезапуска (там нет ни interaction, ни голосового канала участника -- есть id из базы).
 // [v2.18] reason -- зачем переехали: попадает в строку лога («перешёл в «X» -- автор трека ...»).
+// [v2.24] Настоящая работа -- в joinVoiceNow, а здесь обёртка: после каждого удачного
+// захода/переезда присутствие бота уходит в базу (см. saveVoiceState).
 function joinVoice (guildId, voiceChannel, guild, reason = '')
+{
+    const m = joinVoiceNow (guildId, voiceChannel, guild, reason);
+    if (m && m.connection) saveVoiceState (guildId);
+    return m;
+}
+
+function joinVoiceNow (guildId, voiceChannel, guild, reason = '')
 {
     const m = musicOf (guildId);
     if (!voiceChannel) return m;
@@ -6570,6 +6659,11 @@ function destroyMusic (guildId, opts = {})
         m.leftByUser = !opts.unexpected; // /leave -- сами не возвращаемся; обрыв -- вернёмся
         saveMusicState (guildId);
     }
+    // [v2.24] Присутствие: при обрыве связи (или когда бота выкинули из канала) тот же
+    // канал остаётся в записи -- при следующем запуске бот вернётся туда сам. А вот
+    // /leave и /stop -- это явный выход: канал забываем совсем.
+    if (opts.unexpected && !opts.forget) writeVoiceState (guildId, chId, false);
+    else writeVoiceState (guildId, null, false);
     // [v2.7] снимаем статус: иначе в канале останется старая строка
     clearVoiceStatus (chId);
     if ($voiceStatus[guildId] && $voiceStatus[guildId].timer)
