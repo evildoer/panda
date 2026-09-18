@@ -23,6 +23,20 @@
 //     приветствие со ссылкой на сообщение из `welcome_message` (канал `welcome_channel`).
 //     Нет id сообщения -- даём ссылку на канал. Пустой welcome_channel = выключено.
 //     Перезаходы в таймауте приветствия НЕ получают (у них другой путь -- бан-таймаут).
+//   * [v2.13] ВЕСЬ ПОТОК ТАЙМАУТА ГОВОРИТ ПРАВДУ (пункты из того же разбора):
+//     -- письмо «вам ограничен вход» перезаходящему уходит ТОЛЬКО если бан действительно
+//        будет выдан (onEnterBanRealy: true); если он выключен -- в лог идёт строка
+//        'came back during timeout, but no ban (onEnterBanRealy is off)'; раньше письмо
+//        уходило всегда (и в тексте было '[object Object]' вместо обращения к человеку,
+//        потому что текст брался из сырого JSON, а не из полученного User);
+//     -- запись таймаута с прошедшим сроком (= обычный вход, а не перезаход) больше
+//        не выдаёт «ограничен вход» с прошедшей датой -- запись чистится, и человек
+//        получает обычное приветствие;
+//     -- в строке про бан видно и остаток срока: 'banned on ~3 min. (re-enter during
+//        timeout, left 0:03:20)', и разбан считается от ОСТАТКА, а не от полного срока;
+//     -- sweepExpiredBans сначала снимает бан и только потом чистит запись: если снятие
+//        не удалось (нет прав, сеть), запись остаётся и бот попробует в следующем тике
+//        (раньше запись стиралась сразу, и бот «забывал» о бане, который реально стоял).
 //   * [FIX] лог бан-таймаута больше не врёт: при onLeaveBanRealy: false писалось
 //     «banned on N min.», хотя бана не было -- ставился только таймаут (бан прилетает
 //     при перезаходе, onEnterBanRealy). Теперь: 'timeout on N min. (ban -- only if
@@ -2019,27 +2033,32 @@ async function sweepExpiredBans (server)
         {
             rows.push ([key, value]);
         }
+        const members = client.guilds.cache.get (server).members;
         for (let [id, until] of rows)
         {
             if (typeof until !== 'number') continue; // не таймаут-запись
-            if (Date.now() >= until)
+            if (Date.now() < until) continue;         // срок ещё не вышел
+            // [v2.13] Сначала СНИМАЕМ бан, только потом чистим запись. Раньше было
+            // наоборот: если снятие не удалось по-настоящему (нет прав, сеть), запись
+            // уже была стёрта -- бот «забывал» о человеке, который в бане остался.
+            try
             {
+                const user = await members.unban (id, 'Таймаут истёк (снято при проверке)');
                 await db (server, 'membersBanTimeout', id, null);
                 unbannedAny = true;
-                await client.guilds.cache.get (server).members.unban (id, 'Таймаут истёк (снято при проверке)')
-                .then
-                (
-                    user => console.log ('[' + (d()) + '] member ' + (user ? user.username : id) + ' unbanned (sweep)')
-                )
-                .catch
-                (
-                    e =>
-                    {
-                        // Не забанен/уже снят -- запись уже вычищена, это не ошибка.
-                        if (!/Unknown Ban|404/i.test (e.message))
-                            console.error ('[sweepExpiredBans] unban error: ' + e.message);
-                    }
-                );
+                console.log ('[' + (d()) + '] member ' + (user ? user.username : id) + ' unbanned (sweep)');
+            }
+            catch (e)
+            {
+                if (/Unknown Ban|404/i.test (e.message))
+                {
+                    // человека и так нет в бане (запись просто устарела) -- чистим;
+                    // «unbanned» в лог НЕ пишем: снимать было нечего.
+                    await db (server, 'membersBanTimeout', id, null);
+                    unbannedAny = true;
+                }
+                else
+                    console.error ('[sweepExpiredBans] ' + id + ': не смог снять бан (' + e.message + ') -- запись оставлена, попробую в следующем тике');
             }
         }
     }
@@ -2139,96 +2158,92 @@ async function welcomeDM (server, uid, raw)
 }
 
 // Обработка ВХОДА (бывший guildMemberAdd): бан-таймаут при перезаходе.
-// [v2.13] Привет-ЛС новичкам снова включены (welcome_channel/welcome_message в конфиге).
+// [v2.13] Всё, что бот пишет в ЛС и в журнал, -- по факту: если бана не будет
+// (onEnterBanRealy выключен), то и «ограничения входа» в письме не будет; если
+// срок уже прошёл (запись просто не вычищена) -- это обычный вход, а не перезаход.
+// Источник правды о таймауте -- база (until); setTimeout в памяти -- только удобство
+// (снять бан вовремя), и если процесс перезапустился, снятие доделает sweepExpiredBans.
 async function handleMemberJoin (server, uid, raw)
 {
     const guild = client.guilds.cache.get (server);
+    const serverName = SERVERS[server].name;
     let onLeaveBanTimeout = SERVERS[server].onLeaveBanTimeout || 0;
     let onEnterBanRealy = SERVERS[server].onEnterBanRealy || false;
-    let membersBanTimeout = await db (server, 'membersBanTimeout', uid);
-    if (membersBanTimeout)
+    let until = await db (server, 'membersBanTimeout', uid); // конец таймаута (Date.now-мс)
+    const left = until ? until - Date.now () : 0;
+    const username = (raw && raw.user && raw.user.username) || uid;
+    // Срок истёк, а запись ещё не вычищена (бот был выключен в момент снятия):
+    // это НЕ «перезаход в таймауте» -- убираем запись и ведём себя как с обычным входом
+    if (until && left <= 0)
     {
-        let user = raw ? raw.user : await client.users.fetch (uid).catch(() => null);
-        if (user)
-        {
-            let notify_text =
-            `${user}, вам временно **ограничен** 🏃 вход на сервер \`${SERVERS[server].name}\` 🟥\n` +
-            `Из-за перезаходов для обхода блокировок, установлен таймаут: \`${onLeaveBanTimeout} мин.\`\n` +
-            `Вы сможете зайти \`${d(membersBanTimeout, true)}\`, это через \`${dd(membersBanTimeout)}\``;
-            await client.users.fetch (uid)
-            .then
+        await db (server, 'membersBanTimeout', uid, null);
+        until = null;
+    }
+    if (!until)
+    {
+        // [v2.13] обычный вход (не в таймауте) -- приветственная ЛС новичку
+        await welcomeDM (server, uid, raw);
+        return;
+    }
+    const user = await client.users.fetch (uid).catch (() => null);
+    if (onEnterBanRealy)
+    {
+        // Только здесь вход ДЕЙСТВИТЕЛЬНО ограничивается: поэтому письмо, бан и
+        // запись в журнал идут вместе, а не как раньше -- письмо всем без разбора.
+        if (user && typeof user.send === 'function')
+            await user.send
             (
-                fetched =>
                 {
-                    fetched.send
-                    (
+                    embeds:
+                    [
                         {
-                            embeds:
-                            [
-                                {
-                                    color: 0xFF0000, // 'RED',
-                                    description: notify_text,
-                                },
-                            ]
-                        }
-                    )
+                            color: 0xFF0000, // 'RED',
+                            description:
+                                `${user}, вам временно **ограничен** 🏃 вход на сервер \`${serverName}\` 🟥\n` +
+                                `Причина: перезаход во время таймаута (\`${onLeaveBanTimeout} мин.\` за выход).\n` +
+                                `Ограничение снимется \`${d(until, true)}\` -- это через \`${dd(until)}\``,
+                        },
+                    ],
                 }
             )
-            .catch (e => console.error ('[memberJoin] error on user.send: ' + e.message));
-        }
+            .catch (e => console.error ('[memberJoin] ЛС о таймауте ' + username + ' не ушла: ' + e.message));
         else
-        {
-            console.error ('[memberJoin] error on user: user not found :( // fetch failed');
-        }
-        if (onEnterBanRealy)
-        {
-            let plusTimeout = membersBanTimeout - Date.now();
-            if (plusTimeout > 0)
+            console.error ('[memberJoin] ЛС о таймауте ' + username + ' не отправить: пользователь недоступен');
+        const mins = Math.max (1, Math.round (left / 1000 / 60)); // «~0 мин.» в логе -- не по-человечески
+        guild.members.ban (uid, { reason: 'Забанен ботом на ~' + mins + ' мин. (перезаход во время таймаута)' })
+        .then
+        (
+            async () =>
             {
-                guild.members.ban
-                (
-                    uid,
-                    {
-                        days: 0,
-                        reason: 'Забанен ботом на ~' + Math.round (plusTimeout / 1000 / 60) + ' мин.',
-                    }
-                )
-                .then
+                // [v2.13] в лог -- ровно то, что произошло: бан выдан за перезаход,
+                // сколько оставалось от срока и когда снимем.
+                console.log ('[' + (d()) + '] member ' + username + ' banned on ~' + mins +
+                    ' min. (re-enter during timeout, left ' + dd (until) + ')');
+                setTimeout
                 (
                     async () =>
                     {
-                        let username = raw && raw.user ? raw.user.username : uid;
-                        // [v2.13] честная формулировка: бан выдан ПО ПЕРЕЗАХОДУ, на остаток срока
-                        console.log ('[' + (d()) + '] member ' + username + ' banned on ~' + Math.round (plusTimeout / 1000 / 60) + ' min. (re-enter during timeout)');
-                        setTimeout
-                        (
-                            async () =>
-                            {
-                                await db (server, 'membersBanTimeout', uid, null);
-                                guild.members.unban (uid)
-                                .then
-                                (
-                                    user => console.log ('[' + (d()) + '] member ' + (user ? user.username : uid) + ' unbanned after ~' + Math.round (plusTimeout / 1000 / 60) + ' min.')
-                                )
-                                .catch (e => console.error ('[memberJoin] unban: ' + e.message + ' -- unbanned already ?'));
-                            },
-                            plusTimeout
-                        );
-                    }
-                )
-                .catch (e => console.error ('[memberJoin] ban error: ' + e.message));
+                        await db (server, 'membersBanTimeout', uid, null);
+                        guild.members.unban (uid)
+                        .then (u => console.log ('[' + (d()) + '] member ' + (u ? u.username : uid) + ' unbanned after ~' + mins + ' min.'))
+                        .catch (e => console.error ('[memberJoin] unban: ' + e.message + ' -- unbanned already ?'));
+                    },
+                    left // остаток срока (а не весь таймаут заново)
+                );
             }
-        }
+        )
+        .catch (e => console.error ('[memberJoin] ban error: ' + e.message));
+        return;
     }
-    else
-    {
-        // [v2.13] не в таймауте -- обычный вход: приветственная ЛС новичку
-        await welcomeDM (server, uid, raw);
-    }
+    // [v2.13] Таймаут записан, но бана по конфигу нет (onEnterBanRealy выключен):
+    // сообщаем ровно это -- без выдуманного «ограничения входа» и без письма.
+    console.log ('[' + (d()) + '] member ' + username + ' came back during timeout, but no ban' +
+        ' (onEnterBanRealy is off, left ' + dd (until) + ')');
 }
 
 // Обработка ВЫХОДА (бывший guildMemberRemove): бан-за-выход.
-// Причины банов -- как было: 'Забанен ботом на N мин.'
+// Причины банов: 'Забанен ботом на N мин.' (сразу при выходе, onLeaveBanRealy)
+// и 'Забанен ботом на ~N мин. (перезаход во время таймаута)' (при перезаходе).
 async function handleMemberLeave (server, uid, raw)
 {
     const guild = client.guilds.cache.get (server);
