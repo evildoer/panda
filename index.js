@@ -5016,13 +5016,16 @@ function queuePage (m, start)
     // не влезло в лимит Discord -- укорачиваем названия (не выбрасываем треки):
     // короткое имя с «…» лучше, чем трек, до которого не добраться.
     let lines = null;
-    for (const clip of [120, 80, 60, 45, 30])
+    for (const clip of [120, 80, 60, 45, 30, 25, 20])
     {
         lines = queueLines (slice, start, clip);
         if (lines.join ('\n').length <= budget) break;
     }
-    // Крайняя страховка (совсем экзотические ники + названия): режем список, но
-    // листание идёт по показанным номерам, так что потерянного куска не будет.
+    // Крайняя страховка. Срабатывает только если ОДНОВРЕМЕННО: queue_page выставлен
+    // большим (например 25), у ВСЕХ треков страницы длинющие названия И у каждого свой
+    // длинный ник (ник Clippом не уменьшаем -- он и есть адресат). Тогда показываем
+    // столько, сколько влезло, а хвост сообщения ведёт на реальный следующий номер --
+    // трек доступен через /queue from:N, потерянного куска между страницами нет.
     while (lines.length > 1 && lines.join ('\n').length > budget) lines.pop ();
     return { start, total, count: lines.length, list: lines.join ('\n'), size: size };
 }
@@ -5263,8 +5266,20 @@ function queueView (m, start, moveSel = 0)
     if (!total) content = queueHeadText (m);
     else
     {
+        // Сперва пробуем полную подсказку, потом короткую...
         content = build (QUEUE_HINT_FULL);
         if (content.length > QUEUE_MSG_LIMIT) content = build (QUEUE_HINT_SHORT);
+        // ...и только в самом конце срезаем хвост списка. Сюда попадаем только при
+        // ОДНОВРЕМЕННЫХ крайностях: queue_page выставлен большим, все названия страницы
+        // длиннющие и у каждого трека свой длинный ник (ник не укорачиваем -- он адресат).
+        // Ничего не теряется: хвост сообщения ведёт на реальный следующий номер.
+        let guard = 0;
+        while (content.length > QUEUE_MSG_LIMIT && page.count > 1 && guard++ < 50)
+        {
+            page.count--;
+            page.list = page.list.split ('\n').slice (0, page.count).join ('\n');
+            content = build (QUEUE_HINT_SHORT);
+        }
     }
     return { content: content, components: queueComponents (page, m, moveSel) };
 }
