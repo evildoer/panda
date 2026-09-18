@@ -1,14 +1,11 @@
 # Privacy Policy — PANDAMIA Discord bot
 
-_Last updated: 18.09.2026_
+_Last updated: 19.09.2026_
 
 This bot is a **private, self-hosted** Discord bot (Discord application name: "Peka") operated by one
 person for one community. It is not listed in any bot directory, is not offered as a service to the
 public, and is not used for advertising, analytics or profiling. This page describes exactly what the
 bot stores and how it can be deleted.
-
-По-русски: бот приватный, работает на домашней машине владельца и нигде не публикуется. Ниже —
-полный список того, что он хранит, зачем, где и как это удалить (краткая русская версия в конце).
 
 ## What the bot stores
 
@@ -79,11 +76,6 @@ a cloud-synced folder, a copy on another machine): its content is unreadable cip
 list of role IDs and moderation counters. Nothing here protects against a person who has access to the
 running machine under the operator's own account.
 
-По-русски: записи в базе шифруются AES-256-GCM, ключ -- в `config.json` (`db_key`). Ключ лежит рядом
-с базой, поэтому копия папки целиком читается; защищён случай, когда утекает **только файл базы** --
-там нечитаемый шифртекст. Против человека за тем же включённым компьютером под учётной записью
-владельца это, разумеется, не помогает.
-
 ## Retention
 
 | Data | Default | Configurable |
@@ -128,18 +120,7 @@ last change is at the top.
 The operator of this bot and the contact for any privacy request:
 
 - **Discord: `lapulya666`** (user ID `247110936115150848`) -- direct messages are open, so this works
-  for anyone, including people who are not in the server where the bot runs;
-
-<!--
-  СТРОКА ПРО E-MAIL (решение владельца, поэтому закомментирована: в опубликованном файле этот блок
-  не виден, а напоминание остаётся здесь). Хочешь второй контакт, доступный тому, кто вообще не в
-  Discord, -- заведи адрес только для бота и верни строку в список выше:
-
-- **E-mail:** pandamia.bot@example.com
-
-  Заводить НЕ личный ящик: этот адрес станет публичным. Если не хочешь вообще -- блок можно удалить,
-  Discord-ника достаточно (ни одного "<...>" в файле остаться не должно).
--->
+  for anyone, including people who are not in the server where the bot runs.
 
 The bot also prints this contact by itself in the `/help` message on every server it runs on, so the
 contact can be found without opening this page (it is configured by the operator, not hard-coded).
@@ -148,6 +129,8 @@ contact can be found without opening this page (it is configured by the operator
 
 ## Кратко по-русски
 
+_Полная версия -- выше по-английски; здесь -- то же самое коротко._
+
 Бот приватный, крутится на машине владельца и хранит только это (по **id** участника/роли/канала):
 таймер таймаута за выход (20 минут, снимается сразу), id ролей -- чтобы вернуть их при возврате
 человека на сервер, счётчики наказаний для сводки `/bans`, текущую очередь музыки (названия, позиция,
@@ -155,7 +138,7 @@ contact can be found without opening this page (it is configured by the operator
 -- так и задумано: человек, вернувшийся через месяцы, всё равно получает свои роли. Владелец может
 поставить срок в днях в файле конфигурации.
 
-**Шифрование:** записи в базе -- AES-256-GCM, ключ в `config.json` (`db_key`); без ключа файл базы нечитаем. Наружу ничего не расшифровывается: посмотреть содержимое владелец может только командой чтения (`node . dump [id человека]`) -- файл открывается read-only, ни один байт не меняется, данные на диске остаются зашифрованными.
+**Шифрование:** записи в базе -- AES-256-GCM, ключ в `config.json` (`db_key`); без ключа файл базы нечитаем. Наружу ничего не расшифровывается: посмотреть содержимое владелец может только командой чтения (`node . dump [id человека]`) -- файл открывается read-only, ни один байт не меняется, данные на диске остаются зашифрованными. Честно про границы: ключ лежит рядом с базой, поэтому копия папки целиком всё равно читается -- защищён случай, когда утекает **только файл базы** (там шифртекст, а не список id ролей).
 
 **Не хранится:** текст сообщений (он используется только для команд staff и пересылки объявления),
 ники, аватары, e-mail, история сообщений, записи голоса, IP-адреса, платежные данные. Никакой
