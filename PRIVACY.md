@@ -1,0 +1,126 @@
+# Privacy Policy — PANDAMIA Discord bot
+
+_Last updated: 18.09.2026_
+
+This bot is a **private, self-hosted** Discord bot (Discord application name: "Peka") operated by one
+person for one community. It is not listed in any bot directory, is not offered as a service to the
+public, and is not used for advertising, analytics or profiling. This page describes exactly what the
+bot stores and how it can be deleted.
+
+По-русски: бот приватный, работает на домашней машине владельца и нигде не публикуется. Ниже —
+полный список того, что он хранит, зачем, где и как это удалить (краткая русская версия в конце).
+
+## What the bot stores
+
+Everything is keyed by **Discord IDs** (user IDs, role IDs, channel IDs, message IDs). Nothing is
+stored in the cloud: there is no external database, no analytics service, no third-party API.
+
+1. **Voice-room state and appearance** — which member currently owns which voice room, and the
+   key mark (🔑) that the bot puts in front of a member's nickname while that member has rights in a
+   channel. Derived from the current state and re-checked continuously; removed as soon as the
+   rights are gone.
+2. **Moderation timers** — when a member leaves the server, the bot records a 20-minute timeout
+   (configurable by the operator) under that member's user ID, so that leaving and instantly
+   rejoining cannot bypass an active moderation. The record is deleted as soon as the timeout is
+   lifted or expires.
+3. **Roles for restoration** — the IDs of the roles a member had when they left, so those roles can be
+   given back when the member returns. **Kept indefinitely by default**, on purpose: a member who comes
+   back after months still gets their roles back. The operator can set an expiry in days in the bot's
+   configuration file (`save_roles_days`) if he prefers a shorter period.
+4. **Punishment counters** — for each user ID, how many times the member left the server, was timed
+   out or banned, and had a punishment lifted. Used by the staff-only `/bans` summary. **Kept
+   indefinitely by default** for long-term statistics, with the same optional expiry in days
+   (`bans_history_days`).
+5. **Music queue** — the queue of tracks (their titles and links), the position in the current track
+   and which member added each track. Stored so that a restart, a crash or a temporary disconnect does
+   not reset the music. Cleared when a DJ stops the bot (`/stop`) or when the queue finishes.
+6. **Server configuration** — channel IDs and role IDs that the operator put in the bot's config file
+   (log channel, rules channel, DJ role, and so on).
+
+The bot also writes a **plain-text log** (to its own console/`logs` on the operator's machine) about
+active events: who joined or left voice, who was muted, which command was used and by whom. This log
+never leaves the operator's machine except for the events the staff themselves want to see in the
+server's own log channel (messages posted by the bot inside Discord).
+
+## What the bot does NOT store
+
+- **No message content.** The bot does not save, index or keep the text of any message. If the
+  Message Content intent is available, it is used only to react to a staff command in the chat
+  (a message starting with the configured prefix) and to republish a staff announcement from one
+  channel to another; the text is neither written to a database nor kept after the action.
+- No usernames, avatars, nicknames, e-mails, phone numbers or any other profile data.
+- No message history, no voice recordings, no audio.
+- No payment data, no IP addresses, no device information.
+- No analytics, no advertising, no profiling, no machine-learning training on user data.
+- Nothing is sold, shared or transferred to third parties (there are no third parties involved).
+
+## Where the data is kept
+
+In a single local SQLite file next to the bot on the machine of the person who runs it (the operator).
+The bot runs on the operator's own computer/hosting; there is no external database and no API calls to
+any service other than Discord itself. Access to the machine and to the file is limited to the
+operator. The bot token and the configuration file are never published.
+
+## Retention
+
+| Data | Default | Configurable |
+|---|---|---|
+| Moderation timers | deleted when the timeout is lifted or expires | yes |
+| Key marks (🔑) | removed as soon as the rights are gone | — |
+| Role IDs for restoration | kept indefinitely (so returning members get their roles back) | yes, in days (`save_roles_days`) |
+| Punishment counters | kept indefinitely, for statistics | yes, in days (`bans_history_days`) |
+| Current music queue | until `/stop` or the end of the queue | — |
+| Plain-text event log | the bot only prints it to its own console; nothing is uploaded and the bot keeps no log files itself (the operator may redirect the console to a local file) | — |
+
+## How to have your data deleted
+
+Any member can request deletion of everything the bot stores about them, in two ways:
+
+1. **In Discord:** ask the staff of the server where the bot runs. They have the command
+   `/forget user:@who`, which immediately deletes the stored role IDs and the punishment counters for
+   that member. The command is available to server administrators/moderators only, the reply is visible
+   only to them, and the deletion is written to the bot log. An active punishment is not affected by
+   this command — it is lifted with `/unban`.
+2. **Directly to the operator:** the contact is shown by the bot itself in the `/help` message (and in
+   the message the bot sends when it starts). Write there and the same records will be deleted
+   manually.
+
+Because everything is stored locally and keyed by the Discord user ID, a deletion request is a single
+lookup — nothing has to be requested from a third party, and nothing is left behind except the plain
+text of already published log messages inside Discord itself (those can be deleted by the server's
+staff like any other message).
+
+## Children
+
+The bot is not directed at children and does not knowingly store data about them. Discord's own
+age requirements apply to everyone who uses the server where the bot runs.
+
+## Changes
+
+If the bot starts storing anything new, this page will be updated before that happens. The date of the
+last change is at the top.
+
+## Contact
+
+The operator of this bot and the contact for any privacy request: **<контакт владельца: Discord-ник или e-mail>**
+(see also `/help` in the server where the bot runs).
+
+---
+
+## Кратко по-русски
+
+Бот приватный, крутится на машине владельца и хранит только это (по **id** участника/роли/канала):
+таймер таймаута за выход (20 минут, снимается сразу), id ролей -- чтобы вернуть их при возврате
+человека на сервер, счётчики наказаний для сводки `/bans`, текущую очередь музыки (названия, позиция,
+кто поставил) и настройки сервера из конфига. По умолчанию роли и счётчики **не имеют срока давности**
+-- так и задумано: человек, вернувшийся через месяцы, всё равно получает свои роли. Владелец может
+поставить срок в днях в файле конфигурации.
+
+**Не хранится:** текст сообщений (он используется только для команд staff и пересылки объявления),
+ники, аватары, e-mail, история сообщений, записи голоса, IP-адреса, платежные данные. Никакой
+аналитики, профилирования, обучения моделей и передачи данных на сторону -- сторонних сервисов нет
+вообще, база одна и лежит локально.
+
+**Удалить свои данные:** попросить staff сервера -- у них есть команда `/forget user:@кто`, она сразу
+стирает id ролей и счётчики наказаний этого человека (активное наказание не трогает: его снимает
+`/unban`); либо написать владельцу (контакт есть в `/help`), и те же записи удаляют вручную.
