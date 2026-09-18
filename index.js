@@ -18,6 +18,42 @@
 //   * channelCreate/channelUpdate: в v14 каналы приходят без guild -> берём через .guild ?? client.guilds.cache.get
 //   * [FIX v2] NaN-баг в логе переименования: скобки вокруг 'Владельцы канала: ' + (owners.size ? ... : ...)
 //   * [FIX v2] e.message там, где e не существует (users.fetch .catch(() => null))
+// CHANGELOG v2.14 (по просьбам владельца: видеть наказания, помнить роли, удобная очередь):
+//   * [ban] ОТЧЁТ ПРИ СТАРТЕ: сколько банов/таймаутов поднято из базы -- пишется ВСЕГДА,
+//     в том числе когда наказаний нет ('поднято 0: активных банов/таймаутов нет').
+//     В строке видно имя, точный срок и что это: бан или только таймаут.
+//   * [/bans] -- кто сейчас в наказании: имя, бан/таймаут, срок до секунды и причина.
+//     Только админ/модер, ответ виден вызвавшему, вызов команды -- в логе как обычно.
+//   * ТОЧНЫЕ СРОКИ вместо «~3 мин»: и в логе, и в письме, и в причине бана в Discord
+//     ('banned until 18.09.2026, 21:04:33 (left 00:03:20, re-enter during timeout)').
+//   * РОЛИ МЕЖДУ ПЕРЕЗАХОДАМИ (save_roles, ВКЛ по умолчанию): на выходе роли человека
+//     кладутся в базу (ключ -- id), на входе ДОБАВЛЯЮТСЯ недостающие -- ничего не
+//     снимаем, поэтому это мирно сосуществует с другим ботом-хранителем ролей.
+//     Не храним @everyone/роли интеграций/удалённые роли; список исключений --
+//     save_roles_exclude, срок хранения -- save_roles_days (30 дн, чистится свипом).
+//   * ОЧЕРЕДЬ ГЛАЗАМИ DJ: в /queue виден автор каждого трека ('· 👤 ник'), сколько
+//     уже играет текущий и СКОЛЬКО ВСЕГО ждать до конца плейлиста (с учётом позиции
+//     в текущем треке; эфиры и треки без длины -- отдельно); у длинных очередей --
+//     кнопки «◀ Назад / Вперёд ▶» (страница зашита в customId, чужой не перелистнёт).
+//     Новое: '/clear author:@кто' -- убрать из очереди треки одного человека.
+//   * ВЫРАВНИВАНИЕ ГРОМКОСТИ (MUSIC.normalize, ВКЛ по умолчанию): между yt-dlp и
+//     Discord становится свой ffmpeg с фильтром loudnorm, поэтому песни больше не
+//     отличаются громкостью. Фильтр проверяется один раз при старте; не умеет --
+//     играем как раньше (без нормализации). Отключить: MUSIC.normalize = false.
+//   * [FIX] УТЕЧКА ПРОЦЕССОВ: player.stop() НЕ закрывает поток трека, поэтому после
+//     /skip, /stop и /leave yt-dlp (и добавленный ffmpeg) оставались висеть в памяти.
+//     Теперь у играющего трека есть streamHandle, и он глушится в Idle-обработчике.
+//   * [FIX] MUSIC.proxy из config.json реально читается (раньше объект MUSIC вообще
+//     не брался из конфига -- всегда работал только дефолт/переменная окружения).
+//   * ПЕРЕНОС БОТА РУКАМИ (drag&drop) виден в логе и снимает статус со старого канала.
+//   * КОММЕНТАРИИ В КОНФИГЕ: подсказки лежат ключами с окончанием _comment (JSON при этом
+//     остаётся валидным); ключи-комментарии внутри SERVERS бот выкидывает при загрузке.
+//   * КОНТАКТЫ В ПОМОЩИ: OWNER (владелец ХОСТИНГА) + owner_server (владелец сервера),
+//     каждый показывается по своему флагу show_owner_hoster / show_owner_server.
+//   * [panda welcome] -- посмотреть глазами новичка, какое приветствие уходит в ЛС
+//     (без аргумента -- себе; другому -- только админ).
+//   * лог трека -- ОДНА строка: 'играю: X (из предзагрузки, без паузы)' вместо
+//     отдельной строки 'предзагрузка сыграла: X', которую читали как «прошлый отыграл».
 // CHANGELOG v2.13 (приветствие новичкам + лог бан-таймаута по факту):
 //   * [v2.13] ПРИВЕТ-ЛС НОВИЧКАМ ВЕРНУЛИСЬ: при входе на сервер бот пишет в личку
 //     приветствие со ссылкой на сообщение из `welcome_message` (канал `welcome_channel`).
@@ -116,21 +152,60 @@ const
     ID, TOKEN, PREFIX, SERVERS,
     ERROR, DEBUG, NOTICE, STARTUP_DM,
     MESSAGE_CONTENT,
+    // [v2.14] Новые верхние ключи (все необязательные):
+    //   OWNER -- id владельца ХОСТИНГА бота (кто его крутит): идёт в текст помощи
+    //            как контакт «если бот выключен»; если его нет -- берётся STARTUP_DM[0].
+    //   MUSIC -- настройки музыки: proxy (socks5), normalize (громкость), filter.
+    OWNER, MUSIC,
 }
 = require ('./config.json');
 const space = ' ';
+
+// [v2.14] КОММЕНТАРИИ В КОНФИГЕ. В JSON комментариев нет, поэтому подсказки лежат
+// обычными ключами с окончанием _comment (идея владельца). Читает их только человек.
+// Но внутри SERVERS ключ -- это ID сервера, поэтому одноразовая чистка обязательна:
+// без неё бот пытался бы работать с 'ID_СЕРВЕРА_comment' как с настоящим сервером.
+// Выкидываем всё, что не похоже на id (в том числе '_comment' и '_ПРО_КОММЕНТАРИИ').
+for (const _key of Object.keys (SERVERS))
+    if (!/^\d{17,20}$/.test (_key))
+    {
+        // '_comment' -- это подсказка (тихо); всё остальное странно -- лучше сказать.
+        if (!/_comment$/.test (_key))
+            console.log ('[' + new Date ().toLocaleString () + '] [config] ключ "' + _key +
+                '" в SERVERS -- не похож на id сервера -- пропускаю его');
+        delete SERVERS[_key];
+    }
 
 // [v2.5] Привилегированный интент Message Content (в портале приложения включён).
 // Он нужен двум вещам: пересылке из пандалогии и текстовым командам 'panda ...'.
 // Поставь в config.json "MESSAGE_CONTENT": false -- если Discord его отзовёт.
 const USE_MESSAGE_CONTENT = MESSAGE_CONTENT !== false;
 
-// [v2.5] «Владелец» для текста помощи -- первый id из STARTUP_DM (config.json).
-// Зашитых id в коде быть не должно: репозиторий отдаётся людям как есть.
-const OWNER_ID =
-    (Array.isArray (STARTUP_DM) && /^\d{17,20}$/.test (STARTUP_DM[0] || ''))
-        ? STARTUP_DM[0]
-        : '';
+// [v2.14] КТО В КОНТАКТАХ. Контактов теперь два, и оба необязательны:
+//   * владелец ХОСТИНГА бота -- кто его запускает и следит (верхний ключ OWNER,
+//     иначе первый id из STARTUP_DM, как было раньше);
+//   * владелец СЕРВЕРА -- чей это сервер (ключ сервера owner_server).
+// Это разные люди: бот может стоять на сервере, где владелец хостинга -- не админ.
+// Показывать каждый контакт можно отдельно: show_owner_hoster / show_owner_server
+// (по умолчанию включены). Зашитых id в коде нет: репозиторий отдаётся людям как есть.
+const OWNER_HOSTER =
+    /^\d{17,20}$/.test (String (OWNER || ''))
+        ? String (OWNER)
+        : ((Array.isArray (STARTUP_DM) && /^\d{17,20}$/.test (STARTUP_DM[0] || '')) ? STARTUP_DM[0] : '');
+
+// Строка контактов для текста помощи (с учётом флагов сервера):
+function contactsText (server)
+{
+    const s = SERVERS[server] || {};
+    let list = [];
+    const hoster = (s.show_owner_hoster === false) ? '' : OWNER_HOSTER;
+    const owner  = (s.show_owner_server === false)
+        ? ''
+        : (/^\d{17,20}$/.test (String (s.owner_server || '')) ? String (s.owner_server) : '');
+    if (hoster) list.push (u (hoster) + ' (хостинг бота)');
+    if (owner && owner !== hoster) list.push (u (owner) + ' (владелец сервера)');
+    return list.length ? list.join (', ') : 'администрации сервера';
+}
 
 // [v2.2] Инструкция по использованию. Один текст на все входы: стартовая ЛС
 // (STARTUP_DM из config.json), слэш `/help` и `panda help` -- правки только здесь.
@@ -143,9 +218,12 @@ const STARTUP_DM_TEXT =
     '`/play ссылка или запрос` -- трек, плейлист или прямой эфир (YouTube и др.)\n' +
     '  Добавляется В КОНЕЦ очереди. Стоять в голосовом канале не обязательно:\n' +
     '  DJ может просто собирать плейлист -- бот зайдёт, когда позовёшь.\n' +
-    '`/queue` -- что играет и что дальше, с номерами (`from:11` -- дальше по списку)\n' +
+    '`/queue` -- что играет и что дальше: номера, автор каждого трека, сколько уже\n' +
+    '  играет текущий и сколько ещё ждать до конца плейлиста целиком. У длинных\n' +
+    '  очередей есть кнопки «◀ Назад / Вперёд ▶», а `from:11` -- сразу нужная страница\n' +
     '`/remove number` -- убрать трек, `/move number to` -- переставить его,\n' +
-    '`/jump number` -- прыгнуть к треку, `/clear` -- очистить очередь\n' +
+    '`/jump number` -- прыгнуть к треку, `/clear` -- очистить всю очередь,\n' +
+    '`/clear author:@кто` -- убрать только треки этого человека\n' +
     '  (number/to -- те же номера, что в `/queue`; текущий трек в них не входит)\n' +
     '`/skip` -- следующий • `/stop` -- стоп и забыть очередь совсем\n' +
     '`/pause` / `/resume` -- пауза / продолжить\n' +
@@ -171,22 +249,37 @@ const STARTUP_DM_TEXT =
     '• выдаёт права владельцу канала и ставит тег 🔑 в ник\n' +
     '• новичку при входе приходит приветствие в личку: правила и знакомство\n' +
     '  (ссылка на сообщение из `welcome_message` в канале знакомства)\n' +
+    '• роли помнятся: выходя с сервера, человек не теряет свои роли -- при\n' +
+    '  возврате бот вернёт их обратно (выключается `save_roles: false`)\n' +
     '• за выход с сервера ставится таймаут (в этом конфиге 20 мин): перезаход\n' +
     '  раньше срока = бан до его конца\n' +
+    '• кто сейчас в наказании -- у админов и модеров есть `/bans`: имя, точный\n' +
+    '  срок и причина (ответ виден только вызвавшему)\n' +
+    '\n' +
+    '🧪 **Проверить на себе** (в чате, без `/`): `panda welcome` -- бот пришлёт\n' +
+    'тебе такую же ЛС, что видят новички (`panda welcome @юзер` -- для другого).\n' +
     '\n' +
     '🔑 **Тег 🔑 в нике** -- права в этом канале есть. У ADM/MOD тега нет: у них права и так.\n' +
     '\n' +
-    '🖥️ **Если бот выключен** -- напиши ' + (OWNER_ID ? u (OWNER_ID) : 'владельцу сервера') + '.';
+    '🖥️ **Если бот выключен** -- напиши ';
+
+// [v2.14] Текст помощи собирается НА СЕРВЕР: контакты в последней строке у разных
+// экземпляров бота разные (см. contactsText). Тело -- одно на всех.
+function helpText (server)
+{
+    return STARTUP_DM_TEXT + contactsText (server) + '.';
+}
 
 // [v2.6] Инструкция одним объектом -- чтобы /help, `panda help` и стартовая ЛС
 // никогда не разъезжались по тексту:
-function helpEmbed ()
+function helpEmbed (server)
 {
-    const first = Object.keys (SERVERS)[0];
+    const s = SERVERS[server];
+    const first = server && s ? server : Object.keys (SERVERS)[0];
     return {
         color: 0x00CCFF,
         title: '🐼 PANDAMIA Bot: инструкция',
-        description: STARTUP_DM_TEXT,
+        description: helpText (first),
         footer:
         {
             text: (first && SERVERS[first]) ? SERVERS[first].name : 'PANDAMIA Bot',
@@ -271,6 +364,9 @@ for (let _server in SERVERS)
     $db[_server]['channelsBusy']      = dbMake (_server, 'channelsBusy');
     // [v2.10] очередь и позиция музыки -- чтобы перезапуск бота не сбрасывал плейлист:
     $db[_server]['musicState']        = dbMake (_server, 'musicState');
+    // [v2.14] роли участников -- чтобы человек не терял их, выходя с сервера
+    // (ключ -- id участника: возврат идёт именно по нему, см. restoreMemberRoles):
+    $db[_server]['memberRoles']       = dbMake (_server, 'memberRoles');
 }
 
 async function db (server, namespace, id, value = undefined, item = undefined)
@@ -375,6 +471,13 @@ client.on
             '[' + (d()) + '] ' +
             `Logged in as ${client.user.tag}!` // v14: tag === username (discriminator убрали)
         );
+        // [v2.14] Выравнивание громкости проверяем ОДИН раз при старте (умеет ли
+        // сборка ffmpeg выбранный фильтр) -- чтобы играть без сюрпризов.
+        musicNormalizeReady = await probeNormalize ();
+        console.log ('[' + (d()) + '] [music] выравнивание громкости (MUSIC.normalize): ' +
+            (musicNormalizeReady
+                ? 'включено -- ' + MUSIC_NORMALIZE_FILTER
+                : (MUSIC_NORMALIZE ? 'НЕДОСТУПНО (ffmpeg не осилил фильтр) -- играю как есть' : 'выключено в конфиге')));
         schedulePresence (true); // [v2.8] профильный статус: «свободен, жду команду»
         // [v2.2] Инструкция по использованию -- в ЛС владельцу и коллеге (STARTUP_DM из config.json):
         for (const uid of (STARTUP_DM || []))
@@ -383,7 +486,7 @@ client.on
             .then
             (
                 user =>
-                user.send ({ embeds: [helpEmbed ()] }) // [v2.6] тот же текст, что у /help
+                user.send ({ embeds: [helpEmbed (Object.keys (SERVERS)[0])] }) // [v2.6] тот же текст, что у /help
             )
             .then (() => console.log ('[' + (d()) + '] startup DM sent to ' + uid))
             .catch (e => console.error ('[' + (d()) + '] startup DM error for ' + uid + ': ' + e.message));
@@ -491,9 +594,9 @@ function attachOf (message)
 // Раньше целью было ТОЛЬКО упоминание, поэтому `panda dm <id> текст`
 // молча ничего не делал (а команда при этом удалялась).
 // Возвращает { id, letter }: id может быть null (кому -- не поняли).
-function dmParse (content, mentions)
+function dmParse (content, mentions, cmd = 'dm')
 {
-    let rest = content.slice ((PREFIX + 'dm').length);
+    let rest = content.slice ((PREFIX + cmd).length);
     let id = null;
     let mentioned = mentions.users.first () || null;
     if (mentioned)
@@ -554,7 +657,7 @@ client.on ('messageCreate', async message =>
         // В чат её не льём (20 строк шума); саму команду в канале уберёт блок ниже.
         if (isCmd (message.content, 'help'))
         {
-            message.author.send ({ embeds: [helpEmbed ()] })
+            message.author.send ({ embeds: [helpEmbed (message.guild ? message.guild.id : null)] })
             .then (() => console.log ('[' + (d()) + '] [dm] help -> ' + uu (message.author) + ' OK'))
             .catch (e => console.error
             (
@@ -815,6 +918,42 @@ client.on ('messageCreate', async message =>
                                 }
                             );
                         }
+                    }
+                }
+                // command 'welcome' ## [v2.14] «покажи, какое приветствие видят новички»:
+                // бот присылает его в ЛС (без аргумента -- себе). Это именно проверка
+                // ТЕКСТА, а не факт входа: правишь welcome_message и сразу смотришь.
+                else if (isCmd (message.content, 'welcome'))
+                {
+                    const is_admin = !!message.member && !!SERVERS[server].role_admin &&
+                        message.member._roles.includes (SERVERS[server].role_admin);
+                    const { id } = dmParse (message.content, message.mentions, 'welcome');
+                    const targetId = id || message.author.id;
+                    if (!welcomeLink (server))
+                        return message.channel.send
+                        ({ content: '⚠️ Приветствие выключено: в `config.json` не задан `welcome_channel` (или он неверный).' })
+                        .catch (console.error);
+                    if (id && !is_admin)
+                        return message.channel.send
+                        ({ content: '🚫 Другому -- только админ. Без аргумента пришлю тебе.' })
+                        .catch (console.error);
+                    let user = client.users.cache.get (targetId) ||
+                        await client.users.fetch (targetId).catch (() => null);
+                    if (!user)
+                        return message.channel.send ({ content: '🤔 Пользователь `' + targetId + '` не найден.' })
+                        .catch (console.error);
+                    try
+                    {
+                        await user.send ({ embeds: [await welcomeEmbed (server, user)] });
+                        console.log ('[' + (d()) + '] [welcome] проверка: ' +
+                            (message.member ? uuu (message.member) : message.author.username) + ' -> ' + uu (user));
+                        message.channel.send ({ content: '✅ Приветствие отправлено в ЛС: ' + u (user.id) }).catch (console.error);
+                        message.delete ().catch (console.error);
+                    }
+                    catch (e)
+                    {
+                        console.error ('[' + (d()) + '] [welcome] проверка: ЛС не ушло (' + e.message + ')');
+                        message.channel.send ({ content: '⚠️ ЛС не ушло: `' + code (e.message) + '`' }).catch (console.error);
                     }
                 }
                 // command 'test' ## в текстовом канале команда просто убирается из чата
@@ -1477,6 +1616,32 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
     if (server in SERVERS && SERVERS[server].allow)
     {
         logVoiceEvent (oldState, newState);
+        // [v2.14] БОТА ПЕРЕНЕСЛИ РУКАМИ (drag&drop админом). Сам @discordjs/voice
+        // обновляет joinConfig.channelId, а вот статус канала в СТАРОМ канале остался
+        // бы висеть, и в логе переезд вообще не был виден. Снимаем статус со старого
+        // канала и пишем событие; пауза/продолжение по слушателям -- в checkListeners
+        // ниже (он смотрит на новый канал).
+        if (newState.id === client.user.id)
+        {
+            const from = oldState.channelId, to = newState.channelId;
+            const mSelf = $music[server];
+            if (from && to && from !== to)
+            {
+                const oldCh = client.channels.cache.get (from);
+                console.log ('[' + (d()) + '] [music] бота перенесли: «' +
+                    (oldCh ? oldCh.name : from) + '» -> «' +
+                    (newState.channel ? newState.channel.name : to) + '»');
+                clearVoiceStatus (from);
+                if (mSelf) { mSelf.savedChannelId = to; mSelf.pending = false; mSelf.leftByUser = false; }
+                scheduleVoiceStatus (server, true);
+                schedulePresence (true);
+                // joinConfig обновляется тем же пакетом, но чуть позже -- повторяем
+                // проверку слушателей, когда состояние соединения точно свежее
+                setTimeout (() => checkListeners (server), 500);
+            }
+            else if (from && !to)
+                console.log ('[' + (d()) + '] [music] бота выключили/выкинули из голосового канала -- очередь помню');
+        }
         scheduleVoiceStatus (server); // [v2.7] «в канале: N» в статусе канала (дебаунс)
         checkListeners (server);     // [v2.12] никого -- пауза; вернулся -- продолжаем
         await modNick
@@ -2020,6 +2185,141 @@ async function logMemberJoinLeave (server, memberUser, isJoin)
     }
 }
 
+// ============================================================================
+// [v2.14] ОТЧЁТ ПО БАНАМ/ТАЙМАУТАМ: сколько поднято из базы при старте и что активно
+// сейчас. Владелец просил видеть после каждого перезапуска, не был ли кто наказан
+// за время, пока бот не работал (раньше это приходилось выяснять только по журналу
+// Discord), и видеть по команде, кто сидит в наказании и до какого часа.
+// ============================================================================
+
+// Русские формы числительных: plural(2,'трек','трека','треков') -> 'трека'
+function plural (n, one, few, many)
+{
+    const a = Math.abs (n) % 100, b = a % 10;
+    if (a > 10 && a < 20) return many;
+    if (b > 1 && b < 5) return few;
+    if (b === 1) return one;
+    return many;
+}
+
+// Что лежит в базе: активные (срок ещё идёт) и просроченные (срок вышел, пока бота
+// не было -- их снимет sweepExpiredBans). Сортировка по сроку окончания.
+async function storedBans (server)
+{
+    let active = [], expired = [];
+    try
+    {
+        for await (const [id, until] of $db[server]['membersBanTimeout'].iterator())
+        {
+            if (typeof until !== 'number') continue; // не таймаут-запись
+            if (Date.now() < until) active.push ({ id, until });
+            else expired.push ({ id, until });
+        }
+    }
+    catch (e) { console.error ('[ban] не смог прочитать базу: ' + oneLine (e.message)); }
+    active.sort ((a, b) => a.until - b.until);
+    return { active, expired };
+}
+
+// Действующие баны сервера из Discord (id -> причина). Это ЕДИНСТВЕННЫЙ способ отличить
+// настоящий бан от простого таймаута: в базе лежит только срок, а бана при
+// onLeaveBanRealy: false может и не быть.
+async function guildBans (server)
+{
+    const guild = client.guilds.cache.get (server);
+    const map = new Map ();
+    if (!guild) return map;
+    try
+    {
+        const bans = await guild.bans.fetch ();
+        for (const [id, ban] of bans) map.set (id, (ban && ban.reason) || '');
+    }
+    catch (e) { console.error ('[ban] список банов не получен: ' + oneLine (e.message)); }
+    return map;
+}
+
+// Имена наказанных: у забаненного нет объекта участника (он не на сервере) -- берём
+// пользователя по REST. Если и его не отдали -- остаётся id (падать из-за этого нельзя).
+async function namesFor (ids)
+{
+    const map = new Map ();
+    for (const id of ids.slice (0, 25))
+    {
+        let user = client.users.cache.get (id);
+        if (!user) user = await client.users.fetch (id).catch (() => null);
+        map.set (id, user ? user.username : id);
+    }
+    return map;
+}
+
+// Одна сводка для старта и для /bans: строки -- по людям, каждая уже с точным сроком.
+async function bansOverview (server)
+{
+    const { active, expired } = await storedBans (server);
+    const bans = await guildBans (server);
+    const names = await namesFor (active.map (a => a.id));
+    const rows = active.map (a =>
+    ({
+        id: a.id,
+        until: a.until,
+        isBan: bans.has (a.id),
+        reason: bans.get (a.id) || '',
+        name: names.get (a.id) || a.id,
+        left: dd (a.until),
+        at: d (a.until, true),
+    }));
+    return { rows, expired };
+}
+
+// Текст отчёта для человека (ЛС/ответ на /bans): имена, сроки, причина.
+function bansReportText (o, max = 20)
+{
+    const banned = o.rows.filter (r => r.isBan).length;
+    if (!o.rows.length)
+        return '✅ Активных банов и таймаутов нет' +
+            (o.expired.length
+                ? ' (просроченных записей в базе: ' + o.expired.length + ' -- бот снимет их в ближайшем тике)'
+                : '') + '.';
+    const lines = o.rows.slice (0, max).map (r =>
+        '• **' + r.name + '** -- ' + (r.isBan ? '🚫 бан' : '⏳ таймаут') +
+        ', снимется `' + r.at + '` (через `' + r.left + '`)' +
+        (r.reason ? '\n  причина: `' + clipText (oneLine (r.reason, 160), 160) + '`' : ''))
+        .join ('\n');
+    return '🛡️ **Наказания сейчас (' + o.rows.length + ': ' + banned + ' ' + plural (banned, 'бан', 'бана', 'банов') +
+        ', ' + (o.rows.length - banned) + ' ' + plural (o.rows.length - banned, 'таймаут', 'таймаута', 'таймаутов') + ')**\n' +
+        lines +
+        (o.rows.length > max ? '\n*...и ещё ' + (o.rows.length - max) + '*' : '') +
+        (o.expired.length ? '\n_Просроченных записей в базе: ' + o.expired.length + ' -- снимутся сами._' : '');
+}
+
+// [v2.14] Строка при СТАРТЕ: сколько наказаний поднято из базы. Пишется ВСЕГДА --
+// в том числе когда наказаний нет (владелец смотрит как раз на эти строки).
+async function reportStoredBans (server)
+{
+    try
+    {
+        const o = await bansOverview (server);
+        const banned = o.rows.filter (r => r.isBan).length;
+        const tail = o.expired.length
+            ? '; просроченных записей: ' + o.expired.length + ' -- сниму сейчас (срок вышел, пока бот не работал)'
+            : '';
+        if (!o.rows.length)
+            console.log ('[' + (d()) + '] [ban] из базы поднято 0: активных банов/таймаутов нет -- никто не наказан' + tail);
+        else
+            console.log ('[' + (d()) + '] [ban] из базы поднято ' + o.rows.length + ' ' +
+                plural (o.rows.length, 'активное', 'активных', 'активных') + ' (' + banned + ' ' +
+                plural (banned, 'бан', 'бана', 'банов') + ', ' + (o.rows.length - banned) + ' ' +
+                plural (o.rows.length - banned, 'таймаут', 'таймаута', 'таймаутов') + '): ' +
+                o.rows.map (r => r.name + ' до ' + r.at + ' (осталось ' + r.left + (r.isBan ? ', бан' : ', только таймаут') + ')').join (' | ') +
+                tail);
+    }
+    catch (e)
+    {
+        // Отчёт не должен мешать старту: ошибку видно, бот продолжает работать.
+        console.error ('[ban] отчёт при старте: ' + e.message);
+    }
+}
+
 // [!!!] Рестарт-безопасность: ban-таймеры живут в памяти (setTimeout) и умирают
 // вместе с процессом. Теперь при каждом старте (и в каждом тике поллера)
 // проверяем просроченные membersBanTimeout в SQLite и снимаем баны.
@@ -2109,9 +2409,41 @@ function welcomeLink (server)
         (/^\d{17,20}$/.test (message) ? '/' + message : '');
 }
 
-async function welcomeDM (server, uid, raw)
+// Текст приветствия ОТДЕЛЬНОЙ функцией: его же показывает `panda welcome` (проверка
+// на себе -- владелец может посмотреть глазами новичка и поправить welcome_message).
+async function welcomeEmbed (server, user)
 {
     const s = SERVERS[server] || {};
+    const link = welcomeLink (server);
+    // название канала знакомства: «зайди в #канал» понятнее одной ссылки
+    let chName = '';
+    try
+    {
+        let ch = client.channels.cache.get (s.welcome_channel) ||
+                 await client.channels.fetch (s.welcome_channel);
+        if (ch && ch.name) chName = '#' + ch.name;
+    }
+    catch (e) { /* канал не отдался -- обойдёмся ссылкой */ }
+    const embed =
+    {
+        color: 0x00CCFF,
+        title: '🐼 Добро пожаловать на ' + (s.name || 'сервер') + '!',
+        description:
+            `${user}, привет! 👋\n` +
+            `\n📜 **Правила и знакомство**` + (chName ? ' -- в канале ' + code (chName) : '') + `:\n` +
+            `${link}\n` +
+            `\n🎵 **Музыка:** \`/play ссылка или запрос\`, очередь -- \`/queue\`,\n` +
+            `выйти боту из канала -- \`/leave\` (управляют админы, модеры и роль DJ).\n` +
+            `📌 Инструкция по боту -- в любой момент \`/help\`.\n` +
+            `\nЕсли что-то непонятно или не работает -- напиши администрации.`,
+        timestamp: dt(),
+    };
+    if (s.name) embed.footer = { text: s.name };
+    return embed;
+}
+
+async function welcomeDM (server, uid, raw)
+{
     const link = welcomeLink (server);
     if (!link) return; // welcome_channel не задан -- приветствие выключено
     const name = (raw && raw.user && raw.user.username) || uid;
@@ -2123,31 +2455,7 @@ async function welcomeDM (server, uid, raw)
             console.error ('[welcome] ЛС новичку ' + name + ' не отправить: пользователь недоступен');
             return;
         }
-        // название канала знакомства: «зайди в #канал» понятнее одной ссылки
-        let chName = '';
-        try
-        {
-            let ch = client.channels.cache.get (s.welcome_channel) ||
-                     await client.channels.fetch (s.welcome_channel);
-            if (ch && ch.name) chName = '#' + ch.name;
-        }
-        catch (e) { /* канал не отдался -- обойдёмся ссылкой */ }
-        const embed =
-        {
-            color: 0x00CCFF,
-            title: '🐼 Добро пожаловать на ' + (s.name || 'сервер') + '!',
-            description:
-                `${user}, привет! 👋\n` +
-                `\n📜 **Правила и знакомство**` + (chName ? ' -- в канале ' + code (chName) : '') + `:\n` +
-                `${link}\n` +
-                `\n🎵 **Музыка:** \`/play ссылка или запрос\`, очередь -- \`/queue\`,\n` +
-                `выйти боту из канала -- \`/leave\` (управляют админы, модеры и роль DJ).\n` +
-                `📌 Инструкция по боту -- в любой момент \`/help\`.\n` +
-                `\nЕсли что-то непонятно или не работает -- напиши администрации.`,
-            timestamp: dt(),
-        };
-        if (s.name) embed.footer = { text: s.name };
-        await user.send ({ embeds: [embed] });
+        await user.send ({ embeds: [await welcomeEmbed (server, user)] });
         console.log ('[' + (d()) + '] [welcome] ЛС новичку ' + name + ' отправлена (' + link + ')');
     }
     catch (e)
@@ -2190,6 +2498,8 @@ async function handleMemberJoin (server, uid, raw)
     {
         // Только здесь вход ДЕЙСТВИТЕЛЬНО ограничивается: поэтому письмо, бан и
         // запись в журнал идут вместе, а не как раньше -- письмо всем без разбора.
+        // [v2.14] ТОЧНЫЕ СРОКИ вместо «~3 мин»: видно и остаток до секунды (dd),
+        // и момент, когда ограничение снимется (d(until, true)).
         if (user && typeof user.send === 'function')
             await user.send
             (
@@ -2209,23 +2519,23 @@ async function handleMemberJoin (server, uid, raw)
             .catch (e => console.error ('[memberJoin] ЛС о таймауте ' + username + ' не ушла: ' + e.message));
         else
             console.error ('[memberJoin] ЛС о таймауте ' + username + ' не отправить: пользователь недоступен');
-        const mins = Math.max (1, Math.round (left / 1000 / 60)); // «~0 мин.» в логе -- не по-человечески
-        guild.members.ban (uid, { reason: 'Забанен ботом на ~' + mins + ' мин. (перезаход во время таймаута)' })
+        guild.members.ban (uid,
+            { reason: 'Забанен ботом до ' + d (until, true) + ' (перезаход во время таймаута, осталось ' + dd (until) + ')' })
         .then
         (
             async () =>
             {
                 // [v2.13] в лог -- ровно то, что произошло: бан выдан за перезаход,
-                // сколько оставалось от срока и когда снимем.
-                console.log ('[' + (d()) + '] member ' + username + ' banned on ~' + mins +
-                    ' min. (re-enter during timeout, left ' + dd (until) + ')');
+                // сколько оставалось и до какого момента (по секундам, без «~»).
+                console.log ('[' + (d()) + '] member ' + username + ' banned until ' + d (until, true) +
+                    ' (left ' + dd (until) + ', re-enter during timeout)');
                 setTimeout
                 (
                     async () =>
                     {
                         await db (server, 'membersBanTimeout', uid, null);
                         guild.members.unban (uid)
-                        .then (u => console.log ('[' + (d()) + '] member ' + (u ? u.username : uid) + ' unbanned after ~' + mins + ' min.'))
+                        .then (u => console.log ('[' + (d()) + '] member ' + (u ? u.username : uid) + ' unbanned (timeout over)'))
                         .catch (e => console.error ('[memberJoin] unban: ' + e.message + ' -- unbanned already ?'));
                     },
                     left // остаток срока (а не весь таймаут заново)
@@ -2250,6 +2560,9 @@ async function handleMemberLeave (server, uid, raw)
     let log_channel = SERVERS[server].log_channel || '';
     let onLeaveBanTimeout = SERVERS[server].onLeaveBanTimeout || 0;
     let onLeaveBanRealy = SERVERS[server].onLeaveBanRealy || false;
+    // [v2.14] Сначала запоминаем роли выходящего -- ДО таймаута и до любых банов.
+    // Это делает сама PANDAMIA (раньше это умел только сторонний бот), см. saveMemberRoles.
+    await saveMemberRoles (server, uid, raw);
     if (await db (server, 'membersBanTimeout', uid))
     {
         // Уже в таймауте (перезаход) -- банить повторно не надо.
@@ -2259,21 +2572,24 @@ async function handleMemberLeave (server, uid, raw)
     let username = raw && raw.user ? (raw.user.username + (raw.nick ? ' (' + raw.nick + ')' : '')) : uid;
     if (onLeaveBanRealy)
     {
+        // [v2.14] точный срок бана: и причина в аудите Discord, и строка в логе.
+        const untilLeave = Date.now () + onLeaveBanTimeout * 60 * 1000;
         guild.members.ban
         (
             uid,
             {
                 days: 0,
-                reason: 'Забанен ботом на ' + onLeaveBanTimeout + ' мин.',
+                reason: 'Забанен ботом до ' + d (untilLeave, true) + ' (выход с сервера, таймаут ' + onLeaveBanTimeout + ' мин.)',
             }
         )
         .then
         (
             async () =>
             {
-                await db (server, 'membersBanTimeout', uid, Date.now() + onLeaveBanTimeout * 60 * 1000);
+                await db (server, 'membersBanTimeout', uid, untilLeave);
                 // [v2.13] бан выдан сразу при выходе (onLeaveBanRealy: true)
-                console.log ('[' + (d()) + '] member ' + username + ' banned on ' + onLeaveBanTimeout + ' min. (on leave)');
+                console.log ('[' + (d()) + '] member ' + username + ' banned until ' + d (untilLeave, true) +
+                    ' (' + onLeaveBanTimeout + ' min., on leave)');
                 setTimeout
                 (
                     async () =>
@@ -2282,7 +2598,7 @@ async function handleMemberLeave (server, uid, raw)
                         guild.members.unban (uid)
                         .then
                         (
-                            user => console.log ('[' + (d()) + '] member ' + (user ? user.username : uid) + ' unbanned after ' + onLeaveBanTimeout + ' min.')
+                            user => console.log ('[' + (d()) + '] member ' + (user ? user.username : uid) + ' unbanned (timeout over)')
                         )
                         .catch (e => console.error ('[memberLeave] unban: ' + e.message + ' -- unbanned already ?'));
                     },
@@ -2298,18 +2614,137 @@ async function handleMemberLeave (server, uid, raw)
         // таймаут: бан прилетит, если человек зайдёт раньше срока (handleMemberJoin,
         // onEnterBanRealy). Раньше в логе писалось «banned on N min.», хотя никакого
         // бана не было -- теперь написано ровно то, что сделано.
-        await db (server, 'membersBanTimeout', uid, Date.now() + onLeaveBanTimeout * 60 * 1000);
-        console.log ('[' + (d()) + '] member ' + username + ' timeout on ' + onLeaveBanTimeout + ' min. (ban -- only if re-enters earlier)');
+        const untilTimeout = Date.now () + onLeaveBanTimeout * 60 * 1000;
+        await db (server, 'membersBanTimeout', uid, untilTimeout);
+        console.log ('[' + (d()) + '] member ' + username + ' timeout until ' + d (untilTimeout, true) +
+            ' (' + onLeaveBanTimeout + ' min., ban -- only if re-enters earlier)');
         setTimeout
         (
             async () =>
             {
                 await db (server, 'membersBanTimeout', uid, null);
-                console.log ('[' + (d()) + '] member ' + username + ' timeout expired after ' + onLeaveBanTimeout + ' min. (did not come back)');
+                console.log ('[' + (d()) + '] member ' + username + ' timeout expired after ' + onLeaveBanTimeout +
+                    ' min. (did not come back)');
             },
             onLeaveBanTimeout * 60 * 1000
         );
     }
+}
+
+// ============================================================================
+// [v2.14] РОЛИ ЖИВУТ МЕЖДУ ПЕРЕЗАХОДАМИ (config: save_roles, по умолчанию ВКЛЮЧЕНО)
+// Раньше этим занимался сторонний бот: человек выходил с сервера, терял роли и
+// получал их обратно только благодаря ему. Теперь это умеет и PANDAMIA:
+//   * на выходе роли участника кладутся в базу (ключ -- его id);
+//   * на входе бот ДОБАВЛЯЕТ то, чего сейчас нет, и НИЧЕГО не отнимает. Поэтому
+//     работать это может одновременно с другим ботом-хранителем: кто успел -- тот и
+//     вернул, второй просто ничего не меняет (у нас -- add-only);
+//   * ненужное в базу не пишем: @everyone, роли интеграций (managed -- их нельзя
+//     выдать) и роли, которых на сервере уже нет; свой список -- save_roles_exclude;
+//   * записи старше save_roles_days (по умолчанию 30 дней) убираются сами.
+// Выключить совсем: "save_roles": false у сервера.
+// ============================================================================
+const ROLE_SAVE_DAYS_DEFAULT = 30;
+
+function roleSaveOn (server)
+{
+    return (SERVERS[server] || {}).save_roles !== false;
+}
+
+// Можно ли эту роль выдать обратно: не исключена в конфиге, не @everyone, не роль
+// интеграции (managed) и всё ещё существует на сервере.
+function roleRestorable (server, guild, id)
+{
+    const s = SERVERS[server] || {};
+    const skip = (Array.isArray (s.save_roles_exclude) ? s.save_roles_exclude : []).map (String);
+    if (skip.includes (String (id))) return false;
+    const role = guild.roles.cache.get (id);
+    return !!(role && !role.managed && role.id !== guild.id);
+}
+
+function roleSaveDays (server)
+{
+    const d = Number ((SERVERS[server] || {}).save_roles_days);
+    return (d > 0) ? d : ROLE_SAVE_DAYS_DEFAULT;
+}
+
+// Запомнить роли выходящего участника (вызывается ДО выдачи таймаута).
+async function saveMemberRoles (server, uid, raw)
+{
+    if (!roleSaveOn (server)) return;
+    const guild = client.guilds.cache.get (server);
+    if (!guild) return;
+    const roles = (raw && Array.isArray (raw.roles)) ? raw.roles : null;
+    if (!roles) return; // данных о ролях нет -- запоминать нечего
+    const name = (raw && raw.user && raw.user.username) || uid;
+    const keep = roles.filter (id => roleRestorable (server, guild, id));
+    if (!keep.length) return;
+    try
+    {
+        await db (server, 'memberRoles', uid, { at: Date.now (), roles: keep });
+        console.log ('[' + (d()) + '] [roles] запомнил ' + keep.length + ' ' + plural (keep.length, 'роль', 'роли', 'ролей') +
+            ' для ' + name + ': ' + keep.map (id => '«' + ((guild.roles.cache.get (id) || {}).name || id) + '»').join (', '));
+    }
+    catch (e) { console.error ('[roles] не смог сохранить роли ' + name + ': ' + oneLine (e.message)); }
+}
+
+// Вернуть роли при входе. Важно: только ДОБАВЛЯЕМ (ничего не снимаем) -- так этот
+// механизм не мешает другим ботам и не спорит с ручной выдачей ролей администрацией.
+async function restoreMemberRoles (server, uid, raw)
+{
+    if (!roleSaveOn (server)) return 0;
+    const guild = client.guilds.cache.get (server);
+    if (!guild) return 0;
+    const name = (raw && raw.user && raw.user.username) || uid;
+    let saved = null;
+    try { saved = await db (server, 'memberRoles', uid); }
+    catch (e) { console.error ('[roles] не смог прочитать роли ' + name + ': ' + oneLine (e.message)); return 0; }
+    if (!saved || !Array.isArray (saved.roles) || !saved.roles.length) return 0;
+    const days = roleSaveDays (server);
+    if (Date.now () - (Number (saved.at) || 0) > days * 86400000)
+    {
+        await db (server, 'memberRoles', uid, null).catch (() => {});
+        console.log ('[' + (d()) + '] [roles] запись о ролях ' + name + ' старше ' + days + ' дн -- забываю');
+        return 0;
+    }
+    const have = new Set ((raw && Array.isArray (raw.roles)) ? raw.roles : []);
+    const want = saved.roles.filter (id => !have.has (id) && roleRestorable (server, guild, id));
+    if (!want.length) return 0;
+    try
+    {
+        const member = await guild.members.fetch (uid);
+        await member.roles.add (want, 'PANDAMIA: возврат ролей после перезахода');
+        console.log ('[' + (d()) + '] [roles] вернул ' + want.length + ' ' + plural (want.length, 'роль', 'роли', 'ролей') + ' ' + name + ': ' +
+            want.map (id => '«' + ((guild.roles.cache.get (id) || {}).name || id) + '»').join (', '));
+        return want.length;
+    }
+    catch (e)
+    {
+        // Запись НЕ удаляем: если не вышло из-за бана/прав/сети, попробуем в следующий вход.
+        console.error ('[roles] не смог вернуть роли ' + name + ': ' + oneLine (e.message) + ' -- запись оставлена, попробую в следующий вход');
+        return 0;
+    }
+}
+
+// Уборка старых записей о ролях (чтобы база не росла бесконечно).
+async function sweepSavedRoles (server)
+{
+    if (!roleSaveOn (server)) return;
+    const days = roleSaveDays (server);
+    let keys = [];
+    try
+    {
+        for await (const [key, value] of $db[server]['memberRoles'].iterator())
+        {
+            if (!value || typeof value.at !== 'number' || Date.now () - value.at > days * 86400000)
+                keys.push (key);
+        }
+        for (const key of keys) await db (server, 'memberRoles', key, null);
+    }
+    catch (e) { console.error ('[roles] уборка: ' + oneLine (e.message)); return; }
+    if (keys.length)
+        console.log ('[' + (d()) + '] [roles] убрал ' + keys.length + ' старых ' +
+            plural (keys.length, 'запись', 'записи', 'записей') + ' о ролях (старше ' + days + ' дн)');
 }
 
 // [v2.2.3] РЕСТАРТ-БЕЗОПАСНАЯ сверка тегов 🔑: события, случившиеся пока бот был выключен
@@ -2532,6 +2967,8 @@ async function pollMembers (server)
                         let memberUser = await resolveUser (uid, raw);
                         console.log ('[' + (d()) + '] member ' + memberUser.username + ' JOINED ' + SERVERS[server].name);
                         await logMemberJoinLeave (server, memberUser, true);
+                        // [v2.14] роли назад (до таймаутов: человек ещё точно на сервере)
+                        await restoreMemberRoles (server, uid, raw);
                         await handleMemberJoin (server, uid, raw);
                     }
                     catch (e) { console.error ('[pollMembers] join ' + uid + ': ' + e.message); }
@@ -2581,8 +3018,14 @@ client.on
             console.log ('[' + (d()) + '] [poll] snapshot ready: ' + ($membersSnapshot[server] ? $membersSnapshot[server].size : 'ERR') + ' members @ ' + SERVERS[server].name);
             // [v2.5] заодно проверить id из config.json (молчит, если всё цело):
             await checkConfigChannels (server);
+            // [v2.14] Сперва отчёт: сколько наказаний поднято из базы (пишется всегда),
+            // и только потом снятие просроченных -- чтобы в логе было видно исходное
+            // состояние, а не только «уже снял».
+            await reportStoredBans (server);
             // Рестарт-безопасность: снять истёкшие бан-таймауты из SQLite:
             await sweepExpiredBans (server);
+            // [v2.14] убрать слишком старые записи о ролях (save_roles_days):
+            await sweepSavedRoles (server);
             // [v2.3] почистить пустые личные каналы после рестарта:
             await tempSweep (server);
             // [v2.10] вернуть музыку с прошлого запуска (очередь + тот же канал):
@@ -2600,6 +3043,7 @@ client.on
                         [
                             () => pollMembers (server),
                             () => sweepExpiredBans (server),
+                            () => sweepSavedRoles (server),   // [v2.14] старые записи о ролях
                             () => sweepNicks (server),        // ключи 🔑
                             () => tempSweep (server),         // пустые кабинеты
                             () => tempLobbyCheck (server),    // лобби -> кабинет
@@ -2638,19 +3082,37 @@ const
 } = require ('@discordjs/voice');
 const ytdlp = require ('youtube-dl-exec');
 const ffmpegPath = require ('ffmpeg-static');
+const { spawn } = require ('child_process'); // [v2.14] свой ffmpeg: выравнивание громкости
 const
 {
     SlashCommandBuilder,
     REST,
     Routes,
     MessageFlags,
+    ActionRowBuilder, // [v2.14] кнопки листания очереди
+    ButtonBuilder,
+    ButtonStyle,
 } = require ('discord.js');
 
+// Настройки музыки из config.json (объект MUSIC). Все необязательны.
+// [FIX v2.14] Раньше здесь стояло `typeof MUSIC !== 'undefined' && MUSIC.proxy`, но
+// MUSIC НИКОГДА не читался из конфига (объекта не было в require выше) -- то есть
+// MUSIC.proxy в config.json молча не работал, всегда брался порт по умолчанию.
+// Теперь MUSIC берётся из конфига, как и обещает README.
+const MUSIC_CFG = MUSIC || {};
 // Прокси для yt-dlp (YouTube напрямую из РФ недоступен).
 // [v2.2.2] Стратегия: сначала через прокси; если не отвечает 3 секунды -- DIRECT:
-const MUSIC_PROXY = (typeof MUSIC !== 'undefined' && MUSIC && MUSIC.proxy) || (process.env.MUSIC_PROXY || 'socks5://127.0.0.1:10808');
+const MUSIC_PROXY = MUSIC_CFG.proxy || process.env.MUSIC_PROXY || 'socks5://127.0.0.1:10808';
 const MUSIC_PROXY_TIMEOUT = 3000; // мс -- «не получилось за 3 сек» -> DIRECT
 let proxyStreamDead = false;      // прокси отвечает по TCP, но стрим умер -> временно DIRECT
+// [v2.14] ВЫРАВНИВАНИЕ ГРОМКОСТИ: yt-dlp -> ffmpeg(-af loudnorm) -> Discord.
+// Записи бывают сведены с разной громкостью (одна тише, другая громче) -- фильтр
+// loudnorm приводит их к среднему уровню, поэтому между песнями нет «качелей»
+// громкости. Выключается в конфиге: MUSIC.normalize = false; свой фильтр --
+// MUSIC.filter. Если ffmpeg почему-то не поднялся -- трек играет как раньше
+// (обычным путём), музыка из-за этого не встаёт.
+const MUSIC_NORMALIZE = MUSIC_CFG.normalize !== false;
+const MUSIC_NORMALIZE_FILTER = MUSIC_CFG.filter || 'loudnorm=I=-16:TP=-1.5:LRA=11';
 // Роль DJ -- задаётся в config.json сервера как role_dj.
 
 // [v2.2.2] Быстрая TCP-проверка прокси (коннект за timeoutMs, иначе -- мёртв):
@@ -2765,8 +3227,28 @@ function musicOf (guildId)
             streamRetries: 0,       // попытки продолжить трек с места обрыва потока
             lastErrorAt: 0,
             playerWired: false,     // обработчики плеера вешаются ОДИН раз
+            // [v2.14] Ссылка на поток ИГРАЮЩЕГО трека (yt-dlp + наш ffmpeg). Нужна,
+            // чтобы их глушить: player.stop() сам поток НЕ закрывает, и без этого
+            // yt-dlp/ffmpeg оставались висеть в памяти после /skip, /stop, /leave.
+            streamHandle: null,
         };
     return $music[guildId];
+}
+
+// [v2.14] Staff (админ/модер) ли вызывающий слэш-команду. Роли берём из сырого
+// списка member._roles: он есть и у GuildMember, и у «лёгкого» объекта участника
+// (у последнего нет member.roles.cache, на котором спотыкается isStaff).
+function isStaffInteraction (interaction)
+{
+    const server = interaction.guildId;
+    if (!(server in SERVERS)) return false;
+    const member = interaction.member;
+    if (!member) return false;
+    const s = SERVERS[server];
+    const roles = member._roles ||
+        (member.roles && member.roles.cache ? [...member.roles.cache.keys ()] : []);
+    return !!((s.role_admin && roles.includes (s.role_admin)) ||
+              (s.role_moder && roles.includes (s.role_moder)));
 }
 
 function isDJ (interaction)
@@ -2832,6 +3314,48 @@ async function playlistInfo (query)
     );
 }
 
+// ============================================================================
+// [v2.14] ВЫРАВНИВАНИЕ ГРОМКОСТИ (MUSIC.normalize, по умолчанию включено).
+// Записи сведены с разной громкостью: одна тише, другая громче, и между песнями
+// приходится крутить громкость вручную. Фильтр loudnorm приводит всё к одному
+// среднему уровню, поэтому разницы не слышно.
+// Как это устроено: между yt-dlp и Discord становится НАШ ffmpeg, который сразу
+// отдаёт готовый PCM 48k/stereo (StreamType.Raw) -- то есть отдельный процесс
+// ffmpeg всё равно нужен, просто теперь он наш и с фильтром.
+// Если фильтр не поддерживается сборкой ffmpeg или его отключили в конфиге -- играем
+// как раньше (без нормализации), музыка из-за этого не встаёт.
+// ============================================================================
+let musicNormalizeReady = false; // ставится при старте (probeNormalize)
+function probeNormalize ()
+{
+    return new Promise (resolve =>
+    {
+        if (!MUSIC_NORMALIZE) return resolve (false);
+        if (!ffmpegPath) return resolve (false);
+        let p;
+        try
+        {
+            p = spawn (ffmpegPath,
+                ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi',
+                 '-i', 'anullsrc=r=48000:cl=stereo', '-af', MUSIC_NORMALIZE_FILTER,
+                 '-t', '0.2', '-f', 'null', '-'],
+                { windowsHide: true });
+        }
+        catch (e) { return resolve (false); }
+        let err = '';
+        let guard = setTimeout (() => { try { p.kill (); } catch {} resolve (false); }, 8000);
+        p.stderr.on ('data', d => { err += String (d); });
+        p.on ('error', () => { clearTimeout (guard); resolve (false); });
+        p.on ('close', code =>
+        {
+            clearTimeout (guard); // таймер-предохранитель больше не держит событийный цикл
+            if (code !== 0 && err.trim ())
+                console.error ('[music] выравнивание громкости недоступно: ' + ytDlpErr ({ stderr: err }, 150));
+            resolve (code === 0);
+        });
+    });
+}
+
 // Аудио-ресурс: yt-dlp стримит в stdout -> ffmpeg ресемплирует в Opus для Discord:
 // [v2.2.2] стрим по той же стратегии, что и метаданные: прокси -> DIRECT:
 async function createTrackStream (track, seekSec = 0)
@@ -2864,13 +3388,53 @@ async function createTrackStream (track, seekSec = 0)
     // [v2.9.2] В лог -- одна строка (см. ytDlpErr): читаемая причина, без простыни.
     if (ytdlpStream && typeof ytdlpStream.catch === 'function')
         ytdlpStream.catch (e => console.error ('[music] yt-dlp exited: ' + ytDlpErr (e)));
-    // yt-dlp выдаёт m4a/webm -- ffmpeg конвертирует в 48kHz stereo PCM,
-    // а @discordjs/voice сама упакует в Opus (ffmpegProcess -> StreamType.Raw):
+    // [v2.14] Громкость: yt-dlp -> ffmpeg(loudnorm) -> PCM 48k/stereo (StreamType.Raw).
+    // Не смогли поднять ffmpeg -- тихо откатываемся к обычному пути (Arbitrary),
+    // который сами конвертирует внутри @discordjs/voice.
+    let ff = null, input = ytdlpStream.stdout, raw = false;
+    if (musicNormalizeReady)
+    {
+        try
+        {
+            ff = spawn (ffmpegPath,
+                ['-hide_banner', '-loglevel', 'error', '-i', 'pipe:0', '-af', MUSIC_NORMALIZE_FILTER,
+                 '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'],
+                { windowsHide: true });
+        }
+        catch (e)
+        {
+            console.error ('[music] ffmpeg (громкость) не поднялся: ' + oneLine (e.message) + ' -- играю без него');
+            ff = null;
+        }
+        if (ff)
+        {
+            // пайп yt-dlp -> ffmpeg; EPIPE/обрыв пайпа -- не повод писать в лог шум
+            ytdlpStream.stdout.on ('error', () => {});
+            ff.stdin.on ('error', () => {});
+            ff.stdout.on ('error', () => {});
+            ytdlpStream.stdout.pipe (ff.stdin);
+            // ffmpeg может умереть на середине (битый поток, нехватка ресурсов).
+            // Это не повод ронять бота -- пишем одной строкой.
+            let ffErr = '';
+            ff.stderr.on ('data', d => { ffErr += String (d); });
+            ff.on ('error', () => {});
+            ff.on ('close', code =>
+            {
+                if (code === 0 || code === null) return; // нормально отработал
+                console.error ('[music] ffmpeg (громкость) остановился: код ' + code +
+                    (ffErr.trim () ? ' -- ' + ytDlpErr ({ stderr: ffErr }, 150) : ''));
+            });
+            input = ff.stdout;
+            raw = true;
+        }
+    }
     const resource = createAudioResource
     (
-        ytdlpStream.stdout,
+        input,
         {
-            inputType: StreamType.Arbitrary,
+            // Raw -- уже готовый PCM 48k/stereo от нашего ffmpeg (или Arbitrary, если
+            // нормализация выключена: тогда конвертацию делает @discordjs/voice):
+            inputType: raw ? StreamType.Raw : StreamType.Arbitrary,
             inlineVolume: true,
         }
     );
@@ -2878,7 +3442,7 @@ async function createTrackStream (track, seekSec = 0)
         resource.volume.setVolume (MUSIC_VOLUME); // [FIX v2.9.1] было musicOf('') -- создавало мусорную запись $music['']
     // [v2.9] source/proc отдаём наружу: у предзагрузки нужно уметь всё это глушить
     // (иначе непригодившийся трек оставил бы висеть yt-dlp, ждущий читателя в пайпе).
-    return { resource, viaProxy, source: ytdlpStream.stdout, proc: ytdlpStream };
+    return { resource, viaProxy, source: ytdlpStream.stdout, proc: ytdlpStream, ff: ff };
 }
 
 // Воспроизведение следующего трека:
@@ -2886,6 +3450,10 @@ async function playNext (guildId)
 {
     const m = musicOf (guildId);
     if (m.leaving) return; // [v2.9] бот уже уходит -- новый трек не запускаем
+    // [v2.14] Прошлый поток больше не нужен: глушим его ДО всего остального (иначе
+    // после каждого перехода висел бы yt-dlp, ждущий читателя в пайпе).
+    killStream (m.streamHandle);
+    m.streamHandle = null;
     if (!m.tracks.length)
     {
         m.current = null;
@@ -2908,12 +3476,18 @@ async function playNext (guildId)
     if (m.seekTrack !== m.tracks[0]) m.streamRetries = 0; // новый трек -- счётчик попыток с нуля
     let track = m.tracks.shift ();
     m.current = track;
-    console.log ('[' + (d()) + '] [music] играю: ' + (track.title || track.url || 'трек')); // [v2.4] активное событие в лог
+    // [v2.14] ОДНА строка на запуск трека. Раньше рядом появлялась отдельная
+    // «предзагрузка сыграла: X (без паузы)» -- по логу это читалось как «предыдущий
+    // ролик уже отыграл». Теперь всё в строке «играю»: это просто пометка, что трек
+    // не искали заново, а взяли готовый поток (заготовка ждала, пока играл прошлый).
+    const fromPreload = !!(m.preload && m.preload.track === track);
+    console.log ('[' + (d()) + '] [music] играю: ' + (track.title || track.url || 'трек') +
+        (fromPreload ? ' (из предзагрузки, без паузы)' : '')); // [v2.4] активное событие в лог
     scheduleVoiceStatus (guildId, true); // [v2.7] сразу показать новый трек и очередь
     schedulePresence (true);             // [v2.8] «слушает» этот трек
     try
     {
-        let resource = null, viaProxy = false;
+        let resource = null, viaProxy = false, handle = null;
         let startedAt = 0; // [v2.12] с какой секунды трек реально начал играть (0 -- с начала)
         const p = m.preload;
         if (p && p.track === track)
@@ -2921,16 +3495,14 @@ async function playNext (guildId)
             // [v2.9] этот трек уже готовился пока играл предыдущий -- берём готовое
             m.preload = null; // вынули: теперь это обычный играющий ресурс, не предзагрузка
             const r = await p.promise; // в бою уже готова (песня играла минуты)
-            if (r) { resource = r.resource; viaProxy = r.viaProxy; }
+            if (r) { resource = r.resource; viaProxy = r.viaProxy; handle = { resource: r.resource, source: p.source, proc: p.proc, ff: p.ff }; }
         }
         else
         {
             // готовили не этот трек (или вообще ничего) -- выкидываем, иначе утечёт ffmpeg
             dropPreload (m);
         }
-        if (resource)
-            console.log ('[' + (d()) + '] [music] предзагрузка сыграла: ' + (track.title || 'трек') + ' (без паузы)');
-        else
+        if (!resource)
         {
             // [v2.10] этот трек может быть восстановлен после перезапуска -- тогда
             // пробуем начать с того же места, а не с начала:
@@ -2949,6 +3521,7 @@ async function playNext (guildId)
             }
             resource = opened.resource;
             viaProxy = opened.viaProxy;
+            handle = { resource: opened.resource, source: opened.source, proc: opened.proc, ff: opened.ff };
             startedAt = seekSec;
         }
         // [v2.12.2] позиция «прерванного» трека не теряется, если он стоит в очереди
@@ -2964,6 +3537,7 @@ async function playNext (guildId)
         m.playingSince = Date.now ();
         m.pausedByNobody = false;
         wireStreamErrors (m, track, resource, viaProxy, guildId);
+        m.streamHandle = handle; // [v2.14] чем глушить этот трек (см. killStream)
         m.player.play (resource);
         startPreload (guildId); // [v2.9] пока играет -- готовим следующий трек
         // [v2.12] играет кому-то живому? тогда естественный конец очереди = забыть её;
@@ -2998,13 +3572,15 @@ function dropPreload (m)
     killStream ({ resource: p.resource, source: p.source, proc: p.proc });
 }
 
-// Глушим поток трека целиком: сам ресурс, поток yt-dlp и его процесс.
+// Глушим поток трека целиком: сам ресурс, поток yt-dlp и его процесс (а также наш
+// ffmpeg выравнивания громкости -- иначе процесс остался бы висеть в пайпе).
 function killStream (r)
 {
     if (!r) return;
     try { if (r.resource) r.resource.playStream.destroy (); } catch {}
     try { if (r.source) r.source.destroy (); } catch {}
     try { if (r.proc && typeof r.proc.kill === 'function') r.proc.kill (); } catch {}
+    try { if (r.ff) { r.ff.stdin.destroy (); r.ff.stdout.destroy (); r.ff.kill (); } } catch {}
 }
 
 // Начать готовить первый трек очереди (повторные вызовы безопасны).
@@ -3030,10 +3606,12 @@ function startPreload (guildId)
             p.viaProxy = r.viaProxy;
             p.source = r.source;
             p.proc = r.proc;
+            p.ff = r.ff;
             // Обработчик ошибок вешаем сразу (а не когда трек начнёт играть): иначе
             // 'error' у потока без слушателя уронил бы процесс.
             wireStreamErrors (m, next, r.resource, r.viaProxy, guildId);
-            console.log ('[' + (d()) + '] [music] предзагрузка готова: ' + (next.title || 'трек'));
+            // [v2.14] ясно, ЧТО именно готово: это следующий трек, а не отыгравший
+            console.log ('[' + (d()) + '] [music] предзагрузка готова (следующий): ' + (next.title || 'трек'));
             return r;
         },
         e =>
@@ -3337,8 +3915,17 @@ const MUSIC_STREAM_RETRIES = 3;
 
 function trackToJson (t)
 {
+    // [v2.14] byId/byName -- кто добавил трек: нужны после перезапуска, чтобы в /queue
+    // было видно авторство и работала чистка «по автору».
     return { url: t.url, title: t.title, duration: t.duration || 0, author: t.author || '',
-             isLive: !!t.isLive, seek: t.seek || 0 };
+             isLive: !!t.isLive, seek: t.seek || 0,
+             byId: t.byId || null, byName: t.byName || '' };
+}
+
+// [v2.14] Подпись автора трека для /queue (у треков из старых баз автора нет).
+function byLabel (t)
+{
+    return (t && t.byName) ? ' · 👤 ' + t.byName : '';
 }
 
 // сколько миллисекунд играет текущий трек (пауза не считается):
@@ -3411,8 +3998,98 @@ function restCount (m)
 function queuePreview (m, max = 5)
 {
     const total = m.tracks.length;
-    const list = m.tracks.slice (0, max).map ((t, i) => (i + 1) + '. ' + (t.title || 'трек')).join ('\n');
+    const list = m.tracks.slice (0, max).map ((t, i) => (i + 1) + '. ' + (t.title || 'трек') + byLabel (t)).join ('\n');
     return '**Очередь (' + total + '):**\n' + list + (total > max ? '\n*...и ещё ' + (total - max) + ' -- /queue*' : '');
+}
+
+// ============================================================================
+// [v2.14] УПРАВЛЕНИЕ ОЧЕРЕДЬЮ ГЛАЗАМИ DJ: видеть, кто добавил трек, сколько ещё
+// ждать до конца плейлиста и листать очередь кнопками.
+// ============================================================================
+
+// Сколько ещё ждать до конца очереди: остаток ТЕКУЩЕГО трека (с учётом позиции) плюс
+// длительности всех треков в очереди. Эфиры и треки без длины считаем отдельно --
+// у них длительности нет и быть не может.
+function queueLeft (m)
+{
+    let sec = 0, unknown = 0, live = 0;
+    for (const t of m.tracks)
+    {
+        if (t.isLive) live++;
+        else if (t.duration > 0) sec += t.duration;
+        else unknown++;
+    }
+    let curLeft = 0;
+    if (m.current && !m.current.isLive && m.current.duration > 0)
+    {
+        curLeft = Math.max (0, m.current.duration - Math.floor (playedMsOf (m) / 1000));
+        sec += curLeft;
+    }
+    return { sec, curLeft, unknown, live };
+}
+
+// Кнопки листания (появляются только у длинной очереди). Страница зашита в customId,
+// поэтому никакого состояния между нажатиями держать не надо.
+const QUEUE_PAGE = 10;
+function queueComponents (start, total)
+{
+    if (total <= QUEUE_PAGE) return [];
+    return [
+        new ActionRowBuilder ().addComponents
+        (
+            new ButtonBuilder ()
+                .setCustomId ('q:p:' + start).setLabel ('◀ Назад')
+                .setStyle (ButtonStyle.Secondary).setDisabled (start <= 1),
+            new ButtonBuilder ()
+                .setCustomId ('q:n:' + start).setLabel ('Вперёд ▶')
+                .setStyle (ButtonStyle.Secondary).setDisabled (start + QUEUE_PAGE > total)
+        ),
+    ];
+}
+
+// Одна страница очереди: номера (те же, что в /remove,/move,/jump), автор каждого
+// трека, позиция внутри текущего трека и ОБЩИЙ остаток по времени.
+function queueView (m, start)
+{
+    const total = m.tracks.length;
+    start = Math.min (Math.max (1, Math.round (start) || 1), Math.max (1, total));
+    const slice = m.tracks.slice (start - 1, start - 1 + QUEUE_PAGE);
+    const list = slice.map ((t, i) =>
+        (start + i) + '. **' + (t.title || 'трек') + '** `' + fmtDur (t.duration, t.isLive) + '`' + byLabel (t)
+    ).join ('\n');
+    const rest = total - (start - 1 + slice.length);
+    const q = queueLeft (m);
+    let wait = '⏳ **До конца очереди:** ' + (q.sec ? fmtAgo (q.sec * 1000) : '0 сек');
+    if (q.curLeft) wait += ' (с учётом `' + fmtDur (q.curLeft) + '` текущего)';
+    if (q.live) wait += ' + ' + q.live + ' 🔴 ' + plural (q.live, 'эфир', 'эфира', 'эфиров') + ' (без конца)';
+    if (q.unknown) wait += ' + ' + q.unknown + ' ' + plural (q.unknown, 'трек', 'трека', 'треков') + ' без длительности';
+    let head;
+    if (m.current)
+    {
+        // позиция внутри играющего трека -- «сколько уже играет / сколько всего»:
+        const pos = m.current.isLive ? '' :
+            (m.current.duration > 0
+                ? ' `' + fmtDur (Math.min (Math.floor (playedMsOf (m) / 1000), m.current.duration)) + ' / ' + fmtDur (m.current.duration) + '`'
+                : '');
+        head = '🎵 **Сейчас:** ' + (m.current.isLive ? '🔴 ' : '') + '**' + (m.current.title || 'трек') + '**' + pos +
+            byLabel (m.current) +
+            (m.pausedByNobody ? ' _(пауза: нет слушателей)_' : '');
+    }
+    else if (m.pending && total)
+        head = '⏸ Музыка ждёт слушателя -- позови `/join` (очередь помнится)';
+    else
+        head = '🎵 **Сейчас:** —';
+    return {
+        content: head +
+            (total
+                ? '\n\n**Очередь (' + total + ')**' + (start > 1 ? ' с №' + start : '') + ':\n' + list +
+                  (rest > 0 ? '\n*...и ещё ' + rest + ': `/queue from:' + (start + QUEUE_PAGE) + '`*' : '') +
+                  '\n\n' + wait +
+                  '\n_Убрать -- `/remove`, переставить -- `/move`, прыгнуть -- `/jump`; чистить всё -- `/clear`,_\n' +
+                  '_а только треки одного человека -- `/clear author:@кто`._'
+                : ''),
+        components: queueComponents (start, total),
+    };
 }
 
 // Старт после перезапуска/падения: вернуть в память очередь, текущий трек и позицию.
@@ -3547,7 +4224,8 @@ function checkListeners (server)
 function jsonToTrack (t)
 {
     return { url: t.url, streamUrl: t.url, title: t.title || 'Без названия', duration: t.duration || 0,
-             author: t.author || '', isLive: !!t.isLive, thumbnail: '', seek: t.seek || 0 };
+             author: t.author || '', isLive: !!t.isLive, thumbnail: '', seek: t.seek || 0,
+             byId: t.byId || null, byName: t.byName || '' };
 }
 
 // ============================================================================
@@ -3653,6 +4331,11 @@ function joinVoice (guildId, voiceChannel, guild)
             m.playerWired = true;
             m.player.on (AudioPlayerStatus.Idle, () =>
             {
+                // [v2.14] Трек (любой: доигравший, пропущенный /skip, /stop, /leave)
+                // больше не звучит -- закрываем его поток. Иначе yt-dlp вместе с
+                // ffmpeg оставались жить в памяти до конца работы бота.
+                killStream (m.streamHandle);
+                m.streamHandle = null;
                 if (m.leaving) return; // [v2.9] это Idle от нашего же выхода, а не конец трека
                 // трек кончился -- следующий:
                 m.current = null;
@@ -3721,6 +4404,10 @@ function destroyMusic (guildId, opts = {})
     m.playedMs = at * 1000;
     m.playingSince = null;
     dropPreload (m); // [v2.9] убираем за собой: заготовка следующего трека тоже не нужна
+    // [v2.14] Глушим играющий поток явно: если плеер уже в Idle, stop() не сработает
+    // и без этой строки процессы yt-dlp/ffmpeg остались бы висеть.
+    killStream (m.streamHandle);
+    m.streamHandle = null;
     try { m.player.stop (true); } catch {}
     try { m.connection.destroy (); } catch {}
     m.connection = null;
@@ -3841,7 +4528,10 @@ const musicCommands =
              .setRequired (true)),
     new SlashCommandBuilder ()
         .setName ('clear')
-        .setDescription ('Очистить очередь (текущий трек доиграет; совсем остановить -- /stop)'),
+        .setDescription ('Очистить очередь (текущий трек доиграет; совсем остановить -- /stop)')
+        .addUserOption (o =>
+            o.setName ('author')
+             .setDescription ('Убрать ТОЛЬКО треки этого человека (без него -- вся очередь)')),
     new SlashCommandBuilder ()
         .setName ('jump')
         .setDescription ('Перейти сразу к треку под этим номером')
@@ -3856,6 +4546,11 @@ const musicCommands =
     new SlashCommandBuilder ()
         .setName ('resume')
         .setDescription ('Продолжить воспроизведение'),
+    // [v2.14] /bans -- кто сейчас в наказании: имя, точный срок, причина (только staff).
+    // Ответ виден только вызвавшему (ephemeral), вызов фиксируется в логе как и все команды.
+    new SlashCommandBuilder ()
+        .setName ('bans')
+        .setDescription ('Активные баны и таймауты: кто, до какого времени и за что (админы/модеры)'),
     new SlashCommandBuilder ()
         .setName ('queue')
         .setDescription ('Показать очередь треков')
@@ -3894,6 +4589,34 @@ async function registerMusicCommands ()
 // Обработка слэш-команд:
 client.on ('interactionCreate', async (interaction) =>
 {
+    // [v2.14] Кнопки листания очереди («◀ Назад» / «Вперёд ▶» под ответом /queue).
+    // Номер страницы зашит в customId, поэтому состояние между нажатиями не нужно,
+    // а содержимое берётся из ЖИВОЙ очереди (она могла уже измениться).
+    if (interaction.isButton ())
+    {
+        const mBtn = /^q:([pn]):(\d+)$/.exec (interaction.customId || '');
+        if (!mBtn) return;
+        const guildId = interaction.guildId;
+        if (!(guildId in SERVERS)) return;
+        // Очередь листает тот, кто её открыл: чужие нажатия не трогают сообщение.
+        const opener = interaction.message && interaction.message.interaction && interaction.message.interaction.user
+            ? interaction.message.interaction.user.id
+            : null;
+        if (opener && opener !== interaction.user.id)
+            return interaction.reply
+            (
+                { content: '📜 Эту очередь открыл другой человек -- вызови `/queue` сам.', flags: MessageFlags.Ephemeral }
+            );
+        const cur = parseInt (mBtn[2], 10) || 1;
+        const next = mBtn[1] === 'p' ? cur - QUEUE_PAGE : cur + QUEUE_PAGE;
+        const view = queueView (musicOf (guildId), next);
+        return interaction.update
+        (
+            view.components.length
+                ? { content: view.content, components: view.components }
+                : { content: view.content, components: [] }
+        );
+    }
     if (!interaction.isChatInputCommand ()) return;
     const name = interaction.commandName;
     // [v2.4] активное действие -- в лог: кто и что вызвал
@@ -3908,7 +4631,20 @@ client.on ('interactionCreate', async (interaction) =>
     );
     // [v2.6] /help -- всем и всегда: без DJ-роли и без голосового канала, ephemeral.
     if (name === 'help')
-        return interaction.reply ({ embeds: [helpEmbed ()], flags: MessageFlags.Ephemeral });
+        return interaction.reply ({ embeds: [helpEmbed (interaction.guildId)], flags: MessageFlags.Ephemeral });
+    // [v2.14] /bans -- до всего остального (это не музыка, а модерация): ответ
+    // виден только вызвавшему, права -- админ/модер.
+    if (name === 'bans')
+    {
+        if (!isStaffInteraction (interaction))
+            return interaction.reply ({ content: '🚫 Команда только для админов и модеров.', flags: MessageFlags.Ephemeral });
+        // Список банов спрашиваем у Discord -- ответ приходит не мгновенно:
+        await interaction.deferReply ({ flags: MessageFlags.Ephemeral });
+        const o = await bansOverview (interaction.guildId);
+        console.log ('[' + (d()) + '] [ban] /bans: активных ' + o.rows.length +
+            ', банов ' + o.rows.filter (r => r.isBan).length);
+        return interaction.editReply ({ content: bansReportText (o) });
+    }
     if (!['play','join','stop','skip','pause','resume','queue','leave','remove','clear','jump','move'].includes (name)) return;
     const guildId = interaction.guildId;
     const m = musicOf (guildId);
@@ -3972,6 +4708,13 @@ client.on ('interactionCreate', async (interaction) =>
             }
             if (!tracks.length)
                 return interaction.editReply ('❌ Пустой результат.');
+            // [v2.14] Кто добавил треки: видно в /queue, а по этому же полю работает
+            // `/clear author:@кто` (убрать из очереди треки одного человека).
+            for (const t of tracks)
+            {
+                t.byId = interaction.user.id;
+                t.byName = interaction.user.username;
+            }
 
             // [v2.12] Куда играть. Правила:
             //   * бот уже играет живым слушателям в другом канале -- НЕ перехватываем
@@ -4099,6 +4842,35 @@ client.on ('interactionCreate', async (interaction) =>
         }
         else if (name === 'clear')
         {
+            // [v2.14] /clear author:@кто -- убрать из очереди только ЕГО треки
+            // (длинный плейлист часто собирают несколько DJ, а убрать надо одного).
+            const who = interaction.options.getUser ('author');
+            if (who)
+            {
+                const gone = m.tracks.filter (t => t.byId === who.id);
+                if (!gone.length)
+                    return interaction.reply
+                    ({
+                        content: '🈳 В очереди нет треков от ' + u (who.id) + '.' +
+                            (m.tracks.length && m.tracks.some (t => !t.byId)
+                                ? ' (у части треков автор не записан -- они добавлены до этой версии и останутся)'
+                                : ''),
+                        flags: MessageFlags.Ephemeral,
+                    });
+                m.tracks = m.tracks.filter (t => t.byId !== who.id);
+                dropPreload (m);
+                startPreload (guildId);
+                saveMusicState (guildId);
+                scheduleVoiceStatus (guildId, true);
+                schedulePresence (true);
+                console.log ('[' + (d()) + '] [music] убрал из очереди треки ' + who.username + ' (' + gone.length + ')');
+                return interaction.reply
+                (
+                    '🧹 Убрал ' + gone.length + ' ' + plural (gone.length, 'трек', 'трека', 'треков') +
+                    ' от ' + u (who.id) + ' (в очереди осталось ' + m.tracks.length + ').' +
+                    (m.current ? ' Текущий **' + (m.current.title || 'трек') + '** доиграет.' : '')
+                );
+            }
             if (!m.tracks.length)
                 return interaction.reply ({ content: '🈳 Очередь и так пуста -- чистить нечего.', flags: MessageFlags.Ephemeral });
             const n = m.tracks.length;
@@ -4165,29 +4937,18 @@ client.on ('interactionCreate', async (interaction) =>
         }
         else if (name === 'queue')
         {
-            // [v2.12] очередь бывает на 50 треков -- показываем по 10, с номерами
-            // (номера совпадают с /remove и /jump) и с возможностью листать: /queue from:11
+            // [v2.14] Страница очереди собирается в queueView: номера (те же, что в
+            // /remove,/move,/jump), автор каждого трека, позиция внутри текущего,
+            // ОБЩИЙ остаток по времени и кнопки листания у длинных очередей.
             const total = m.tracks.length;
             if (!m.current && !total)
                 return interaction.reply ('🈳 Очередь пуста.');
-            const start = Math.min (Math.max (1, interaction.options.getInteger ('from') || 1), Math.max (1, total));
-            const list = m.tracks.slice (start - 1, start - 1 + 10)
-                .map ((t, i) => (start + i) + '. **' + t.title + '** `' + fmtDur (t.duration, t.isLive) + '`').join ('\n');
-            const left = total - (start - 1 + 10);
-            let head;
-            if (m.current)
-                head = '🎵 **Сейчас:** ' + (m.current.isLive ? '🔴 ' : '') + '**' + m.current.title + '** `' + fmtDur (m.current.duration, m.current.isLive) + '`' +
-                    (m.pausedByNobody ? ' _(пауза: нет слушателей)_' : '');
-            else if (m.pending && total)
-                head = '⏸ Музыка ждёт слушателя -- позови `/join` (очередь помнится)';
-            else
-                head = '🎵 **Сейчас:** —';
+            const view = queueView (m, interaction.options.getInteger ('from') || 1);
             return interaction.reply
             (
-                head +
-                (total ? '\n\n**Очередь (' + total + '):**\n' + list +
-                    (left > 0 ? '\n*...и ещё ' + left + ': `/queue from:' + (start + 10) + '`*' : '') : '') +
-                (total ? '\n\n_Убрать -- `/remove`, прыгнуть -- `/jump`, очистить -- `/clear`._' : '')
+                view.components.length
+                    ? { content: view.content, components: view.components }
+                    : { content: view.content }
             );
         }
         else if (name === 'leave')
