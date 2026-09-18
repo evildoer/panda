@@ -41,6 +41,12 @@
 //     Оригинал удаляется только в канале-источнике (как у моста); если staff
 //     переслал сообщение из другого канала, оригинал остаётся (чужое не удаляем).
 //     Отправка у моста и у меню -- ОДНА функция relayPipe (поведение не разъезжается).
+//   * [/join] ЗАЩИТА ОТ ПЕРЕХВАТА: если бот играет трек, а его автр сидит в той же
+//     комнате (то есть бот поёт именно для него), другой DJ не уведёт бота командой
+//     /join -- отказ виден только вызвавшему, а в лог идёт 'кто просил / что играет /
+//     для кого'. Если автора в комнате нет -- /join работает, но при живых слушателях
+//     в ответе и в логе прямо сказано, что они остались без музыки. Без музыки и во
+//     время /leave -- /join как раньше.
 //   * [music] Stage-каналы: бот заходит и туда, а в лог пишется подсказка, что для
 //     слышимости Stage Moderator должен сделать его спикером (Discord иначе не
 //     пускает бота вещать в эфир).
@@ -6002,6 +6008,41 @@ client.on ('interactionCreate', async (interaction) =>
             if (!voiceChannel)
                 return interaction.reply ({ content: '🔊 Сначала зайди в голосовой канал!', flags: MessageFlags.Ephemeral });
             const here = !!m.connection && m.connection.joinConfig.channelId === voiceChannel.id;
+            // [v2.18] ЗАЩИТА ОТ ПЕРЕХВАТА. Бот играет для АВТОРА трека: тот, кто его
+            // добавил, слушает его в своей комнате. Значит /join от другого DJ увёл бы
+            // бота прямо посреди прослушивания -- отказываем (тот же смысл, что «кто
+            // первый, тот и прав» у /play). Уйти можно только по-честному: /skip, /stop,
+            // когда автор сам уйдёт или когда дойдёт до трека другого автора.
+            // Если автор ушёл (или его и не было), а бот играет кому-то в другой комнате --
+            // /join разрешён, но в ответе и в логе будет сказано, что слушатели остаются.
+            const myChId = m.connection ? m.connection.joinConfig.channelId : null;
+            let stoleNote = '';
+            if (myChId && myChId !== voiceChannel.id && m.current && !m.leaving)
+            {
+                const whoCall = interaction.member ? uuu (interaction.member) : interaction.user.username;
+                const mineCh0 = client.channels.cache.get (myChId);
+                const mineName0 = mineCh0 ? '«' + mineCh0.name + '»' : 'другом канале';
+                if (authorVoiceId (guildId, m.current) === myChId)
+                {
+                    const title = m.current.title || 'трек';
+                    const authorName = m.current.byName || u (m.current.byId);
+                    console.log ('[' + (d()) + '] [music] (кто: ' + whoCall + ') /join отклонён: играю для автора трека ' +
+                        authorName + ' в ' + mineName0);
+                    return interaction.reply
+                    ({
+                        content: '🎧 Не перееду: я играю **' + title + '** в ' + mineName0 +
+                            ' для автора трека (' + authorName + ').\n' +
+                            'Увести можно, когда он уйдёт, или командами `/skip` / `/stop` ✌️',
+                        flags: MessageFlags.Ephemeral,
+                    });
+                }
+                if (humansInChannel (guildId, myChId) > 0)
+                {
+                    stoleNote = '🎧 В ' + mineName0 + ' оставались слушатели -- теперь они без музыки';
+                    console.log ('[' + (d()) + '] [music] (кто: ' + whoCall + ') /join увёл бота из ' + mineName0 +
+                        ' (автора трека там нет, но слушатели оставались)');
+                }
+            }
             connectTo (interaction);
             // [v2.7] куда писать уведомления (например «трек не воспроизвёлся»), если
             // /join был первым вызовом, а /play никто не делал:
@@ -6022,6 +6063,7 @@ client.on ('interactionCreate', async (interaction) =>
                 (here
                     ? '🎧 Я уже тут: **' + voiceChannel.name + '**. Выйти -- `/leave`.'
                     : '🎧 Зашёл в **' + voiceChannel.name + '** и остаюсь. Выйти -- `/leave`.') +
+                (stoleNote ? '\n' + stoleNote : '') +
                 resume
             );
         }
