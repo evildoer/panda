@@ -5,6 +5,21 @@
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
+// CHANGELOG v2.39 (проблема трека -- в канал его автора, проигранное не копится, конфиг целиком):
+//   * ОШИБКА ТРЕКА УХОДИТ В КАНАЛ, ОТКУДА ЕГО ДОБАВИЛИ. Раньше любое «видео больше нет»
+//     и «не удалось воспроизвести» писалось в ОДИН канал -- тот, откуда шла последняя
+//     команда (мог быть чужим для автора трека). Теперь у каждого трека помнится свой
+//     канал добавления (track.addIn из /play), и туда же уходит причина: автор вернётся
+//     в свою комнату и сразу увидит, что его трек убран и почему, а не будет думать,
+//     что забыл его поставить. Канала нет -- падаем на прежний путь (как раньше).
+//   * ДИСК ПОМНИТ ТОЛЬКО ТО, ЧТО ЗВУЧИТ СЕЙЧАС. Скачанные файлы больше не копятся до
+//     лимита: после каждого перехода на диске остаются ровно играющий трек и предзагрузка,
+//     всё проигранное удаляется сразу (`кэш: убрал N файлов (M МБ)`). Прежнее поведение
+//     (файлы живут до MUSIC.cache_max_mb) включается ключом `cache_keep_played: true`.
+//     Файл, который Windows ещё не отдал (его читает только что убитый ffmpeg), уберётся
+//     повторной попыткой -- но только если трек к тому моменту не понадобился снова.
+//   * БОЕВОЙ КОНФИГ = ПРИМЕР: в config.json недоставало ключей MUSIC.cache* (работали
+//     значения по умолчанию, а самого ключа не было видно). Теперь списки ключей совпадают.
 // CHANGELOG v2.38 (кнопки переноса, короткая инструкция, кэш в отчётах, запреты ботам):
 //   * ПЕРЕНОС ТРЕКА -- ТОЛЬКО ПЕРЕНОС. Список треков под /queue переключает сообщение
 //     в режим переноса: остаются ровно две строки кнопок (убрать / в начало / в конец /
@@ -1419,7 +1434,7 @@ const STARTUP_DM_TEXT =
     '**🐼 Что умеет бот и как этим пользоваться**\n' +
     '\n' +
     '🎧 **Слушать музыку**\n' +
-    'Заходи в голосовой канал, где сидит бот, -- и слушай. Включает и добавляет музыку тот, у кого есть роль **DJ** (её выдают в канале ролей или у администрации).\n' +
+    'Заходи в голосовой канал, где сидит бот, -- и слушай. Включает и добавляет музыку тот, у кого есть роль **DJ** (её выдают администраторы и модеры).\n' +
     '`/play` ссылка или запрос -- поставить трек, плейлист или прямой эфир\n' +
     '`/queue` -- что играет сейчас и что дальше: кто что поставил и сколько ещё ждать\n' +
     'Если в канале никого, музыка встаёт на паузу и продолжается, когда кто-то зашёл: бот помнит и трек, и место в нём -- перезапуск и обрыв связи их не сбрасывают.\n' +
@@ -1429,10 +1444,9 @@ const STARTUP_DM_TEXT =
     '\n' +
     '🛡️ **Что бот делает сам**\n' +
     '• мут и глухота действуют только в том канале, где выданы: в других говорить можно, а вернёшься -- ограничение на месте\n' +
-    '• замучен несправедливо -- зайди в общий канал 🆘: там ограничение снимается, а в журнал уходит запись\n' +
+    '• замучен несправедливо -- зайди в общий канал 🆘: он создаст для тебя отдельный канал, где ограничение снимается и ты сам можешь говорить\n' +
     '• вышел с сервера -- таймаут (в этом конфиге 20 мин); вернёшься раньше срока -- бан до его конца\n' +
     '• роли не теряются: вышел и вернулся -- бот вернёт их обратно\n' +
-    '• новичку приходит приветствие в личку: правила и как слушать музыку\n' +
     '\n' +
     '🙋 **Про тебя**\n' +
     '`/welcome` -- посмотреть, какое приветствие видят новички\n' +
@@ -6751,10 +6765,19 @@ const MUSIC_CACHE_MAX_MB = MUSIC_CFG.cache_max_mb === undefined || MUSIC_CFG.cac
 const MUSIC_CACHE_FULL_MAX = (MUSIC_CFG.cache_full_max_min === undefined || MUSIC_CFG.cache_full_max_min === null
     ? 15
     : Math.max (0, Math.round (Number (MUSIC_CFG.cache_full_max_min) || 0))) * 60;
+// [v2.39] ХРАНИТЬ ЛИ УЖЕ ПРОИГРАННОЕ. По умолчанию нет: файл отыгравшего трека
+// удаляется сразу, на диске живут только играющий трек и предзагрузка. Иначе
+// скачанное копилось бы до лимита гигабайтами, хотя заново оно уже не понадобится
+// (интернет безлимитный -- перекачать не грех). false -- удалять, true -- старое
+// поведение (файлы живут до лимита cache_max_mb, удобно слушать плейлист по кругу).
+const MUSIC_CACHE_KEEP_PLAYED = MUSIC_CFG.cache_keep_played === true;
 // Одна строка при старте (как остальные отчёты): видно, включён ли кэш и куда он пишет.
 if (MUSIC_CACHE)
     console.log ('[' + (d()) + '] [music] кэш аудио: ВКЛЮЧЁН -- ' + MUSIC_CACHE_DIR + ' (' +
         (MUSIC_CACHE_MAX_MB ? 'лимит ' + MUSIC_CACHE_MAX_MB + ' МБ, старое удаляется само' : 'без лимита места') + ')' +
+        (MUSIC_CACHE_KEEP_PLAYED
+            ? '; проигранное остаётся на диске (cache_keep_played: true)'
+            : '; проигранные файлы удаляются сразу -- на диске только играющий и предзагрузка') +
         (MUSIC_CACHE_FULL_MAX ? '; треки до ' + Math.round (MUSIC_CACHE_FULL_MAX / 60) +
             ' мин качаю на диск до старта, длинные сеты пишу во время игры' : ''));
 else
@@ -6782,7 +6805,8 @@ function cacheCleanStale ()
     for (const f of names)
         if (f.includes ('.dl.'))
             try { fsMod.unlinkSync (pathMod.join (MUSIC_CACHE_DIR, f)); n++; } catch {}
-    if (n) console.log ('[' + (d()) + '] [music] кэш: убрал ' + n + ' недокачанных файлов прошлого запуска');
+    if (n) console.log ('[' + (d()) + '] [music] кэш: убрал ' + n + ' ' +
+        plural (n, 'недокачанный файл', 'недокачанных файла', 'недокачанных файлов') + ' прошлого запуска');
     return n;
 }
 function fmtMb (bytes) { return Math.max (1, Math.round (Number (bytes || 0) / 1048576)) + ' МБ'; }
@@ -6952,6 +6976,66 @@ function pruneCache (keepPaths = [])
             console.log ('[' + (d()) + '] [music] кэш переполнен -- убрал старый файл (' + fmtMb (it.size) + ')'); } catch {}
     }
 }
+// [v2.39] НА ДИСКЕ -- ТОЛЬКО ТО, ЧТО ЗВУЧИТ СЕЙЧАС (или ждёт своей очереди следующим).
+// Файлы нужны ровно на время, пока трек играет: скачали -- отыграли -- забыли. Всё,
+// что к текущему моменту не играет и не предзагружено, отсюда уходит.
+// MUSIC.cache_keep_played: true отключает уборку (файлы живут до лимита cache_max_mb).
+// Отдельные файлы Windows отдаёт не сразу (их ещё читает только что убитый ffmpeg),
+// поэтому по ним делается короткая повторная попытка -- но только если трек к тому
+// моменту так и не понадобился снова.
+function cacheKeysInUse ()
+{
+    // ВАЖНО: папка кэша общая на ВСЕ серверы, где стоит бот, поэтому в защищённый
+    // список входит играющее и предзагруженное НА КАЖДОМ из них -- иначе уборка
+    // на одном сервере снесла бы файл трека, который прямо сейчас звучит на другом.
+    const set = new Set ();
+    for (const id of Object.keys ($music))
+    {
+        const m = $music[id];
+        if (!m) continue;
+        for (const t of [m.current, m.preload && m.preload.track])
+            if (t && !t.isLive) set.add (cacheKeyOf (t));
+    }
+    return set;
+}
+function cacheDropUnused (retries = 5)
+{
+    if (!MUSIC_CACHE || MUSIC_CACHE_KEEP_PLAYED || !cacheDirOk) return;
+    const keep = cacheKeysInUse ();
+    let names = [];
+    try { names = fsMod.readdirSync (MUSIC_CACHE_DIR); } catch { return; }
+    const busy = [];
+    let dropped = 0, freed = 0;
+    for (const n of names)
+    {
+        const k = n.split ('.')[0];
+        if (!/^[0-9a-f]{16}$/.test (k)) continue; // не наш файл (имена кэша -- <sha1 адреса>.m4a)
+        if (keep.has (k)) continue;               // играющий трек и предзагрузка остаются
+        const p = pathMod.join (MUSIC_CACHE_DIR, n);
+        let st;
+        try { st = fsMod.statSync (p); } catch { continue; }
+        if (!st.isFile ()) continue;
+        try { fsMod.unlinkSync (p); dropped++; freed += st.size; }
+        catch { busy.push (p); }
+    }
+    if (dropped)
+        console.log ('[' + (d()) + '] [music] кэш: убрал ' + dropped + ' ' +
+            plural (dropped, 'файл', 'файла', 'файлов') + ' (' + fmtMb (freed) +
+            ') -- на диске остаются только играющий трек и предзагрузка');
+    if (busy.length && retries > 0)
+        setTimeout (() =>
+        {
+            const still = cacheKeysInUse ();
+            let left = 0;
+            for (const p of busy)
+            {
+                if (still.has (pathMod.basename (p).split ('.')[0])) continue; // снова нужен -- не трогаем
+                try { fsMod.unlinkSync (p); } catch { left++; }
+            }
+            if (left && retries > 1) setTimeout (() => cacheDropUnused (retries - 1), 700);
+        }, 700).unref (); // уборка не держит процесс
+}
+
 // ИГРАТЬ ФАЙЛ С ДИСКА: наш ffmpeg читает файл (сдвиг -- ДО входа, поэтому мгновенный и
 // точный), дальше всё как обычно (выравнивание громкости -> PCM для Discord).
 function openCachedTrack (track, file, seekSec = 0)
@@ -7367,7 +7451,10 @@ async function playNext (guildId)
         const dead = m.tracks.shift ();
         console.error ('[' + (d()) + '] [music] видео больше нет на YouTube (проверено предзагрузкой): ' +
             (dead.title || 'трек') + ' -- убрал из очереди');
-        musicNotice (guildId, '🗑 **' + (dead.title || 'Трек') + '** -- видео больше нет на YouTube, убрал из очереди.');
+        // [v2.39] Про это уже сказали в канал автора, как только выяснили (см. предзагрузку)
+        // -- второй раз то же самое человеку не нужно.
+        if (!dead.goneTold)
+            trackNotice (guildId, dead, '🗑 **' + (dead.title || 'Трек') + '** -- видео больше нет на YouTube, убрал из очереди.');
     }
     // [v2.35] Пустые записи в очереди (бывает после ручной правки базы) -- убираем:
     // дальше всё считает, что в очереди объекты треков.
@@ -7532,6 +7619,7 @@ async function playNext (guildId)
         m.player.play (resource);
         m.playFailStreak = 0; // трек заиграл -- цепочка неудач сброшена (см. catch ниже)
         startPreload (guildId); // [v2.9] пока играет -- готовим следующий трек
+        cacheDropUnused (); // [v2.39] проигранное уходит с диска -- остаёмся при текущем и предзагрузке
         // [v2.12] играет кому-то живому? тогда естественный конец очереди = забыть её;
         // и если слушателей нет -- сразу пауза (музыка не играет в пустоту)
         const chId = m.connection ? m.connection.joinConfig.channelId : null;
@@ -7699,6 +7787,12 @@ function startPreload (guildId)
                 next.gone = true;
                 console.error ('[' + (d()) + '] [music] видео больше нет на YouTube (' + (next.title || 'трек') +
                     ') -- уберу его из очереди, когда дойдёт; очередь не трогаю: ' + ytDlpErr (e, 120));
+                // [v2.39] Скажем автору СРАЗУ, а не когда очередь дойдёт до мертвяка: у него
+                // будет время поставить другой трек, и он точно будет знать, что дело не в нём
+                // (владелец: «чтобы в следующий раз он знал, что не надо тыкать этот трек»).
+                next.goneTold = true;
+                trackNotice (guildId, next, '🗑 **' + (next.title || 'Трек') + '** -- видео больше нет на YouTube: ' +
+                    'уберу из очереди, когда дойдёт. Поставь другой трек, если он нужен.');
                 return null;
             }
             console.error ('[music] предзагрузка не удалась (' + (next.title || 'трек') + '): ' + ytDlpErr (e));
@@ -7735,7 +7829,7 @@ function wireStreamErrors (m, track, resource, viaProxy, guildId)
         {
             console.error ('[' + (d()) + '] [music] видео больше нет на YouTube (' + (track.title || 'трек') +
                 ') -- убираю из очереди: ' + ytDlpErr (e, 120));
-            musicNotice (guildId, '🗑 **' + (track.title || 'Трек') + '** -- видео больше нет на YouTube, убираю из очереди.');
+            trackNotice (guildId, track, '🗑 **' + (track.title || 'Трек') + '** -- видео больше нет на YouTube, убираю из очереди.');
             m.current = null;
             m.playedMs = 0;
             m.playingSince = null;
@@ -7767,9 +7861,11 @@ function wireStreamErrors (m, track, resource, viaProxy, guildId)
         console.error ('[music] поток обрывается снова (' + attempt + ' раз) -- пропускаю: ' + (track.title || 'трек'));
         m.streamRetries = 0;
         m.current = null;
-        let ch = m.textChannelId && client.channels.cache.get (m.textChannelId);
-        if (ch)
-            ch.send ('⚠️ **' + (track.title || 'Трек') + '** -- не удалось воспроизвести, пропускаю.').catch (() => {});
+        // [v2.39] И причину тоже: «не удалось воспроизвести» само по себе ничего не
+        // объясняет, а автору важно понять -- трек битый, видео удалили или это сеть.
+        const _why = ytDlpErr (e, 160);
+        trackNotice (guildId, track, '⚠️ **' + (track.title || 'Трек') + '** -- не удалось воспроизвести, пропускаю.' +
+            (_why ? ' Причина: ' + _why : ''));
         m.player.stop (true); // Idle -> playNext
     });
 }
@@ -8087,7 +8183,12 @@ function trackToJson (t)
              isLive: !!t.isLive, seek: t.seek || 0,
              byId: t.byId || null, byName: t.byName || '',
              // [v2.35] когда трек поставили -- для истории добавлений в /queue
-             addAt: Number (t.addAt) || 0 };
+             addAt: Number (t.addAt) || 0,
+             // [v2.39] откуда добавили (текстовый канал) -- туда уходит сообщение,
+             // если с треком что-то не так. Переживает перезапуск вместе с треком:
+             // поле сохраняет себя в базу, иначе после рестарта уведомление ушло бы
+             // «в последний канал вообще», то есть могло попасть к чужим людям.
+             addIn: t.addIn || null };
 }
 
 // ============================================================================
@@ -8710,6 +8811,7 @@ function queueWipe (guildId)
     dropPreload (m);
     m.player.stop (true);     // тишина: играть больше нечего (Idle-хэндлер запустит нечего)
     clearMusicState (guildId); // и из базы -- чтобы убранное не воскресло после перезапуска
+    cacheDropUnused (); // [v2.39] очередь стёрта -- и кэш тоже: играть больше нечего
     return w;
 }
 
@@ -8740,6 +8842,7 @@ function queuePurge (guildId, keep)
     {
         m.pending = false;
         clearMusicState (guildId);
+        cacheDropUnused (); // [v2.39] убирать больше нечего -- чистим и кэш
     }
     else saveMusicState (guildId);
     dropPreload (m);
@@ -9412,6 +9515,23 @@ function musicNotice (guildId, text)
     ch.send (text).catch (() => {});
 }
 
+// [v2.39] КОМУ ГОВОРИТЬ О ПРОБЛЕМЕ С ТРЕКОМ. Раньше любое «этот трек не заиграл/его
+// больше нет» уходило в ОДИН канал -- тот, откуда шла последняя команда (m.textChannelId),
+// и это мог быть чужой канал, где автор трека вообще не появится. Проблема же касается
+// того, кто трек поставил. Поэтому у каждого трека помним текстовый канал, откуда его
+// добавили (track.addIn, ставится в /play), и пишем туда: автор вернётся в свою комнату
+// и сразу увидит, что его трек удалён и почему -- а не будет думать, что забыл его
+// добавить. Канала больше нет (удалён, бот не видит) -- падаем на прежний путь.
+function trackNotice (guildId, track, text)
+{
+    const m = $music[guildId];
+    if (!m || !text) return;
+    const _id = track && track.addIn ? String (track.addIn) : '';
+    const ch = _id ? client.channels.cache.get (_id) : null;
+    if (ch && typeof ch.send === 'function') { ch.send (text).catch (() => {}); return; }
+    musicNotice (guildId, text);
+}
+
 // [v2.28] РЕЖИМ «НЕ ЖДАТЬ ОТСУТСТВУЮЩИХ АВТОРОВ» (MUSIC.skip_absent_author).
 // Ситуация: бот один в канале и молчит (пауза: своя «нет слушателей» или человек
 // поставил /pause), а дальше в очереди есть треки тех, кто СЛУШАЕТ прямо сейчас в
@@ -9609,7 +9729,8 @@ function jsonToTrack (t)
 {
     return { url: t.url, streamUrl: t.url, title: t.title || 'Без названия', duration: t.duration || 0,
              author: t.author || '', isLive: !!t.isLive, thumbnail: '', seek: t.seek || 0,
-             byId: t.byId || null, byName: t.byName || '', addAt: Number (t.addAt) || 0 };
+             byId: t.byId || null, byName: t.byName || '', addAt: Number (t.addAt) || 0,
+             addIn: t.addIn || null }; // [v2.39] куда писать, если с треком что-то не так
 }
 
 // ============================================================================
@@ -9757,7 +9878,7 @@ function joinVoiceNow (guildId, voiceChannel, guild, reason = '')
                 {
                     console.error ('[' + (d()) + '] [music] видео больше нет на YouTube (' + (playing.title || 'трек') +
                         ') -- убираю из очереди: ' + ytDlpErr (_deadErr, 120));
-                    musicNotice (guildId, '🗑 **' + (playing.title || 'Трек') + '** -- видео больше нет на YouTube, убираю из очереди.');
+                    trackNotice (guildId, playing, '🗑 **' + (playing.title || 'Трек') + '** -- видео больше нет на YouTube, убираю из очереди.');
                     m.current = null;
                     m.playedMs = 0;
                     m.playingSince = null;
@@ -11148,6 +11269,7 @@ client.on ('interactionCreate', async (interaction) =>
                 t.byId = interaction.user.id;
                 t.byName = interaction.user.username;
                 t.addAt = addedAt;
+                t.addIn = interaction.channelId; // [v2.39] куда писать, если с треком что-то не так
             }
 
             // [v2.12] Куда играть. Правила:
