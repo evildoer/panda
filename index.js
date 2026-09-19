@@ -5,6 +5,47 @@
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
+// CHANGELOG v2.35 (перемотка кнопками, история добавлений, живучесть продолжения с места):
+//   * ПРОДОЛЖЕНИЕ С МЕСТА БОЛЬШЕ НЕ СЪЕДАЕТ ТРЕК. Измерено живым опытом на настоящем
+//     DJ-сете (тот самый случай из лога владельца -- возобновлённый сет замолкал
+//     через пару секунд): `--download-sections` на таких источниках отдаёт НОЛЬ байт
+//     и падает через 30-45 секунд ('ERROR: ffmpeg exited with code 4294967274'), а
+//     старая проверка ждала всего 1.5 с и принимала пустышку за рабочий поток.
+//     Теперь: сдвиг до 2 минут делается сразу СВОИМ ffmpeg (звук -- через ~5-6 с),
+//     большой сдвиг -- сначала секцией, но с проверкой, что поток реально отдал
+//     данные (не отдал за 8 с -- сразу ffmpeg), и адрес, на котором секция не сработала,
+//     больше не пробуется до конца работы бота.
+//   * ВИДЕО, КОТОРОГО БОЛЬШЕ НЕТ (удалено/закрыто), БОЛЬШЕ НЕ ТЕРЯЕТСЯ МОЛЧА. И раньше
+//     это была обычная ошибка: трек пропадал только после четырёх неудачных попыток
+//     yt-dlp, а в логе оставалась голая причина без контекста. Теперь: предзагрузка,
+//     упавшая с 'Video unavailable', помечает трек и говорит об этом в лог сразу, а
+//     когда очередь до него доходит -- он убирается СРАЗУ (без четырёх попыток) с
+//     понятной строкой в логе и сообщением в канал; остальные треки не трогаются, а
+//     если в очереди только такие -- это как пустая очередь.
+//     Проверки «не бот» и возрастные ограничения -- НЕ этот случай (зависят от IP).
+//   * ПРОВЕРЕНО ЖИВЫМ ЗАПУСКОМ (19.09.2026, бот на реальном сервере): возобновление
+//     того самого длинного сета прошло через два шага -- 'секция с 22:41 ничего не
+//     отдала за 8 с -- беру тот же трек через ffmpeg' -- и играло дальше без единого
+//     обрыва (раньше в этом месте лог через пару секунд уходил на следующий трек).
+//     Тогда же живьём сработала пометка удалённого видео:
+//     'видео больше нет на YouTube (Boris Brejcha WE2 | Tomorrowland 2024) -- уберу из
+//     очереди, когда дойдёт'.
+//   * [FIX] ПРЕДОХРАНИТЕЛЬ ОТ БЕСКОНЕЧНОГО КРУГА: если трек не заиграл, playNext звал
+//     себя же без ограничений -- при сбое, который не связан с одним треком, бот
+//     вычерпывал память и падал (поймано стендом: 'out of memory'). Теперь после
+//     десяти неудач подряд честно останавливается и говорит об этом в лог.
+//   * [v2.35] КНОПКИ ПЕРЕМОТКИ ±30 с под /queue: «◀ 30 с» / «30 с ▶» -- та же
+//     функция, что у /seek. У прямого эфира позиции нет, поэтому там кнопки погашены.
+//   * [v2.35] ИСТОРИЯ ДОБАВЛЕНИЙ в /queue: «🕘 Последние добавления: 20:08 Фантазёр --
+//     3 трека (№1, 2, 3)». Метка времени пишется каждому треку при добавлении (/play),
+//     один заход = одна «пачка», номера -- текущие места в очереди (тем же номерам
+//     подчиняются /remove и кнопки). Видно свежие вставки в чужом длинном плейлисте.
+//     В историю добавлений входит ТОЛЬКО текущая очередь: доигранное уже не помнится.
+//   * РЯДЫ ПОД /queue ПЕРЕСОБРАНЫ ПОД ЖЁСТКИЙ ЛИМИТ DISCORD (5). Два меню с ОДНИМИ И
+//     ТЕМИ ЖЕ номерами («убрать трек» и «двигать трек») заменены одним списком, а
+//     действия -- «🗑 Убрать / ⬆ Выше / ⬇ Ниже / ✖ Готово» -- появляются после выбора
+//     трека. Освободившийся ряд заняла перемотка. Старые сообщения (q:rm / q:mv) при
+//     этом понимаются по-прежнему.
 // CHANGELOG v2.34 (старт без слушателей и честный счёт людей в канале):
 //   * ПОСЛЕ ПЕРЕЗАПУСКА БОТ ЗАХОДИТ И МОЛЧИТ, ЕСЛИ ЛЮДЕЙ НЕТ. Раньше он входил в
 //     канал и СРАЗУ начинал играть («подключился -> возобновляю очередь -> играю»),
@@ -1280,16 +1321,17 @@ const STARTUP_DM_TEXT =
     '  Добавляется В КОНЕЦ очереди. Стоять в голосовом канале не обязательно:\n' +
     '  DJ может просто собирать плейлист -- бот зайдёт, когда позовёшь.\n' +
     '`/queue from:16` -- что играет и что дальше: номера, автор каждого трека,\n' +
-    '  сколько уже играет текущий, сколько ещё ждать до конца плейлиста целиком и\n' +
-    '  сводка ПО АВТОРАМ (у кого сколько треков и на сколько времени). На странице\n' +
-    '  по 15 треков (у одного автора подряд он не повторяется), у длинных очередей\n' +
-    '  есть листание «⏮ В начало / ◀ Влево / Вправо ▶ / В конец ⏭» (или `from:16`).\n' +
-    '  Под очередью -- кнопки и меню: листание; «⏭ Пропустить»; «▶ Войти» (`/join`);\n' +
-    '  «⏏ Выйти» (`/leave`: свои треки откладываются, чужое играет дальше);\n' +
-    '  «🧹 Очистить» (`/clear`) и «🧹⏏ Очистка/Выход» (`/clear` + `/leave`) -- обе\n' +
-    '  с подтверждением и точным списком того, что уйдёт; «🗑 Убрать трек»;\n' +
-    '  «👤 Автор…» (⬆ поднять его треки наверх или 🗑 убрать -- с подтверждением)\n' +
-    '  и «🎚 Двигать трек» («⬆ Выше»/«⬇ Ниже»). Номера -- как в `/remove`.\n' +
+    '  сколько уже играет текущий, сколько ещё ждать до конца плейлиста целиком,\n' +
+    '  сводка ПО АВТОРАМ и история добавлений (кто и когда поставил).\n' +
+    '  На странице по 15 треков, у длинных очередей -- листание\n' +
+    '  «⏮ В начало / ◀ Влево / Вправо ▶ / В конец ⏭» (или `from:16`).\n' +
+    '  Под очередью -- кнопки и меню: листание; «◀ 30 с / 30 с ▶» (перемотка внутри\n' +
+    '  трека, как `/seek`); «⏭ Пропустить»; «▶ Войти» (`/join`); «⏏ Выйти» (`/leave`:\n' +
+    '  свои треки откладываются, чужое играет дальше); «🧹 Очистить» (`/clear`) и\n' +
+    '  «🧹⏏ Очистка/Выход» (`/clear` + `/leave`) -- с подтверждением; «🗂 Трек: убрать\n' +
+    '  или подвинуть…» (выбери номер -- рядом «🗑 Убрать / ⬆ Выше / ⬇ Ниже») и\n' +
+    '  «👤 Автор…» (⬆ поднять его треки наверх или 🗑 убрать -- с подтверждением).\n' +
+    '  Номера -- как в `/remove`.\n' +
     '  **Свои и чужие:** обычный DJ убирает, двигает, поднимает и чистит ТОЛЬКО свои\n' +
     '  записи (в меню ему видны только они); админы и модеры -- любые и всю очередь сразу.\n' +
     '`/remove number` / `/move number to` -- убрать и переставить (номера как в\n' +
@@ -6328,6 +6370,60 @@ function failedFast (proc, ms = 1500)
     ]);
 }
 
+// [v2.35] «ЭТОГО ВИДЕО БОЛЬШЕ НЕТ» -- не сбой сети и не наша ошибка: удалили,
+// закрыли доступ, канал снесён. Разница важна: такое видео бессмысленно пробовать
+// снова (раньше бот честно жёг на нём четыре попытки yt-dlp: предзагрузка, трек,
+// «продолжаю тот же трек» x3 -- и только потом пропускал). Живой опыт это подтвердил:
+// `--download-sections` на живой DJ-сет отдаёт `ERROR: ffmpeg exited with code
+// 4294967274`, а удалённое видео -- `ERROR: [youtube] TBMH2tO1SMo: Video unavailable`.
+// ВАЖНО: «Sign in to confirm ...» и возрастные ограничения сюда НЕ попадают -- это
+// про доступ с этого IP/прокси, видео может подождать и попробоваться позже.
+function isGoneError (e)
+{
+    const s = String ((e && (e.stderr || e.message)) || e);
+    return /video unavailable|has been removed|removed by the uploader|is not available|private video|no longer available|has been terminated|blocked (?:it )?(?:on copyright|in your country)|not available in your country/i.test (s);
+}
+
+// [v2.35] СДВИГ СЧИТАЕТСЯ УДАВШИМСЯ ТОЛЬКО ЕСЛИ ЧТО-ТО ПРИШЛО. `--download-sections`
+// (быстрый путь продолжения с места) умеет и промолчать: процесс стартовал, отдал
+// НОЛЬ байт и упал через 30-45 секунд («ffmpeg exited with code 4294967274»), а старая
+// проверка ждала всего 1.5 с и принимала такую пустышку за рабочий поток -- плееру
+// нечего было играть, трек «кончался» через пару секунд и очередь ехала дальше
+// (живой лог владельца: возобновлённый сет замолк почти сразу).
+// Ждём первый байт: пришёл -- сдвиг рабочий; процесс умер или молчит дольше ms -- нет.
+function streamFirstData (source, proc, ms)
+{
+    return new Promise (resolve =>
+    {
+        if (!source) return resolve (false);
+        let done = false;
+        const finish = ok =>
+        {
+            if (done) return;
+            done = true;
+            clearTimeout (timer);
+            try { source.removeListener ('data', onData); } catch {}
+            resolve (ok);
+        };
+        const onData = () => finish (true);
+        const timer = setTimeout (() => finish (false), ms);
+        source.once ('data', onData);
+        if (proc && typeof proc.catch === 'function') proc.catch (() => finish (false));
+    });
+}
+
+// [v2.35] КАК ПРОДОЛЖАТЬ С МЕСТА -- измерено на живых DJ-сетах (yt-dlp + наш ffmpeg):
+//   * сдвиг до 2 минут делается НАШИМ ffmpeg-ом (-ss) за считанные секунды: поток с
+//     начала отдаёт первые байты через ~5 с, звук после -ss -- через ~5-6 с (при
+//     сдвиге 110 с -- ~10 с);
+//   * `--download-sections` (быстрый путь) на этих источниках не работает: 45 секунд
+//     ожидания, НОЛЬ байт и `ERROR: ffmpeg exited with code 4294967274`.
+// Поэтому маленький сдвиг идём сразу через ffmpeg (надёжно), а sections пробуем только
+// на больших сдвигах (там он окупается, если источник умеет) и ТОЛЬКО с проверкой,
+// что поток реально отдал данные; не отдал -- сразу к обычному пути.
+const SEEK_FFSEEK_MAX = 120;   // сдвиги до 2 минут -- сразу своим ffmpeg
+const SEEK_SECTIONS_WAIT_MS = 8000; // сколько ждать первый байт от --download-sections
+
 // [v2.2.2] Сетевая ли это ошибка (прокси/сеть), а не реальный ответ YouTube:
 function isNetworkError (e)
 {
@@ -6594,6 +6690,10 @@ async function createTrackStream (track, seekSec = 0, seekMode = 'sections')
     if (ytdlpStream && typeof ytdlpStream.catch === 'function')
         ytdlpStream.catch (e =>
         {
+            // [v2.35] Помним причину смерти потока на самом процессе: Idle-обработчик
+            // видит только «трек кончился» и по этой отметке отличит удалённое видео
+            // (его надо убрать сразу) от обычного обрыва (его надо продолжить).
+            ytdlpStream.lastErr = e;
             // [v2.30] Поток глушили мы сами (/skip, /stop, /leave, переезд) -- это не
             // событие: yt-dlp просто не смог дописать в уже закрытый пайп ('Broken pipe').
             if (ytdlpStream.weKilled) return;
@@ -6633,10 +6733,14 @@ async function createTrackStream (track, seekSec = 0, seekMode = 'sections')
             let ffErr = '';
             ff.stderr.on ('data', d => { ffErr += String (d); });
             ff.on ('error', () => {});
+            // [v2.35] если yt-dlp уже сказал «видео больше нет» -- наша ffmpeg-ошибка
+            // ('Invalid data found') лишь следствие: не пишем в лог второй раз.
+            const ffNoiseIfGone = () => isGoneError (ytdlpStream.lastErr);
             ff.on ('close', code =>
             {
                 if (code === 0 || code === null) return; // нормально отработал
                 if (ff.weKilled) return; // [v2.30] глушили мы сами -- не событие
+                if (ffNoiseIfGone ()) return; // [v2.35] причина уже названа yt-dlp-ом
                 console.error ('[' + (d()) + '] [music] выравнивание громкости оборвалось: код ' + exitCodeText (code) +
                     (ffErr.trim () ? ' -- ' + ytDlpErr ({ stderr: ffErr }, 160) : '') +
                     ' -- звук этого трека оборвётся раньше, дальше иду по очереди');
@@ -6791,6 +6895,21 @@ async function playNext (guildId)
         schedulePresence ();           // [v2.8] трек кончился -- «смотрит канал»
         return;
     }
+    // [v2.35] ТРЕКИ, КОТОРЫХ БОЛЬШЕ НЕТ НА YOUTUBE. Если предзагрузка уже выяснила,
+    // что видео удалено/закрыто (isGoneError), незачем ещё раз запускать yt-dlp и
+    // ждать четыре неудачных попытки: убираем такой трек сразу и говорим об этом в
+    // логе и в канал (люди видели в логе "Video unavailable" без объяснений).
+    while (m.tracks.length && m.tracks[0] && m.tracks[0].gone)
+    {
+        const dead = m.tracks.shift ();
+        console.error ('[' + (d()) + '] [music] видео больше нет на YouTube (проверено предзагрузкой): ' +
+            (dead.title || 'трек') + ' -- убрал из очереди');
+        musicNotice (guildId, '🗑 **' + (dead.title || 'Трек') + '** -- видео больше нет на YouTube, убрал из очереди.');
+    }
+    // [v2.35] Пустые записи в очереди (бывает после ручной правки базы) -- убираем:
+    // дальше всё считает, что в очереди объекты треков.
+    while (m.tracks.length && !m.tracks[0]) { m.tracks.shift (); console.error ('[' + (d()) + '] [music] в очереди была пустая запись -- убрал'); }
+    if (!m.tracks.length) return playNext (guildId); // очередь была пустой только из-за этого
     if (m.seekTrack !== m.tracks[0]) m.streamRetries = 0; // новый трек -- счётчик попыток с нуля
     let track = m.tracks.shift ();
     m.current = track;
@@ -6810,7 +6929,12 @@ async function playNext (guildId)
         let resource = null, viaProxy = false, handle = null;
         let startedAt = 0; // [v2.12] с какой секунды трек реально начал играть (0 -- с начала)
         const p = m.preload;
-        if (p && p.track === track)
+        // [v2.35] ТРЕКИ С ПОМЕТКОЙ `gone` СЮДА НЕ ДОХОДЯТ -- их убирает цикл выше
+        // ("видео больше нет на YouTube (проверено предзагрузкой)"), поэтому брать
+        // мёртвую заготовку повторно не приходится. Остаётся защита от другой
+        // ситуации: заготовка есть, но её yt-dlp уже упал -- такую не берём, пусть
+        // трек стартует свежим потоком (иначе упавший процесс простоит в тишине).
+        if (p && p.track === track && !(track.gone && p.proc && p.proc.lastErr))
         {
             // [v2.9] этот трек уже готовился пока играл предыдущий -- берём готовое
             m.preload = null; // вынули: теперь это обычный играющий ресурс, не предзагрузка
@@ -6832,22 +6956,45 @@ async function playNext (guildId)
             // первым (/move), его позиция приехала вместе с ним (track.seek)
             let seekSec = (m.seekTrack === track) ? (m.seekSec || 0) : (track.seek || 0);
             if (track.isLive) seekSec = 0; // у прямого эфира позиции нет
-            // [v2.25] продолжение с места в ДВА шага, чтобы место не терялось почти
-            // никогда: быстрый путь (--download-sections) -> резервный (сдвиг своим
-            // ffmpeg, работает для любого источника) -> и только потом с начала.
-            let opened = await createTrackStream (track, seekSec, seekSec >= 1 ? 'sections' : 'none');
-            if (seekSec >= 1 && (!opened.seeked || await failedFast (opened.proc)))
+            // [v2.25] продолжение с места: быстрый путь (--download-sections) -> резервный
+            // (сдвиг своим ffmpeg, работает для любого источника) -> с начала.
+            // [v2.35] ПОРЯДОК ДРУГОЙ, и вот почему (измерено на живом DJ-сете):
+            //   * sections на таких источниках отдаёт НОЛЬ байт и падает через 30-45 с
+            //     (`ERROR: ffmpeg exited with code 4294967274`) -- и это тот самый случай,
+            //     когда возобновлённый сет замолкал через пару секунд;
+            //   * свой ffmpeg со сдвигом даёт звук за ~5-6 с (при сдвиге 110 с -- ~10 с).
+            // Поэтому маленький сдвиг (до SEEK_FFSEEK_MAX) -- сразу своим ffmpeg, а
+            // sections -- только на больших сдвигах и только с ПРОВЕРКОЙ, что поток
+            // реально отдал данные (streamFirstData). Не вышло -- сразу резервный путь,
+            // не тратя 45 секунд. Что sections не работает на этом источнике, помним
+            // до конца работы бота (m.seekSections -- уже проверено один раз).
+            const _noSec = (m.seekNoSections || []).includes (track.url); // уже выяснили: не умеет
+            const _trySections = seekSec >= 1 && seekSec > SEEK_FFSEEK_MAX && !_noSec;
+            let opened = await createTrackStream (track, seekSec, _trySections ? 'sections' : (seekSec >= 1 ? 'ffseek' : 'none'));
+            if (_trySections)
             {
-                killStream (opened); // быстрый сдвиг не сработал (экстрактор не умеет)
-                console.error ('[' + (d()) + '] [music] сдвиг через --download-sections не сработал -- пробую через ffmpeg');
-                opened = await createTrackStream (track, seekSec, 'ffseek');
-                if (!opened.seeked || await failedFast (opened.proc))
+                const _ok = opened.seeked && !(await failedFast (opened.proc)) &&
+                    await streamFirstData (opened.source, opened.proc, SEEK_SECTIONS_WAIT_MS);
+                if (!_ok)
+                {
+                    // помним до конца работы бота: этот адрес sections не умеет --
+                    // больше на него не тратим ни секунды
+                    m.seekNoSections = [...(m.seekNoSections || []), track.url].slice (-20);
+                }
+                if (!_ok)
                 {
                     killStream (opened);
-                    console.error ('[' + (d()) + '] [music] продолжение с ' + fmtDur (seekSec) + ' не удалось -- беру трек с начала');
-                    opened = await createTrackStream (track, 0, 'none');
-                    seekSec = 0;
+                    console.error ('[' + (d()) + '] [music] секция с ' + fmtDur (seekSec) +
+                        ' ничего не отдала за ' + Math.round (SEEK_SECTIONS_WAIT_MS / 1000) + ' с -- беру тот же трек через ffmpeg');
+                    opened = await createTrackStream (track, seekSec, 'ffseek');
                 }
+            }
+            if (seekSec >= 1 && (!opened.seeked || await failedFast (opened.proc)))
+            {
+                killStream (opened); // сдвиг не сработал совсем -- трек с начала
+                console.error ('[' + (d()) + '] [music] продолжение с ' + fmtDur (seekSec) + ' не удалось -- беру трек с начала');
+                opened = await createTrackStream (track, 0, 'none');
+                seekSec = 0;
             }
             resource = opened.resource;
             viaProxy = opened.viaProxy;
@@ -6874,6 +7021,7 @@ async function playNext (guildId)
         wireStreamErrors (m, track, resource, viaProxy, guildId);
         m.streamHandle = handle; // [v2.14] чем глушить этот трек (см. killStream)
         m.player.play (resource);
+        m.playFailStreak = 0; // трек заиграл -- цепочка неудач сброшена (см. catch ниже)
         startPreload (guildId); // [v2.9] пока играет -- готовим следующий трек
         // [v2.12] играет кому-то живому? тогда естественный конец очереди = забыть её;
         // и если слушателей нет -- сразу пауза (музыка не играет в пустоту)
@@ -6889,6 +7037,19 @@ async function playNext (guildId)
         console.error ('[' + (d()) + '] [music] трек не заиграл: ' + (track.title || track.url || 'трек') +
             ' -- ' + oneLine (e.message) + ' (беру следующий)');
         m.current = null;
+        // [v2.35] ПРЕДОХРАНИТЕЛЬ ОТ БЕСКОНЕЧНОГО КРУГА: если причина не в одном битом
+        // треке (а, скажем, сломалась сама подготовка потока), эта цепочка не кончалась
+        // -- бот рекурсивно звал сам себя и вычерпывал память до падения всего процесса
+        // (поймано стендом: 'JavaScript heap out of memory'). Теперь после десяти
+        // подряд неудач честно останавливаемся: очередь и место в ней остаются.
+        m.playFailStreak = (m.playFailStreak || 0) + 1;
+        if (m.playFailStreak >= 10)
+        {
+            console.error ('[' + (d()) + '] [music] ' + m.playFailStreak + ' треков подряд не заиграли -- ' +
+                'останавливаюсь, чтобы не крутиться без конца (очередь помню, проверь лог выше)');
+            m.playFailStreak = 0;
+            return;
+        }
         playNext (guildId); // пропустить битый трек
     }
 }
@@ -6950,6 +7111,20 @@ function startPreload (guildId)
             p.source = r.source;
             p.proc = r.proc;
             p.ff = r.ff;
+            // [v2.35] ГЛАВНОЕ ПРО УДАЛЁННОЕ ВИДЕО: поток заготовки создан, а падает он
+            // П О З Ж Е. Промис yt-dlp внутри createTrackStream гасится своим catch-ем,
+            // поэтому outer-промис (этот .then) об ошибке не узнаёт -- без этой проверки
+            // трек не помечался как «его больше нет» и очередь узнавала об этом только по
+            // факту. Теперь помечаем сразу (в логе -- строка с названием), и когда очередь
+            // дойдёт до него -- играть его больше не пытаемся.
+            if (r.proc && typeof r.proc.catch === 'function')
+                r.proc.catch (e =>
+                {
+                    if (!isGoneError (e) || next.gone) return;
+                    next.gone = true;
+                    console.error ('[' + (d()) + '] [music] видео больше нет на YouTube (' + (next.title || 'трек') +
+                        ') -- уберу из очереди, когда дойдёт; очередь не трогаю: ' + ytDlpErr (e, 120));
+                });
             // Обработчик ошибок вешаем сразу (а не когда трек начнёт играть): иначе
             // 'error' у потока без слушателя уронил бы процесс.
             wireStreamErrors (m, next, r.resource, r.viaProxy, guildId);
@@ -6961,6 +7136,17 @@ function startPreload (guildId)
         {
             // не получилось -- не беда: playNext просто возьмёт свежий поток
             p.cancelled = true;
+            // [v2.35] Видео больше нет (удалено/закрыто)? Тогда запоминаем это на самом
+            // треке: когда очередь до него дойдёт, бот не будет заново запускать yt-dlp
+            // и ждать четыре неудачные попытки -- уберёт его сразу и скажет почему.
+            // Раньше в лог падал голый 'Video unavailable', и трек молча пропадал.
+            if (isGoneError (e))
+            {
+                next.gone = true;
+                console.error ('[' + (d()) + '] [music] видео больше нет на YouTube (' + (next.title || 'трек') +
+                    ') -- уберу его из очереди, когда дойдёт; очередь не трогаю: ' + ytDlpErr (e, 120));
+                return null;
+            }
             console.error ('[music] предзагрузка не удалась (' + (next.title || 'трек') + '): ' + ytDlpErr (e));
             return null;
         }
@@ -6988,6 +7174,19 @@ function wireStreamErrors (m, track, resource, viaProxy, guildId)
         {
             console.error ('[music] обрыв потока (предзагрузка): ' + oneLine (e.message));
             if (m.preload && m.preload.track === track) m.preload = null; // сломанную заготовку не берём
+            return;
+        }
+        // [v2.35] Видео больше нет -- повтор не поможет: убираем и говорим в канал.
+        if (isGoneError (e))
+        {
+            console.error ('[' + (d()) + '] [music] видео больше нет на YouTube (' + (track.title || 'трек') +
+                ') -- убираю из очереди: ' + ytDlpErr (e, 120));
+            musicNotice (guildId, '🗑 **' + (track.title || 'Трек') + '** -- видео больше нет на YouTube, убираю из очереди.');
+            m.current = null;
+            m.playedMs = 0;
+            m.playingSince = null;
+            m.streamRetries = 0;
+            try { m.player.stop (true); } catch {}
             return;
         }
         // [v2.12] ОБРЫВ ПОТОКА у играющего трека: трек НЕ выбрасываем -- пробуем
@@ -7039,6 +7238,13 @@ function fmtAgo (ms)
     if (h) return h + ' ч ' + mi + ' мин';
     if (mi) return mi + ' мин';
     return s + ' сек';
+}
+
+// [v2.35] «20:12» -- только время (для истории добавлений в /queue).
+function hhmm (ms)
+{
+    const dt = new Date (Number (ms) || 0);
+    return pad (dt.getHours ()) + ':' + pad (dt.getMinutes ());
 }
 
 // [v2.34] БОТ ЛИ ЭТО ГОЛОСОВОЕ СОСТОЯНИЕ? Раньше признаком было только
@@ -7325,7 +7531,9 @@ function trackToJson (t)
     // было видно авторство и работала чистка «по автору».
     return { url: t.url, title: t.title, duration: t.duration || 0, author: t.author || '',
              isLive: !!t.isLive, seek: t.seek || 0,
-             byId: t.byId || null, byName: t.byName || '' };
+             byId: t.byId || null, byName: t.byName || '',
+             // [v2.35] когда трек поставили -- для истории добавлений в /queue
+             addAt: Number (t.addAt) || 0 };
 }
 
 // ============================================================================
@@ -7510,7 +7718,7 @@ const QUEUE_MSG_LIMIT = 1980;
 // Запас на служебные строки: заголовок «Очередь (N)», переводы строк, хвост
 // «...и ещё N: /queue from:M» (самая длинная часть -- сам хвост) и РАЗДЕЛИТЕЛИ
 // блоков [v2.32] (до трёх линий QSEP по 12 символов).
-const QUEUE_GLUE = 120;
+const QUEUE_GLUE = 150;
 // Подсказка внизу. Короткая -- когда очередь не влезла в одну страницу (все действия
 // и так есть кнопками), полная -- когда всё видно сразу.
 // [v2.32] Визуальный разделитель блоков в сообщении /queue: «Сейчас», «Очередь»,
@@ -7518,8 +7726,9 @@ const QUEUE_GLUE = 120;
 const QSEP = '────────────';
 const QUEUE_HINT_SHORT = '_Действия -- кнопками ниже._';
 const QUEUE_HINT_FULL =
-    '_Убрать -- `/remove`, переставить -- `/move` или кнопками ниже (DJ -- только свои треки\n' +
-    'и только на свои же места), перемотать -- `/seek`, прыгнуть -- `/jump` (админы/модеры);\n' +
+    '_Перемотать внутри трека -- `/seek` или кнопки «◀ 30 с / 30 с ▶»;\n' +
+    'убрать или подвинуть трек -- выбери его в списке ниже (DJ -- только свои треки\n' +
+    'и только на свои же места); прыгнуть по очереди -- `/jump` (админы/модеры);\n' +
     'чистить -- `/clear` (остаться в канале) или `/stop` (уйти совсем): спросят подтверждение.\n' +
     'DJ распоряжается только своими треками, админы и модеры -- любыми._';
 
@@ -7556,13 +7765,49 @@ function queueAuthorsText (m)
         (noAuthor ? (top.length ? ', ' : '') + 'без автора: ' + noAuthor : '');
 }
 
+// [v2.35] «КТО И КОГДА ЭТО ПОСТАВИЛ» -- история добавлений для /queue.
+// Зачем: в длинном плейлисте обычно несколько DJ, и надо видеть СВЕЖИЕ ВСТАВКИ --
+// кто, когда и сколько поставил, и на каких местах это лежит сейчас (номера -- те же,
+// что в /remove). Метка времени пишется каждому треку при добавлении (/play), один
+// заход = одна пачка (общая метка), поэтому читается как «20:02 Фантазёр -- 2 трека».
+// Показываем последние 4 пачки (свежие сверху): больше в сообщение просто не влезет,
+// а старое и так видно по «По авторам» и по самой очереди.
+function queueAddsText (m)
+{
+    const batches = new Map ();
+    let noStamp = 0;
+    m.tracks.forEach ((t, i) =>
+    {
+        const at = Number (t.addAt) || 0;
+        if (!at) { noStamp++; return; } // трек из старой версии -- метки у него нет
+        const key = byIdOf (t) + '@' + at;
+        let b = batches.get (key);
+        if (!b) { b = { name: byNameOf (t) || 'без автора', at: at, nums: [] }; batches.set (key, b); }
+        b.nums.push (i + 1);
+    });
+    if (!batches.size) return '';
+    const list = [...batches.values ()].sort ((a, b) => b.at - a.at).slice (0, 4);
+    const parts = list.map (b =>
+    {
+        const nums = b.nums.length > 3
+            ? b.nums.slice (0, 3).join (', ') + ' и ещё ' + (b.nums.length - 3)
+            : b.nums.join (', ');
+        return '`' + hhmm (b.at) + '` **' + b.name + '** -- ' + b.nums.length + ' ' +
+            plural (b.nums.length, 'трек', 'трека', 'треков') + ' (№' + nums + ')';
+    });
+    const older = batches.size - list.length;
+    return '🕘 **Последние добавления:** ' + parts.join ('; ') +
+        (older ? '; и ещё ' + older + ' ' + plural (older, 'пачка', 'пачки', 'пачек') + ' раньше' : '') +
+        (noStamp ? '; без отметки: ' + noStamp + ' (поставлены раньше, чем бот их начал писать)' : '');
+}
+
 // Сколько символов остаётся на СПИСОК: лимит минус шапка, «до конца очереди»,
-// подсказка и служебные строки. Считается по живым строкам, поэтому бюджет один и тот
-// же при отрисовке страницы и в queuePageOf (там и там -- один и тот же m).
+// история добавлений, подсказка и служебные строки. Считается по живым строкам, поэтому
+// бюджет один и тот же при отрисовке страницы и в queuePageOf (один и тот же m).
 function queueListBudget (m)
 {
     const chrome = queueHeadText (m).length + queueWaitText (m).length +
-        queueAuthorsText (m).length + QUEUE_GLUE + QUEUE_HINT_SHORT.length;
+        queueAuthorsText (m).length + queueAddsText (m).length + QUEUE_GLUE + QUEUE_HINT_SHORT.length;
     return Math.max (200, QUEUE_MSG_LIMIT - chrome);
 }
 
@@ -7627,9 +7872,13 @@ function queuePage (m, start)
 //       подтверждение и скажут, что именно уйдёт);
 //   🗑 Убрать трек -- меню с номерами ТЕКУЩЕЙ страницы (те же номера, что в /remove);
 //   🗑 Удалить треки автора [v2.31] -- выбрать автора и убрать всё его сразу;
-//   🎚 Двигать трек -- выбираешь трек, и рядом появляются «⬆ Выше» / «⬇ Ниже» [v2.17]:
-//       перестановка руками, без /move по номерам. Ряд с ними -- пока трек выбран,
-//       «✖ Готово» убирает его.
+//   ◀ 30 с / 30 с ▶ [v2.35] -- перемотка внутри ТЕКУЩЕГО трека (та же логика, что
+//       у /seek: трек возвращается в очередь с отметкой секунды). У прямого эфира
+//       позиции нет -- кнопки погашены;
+//   🗂 Трек: убрать или подвинуть… [v2.35] -- ОДИН список треков текущей страницы.
+//       Раньше рядом стояли два меню с одними и теми же номерами (одно убирало
+//       сразу, второе начинало перестановку) и занимали два ряда из пяти. Выбрал
+//       трек -- появляются «🗑 Убрать» / «⬆ Выше» / «⬇ Ниже» / «✖ Готово» [v2.17].
 // Права проверяются при нажатии: сообщение очереди видит весь канал, а действия -- DJ.
 // [v2.31] DJ распоряжается только СВОИМИ записями (staff -- любыми), поэтому в меню
 // ему попадают только его треки, а в выборе авторов -- только он сам.
@@ -7703,22 +7952,38 @@ function queueComponents (page, m, moveSel = 0, opts = {})
             )
         );
     }
-    // Действия не зависят от страницы -- отдельный ряд (одинаковый на всех страницах).
-    // [v2.32] Здесь же ВХОД и ВЫХОД: «Войти» -- это /join (зайти и остаться),
-    // «Выйти» -- /leave (отложить СВОИ треки и играть дальше; совсем выйти из
-    // канала -- только когда играть больше нечего), а «Очистка/Выход» -- /stop,
-    // т.е. /clear + /leave одной кнопкой (с подтверждением).
+    // [v2.35] РЯДЫ ПЕРЕСОБРАНЫ ПОД ЖЁСТКИЙ ЛИМИТ DISCORD (не больше пяти). До этого
+    // в ряду действий стояли пять кнопок (пропуск, вход, выход, чистка, стоп/выход) --
+    // для перемотки ±30 с там места не было, а убирать что-то из них нельзя.
+    // Теперь: [перемотка + управление] [чистка] ... [список треков] [авторы].
+    //   * «◀ 30» / «30 ▶» -- перемотка ВНУТРИ текущего трека той же логикой, что /seek
+    //     (у прямого эфира позиции нет -- кнопки погашены);
+    //   * «Войти» -- /join (зайти и остаться), «Выйти» -- /leave (отложить СВОИ треки
+    //     и играть дальше), а «Очистка/Выход» в ряду ниже -- /stop (/clear + /leave).
+    const liveNoSeek = !m.current || m.current.isLive;
     rows.push
     (
         new ActionRowBuilder ().addComponents
         (
+            new ButtonBuilder ()
+                .setCustomId ('q:s:m').setLabel ('◀ 30 с').setStyle (ButtonStyle.Secondary)
+                .setDisabled (liveNoSeek),
+            new ButtonBuilder ()
+                .setCustomId ('q:s:p').setLabel ('30 с ▶').setStyle (ButtonStyle.Secondary)
+                .setDisabled (liveNoSeek),
             new ButtonBuilder ()
                 .setCustomId ('q:skip').setLabel ('⏭ Пропустить').setStyle (ButtonStyle.Secondary)
                 .setDisabled (!m.current),
             new ButtonBuilder ()
                 .setCustomId ('q:join').setLabel ('▶ Войти').setStyle (ButtonStyle.Success),
             new ButtonBuilder ()
-                .setCustomId ('q:leave').setLabel ('⏏ Выйти').setStyle (ButtonStyle.Secondary),
+                .setCustomId ('q:leave').setLabel ('⏏ Выйти').setStyle (ButtonStyle.Secondary)
+        )
+    );
+    rows.push
+    (
+        new ActionRowBuilder ().addComponents
+        (
             new ButtonBuilder ()
                 .setCustomId ('q:clear').setLabel ('🧹 Очистить').setStyle (ButtonStyle.Danger)
                 .setDisabled (!total && !m.current),
@@ -7729,33 +7994,29 @@ function queueComponents (page, m, moveSel = 0, opts = {})
     );
     if (count)
     {
-        const rmOpts = [], mvOpts = [];
+        // [v2.35] ОДИН СПИСОК ТРЕКОВ ВМЕСТО ДВУХ. Раньше рядом стояли два меню с
+        // ОДНИМИ И ТЕМИ ЖЕ номерами («🗑 Убрать трек» -- убирало сразу, «🎚 Двигать трек»
+        // -- начинало перестановку): два ряда только ради выбора трека. Теперь выбор
+        // один, а действия (убрать / выше / ниже) появляются кнопками ПОСЛЕ выбора -- это
+        // и освободило ряд для перемотки ±30 с при лимите Discord в пять рядов.
+        const opts = [];
         for (let i = 0; i < count; i++)
         {
             const n = start + i;
             const t = m.tracks[n - 1];
             if (!t || !mine (t)) continue; // чужое меню DJ не показывает вовсе
             // label -- до 100 символов (лимит Discord), в value -- номер как в /queue:
-            const label = ('№' + n + ' · ' + (t.title || 'трек')).slice (0, 100);
-            rmOpts.push ({ label: label, value: String (n) });
-            mvOpts.push ({ label: label, value: String (n), default: n === moveSel });
+            opts.push ({ label: ('№' + n + ' · ' + (t.title || 'трек')).slice (0, 100),
+                         value: String (n), default: n === moveSel });
         }
-        if (rmOpts.length)
+        if (opts.length)
         {
-            const rm = new StringSelectMenuBuilder ()
-                .setCustomId ('q:rm:' + start)
-                .setPlaceholder (staff ? '🗑 Убрать трек из очереди…' : '🗑 Убрать свой трек…');
-            rm.addOptions (rmOpts);
-            rows.push (new ActionRowBuilder ().addComponents (rm));
-        }
-        if (mvOpts.length)
-        {
-            const mv = new StringSelectMenuBuilder ()
-                .setCustomId ('q:mv:' + start)
-                .setPlaceholder (moveSel ? ('🎚 Двигаю №' + moveSel + ' -- или выбери другой')
-                                          : (staff ? '🎚 Двигать трек в очереди…' : '🎚 Двигать свой трек…'));
-            mv.addOptions (mvOpts);
-            rows.push (new ActionRowBuilder ().addComponents (mv));
+            const tr = new StringSelectMenuBuilder ()
+                .setCustomId ('q:tr:' + start)
+                .setPlaceholder (moveSel ? ('№' + moveSel + ' выбран -- или выбери другой')
+                                         : (staff ? '🗂 Трек: убрать или подвинуть…' : '🗂 Свой трек: убрать или подвинуть…'));
+            tr.addOptions (opts);
+            rows.push (new ActionRowBuilder ().addComponents (tr));
         }
     }
     // [v2.32] МЕНЮ АВТОРА -- ДЛЯ ВСЕХ, а права проверяются при действии. Так видно,
@@ -7788,6 +8049,11 @@ function queueComponents (page, m, moveSel = 0, opts = {})
         (
             new ActionRowBuilder ().addComponents
             (
+                // [v2.35] Убрать выбранный трек -- отсюда же, где его двигают:
+                // раньше для этого надо было лезть в отдельное меню.
+                new ButtonBuilder ()
+                    .setCustomId ('q:rx:' + moveSel + ':' + start).setLabel ('🗑 Убрать')
+                    .setStyle (ButtonStyle.Danger),
                 new ButtonBuilder ()
                     .setCustomId ('q:mu:' + moveSel).setLabel ('⬆ Выше')
                     .setStyle (ButtonStyle.Primary).setDisabled (moveSel <= 1),
@@ -8291,6 +8557,23 @@ function seekMusic (guildId, sec, who)
     };
 }
 
+// [v2.35] ПЕРЕМОТКА ±30 с КНОПКАМИ под /queue. Логика -- та же функция, что у /seek
+// (никакого второго пути: иначе кнопки и команда со временем разъехались бы).
+// У прямого эфира позиции нет и быть не может -- честно говорим об этом, а не делаем
+// вид, что перемотали.
+function queueSeekBy (guildId, delta, who)
+{
+    const m = musicOf (guildId);
+    if (!m.current)
+        return { ok: false, text: '🤷 Сейчас ничего не играет -- перематывать нечего.' };
+    if (m.current.isLive)
+        return { ok: false, text: '🔴 Это прямой эфир -- позиции у него нет (`/seek 0` -- перейти к живому краю).' };
+    const at = Math.max (0, Math.round (playedMsOf (m) / 1000));
+    const res = seekMusic (guildId, at + delta, who);
+    if (!res.ok) return res;
+    return { ok: true, text: res.text + '\n_Место, где играло: `' + fmtDur (at) + '`._' };
+}
+
 // Одна страница очереди: номера (те же, что в /remove,/move,/jump), автор каждого
 // трека, позиция внутри текущего трека и ОБЩИЙ остаток по времени.
 // moveSel -- номер выбранного для перестановки трека (0 -- ничего не выбрано):
@@ -8336,10 +8619,11 @@ function queueView (m, start, moveSel = 0, opts = {})
     const rest = total - (page.start - 1 + page.count);
     // выбранный для перестановки трек -- строкой внизу (видно, что именно двигаешь):
     const move = (moveSel >= 1 && moveSel <= total)
-        ? '\n\n🎚 **Двигаю №' + moveSel + ':** **' + (m.tracks[moveSel - 1].title || 'трек') +
-          '** -- жми «⬆ Выше» / «⬇ Ниже» под списком.'
+        ? '\n\n🗂 **№' + moveSel + ':** **' + (m.tracks[moveSel - 1].title || 'трек') +
+          '** -- под списком ‹🗑 Убрать / ⬆ Выше / ⬇ Ниже›.'
         : '';
     const authors = queueAuthorsText (m);
+    const adds = queueAddsText (m); // [v2.35] кто и когда поставил (свежие вставки)
     // [v2.32] Блоки разделены линией (QSEP): «Сейчас» / «Очередь» / «По авторам» /
     // «До конца очереди» -- по одному взгляду видно, где что.
     const build = hint => queueHeadText (m) +
@@ -8347,6 +8631,7 @@ function queueView (m, start, moveSel = 0, opts = {})
         '\n**Очередь (' + total + ')**' + (page.start > 1 ? ' · с №' + page.start : '') + ':\n' + page.list +
         (rest > 0 ? '\n*...и ещё ' + rest + ': `/queue from:' + (page.start + page.count) + '`*' : '') +
         (authors ? '\n' + QSEP + '\n' + authors : '') +
+        (adds ? '\n' + QSEP + '\n' + adds : '') +
         '\n' + QSEP + '\n' + queueWaitText (m) + move + '\n' + hint;
     // Очереди нет -- только шапка (подсказка про действия тогда не нужна).
     // Иначе берём ПОЛНУЮ подсказку, а если она не влезла в лимит Discord -- короткую
@@ -8724,7 +9009,7 @@ function jsonToTrack (t)
 {
     return { url: t.url, streamUrl: t.url, title: t.title || 'Без названия', duration: t.duration || 0,
              author: t.author || '', isLive: !!t.isLive, thumbnail: '', seek: t.seek || 0,
-             byId: t.byId || null, byName: t.byName || '' };
+             byId: t.byId || null, byName: t.byName || '', addAt: Number (t.addAt) || 0 };
 }
 
 // ============================================================================
@@ -8844,6 +9129,9 @@ function joinVoiceNow (guildId, voiceChannel, guild, reason = '')
             m.playerWired = true;
             m.player.on (AudioPlayerStatus.Idle, () =>
             {
+                // [v2.35] Причина смерти потока (если yt-dlp её сказал) -- ДО затирания
+                // ручки: по ней ниже отличаем «видео больше нет» от обычного обрыва.
+                const _deadErr = (m.streamHandle && m.streamHandle.proc) ? m.streamHandle.proc.lastErr : null;
                 // [v2.14] Трек (любой: доигравший, пропущенный /skip, /stop, /leave)
                 // больше не звучит -- закрываем его поток. Иначе yt-dlp вместе с
                 // ffmpeg оставались жить в памяти до конца работы бота.
@@ -8862,6 +9150,21 @@ function joinVoiceNow (guildId, voiceChannel, guild, reason = '')
                 const at = playing ? Math.round (playedMsOf (m) / 1000) : 0;
                 const asked = !!m.skipRequested; // /skip и /jump -- осознанный уход вперёд
                 m.skipRequested = false;
+                // [v2.35] ВИДЕО БОЛЬШЕ НЕТ -- ЭТО НЕ ОБРЫВ: продолжать нечего, повтор не
+                // поможет. Убираем сразу и говорим людям (раньше падало в лог голым
+                // 'Video unavailable', а трек молча пропадал из очереди).
+                if (playing && !asked && isGoneError (_deadErr))
+                {
+                    console.error ('[' + (d()) + '] [music] видео больше нет на YouTube (' + (playing.title || 'трек') +
+                        ') -- убираю из очереди: ' + ytDlpErr (_deadErr, 120));
+                    musicNotice (guildId, '🗑 **' + (playing.title || 'Трек') + '** -- видео больше нет на YouTube, убираю из очереди.');
+                    m.current = null;
+                    m.playedMs = 0;
+                    m.playingSince = null;
+                    m.streamRetries = 0;
+                    playNext (guildId);
+                    return;
+                }
                 if (playing && !asked && streamEndedEarly (playing, at, m.startedAtSec))
                 {
                     const attempt = (m.streamRetries || 0) + 1;
@@ -9470,7 +9773,7 @@ client.on ('interactionCreate', async (interaction) =>
             return replyView (parseInt (mPage[2], 10) || 1);
         }
         // --- действия: как и слэш-команды, только для админов/модеров и роли DJ ---
-        if (!/^q:(skip|join|leave|clear|stop|da|dau|dax|dx|cq|rm|mv|mu|md|mx)(:|$)/.test (cid)) return;
+        if (!/^q:(skip|join|leave|clear|stop|da|dau|dax|dx|cq|rm|mv|mu|md|mx|s|tr|rx)(:|$)/.test (cid)) return;
         if (!isDJ (interaction))
         {
             const role_dj = SERVERS[guildId].role_dj || '';
@@ -9535,6 +9838,40 @@ client.on ('interactionCreate', async (interaction) =>
         // видно, ЧТО именно уйдёт, а staff выбирает «только свои» или «всю очередь».
         // В customId несём id сообщения очереди (или 0, если пришли командой).
         const msgId = interaction.message ? interaction.message.id : '0';
+        // [v2.35] ПЕРЕМОТКА ±30 с -- тем же путём, что /seek (своей логики нет, поэтому
+        // поведение не может разъехаться): трек возвращается в начало очереди с
+        // отметкой секунды и открывается заново. У прямого эфира позиции нет -- кнопки
+        // для него погашены в самом сообщении.
+        const mSeek = /^q:s:([mp])$/.exec (cid);
+        if (mSeek)
+        {
+            const res = queueSeekBy (guildId, mSeek[1] === 'm' ? -30 : 30, who);
+            // Сообщение очереди обновляем ЧУТЬ ПОЗЖЕ: плеер перезапускается тем же
+            // событием, и сразу после перемотки в строке «Сейчас» был бы прочерк.
+            if (res.ok) setTimeout (() => { refreshQueueMsg (msgId).catch (() => {}); }, 1500);
+            return interaction.reply ({ content: res.text, flags: MessageFlags.Ephemeral });
+        }
+        // [v2.35] Выбрали трек в едином списке (q:tr) -- показываем его действия:
+        // «🗑 Убрать / ⬆ Выше / ⬇ Ниже / ✖ Готово» (раньше было два списка с одними и
+        // теми же номерами: один убирал сразу, второй начинал перестановку).
+        const mTr = /^q:tr:(\d+)$/.exec (cid);
+        if (mTr)
+        {
+            const sel = parseInt ((interaction.values || [])[0], 10) || 0;
+            if (!sel)
+                return interaction.reply ({ content: '🤔 Не понял, какой трек выбран.', flags: MessageFlags.Ephemeral });
+            return replyView (parseInt (mTr[1], 10) || 1, sel);
+        }
+        // [v2.35] «🗑 Убрать» у выбранного трека (та же функция, что /remove).
+        const mRx = /^q:rx:(\d+):(\d+)$/.exec (cid);
+        if (mRx)
+        {
+            const res = queueRemove (guildId, parseInt (mRx[1], 10) || 0, who, ctx);
+            if (!res.ok)
+                return interaction.reply ({ content: res.text, flags: MessageFlags.Ephemeral });
+            await replyView (parseInt (mRx[2], 10) || 1);
+            return interaction.followUp ({ content: res.text, flags: MessageFlags.Ephemeral });
+        }
         // [v2.32] Кнопки ВХОД и ВЫХОД -- те же функции, что у /join и /leave.
         // «Выйти» -- мягкий выход: свои треки в конец (место сохраняется), чужая
         // музыка играет дальше; бот уходит из канала только когда играть нечего.
@@ -10107,10 +10444,16 @@ client.on ('interactionCreate', async (interaction) =>
                 return interaction.editReply ('❌ Пустой результат.');
             // [v2.14] Кто добавил треки: видно в /queue, а по этому же полю работает
             // `/clear author:@кто` (убрать из очереди треки одного человека).
+            // [v2.35] И КОГДА: одна метка на весь заход /play -- это «пачка» в истории
+            // добавлений («20:02 Фантазёр -- 2 трека»), по ней в /queue видно свежие
+            // вставки в чужом длинном плейлисте. Объект у всех треков пачки один -- метка
+            // поэтому общая и не разъезжается.
+            const addedAt = Date.now ();
             for (const t of tracks)
             {
                 t.byId = interaction.user.id;
                 t.byName = interaction.user.username;
+                t.addAt = addedAt;
             }
 
             // [v2.12] Куда играть. Правила:
