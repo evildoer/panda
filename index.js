@@ -687,8 +687,9 @@ const STARTUP_DM_TEXT =
     '  «🗑 Убрать трек» и «🎚 Двигать трек» (после выбора появляются «⬆ Выше»/«⬇ Ниже»,\n' +
     '  а номер виден в списке) -- номера те же, что в `/remove`, жмёт тот, у кого права DJ\n' +
     '`/remove number` -- убрать трек, `/move number to` -- переставить его,\n' +
-    '`/jump number` -- прыгнуть к треку, `/clear` -- очистить всю очередь,\n' +
-    '`/clear author:@кто` -- убрать только треки этого человека\n' +
+    '`/jump number` -- прыгнуть к треку, `/clear` -- очистить очередь вместе с\n' +
+    '  играющим треком (дальше тишина), `/clear author:@кто` -- убрать только треки\n' +
+    '  этого человека, вместе с его играющим -- он прерывается, а не доигрывает\n' +
     '  (number/to -- те же номера, что в `/queue`; текущий трек в них не входит)\n' +
     '`/skip` -- следующий • `/stop` -- стоп и забыть очередь совсем\n' +
     '`/pause` / `/resume` -- пауза / продолжить\n' +
@@ -6088,7 +6089,7 @@ const QUEUE_GLUE = 60;
 const QUEUE_HINT_SHORT = '_Действия -- кнопками ниже._';
 const QUEUE_HINT_FULL =
     '_Убрать -- `/remove`, переставить -- `/move` или кнопками ниже, прыгнуть -- `/jump`; ' +
-    'чистить всё -- `/clear`,_\n_а только треки одного человека -- `/clear author:@кто`._';
+    'чистить всё (вместе с играющим треком) -- `/clear`,_\n_а только треки одного человека -- `/clear author:@кто`._';
 
 // Сколько символов остаётся на СПИСОК: лимит минус шапка, «до конца очереди»,
 // подсказка и служебные строки. Считается по живым строкам, поэтому бюджет один и тот
@@ -6257,19 +6258,38 @@ function queueSkip (guildId, who)
         (m.current ? ' -- играю **' + (m.current.title || 'трек') + '**' : '') };
 }
 
+// [v2.26] /clear -- убираем И то, что играет. Раньше текущий трек молча доигрывал,
+// и получалось «ничейно»: очередь пуста, а музыка ещё играет то, что из неё убрали
+// (а длинные сеты так и вовсе приходилось добивать /stop). Теперь чистка -- это чистка:
+// играющий трек снимается сразу, ждущий (после /leave или обрыва) тоже, и состояние
+// в базе стирается -- чтобы после перезапуска ничего из убранного не воскресло.
 function queueClear (guildId, who)
 {
     const m = musicOf (guildId);
-    if (!m.tracks.length) return { ok: false, text: '🈳 Очередь и так пуста -- чистить нечего.' };
+    const playing = m.current ? (m.current.title || 'трек') : '';
+    const waiting = (!m.current && m.seekTrack) ? (m.seekTrack.title || 'трек') : '';
     const n = m.tracks.length;
+    if (!n && !playing && !waiting)
+        return { ok: false, text: '🈳 Очередь и так пуста -- чистить нечего.' };
     m.tracks = [];
+    m.current = null;
+    m.seekTrack = null;
+    m.seekSec = 0;
+    m.pending = false;
+    m.pausedByNobody = false;
+    m.playedToSomeone = false; // очередь стёрта осознанно -- не пишем «доиграна до конца»
+    m.playedMs = 0;
+    m.playingSince = null;
     dropPreload (m);
-    saveMusicState (guildId);
+    m.player.stop (true);     // тишина: играть больше нечего (Idle-хэндлер запустит нечего)
+    clearMusicState (guildId); // и из базы -- чтобы убранное не воскресло после перезапуска
     scheduleVoiceStatus (guildId, true);
     schedulePresence (true);
-    console.log ('[' + (d()) + '] [music] ' + whoText (who) + 'очистил очередь (' + n + ')');
-    return { ok: true, text: '🧹 Очистил очередь (' + n + (n === 1 ? ' трек' : ' треков') + ').' +
-        (m.current ? ' Текущий **' + (m.current.title || 'трек') + '** доиграет -- остановить совсем: `/stop`.' : '') };
+    console.log ('[' + (d()) + '] [music] ' + whoText (who) + 'очистил очередь (' + n + ')' +
+        (playing ? ' и снял играющий трек' : (waiting ? ' и снял ждущий трек' : '')));
+    return { ok: true, text: '🧹 Очистил очередь (' + n + (n === 1 ? ' трек' : ' треков') + ')' +
+        (playing ? ' и снял играющий **' + playing + '** -- тишина.'
+                 : (waiting ? ' (снял и ждущий **' + waiting + '**).' : '.')) };
 }
 
 function queueRemove (guildId, n, who)
@@ -7450,30 +7470,34 @@ client.on ('interactionCreate', async (interaction) =>
             // [v2.25] Очередь музыки тоже хранит данные о человеке (byId/byName, /mydata
             // считает эти треки его данными), а раньше /forget их не трогал -- то есть
             // удалялось меньше, чем бот помнит. Убираем его треки из очереди (тем же
-            // путём, что `/clear author`) и стираем авторство у трека, который играет
-            // или ждёт продолжения: он доканчивается уже как «ничей», а не как его.
+            // путём, что `/clear author`).
+            // [v2.26] И убираем их ЦЕЛИКОМ: если играет (или ждёт) ЕГО трек -- он снимается
+            // и прерывается. «Ничейного» трека быть не должно: раньше в этом случае у него
+            // просто стиралось авторство, и он продолжал играть как чей-то безымянный.
             {
                 const m = musicOf (server);
                 const same = t => t && String (t.byId || '') === String (target.id);
                 const goneQ = (m.tracks || []).filter (same).length;
-                if (goneQ)
+                const playing = same (m.current) ? (m.current.title || 'трек') : '';
+                const waiting = !playing && same (m.seekTrack) ? (m.seekTrack.title || 'трек') : '';
+                if (goneQ || playing || waiting)
                 {
                     m.tracks = m.tracks.filter (t => !same (t));
+                    if (waiting) { m.seekTrack = null; m.seekSec = 0; }
+                    if (playing)
+                    {
+                        m.current = null;
+                        m.playedMs = 0;
+                        m.playingSince = null;
+                        m.player.stop (true); // Idle-хэндлер запустит следующий (если есть)
+                    }
                     dropPreload (m);
                     startPreload (server);
-                    had.push ('очередь музыки (' + goneQ + ' ' + plural (goneQ, 'трек', 'трека', 'треков') + ')');
-                }
-                let deowned = 0;
-                for (const t of [m.current, m.seekTrack])
-                {
-                    if (!same (t)) continue;
-                    t.byId = null; t.byName = ''; deowned++;
-                }
-                if (goneQ || deowned)
-                {
                     saveMusicState (server);
                     scheduleVoiceStatus (server, true);
                     schedulePresence (true);
+                    had.push ('очередь музыки (' + goneQ + ' ' + plural (goneQ, 'трек', 'трека', 'треков') +
+                        (playing ? ' + его играющий трек' : (waiting ? ' + его ждущий трек' : '')) + ')');
                 }
             }
         }
@@ -7749,31 +7773,47 @@ client.on ('interactionCreate', async (interaction) =>
         {
             // [v2.14] /clear author:@кто -- убрать из очереди только ЕГО треки
             // (длинный плейлист часто собирают несколько DJ, а убрать надо одного).
+            // [v2.26] И его треки уходят ЦЕЛИКОМ: если играет его трек -- он прерывается
+            // сразу, а не доигрывается «ничейным»; ждущий (после /leave/обрыва) -- тоже.
             const who = interaction.options.getUser ('author');
             if (who)
             {
-                const gone = m.tracks.filter (t => t.byId === who.id);
-                if (!gone.length)
+                const same = t => t && String (t.byId || '') === String (who.id);
+                const goneQ = m.tracks.filter (same).length;
+                const playing = same (m.current) ? (m.current.title || 'трек') : '';
+                const waiting = !playing && same (m.seekTrack) ? (m.seekTrack.title || 'трек') : '';
+                if (!goneQ && !playing && !waiting)
                     return interaction.reply
                     ({
-                        content: '🈳 В очереди нет треков от ' + u (who.id) + '.' +
+                        content: '🈳 Нет ни треков от ' + u (who.id) + ', ни его играющего. ' +
+                            'Текущий: ' + (m.current ? '**' + (m.current.title || 'трек') + '**' : '_ничего не играет_') + '.' +
                             (m.tracks.length && m.tracks.some (t => !t.byId)
                                 ? ' (у части треков автор не записан -- они добавлены до этой версии и останутся)'
                                 : ''),
                         flags: MessageFlags.Ephemeral,
                     });
-                m.tracks = m.tracks.filter (t => t.byId !== who.id);
+                m.tracks = m.tracks.filter (t => !same (t));
+                if (waiting) { m.seekTrack = null; m.seekSec = 0; }
+                if (playing)
+                {
+                    m.current = null;      // чтобы база не сохранила снятый трек как играющий
+                    m.playedMs = 0;
+                    m.playingSince = null;
+                    m.player.stop (true);  // Idle-хэндлер сразу запустит следующий (если есть)
+                }
                 dropPreload (m);
                 startPreload (guildId);
                 saveMusicState (guildId);
                 scheduleVoiceStatus (guildId, true);
                 schedulePresence (true);
-                console.log ('[' + (d()) + '] [music] убрал из очереди треки ' + who.username + ' (' + gone.length + ')');
+                console.log ('[' + (d()) + '] [music] убрал из очереди треки ' + who.username + ' (' + goneQ + ')' +
+                    (playing ? ' -- и прервал его играющий трек' : (waiting ? ' -- и его ждущий трек' : '')));
                 return interaction.reply
                 (
-                    '🧹 Убрал ' + gone.length + ' ' + plural (gone.length, 'трек', 'трека', 'треков') +
+                    '🧹 Убрал ' + goneQ + ' ' + plural (goneQ, 'трек', 'трека', 'треков') +
                     ' от ' + u (who.id) + ' (в очереди осталось ' + m.tracks.length + ').' +
-                    (m.current ? ' Текущий **' + (m.current.title || 'трек') + '** доиграет.' : '')
+                    (playing ? ' Его **' + playing + '** прервал -- играю следующий.' : '') +
+                    (waiting ? ' Ждущий **' + waiting + '** тоже убран.' : '')
                 );
             }
             // [v2.15] Очистка всей очереди -- общая логика с кнопкой «🧹 Очистить».
