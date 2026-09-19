@@ -5,6 +5,26 @@
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
+// CHANGELOG v2.37 (кэш аудио на диске -- YouTube больше не участвует в проигрывании):
+//   * ТРЕК ЖИВЁТ ФАЙЛОМ. Раньше звук шёл потоком прямо из yt-dlp в Discord, то есть
+//     YouTube участвовал в проигрывании каждую секунду: его сбои (403, Broken pipe,
+//     оборванный сет) слышали слушатели, а перемотка и продолжение после перезапуска
+//     каждый раз заново просили звук у YouTube.
+//   * ГИБРИД (так выбрал владелец): короткий трек (до MUSIC.cache_full_max_min минут)
+//     скачивается ЦЕЛИКОМ и играет файлом -- перемотка мгновенная и точная, YouTube не
+//     нужен; предзагрузка следующего трека -- это его скачивание, то есть паузы между
+//     песнями нет. Длинный сет и прямой эфир играют сразу потоком, но тот же звук
+//     ПИШЕТСЯ на диск: доиграл до конца -- файл готов, и со следующего раза трек идёт
+//     с диска (у прямого эфира позиции нет -- его не кэшируем).
+//   * МЕСТО ОГРАНИЧЕНО: MUSIC.cache_max_mb (по умолчанию 4096 МБ), при переполнении
+//     уходят самые старые файлы (играющий и уже готовый следующий -- не трогаются).
+//     Недописанные хвосты после перезапуска убираются сами. Папка (MUSIC.cache_dir,
+//     по умолчанию music_cache рядом с ботом) удаляется в любой момент -- бот скачает
+//     заново; в базе про кэш ничего нет. Выключить совсем: MUSIC.cache = false.
+//   * В ЛОГЕ ЭТО ВИДНО: 'кэш аудио: ВКЛЮЧЁН -- <папка>', 'качаю на диск: X',
+//     'сохранил на диск: X (N МБ)', 'играю: X (с диска)', 'кэш переполнен -- убрал ...'.
+//     Кэш не может «сломать» музыку: не скачалось / папка недоступна -- играем потоком,
+//     как раньше (в лог идёт причина).
 // CHANGELOG v2.36 (переход вместо чистки, авторские блоки, перестановка без счёта кликов):
 //   * /JUMP -- ЭТО ПЕРЕХОД, А НЕ ЧИСТКА. Раньше «прыжок» молча выбрасывал всё до
 //     выбранного трека (и в хелпе так и было написано -- владелец: «а выбрасывать или
@@ -6680,6 +6700,270 @@ function probeNormalize ()
     });
 }
 
+// ============================================================================
+// [v2.37] КЭШ АУДИО НА ДИСКЕ (MUSIC.cache, по умолчанию включено).
+// ЗАЧЕМ: раньше звук шёл потоком прямо из yt-dlp в Discord, то есть YouTube участвовал
+// в проигрывании каждую секунду. Любой его сбой (403, Broken pipe, оборвавшийся сет)
+// слышали слушатели, а перемотка и продолжение после перезапуска каждый раз заново
+// просили звук у YouTube. Теперь трек живёт на диске.
+// КАК (гибрид -- так выбрал владелец):
+//   * короткий трек (до MUSIC.cache_full_max_min минут) скачивается ЦЕЛИКОМ и играет
+//     уже файл: перемотка мгновенная и точная, YouTube во время игры не нужен. Обычно
+//     этого даже не замечаешь: пока играет текущий трек, следующий уже скачивается
+//     (предзагрузка), то есть паузы между песнями нет;
+//   * длинный сет и любой прямой эфир играют сразу потоком, но параллельно ПИШУТСЯ на
+//     диск: доиграл до конца -- файл готов, и со следующего раза (перемотка,
+//     восстановление после перезапуска, повтор) трек берётся с диска.
+//   * место ограничено MUSIC.cache_max_mb: старые файлы удаляются сами (текущий и
+//     предзагруженный не трогаются). Папку кэша можно удалить целиком в любой момент --
+//     бот скачает заново; в базе про кэш ничего нет.
+// Файлы: music_cache/<sha1 адреса>.m4a; незавершённое лежит рядом с пометкой '.dl.' и
+// готовым никогда не считается.
+// ============================================================================
+const pathMod = require ('path');
+const MUSIC_CACHE = MUSIC_CFG.cache !== false;
+const MUSIC_CACHE_DIR = pathMod.isAbsolute (String (MUSIC_CFG.cache_dir || 'music_cache'))
+    ? String (MUSIC_CFG.cache_dir)
+    : pathMod.join (__dirname, String (MUSIC_CFG.cache_dir || 'music_cache'));
+// Значения по умолчанию важны: в конфиге этих ключей может не быть вообще (так и есть
+// у боевого бота), а кэш при этом должен работать -- 4 ГБ и треки до 15 минут.
+const MUSIC_CACHE_MAX_MB = MUSIC_CFG.cache_max_mb === undefined || MUSIC_CFG.cache_max_mb === null
+    ? 4096
+    : Math.max (0, Math.round (Number (MUSIC_CFG.cache_max_mb) || 0));
+const MUSIC_CACHE_FULL_MAX = (MUSIC_CFG.cache_full_max_min === undefined || MUSIC_CFG.cache_full_max_min === null
+    ? 15
+    : Math.max (0, Math.round (Number (MUSIC_CFG.cache_full_max_min) || 0))) * 60;
+// Одна строка при старте (как остальные отчёты): видно, включён ли кэш и куда он пишет.
+if (MUSIC_CACHE)
+    console.log ('[' + (d()) + '] [music] кэш аудио: ВКЛЮЧЁН -- ' + MUSIC_CACHE_DIR + ' (' +
+        (MUSIC_CACHE_MAX_MB ? 'лимит ' + MUSIC_CACHE_MAX_MB + ' МБ, старое удаляется само' : 'без лимита места') + ')' +
+        (MUSIC_CACHE_FULL_MAX ? '; треки до ' + Math.round (MUSIC_CACHE_FULL_MAX / 60) +
+            ' мин качаю на диск до старта, длинные сеты пишу во время игры' : ''));
+else
+    console.log ('[' + (d()) + '] [music] кэш аудио: выключен (MUSIC.cache: false) -- звук идёт потоком, как раньше');
+let cacheDirOk = false;
+function cacheDirReady ()
+{
+    if (cacheDirOk) return true;
+    try
+    {
+        fsMod.mkdirSync (MUSIC_CACHE_DIR, { recursive: true });
+        cacheDirOk = true;
+        cacheCleanStale (); // хвосты прошлого запуска уже никто не докачает
+    }
+    catch (e) { console.error ('[' + (d()) + '] [music] папка кэша недоступна (' + MUSIC_CACHE_DIR + '): ' +
+        oneLine (e.message) + ' -- играю потоком, как раньше'); }
+    return cacheDirOk;
+}
+// Недокачанные файлы ('.dl.') после перезапуска бессмысленны: тот поток уже мёртв.
+function cacheCleanStale ()
+{
+    let names = [];
+    let n = 0;
+    try { names = fsMod.readdirSync (MUSIC_CACHE_DIR); } catch { return 0; }
+    for (const f of names)
+        if (f.includes ('.dl.'))
+            try { fsMod.unlinkSync (pathMod.join (MUSIC_CACHE_DIR, f)); n++; } catch {}
+    if (n) console.log ('[' + (d()) + '] [music] кэш: убрал ' + n + ' недокачанных файлов прошлого запуска');
+    return n;
+}
+function fmtMb (bytes) { return Math.max (1, Math.round (Number (bytes || 0) / 1048576)) + ' МБ'; }
+// Ключ файла -- от АДРЕСА (не от названия): тот же трек, добавленный заново, найдёт
+// свою готовую запись; а переименованное видео не создаст вторую копию.
+function cacheKeyOf (track)
+{
+    const src = String ((track && (track.url || track.streamUrl)) || '');
+    return crypto.createHash ('sha1').update (src).digest ('hex').slice (0, 16);
+}
+// Готовый файл этого трека (или null). Незавершённые ('.dl.') и пустышки не считаются.
+function cacheFind (track)
+{
+    if (!MUSIC_CACHE || !track || track.isLive || !cacheDirReady ()) return null;
+    const base = cacheKeyOf (track) + '.';
+    let names = [];
+    try { names = fsMod.readdirSync (MUSIC_CACHE_DIR); } catch { return null; }
+    for (const n of names)
+    {
+        if (!n.startsWith (base) || n.includes ('.dl.')) continue;
+        const p = pathMod.join (MUSIC_CACHE_DIR, n);
+        try { if (fsMod.statSync (p).size > 8192) return p; } catch {}
+    }
+    return null;
+}
+function cacheDropParts (key)
+{
+    let names = [];
+    try { names = fsMod.readdirSync (MUSIC_CACHE_DIR); } catch { return; }
+    for (const n of names)
+        if (n.startsWith (key + '.dl.'))
+            try { fsMod.unlinkSync (pathMod.join (MUSIC_CACHE_DIR, n)); } catch {}
+}
+// Скачанный кусок становится готовым файлом: убираем пометку '.dl.' из имени.
+function cachePromoteParts (key, track)
+{
+    let names = [];
+    try { names = fsMod.readdirSync (MUSIC_CACHE_DIR); } catch { return null; }
+    let file = null, size = 0;
+    for (const n of names)
+    {
+        if (!n.startsWith (key + '.dl.')) continue;
+        const src = pathMod.join (MUSIC_CACHE_DIR, n);
+        const dst = pathMod.join (MUSIC_CACHE_DIR, n.replace ('.dl.', '.'));
+        try
+        {
+            const s = fsMod.statSync (src).size;
+            if (s <= 8192) { fsMod.unlinkSync (src); continue; }
+            fsMod.renameSync (src, dst);
+            if (s > size) { size = s; file = dst; }
+        }
+        catch {}
+    }
+    if (file)
+        console.log ('[' + (d()) + '] [music] сохранил на диск: ' + (track && track.title ? track.title : 'трек') + ' (' + fmtMb (size) + ')');
+    return file;
+}
+// СКАЧАТЬ ТРЕК ЦЕЛИКОМ. holder.stop() -- прервать (предзагрузку выбросили).
+async function cacheDownload (track, holder = {})
+{
+    cacheDirReady ();
+    const viaProxy = !proxyStreamDead && await pingProxy ();
+    const key = cacheKeyOf (track);
+    cacheDropParts (key); // не докачиваем старое -- качаем заново
+    const proc = ytdlp.exec
+    (
+        track.url,
+        {
+            o: pathMod.join (MUSIC_CACHE_DIR, key + '.dl.%(ext)s'),
+            noPart: true,
+            quiet: true,
+            noWarnings: true,
+            noPlaylist: true,
+            ...(viaProxy ? { proxy: MUSIC_PROXY, socketTimeout: 10 } : {}),
+            f: 'bestaudio[acodec!=none][ext=m4a]/bestaudio[acodec!=none]/bestaudio/best',
+            retries: 3,
+        }
+    );
+    holder.stop = () =>
+    {
+        holder.cancelled = true;
+        try { proc.weKilled = true; } catch {}
+        try { if (typeof proc.kill === 'function') proc.kill (); } catch {}
+        cacheDropParts (key);
+    };
+    try { await proc; }
+    catch (e)
+    {
+        cacheDropParts (key);
+        if (holder.cancelled) return null;
+        throw e;
+    }
+    return cachePromoteParts (key, track);
+}
+// ПИСАТЬ ПОТОК НА ДИСК ПО ХОДУ ИГРЫ (длинные сеты): тот же звук, что уходит в Discord,
+// дублируется в файл. Доиграло до конца -- файл готов; прервали -- недописанное убираем.
+function cacheTeeStart (track)
+{
+    if (!MUSIC_CACHE || !track || track.isLive || cacheFind (track) || !cacheDirReady ()) return null;
+    const key = cacheKeyOf (track);
+    const part = pathMod.join (MUSIC_CACHE_DIR, key + '.dl.stream');
+    let ws;
+    try { ws = fsMod.createWriteStream (part); } catch { return null; }
+    ws.on ('error', () => { ws.__dead = true; });
+    return {
+        key, part, ws,
+        finalize ()
+        {
+            try
+            {
+                if (ws.__dead) { try { fsMod.unlinkSync (part); } catch {} return null; }
+                const size = fsMod.existsSync (part) ? fsMod.statSync (part).size : 0;
+                if (size <= 8192) { try { fsMod.unlinkSync (part); } catch {} return null; }
+                const file = pathMod.join (MUSIC_CACHE_DIR, key + '.m4a');
+                fsMod.renameSync (part, file);
+                console.log ('[' + (d()) + '] [music] сохранил на диск: ' + (track.title || 'трек') + ' (' + fmtMb (size) + ')');
+                pruneCache ([file]);
+                return file;
+            }
+            catch { return null; }
+        },
+        abort ()
+        {
+            if (this.__done) return;
+            this.__done = true;
+            try { ws.destroy (); } catch {}
+            // [v2.37] Файл надо убрать ОБЯЗАТЕЛЬНО, а Windows не отдаёт занятый файл сразу:
+            // поэтому пробуем несколько раз (и сразу, и после закрытия потока). Иначе
+            // такие недописанные хвосты копились бы за сессию (полный пример -- предзагрузка
+            // удалённого видео: поток умер, а файл остался нулевого размера).
+            const drop = () =>
+            {
+                try { if (!fsMod.existsSync (part)) return true; fsMod.unlinkSync (part); return true; }
+                catch { return false; }
+            };
+            ws.once ('close', drop);
+            let tries = 0;
+            const again = setInterval (() => { if (drop () || ++tries >= 8) clearInterval (again); }, 400);
+        },
+    };
+}
+// ЛИМИТ МЕСТА: больше cache_max_mb -- убираем самые старые файлы (текущий и
+// предзагруженный не трогаем). Недописанное чистится в первую очередь.
+function pruneCache (keepPaths = [])
+{
+    if (!MUSIC_CACHE_MAX_MB) return;
+    const limit = MUSIC_CACHE_MAX_MB * 1048576;
+    let names = [];
+    try { names = fsMod.readdirSync (MUSIC_CACHE_DIR); } catch { return; }
+    const keep = new Set ((keepPaths || []).filter (Boolean).map (p => pathMod.basename (p)));
+    const items = [];
+    let total = 0;
+    for (const n of names)
+    {
+        const p = pathMod.join (MUSIC_CACHE_DIR, n);
+        try { const st = fsMod.statSync (p); if (!st.isFile ()) continue; items.push ({ n, p, size: st.size, at: st.mtimeMs }); total += st.size; }
+        catch {}
+    }
+    if (total <= limit) return;
+    items.sort ((a, b) => a.at - b.at); // старые -- первыми
+    let freed = 0;
+    for (const it of items)
+    {
+        if (total - freed <= limit) break;
+        if (keep.has (it.n)) continue;
+        try { fsMod.unlinkSync (it.p); freed += it.size;
+            console.log ('[' + (d()) + '] [music] кэш переполнен -- убрал старый файл (' + fmtMb (it.size) + ')'); } catch {}
+    }
+}
+// ИГРАТЬ ФАЙЛ С ДИСКА: наш ffmpeg читает файл (сдвиг -- ДО входа, поэтому мгновенный и
+// точный), дальше всё как обычно (выравнивание громкости -> PCM для Discord).
+function openCachedTrack (track, file, seekSec = 0)
+{
+    if (!ffmpegPath) return null; // без ffmpeg файл не отдать
+    const args = ['-hide_banner', '-loglevel', 'error'];
+    const cut = (!track.isLive && seekSec >= 1) ? Math.max (0, Math.floor (seekSec)) : 0;
+    if (cut) args.push ('-ss', String (cut));
+    args.push ('-i', file);
+    if (musicNormalizeReady) args.push ('-af', MUSIC_NORMALIZE_FILTER);
+    args.push ('-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1');
+    let ff;
+    try { ff = spawn (ffmpegPath, args, { windowsHide: true }); }
+    catch (e) { console.error ('[music] с диска не заиграть: ' + oneLine (e.message)); return null; }
+    ff.stdin.on ('error', () => {});
+    ff.stdout.on ('error', () => {});
+    ff.on ('error', () => {});
+    let err = '';
+    ff.stderr.on ('data', ch => { err += String (ch); });
+    ff.on ('close', code =>
+    {
+        if (code === 0 || code === null || ff.weKilled) return;
+        console.error ('[' + (d()) + '] [music] играю с диска, но ffmpeg оборвался: код ' + exitCodeText (code) +
+            (err.trim () ? ' -- ' + ytDlpErr ({ stderr: err }, 160) : ''));
+    });
+    const resource = createAudioResource (ff.stdout, { inputType: StreamType.Raw, inlineVolume: true });
+    if (resource.volume) resource.volume.setVolume (MUSIC_VOLUME);
+    return { resource, viaProxy: false, source: null, proc: null, ff, fromCache: true, seeked: true };
+}
+
 // Аудио-ресурс: yt-dlp стримит в stdout -> ffmpeg ресемплирует в Opus для Discord:
 // [v2.2.2] стрим по той же стратегии, что и метаданные: прокси -> DIRECT:
 // [v2.25] seekMode -- КАК продолжать с места:
@@ -6692,6 +6976,14 @@ function probeNormalize ()
 //   'none' -- с начала.
 async function createTrackStream (track, seekSec = 0, seekMode = 'sections')
 {
+    // [v2.37] ФАЙЛ УЖЕ НА ДИСКЕ -- сеть не нужна ВООБЩЕ: ни yt-dlp, ни прокси, ни
+    // ожидания. Сдвиг в файле точный и мгновенный (ffmpeg -ss до входа).
+    const _cached = MUSIC_CACHE ? cacheFind (track) : null;
+    if (_cached)
+    {
+        const r = openCachedTrack (track, _cached, seekSec);
+        if (r) return r; // не вышло -- играем как раньше, потоком
+    }
     let viaProxy = !proxyStreamDead && await pingProxy ();
     // [v2.10] продолжение с места после перезапуска: yt-dlp отдаёт поток с N-й секунды
     // (--download-sections, нужен ffmpeg). Если так не умеет -- процесс падает сразу,
@@ -6782,6 +7074,20 @@ async function createTrackStream (track, seekSec = 0, seekMode = 'sections')
             raw = true;
         }
     }
+    // [v2.37] ДЛИННЫЙ ТРЕК: играем сразу потоком, но тот же звук пишем на диск -- если он
+    // доиграет до конца, файл останется готовым и со следующего раза трек играет с диска.
+    // Только при игре С НАЧАЛА: продолжение с места дало бы обрезанный файл.
+    let tee = null;
+    if (!seek && !seekInFfmpeg && !track.isLive && MUSIC_CACHE)
+    {
+        tee = cacheTeeStart (track);
+        if (tee)
+        {
+            ytdlpStream.stdout.pipe (tee.ws);
+            ytdlpStream.then (() => { if (ytdlpStream.weKilled) tee.abort (); else tee.finalize (); },
+                              () => tee.abort ());
+        }
+    }
     const resource = createAudioResource
     (
         input,
@@ -6798,7 +7104,7 @@ async function createTrackStream (track, seekSec = 0, seekMode = 'sections')
     // (иначе непригодившийся трек оставил бы висеть yt-dlp, ждущий читателя в пайпе).
     // [v2.25] seeked -- сработал ли ЗАПРОШЕННЫЙ сдвиг (playNext по этому решает,
     // пробовать резервный путь или брать трек с начала):
-    return { resource, viaProxy, source: ytdlpStream.stdout, proc: ytdlpStream, ff: ff,
+    return { resource, viaProxy, source: ytdlpStream.stdout, proc: ytdlpStream, ff: ff, tee: tee,
              seeked: (seekMode === 'sections' && seek) || (seekMode === 'ffseek' && !!ff) };
 }
 
@@ -6974,8 +7280,10 @@ async function playNext (guildId)
     // ролик уже отыграл». Теперь всё в строке «играю»: это просто пометка, что трек
     // не искали заново, а взяли готовый поток (заготовка ждала, пока играл прошлый).
     const fromPreload = !!(m.preload && m.preload.track === track);
+    // [v2.37] файл уже на диске? тогда так и пишем: видно, что трек играет без YouTube
+    const fromDisk = !!(MUSIC_CACHE && !track.isLive && cacheFind (track));
     console.log ('[' + (d()) + '] [music] играю: ' + (track.title || track.url || 'трек') +
-        (fromPreload ? ' (из предзагрузки, без паузы)' : '')); // [v2.4] активное событие в лог
+        (fromDisk ? ' (с диска)' : (fromPreload ? ' (из предзагрузки, без паузы)' : ''))); // [v2.4] активное событие в лог
     scheduleVoiceStatus (guildId, true); // [v2.7] сразу показать новый трек и очередь
     schedulePresence (true);             // [v2.8] «слушает» этот трек
     try
@@ -6993,7 +7301,7 @@ async function playNext (guildId)
             // [v2.9] этот трек уже готовился пока играл предыдущий -- берём готовое
             m.preload = null; // вынули: теперь это обычный играющий ресурс, не предзагрузка
             const r = await p.promise; // в бою уже готова (песня играла минуты)
-            if (r) { resource = r.resource; viaProxy = r.viaProxy; handle = { resource: r.resource, source: p.source, proc: p.proc, ff: p.ff }; }
+            if (r) { resource = r.resource; viaProxy = r.viaProxy; handle = { resource: r.resource, source: p.source, proc: p.proc, ff: p.ff, tee: p.tee }; }
         }
         else
         {
@@ -7008,6 +7316,30 @@ async function playNext (guildId)
             // до конца трека оставалось 15 сек): не вышло -- тогда берём с начала.
             // [v2.12.2] если этот трек когда-то был «прерван» и ждёт в очереди не
             // первым (/move), его позиция приехала вместе с ним (track.seek)
+            // [v2.37] КОРОТКИЙ ТРЕК СНАЧАЛА НА ДИСК. Он небольшой (песня -- единицы
+            // мегабайт), качается за считанные секунды, зато дальше YouTube в проигрывании
+            // не участвует вообще: ни обрывов по дороге, ни «403», а перемотка и продолжение
+            // после перезапуска работают по файлу -- сразу и точно. Обычно этого шага даже не
+            // видно: трек уже качается предзагрузкой, пока играет предыдущий. Не получилось --
+            // играем потоком, как раньше (музыка из-за кэша встать не должна).
+            if (MUSIC_CACHE && !track.isLive && Number (track.duration) > 0 &&
+                Number (track.duration) <= MUSIC_CACHE_FULL_MAX && !cacheFind (track))
+            {
+                try
+                {
+                    console.log ('[' + (d()) + '] [music] качаю на диск: ' + (track.title || 'трек'));
+                    await cacheDownload (track);
+                }
+                catch (e)
+                {
+                    if (isGoneError (e))
+                        console.error ('[' + (d()) + '] [music] видео больше нет на YouTube (' + (track.title || 'трек') +
+                            ') -- запускать поток бессмысленно: ' + ytDlpErr (e, 120));
+                    else
+                        console.error ('[' + (d()) + '] [music] на диск не легло (' + (track.title || 'трек') +
+                            '): ' + ytDlpErr (e, 150) + ' -- беру потоком');
+                }
+            }
             let seekSec = (m.seekTrack === track) ? (m.seekSec || 0) : (track.seek || 0);
             if (track.isLive) seekSec = 0; // у прямого эфира позиции нет
             // [v2.25] продолжение с места: быстрый путь (--download-sections) -> резервный
@@ -7025,7 +7357,9 @@ async function playNext (guildId)
             const _noSec = (m.seekNoSections || []).includes (track.url); // уже выяснили: не умеет
             const _trySections = seekSec >= 1 && seekSec > SEEK_FFSEEK_MAX && !_noSec;
             let opened = await createTrackStream (track, seekSec, _trySections ? 'sections' : (seekSec >= 1 ? 'ffseek' : 'none'));
-            if (_trySections)
+            // [v2.37] с диска сдвиг делается по файлу и уже сработал -- никаких проверок
+            // «а отдал ли поток байты» здесь не нужно (иначе готовый файл выбрасывался бы зря)
+            if (_trySections && !opened.fromCache)
             {
                 const _ok = opened.seeked && !(await failedFast (opened.proc)) &&
                     await streamFirstData (opened.source, opened.proc, SEEK_SECTIONS_WAIT_MS);
@@ -7140,7 +7474,10 @@ function dropPreload (m)
     if (!p) return;
     m.preload = null;
     p.cancelled = true;
-    killStream ({ resource: p.resource, source: p.source, proc: p.proc });
+    // [v2.37] если предзагрузка -- это скачивание на диск, его тоже надо прервать
+    // (иначе yt-dlp до качает файл, который уже никому не нужен)
+    try { if (p.dlStop) p.dlStop (); } catch {}
+    killStream ({ resource: p.resource, source: p.source, proc: p.proc, tee: p.tee });
 }
 
 // Глушим поток трека целиком: сам ресурс, поток yt-dlp и его процесс (а также наш
@@ -7155,6 +7492,7 @@ function killStream (r)
     try { if (r.ff) r.ff.weKilled = true; } catch {}
     try { if (r.resource) r.resource.playStream.destroy (); } catch {}
     try { if (r.source) r.source.destroy (); } catch {}
+    try { if (r.tee) r.tee.abort (); } catch {} // [v2.37] недописанный файл кэша -- в корзину
     try { if (r.proc && typeof r.proc.kill === 'function') r.proc.kill (); } catch {}
     try { if (r.ff) { r.ff.stdin.destroy (); r.ff.stdout.destroy (); r.ff.kill (); } } catch {}
 }
@@ -7167,6 +7505,46 @@ function startPreload (guildId)
     if (!next) { dropPreload (m); return; }
     if (m.preload && m.preload.track === next) return; // этот уже готовим
     dropPreload (m);                                   // готовили не то -- выкидываем
+    // [v2.37] КОРОТКИЙ ТРЕК ГОТОВИМ СКАЧИВАНИЕМ НА ДИСК: пока играет текущий, следующий
+    // уже лежит файлом -- между песнями нет не только паузы, но и ни одного запроса к
+    // YouTube (а перемотка и восстановление потом вообще мгновенные).
+    if (MUSIC_CACHE && !next.isLive && next.duration > 0 && next.duration <= MUSIC_CACHE_FULL_MAX && !cacheFind (next))
+    {
+        const cp = { track: next, resource: null, viaProxy: false, cancelled: false, cacheOnly: true };
+        const holder = {};
+        cp.dlStop = () => holder.stop && holder.stop ();
+        m.preload = cp;
+        cp.promise = cacheDownload (next, holder).then
+        (
+            file =>
+            {
+                if (cp.cancelled) return null;
+                if (!file)
+                {
+                    console.error ('[music] предзагрузка не удалась (' + (next.title || 'трек') + '): файл на диск не лёг');
+                    return null;
+                }
+                console.log ('[' + (d()) + '] [music] предзагрузка готова (уже на диске): ' + (next.title || 'трек'));
+                return { resource: null, viaProxy: false, fromCache: true };
+            },
+            e =>
+            {
+                cp.cancelled = true;
+                // [v2.35] видео больше нет (удалено/закрыто) -- помним это на треке, чтобы
+                // очередь не тратила на него четыре попытки, а убрала сразу
+                if (isGoneError (e))
+                {
+                    next.gone = true;
+                    console.error ('[' + (d()) + '] [music] видео больше нет на YouTube (' + (next.title || 'трек') +
+                        ') -- уберу его из очереди, когда дойдёт; очередь не трогаю: ' + ytDlpErr (e, 120));
+                    return null;
+                }
+                console.error ('[music] предзагрузка не удалась (' + (next.title || 'трек') + '): ' + ytDlpErr (e));
+                return null;
+            }
+        );
+        return;
+    }
     const p = { track: next, resource: null, viaProxy: false, cancelled: false };
     m.preload = p;
     p.promise = createTrackStream (next).then
@@ -7183,6 +7561,7 @@ function startPreload (guildId)
             p.source = r.source;
             p.proc = r.proc;
             p.ff = r.ff;
+            p.tee = r.tee; // [v2.37] запись на диск живёт вместе с заготовкой
             // [v2.35] ГЛАВНОЕ ПРО УДАЛЁННОЕ ВИДЕО: поток заготовки создан, а падает он
             // П О З Ж Е. Промис yt-dlp внутри createTrackStream гасится своим catch-ем,
             // поэтому outer-промис (этот .then) об ошибке не узнаёт -- без этой проверки
