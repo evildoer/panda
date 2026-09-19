@@ -5,6 +5,27 @@
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
+// CHANGELOG v2.34 (старт без слушателей и честный счёт людей в канале):
+//   * ПОСЛЕ ПЕРЕЗАПУСКА БОТ ЗАХОДИТ И МОЛЧИТ, ЕСЛИ ЛЮДЕЙ НЕТ. Раньше он входил в
+//     канал и СРАЗУ начинал играть («подключился -> возобновляю очередь -> играю»),
+//     а пауза «нет слушателей» ставилась только после первого трека: то есть yt-dlp
+//     уже качал музыку в пустую комнату. Теперь слушатели проверяются ДО старта:
+//     очередь и МЕСТО В ТРЕКЕ остаются как были, а игра начинается с того же места,
+//     как только кто-то зайдёт в канал (или по /join).
+//   * СЛУШАТЕЛЕЙ СЧИТАЕМ ПО ФАКТУ (humansInChannelChecked): у чужого бота, зашедшего
+//     в канал до нас, discord.js может не приложить member к голосовому состоянию, и
+//     такой бот считался ЖИВЫМ слушателем -- это второй источник «играем в пустоту».
+//     Теперь неизвестное состояние спрашивается у Discord (REST); не ответил --
+//     считаем человеком (лучше заиграть живому слушателю, чем молчать).
+//   * startRestored -- вторая линия обороны: проверка слушателей стоит прямо перед
+//     playNext, а не только у вызывающих, поэтому любой путь восстановления (в том
+//     числе будущий) не сможет заиграть в пустоту.
+//   * [FIX] ЖДУЩАЯ ОЧЕРЕДЬ БЕЗ «ТЕКУЩЕГО» ТЕПЕРЬ ТОЖЕ СТАРТУЕТ. Ветка «человек зашёл --
+//     начинаю сохранённую очередь» требовала, чтобы сохранился ждущий трек: если
+//     состояние записалось между треками (m.current пуст), очередь ждала вечно --
+//     комната полна, а бот молчит. Теперь достаточно самой очереди.
+//   * ПРОФИЛЬ ГОВОРИТ ПРАВДУ: пока очередь ждёт слушателя, видно '⏸ «Канал» — жду
+//     слушателя', а не '🎧 «Канал»', как будто музыка просто идёт.
 // CHANGELOG v2.33 (автор у каждого трека, права на очередь, /seek, node . help):
 //   * АВТОР ВИДЕН У КАЖДОГО ТРЕКА. В v2.31 ник у подряд идущих треков одного
 //     человека писался один раз (экономили место) -- при листании длинного плейлиста
@@ -7020,6 +7041,22 @@ function fmtAgo (ms)
     return s + ' сек';
 }
 
+// [v2.34] БОТ ЛИ ЭТО ГОЛОСОВОЕ СОСТОЯНИЕ? Раньше признаком было только
+// `vs.member.user.bot`, но member приходит не всегда: у чужого бота, зашедшего в
+// канал до нас, член сервера может быть не приложен (частичное состояние, кэш
+// участников ещё не догрузился). Тогда ЧУЖОЙ БОТ считался живым слушателем -- и бот
+// «играл в пустую комнату», будучи уверенным, что его слушают. Теперь смотрим и кэш
+// участников, и кэш пользователей; не выяснили -- считаем человеком (лучше заиграть
+// живому слушателю, чем молчать из-за неизвестного состояния).
+function voiceIsBot (guild, vs)
+{
+    if (vs.member && vs.member.user) return !!vs.member.user.bot;
+    const mem = guild.members.cache.get (vs.id);
+    if (mem && mem.user) return !!mem.user.bot;
+    const usr = client.users.cache.get (vs.id);
+    return usr ? !!usr.bot : false;
+}
+
 // Сколько ЛЮДЕЙ в голосовом канале (боты и сам бот не считаются). Считаем по кэшу
 // голосовых состояний: channel.members без интента GuildMembers пуст (в коде уже
 // есть такое место -- tempSweep).
@@ -7030,8 +7067,30 @@ function humansInChannel (guildId, channelId)
     const selfId = client.user ? client.user.id : null; // до ready client.user может быть null
     let n = 0;
     for (const vs of guild.voiceStates.cache.values ())
-        if (vs.channelId === channelId && vs.id !== selfId && !(vs.member && vs.member.user.bot))
-            n++;
+        if (vs.channelId === channelId && vs.id !== selfId && !voiceIsBot (guild, vs)) n++;
+    return n;
+}
+
+// [v2.34] То же, но без догадок -- для СТАРТА бота. Здесь цена ошибки высока: решив
+// «есть слушатель», бот запускает yt-dlp и играет в пустую комнату, а решив «никого» --
+// молчит, когда человек сидит и ждёт музыку. Поэтому по каждому непонятному состоянию
+// спрашиваем у Discord (REST); не ответил -- считаем живым слушателем.
+async function humansInChannelChecked (guildId, channelId)
+{
+    const guild = client.guilds.cache.get (guildId);
+    if (!guild || !channelId) return 0;
+    const selfId = client.user ? client.user.id : null;
+    let n = 0;
+    for (const vs of guild.voiceStates.cache.values ())
+    {
+        if (vs.channelId !== channelId || vs.id === selfId) continue;
+        if (vs.member && vs.member.user) { if (!vs.member.user.bot) n++; continue; }
+        const mem = guild.members.cache.get (vs.id) ||
+            (typeof guild.members.fetch === 'function'
+                ? await guild.members.fetch (vs.id).catch (() => null) : null);
+        if (mem && mem.user) { if (!mem.user.bot) n++; continue; }
+        n++; // выяснить не удалось -- пусть лучше играет
+    }
     return n;
 }
 
@@ -8251,8 +8310,11 @@ function queueHeadText (m)
             byLabel (m.current) +
             (m.pausedByNobody ? ' _(пауза: нет слушателей)_' : '');
     }
+    // [v2.34] Бот может уже сидеть в канале и просто ждать человека (после перезапуска
+    // он заходит и молчит) -- тогда достаточно зайти в канал, /join не обязателен.
     if (m.pending && m.tracks.length)
-        return '⏸ Музыка ждёт слушателя -- позови `/join` (очередь помнится)';
+        return '⏸ Музыка ждёт слушателя -- зайди в голосовой канал, и я начну с того же места' +
+            (m.connection ? '' : ' (или позови `/join`)');
     return '🎵 **Сейчас:** —';
 }
 
@@ -8338,10 +8400,14 @@ async function resumeMusic (server)
         if (vch)
         {
             joinVoice (server, vch, guild, 'вернулся туда, где сидел до перезапуска');
+            // [v2.34] Слушателей на старте считаем БЕЗ ДОГАДОК (humansInChannelChecked):
+            // от этого ответа зависит, играть или молчать, а чужой бот, чей member не
+            // приложен к голосовому состоянию, раньше считался ЖИВЫМ слушателем.
+            const _h = await humansInChannelChecked (server, vch.id);
             if (m.connection)
                 console.log ('[' + (d()) + '] [music] возвращаюсь в «' + vch.name +
                     '» -- бот сидел там до перезапуска' +
-                    (humansInChannel (server, vch.id) ? '' : ' (пока никого в канале)'));
+                    (_h ? '' : ' (живых слушателей нет)'));
         }
         // --- 2) ОЧЕРЕДЬ с прошлого запуска ---
         let saved = await db (server, 'musicState', 'queue');
@@ -8389,10 +8455,21 @@ async function resumeMusic (server)
             console.log ('[' + (d()) + '] [music] канала из прошлого запуска нет -- очередь ждёт /join: ' + where);
             return;
         }
-        if (!humansInChannel (server, ch.id))
+        // [v2.34] НЕ ИГРАТЬ В ПУСТУЮ КОМНАТУ. Раньше здесь стояла быстрая проверка по
+        // кэшу (humansInChannel), и на старте она могла ошибиться в обе стороны: чужой
+        // бот без member считался слушателем (и yt-dlp запускался в тишину), а
+        // недогруженные состояния -- людьми. Теперь спрашиваем по-настоящему; не
+        // ответил Discord -- считаем, что человек есть (лучше заиграть, чем промолчать).
+        if (!await humansInChannelChecked (server, ch.id))
         {
-            // в канал мы уже могли зайти (присутствие) -- тогда просто ждём человека
-            console.log ('[' + (d()) + '] [music] в «' + ch.name + '» пока никого -- очередь ждёт слушателя: ' + where);
+            // В канал мы уже зашли (присутствие выше) -- сидим и молчим, пока кто-то не
+            // войдёт: очередь и МЕСТО В ТРЕКЕ остаются как были (m.seekTrack/m.seekSec).
+            console.log ('[' + (d()) + '] [music] зашёл в «' + ch.name + '» и МОЛЧУ: живых слушателей нет, ' +
+                'играть не для кого -- очередь и место помню (' + where + '); начну, как только кто-то войдёт ' +
+                '(или /join, когда надо)');
+            scheduleVoiceStatus (server, true); // статус/присутствие отражают «жду слушателя»
+            schedulePresence (true);
+            saveMusicState (server); // запись остаётся с той же позицией (elapsed из seekSec)
             return;
         }
         startRestored (server, ch, guild);
@@ -8401,23 +8478,38 @@ async function resumeMusic (server)
 }
 
 // Начать играть «отложенную» (сохранённую) очередь в указанном канале:
+// [v2.34] ГЛАВНОЕ ПРАВИЛО ЗДЕСЬ: НЕ ИГРАТЬ В ПУСТУЮ КОМНАТУ. Проверка слушателей
+// стоит ПОСЛЕДНЕЙ ЛИНИЕЙ обороны -- прямо перед playNext(), а не только у вызывающих.
+// Иначе любой будущий вызов этой функции (или новый путь восстановления) снова
+// заставит бота запустить yt-dlp в тишину и только потом поставить паузу.
+// Если играть некому -- заходим в канал, молчим и ждём человека: очередь и позиция
+// остаются как были в памяти и в базе.
 function startRestored (server, ch, guild)
 {
     const m = musicOf (server);
     const current = m.seekTrack || null;
     const seek = m.seekSec || 0;
     const rest = restCount (m);
-    m.pending = false;
-    m.leftByUser = false;
+    const where = (current ? (current.title || 'трек') +
+        (current.isLive ? ' (эфир)' : (seek ? ' (с ' + fmtDur (seek) + ')' : '')) : 'очередь без текущего') +
+        (rest ? ' + ещё ' + rest + ' в очереди' : '');
     if (!joinVoice (server, ch, guild) || !m.connection) return;
     m.savedChannelId = ch.id;
-    console.log
-    (
-        '[' + (d()) + '] [music] возобновляю очередь в «' + ch.name + '»: ' +
-        (current ? (current.title || 'трек') + (current.isLive ? ' (эфир)' : (seek ? ' (с ' + fmtDur (seek) + ')' : '')) :
-            'очередь без текущего') +
-        (rest ? ' + ещё ' + rest + ' в очереди' : '')
-    );
+    if (!humansInChannel (server, ch.id))
+    {
+        // Остаёмся в канале, но НЕ играем -- тот же режим ожидания, что и после старта:
+        m.pending = true;
+        m.leftByUser = false;
+        console.log ('[' + (d()) + '] [music] в «' + ch.name + '» никого -- играть не для кого: ' +
+            'стою и жду слушателя (помню: ' + where + '), начну с того же места');
+        scheduleVoiceStatus (server, true);
+        schedulePresence (true);
+        saveMusicState (server);
+        return;
+    }
+    m.pending = false;
+    m.leftByUser = false;
+    console.log ('[' + (d()) + '] [music] возобновляю очередь в «' + ch.name + '»: ' + where);
     schedulePresence (true);
     playNext (server);
 }
@@ -8604,7 +8696,11 @@ function checkListeners (server, _noFollow = false)
         // [v2.24] Бот уже в канале (вернулся после перезапуска), но очередь ждала
         // слушателя: человек зашёл -- начинаем с того же места, где остановились.
         // Это НЕ продолжение цепочки выше, а отдельная проверка.
-        if (people > 0 && m.pending && !m.current && m.seekTrack)
+        // [v2.34] ...и не только когда есть ЖДУЩИЙ трек: очередь могла сохраниться
+        // вообще без «текущего» (бот сохранил состояние между треками и упал) -- тогда
+        // m.seekTrack пуст, а играть всё равно есть что (m.tracks[0]). Раньше такая
+        // очередь ждала вечно: комната полна, а бот молчит.
+        if (people > 0 && m.pending && !m.current && (m.seekTrack || m.tracks.length))
         {
             const g = client.guilds.cache.get (server);
             const chHere = client.channels.cache.get (chId);
@@ -8669,7 +8765,9 @@ function presenceNow ()
             playing = icon + clipText (m.current.title || 'трек', 128 - icon.length - suffix.length) + suffix;
         }
         else if (!waiting)
-            waiting = '🎧 ' + where + tail;
+            // [v2.34] Очередь ждёт слушателя (pending) -- это НЕ «музыка идёт»: бот зашёл
+            // и молчит (в том числе после перезапуска в пустой канал). Помечаем прямо.
+            waiting = (m.pending ? '⏸ ' + where + ' — жду слушателя' : '🎧 ' + where) + tail;
     }
     if (playing) return { type: ActivityType.Listening, name: playing };
     if (waiting) return { type: ActivityType.Watching, name: waiting };
