@@ -303,7 +303,7 @@ const DB_ENC_HEX = /^[0-9a-fA-F]{64}$/;
 // игнорировался -- `node . unkey` или опечатка в `node . dum` запускали БОТА, а не
 // давали ошибку: одна случайная строка в консоли = лишний процесс. Список -- ровно то,
 // что обрабатывается ниже; всё остальное считается опечаткой.
-const CONSOLE_CMDS = ['keygen', 'dump', 'backup', 'checkpoint', 'backups', 'restore', 'clearstatus'];
+const CONSOLE_CMDS = ['keygen', 'dump', 'files', 'backup', 'checkpoint', 'backups', 'restore', 'clearstatus', 'unkey'];
 {
     const _first = String (process.argv[2] === undefined ? '' : process.argv[2]).trim ();
     if (_first && !CONSOLE_CMDS.includes (_first.toLowerCase ()))
@@ -313,6 +313,7 @@ const CONSOLE_CMDS = ['keygen', 'dump', 'backup', 'checkpoint', 'backups', 'rest
         console.log ('Есть только эти команды:');
         console.log ('  node . keygen               -- напечатать новый ключ шифрования базы (db_key)');
         console.log ('  node . dump [id]             -- посмотреть базу глазами (только чтение)');
+        console.log ('  node . files                 -- что за каждый файл в папке и что можно удалять');
         console.log ('  node . backup                -- обновить штатную копию базы (одна, перезаписывается)');
         console.log ('  node . checkpoint [метка]    -- сделать контрольную точку (файл с датой в имени)');
         console.log ('  node . backups               -- что есть: база, штатная копия и точки');
@@ -636,6 +637,249 @@ if (process.argv.slice (2).some (_a => /^dump$/i.test (_a)))
     process.exit (0);
 }
 
+// ============================================================================
+// `node . files` -- ЧТО ЗА ФАЙЛЫ ЛЕЖАТ В ПАПКЕ БОТА. Открыл папку и не помнишь,
+// что это и можно ли трогать -- вот ответ. Только чтение: ничего не создаёт,
+// не переименовывает и не удаляет.
+//
+// В конце -- все консольные команды С ПРИМЕРАМИ (чтобы не вспоминать, что писать
+// после `node .`, когда у команды есть аргумент).
+// ============================================================================
+function filesCli ()
+{
+    const _fs = require ('fs'), _path = require ('path');
+    const _dir = __dirname;
+    const _d = stamp => (stamp ? new Date (stamp).toLocaleString () : '?');
+    const _kb = n => (n >= 1024 * 1024 ? (n / (1024 * 1024)).toFixed (1) + ' МБ'
+        : (n >= 1024 ? Math.round (n / 1024) + ' КБ' : n + ' Б'));
+    // Что значит тот или иной файл. По шаблонам: сперва точное имя, потом маски.
+    const _what = _name =>
+    {
+        if (_name === 'index.js') return ['сам бот -- весь код: сообщения, музыка, модерация, база', 'НЕТ'];
+        if (_name === 'README.md') return ['инструкция: запуск, команды, хранение данных', 'НЕТ'];
+        if (_name === 'PRIVACY.md') return ['политика конфиденциальности: что и зачем бот хранит', 'НЕТ'];
+        if (_name === 'config.json') return ['ТВОИ настройки: токен, ключ базы (db_key), каналы, роли (в git не попадает)', 'НЕТ -- потеряешь db_key, и зашифрованные записи не прочитаются'];
+        if (_name === 'config.example.json') return ['образец конфига с комментариями (для тех, кто ставит бота с нуля)', 'МОЖНО -- вернётся из репозитория'];
+        if (_name === 'package.json' || _name === 'package-lock.json') return ['список зависимостей для npm', 'МОЖНО -- npm i восстановит'];
+        if (/^node\.(cmd|exe|bat)$/i.test (_name)) return ['«шим»/портативный Node: благодаря ему привычное `node .` запускает бота', 'НЕТ -- сломается запуск'];
+        if (/^console\.bat$/i.test (_name)) return ['личная мелочь владельца (в git не попадает)', 'можно, если не нужна'];
+        if (_name === '.gitignore' || _name === '.gitattributes') return ['что не попадает в git (токены, базы, точки)', 'НЕТ'];
+        if (/^\d{17,20}\.sqlite$/i.test (_name)) return ['ВСЕ ДАННЫЕ БОТА: роли для возврата, история наказаний, таймауты, очередь музыки (зашифрованы)', 'НЕТ'];
+        if (/\.backup\.sqlite$/i.test (_name)) return ['штатная копия базы (одна, перезаписывается при старте и каждые backup_minutes)', 'можно -- создастся при следующем запуске'];
+        if (/\.broken\.sqlite$/i.test (_name)) return ['побитая база, отложенная командой restore', 'можно, когда убедишься, что не нужна'];
+        if (/\.unkey\.sqlite$/i.test (_name)) return ['копия базы ОТКРЫТЫМ ТЕКСТОМ (красная кнопка `node . unkey`)', 'ДА, и прямо сейчас'];
+        if (/\.check-.*\.sqlite$/i.test (_name)) return ['контрольная точка базы (`node . checkpoint`)', 'можно (самые старые уходят сами по backup_keep)'];
+        if (/\.sqlite-(journal|wal|shm)$/i.test (_name)) return ['хвост незакрытой транзакции SQLite', 'можно, когда бот выключен'];
+        if (/^intents-.*\.md$/i.test (_name)) return ['заявка/шпаргалка по интентам (данные реального сервера -- в git не попадает)', 'можно (но заявка ещё может пригодиться)'];
+        if (/\.log$/i.test (_name)) return ['старый лог', 'можно'];
+        if (/^node-v?\d/i.test (_name)) return ['портативный Node: именно на нём запускается бот', 'НЕТ -- бот не запустится'];
+        if (_name === '.freebuff') return ['служебная папка инструмента разработки (Freebuff) -- к боту не относится', 'можно, если инструментом не пользуешься'];
+        return ['не знаю такой файл -- скорее всего твой личный', 'решай сам'];
+    };
+    let _list = [];
+    try { _list = _fs.readdirSync (_dir, {withFileTypes: true}); }
+    catch (e) { console.log ('[files] не смог прочитать папку: ' + String ((e && e.message) || e)); return 1; }
+    console.log ('[files] папка бота: ' + _dir);
+    console.log ('[files] только чтение: ничего не создаю, не меняю и не удаляю');
+    console.log ('');
+    let _files = 0, _dirs = 0, _bytes = 0;
+    const _lines = [];
+    for (const _e of _list.sort ((a, b) => a.name.localeCompare (b.name)))
+    {
+        const _p = _path.join (_dir, _e.name);
+        let _st = null;
+        try { _st = _fs.statSync (_p); } catch (err) { continue; }
+        let _sizeTxt = '';
+        if (_e.isDirectory ())
+        {
+            _dirs++;
+            let _n = 0;
+            try { _n = _fs.readdirSync (_p).length; } catch (err) { _n = 0; }
+            _sizeTxt = 'папка, ' + _n + ' элем.';
+        }
+        else
+        {
+            _files++; _bytes += _st.size;
+            _sizeTxt = _kb (_st.size);
+        }
+        const _info = _e.name === 'node_modules' ? ['скачанные зависимости npm', 'МОЖНО -- npm i вернёт, и в git они не попадают']
+            : _e.name === 'images' ? ['старые картинки из истории бота (код их не использует)', 'можно (оставлены как память)']
+            : _e.name === '.git' ? ['история git (коммиты): отсюда можно откатиться', 'НЕТ']
+            : _e.name === 'logs' ? ['папка от старого скрипта автозапуска: текущая версия в неё не пишет', 'можно']
+            : (_e.isDirectory () ? _what (_e.name) : _what (_e.name));
+        _lines.push ('  ' + _e.name.padEnd (34).slice (0, 34) + ' ' + _sizeTxt.padStart (14) + '  ' +
+            _d (_st.mtimeMs).padEnd (21) + '  ' + _info[0] + '\n    удалять: ' + _info[1]);
+    }
+    for (const _l of _lines) console.log (_l);
+    console.log ('');
+    console.log ('[files] всего: файлов ' + _files + ' (' + _kb (_bytes) + '), папок ' + _dirs +
+        ' (без учёта содержимого node_modules/.git)');
+    console.log ('[files] если чего-то тут нет -- так и должно быть: лишнего версия не создаёт');
+    console.log ('');
+    console.log ('[files] консольные команды (набираются В ЭТОЙ ПАПКЕ; в справке бота их нет -- это сервис):');
+    console.log ('  node .                        -- запустить бота (это окно = живой лог)');
+    console.log ('  node . keygen                 -- напечатать НОВЫЙ ключ шифрования (вставить в config.json -> db_key)');
+    console.log ('  node . dump                   -- что лежит в базе, по серверам (только чтение)');
+    console.log ('  node . dump 247110936115150848 -- то же, но по одному человеку (фильтр по id)');
+    console.log ('  node . backup                 -- обновить штатную копию базы прямо сейчас');
+    console.log ('  node . checkpoint             -- контрольная точка базы (файл с датой в имени)');
+    console.log ('  node . checkpoint before-cleanup -- то же, но с меткой (её видно в имени файла)');
+    console.log ('  node . backups                -- что есть: база, штатная копия и все точки');
+    console.log ('  node . restore                -- вернуть базу из штатной копии');
+    console.log ('  node . restore before-cleanup -- вернуть из контрольной точки (метка -- часть имени или дата)');
+    console.log ('  node . clearstatus 1414754348139020359 -- снять свою строку из шапки канала (id канала)');
+    console.log ('  node . files                  -- этот отчёт');
+    return 0;
+}
+
+if (process.argv.slice (2).some (_a => /^files$/i.test (_a)))
+{
+    let _code = 1;
+    try { _code = filesCli (); } catch (e) { console.log ('[files] ошибка: ' + ((e && e.message) || e)); }
+    process.exit (_code);
+}
+
+// ============================================================================
+// КРАСНАЯ КНОПКА: `node . unkey [id сервера | путь к файлу базы]`.
+//
+// ЧТО ДЕЛАЕТ: НЕ трогая исходную базу, кладёт рядом её полную копию со всеми
+// РАСШИФРОВАННЫМИ записями -- открытым текстом, который можно прочитать любым
+// просмотрщиком SQLite. Имя копии: <имя базы>.unkey.sqlite.
+//
+// ЗАЧЕМ: посмотреть глазами, что вообще лежит в базе, когда ключ понадобился не для
+// работы, а для разбора; или вытащить данные, не трогая боевой файл.
+//
+// ПОЧЕМУ В КОДЕ, А НЕ В ДОКУМЕНТАЦИИ: это не штатная операция, а именно красная кнопка.
+// Открытая база рядом с ботом -- это то, что мы в заявке на интенты называем «данные
+// зашифрованы», то есть файл нельзя оставлять лежать. Поэтому: команда не описана в
+// README/справке намеренно, а после неё бот напоминает удалить файл.
+//
+// Примеры (стрелочка -- что получится):
+//   node . unkey 470047648112705546            -> 470047648112705546.unkey.sqlite
+//   node . unkey 470047648112705546.sqlite     -> 470047648112705546.unkey.sqlite
+//   node . unkey C:\backup\old.sqlite          -> C:\backup\old.unkey.sqlite
+//
+// Если какую-то запись открыть НИ ОДНИМ из ключей config.json не выходит (db_key и
+// db_key_prev), она остаётся в копии как была -- зашифрованной: команда об этом прямо
+// сообщает и показывает ключи записей, чтобы было видно, что именно не открылось.
+// Без db_key в конфиге расшифровать нечего -- скажет и ничего не сделает.
+// На Node без встроенного node:sqlite (до 23) скажет, что нужен портативный Node
+// из папки бота. Возвращает код выхода: 0 -- копия сделана, 1/2 -- ошибка.
+// ============================================================================
+function dbUnkeyCli (_arg)
+{
+    let DatabaseSync = null;
+    try { ({ DatabaseSync } = require ('node:sqlite')); } catch (e) { /* старый Node */ }
+    if (!DatabaseSync)
+    {
+        console.log ('[unkey] нужен Node 23+ (встроенный node:sqlite): запускай через node.cmd или портативный Node из папки бота');
+        return 1;
+    }
+    const _fs = require ('fs'), _path = require ('path');
+    const _a = String (_arg === undefined || _arg === null ? '' : _arg).trim ();
+    let _src = '';
+    if (/^\d{17,20}$/.test (_a)) _src = __dirname + '/' + _a + '.sqlite';
+    else if (_a) _src = _path.isAbsolute (_a) ? _a : (__dirname + '/' + _a);
+    if (!_src)
+    {
+        console.log ('[unkey] укажи id сервера или путь к файлу базы, например: node . unkey 470047648112705546');
+        return 2;
+    }
+    if (!_fs.existsSync (_src))
+    {
+        console.log ('[unkey] файла нет: ' + _src);
+        return 2;
+    }
+    const _dst = _src.replace (/\.sqlite$/i, '') + '.unkey.sqlite';
+    if (!DB_KEYS.length)
+    {
+        console.log ('[unkey] в config.json нет db_key -- расшифровывать нечего (записи и так открыты либо недоступны)');
+        return 1;
+    }
+    let _rows = [], _db = null;
+    try
+    {
+        _db = new DatabaseSync (_src, {readOnly: true});
+        _rows = _db.prepare ('SELECT key, value FROM keyv').all ();
+    }
+    catch (e)
+    {
+        console.log ('[unkey] не смог прочитать базу: ' + String ((e && e.message) || e));
+        return 1;
+    }
+    try { if (_db) _db.close (); } catch (e) { /* уже закрыта */ }
+    const _fix = [], _badKeys = [];
+    let _plain = 0;
+    for (const _r of _rows)
+    {
+        const _raw = dbRawStr (_r.value);
+        if (!_raw.startsWith (DB_ENC_PREFIX)) { _plain++; continue; }
+        const _t = dbDec (_raw);
+        if (_t === null) { _badKeys.push (String (_r.key)); continue; }
+        _fix.push ([String (_r.key), _t]);
+    }
+    console.log ('[unkey] база: ' + _src);
+    console.log ('[unkey] записей ' + _rows.length + ': зашифрованных ' + _fix.length + ', и так открытых ' + _plain +
+        (_badKeys.length ? ', НЕ открылись (' + _badKeys.length + ')' : ''));
+    let _out = null, _wrote = 0;
+    try
+    {
+        // Копию делает сам SQLite (VACUUM INTO): так она целая и без хвоста WAL, даже
+        // если в этот момент в базу кто-то пишет. Если node:sqlite такой запрос не
+        // умеет -- обычное копирование файла (значения всё равно перезапишем).
+        try { if (_fs.existsSync (_dst)) _fs.unlinkSync (_dst); } catch (e) { /* не наша забота */ }
+        const _ro = new DatabaseSync (_src, {readOnly: true});
+        try
+        {
+            _ro.exec ("VACUUM INTO '" + String (_dst).replace (/'/g, "''") + "'");
+        }
+        catch (e2)
+        {
+            try { _ro.close (); } catch (e3) { /* пусто */ }
+            _fs.copyFileSync (_src, _dst);
+        }
+        try { _ro.close (); } catch (e2) { /* уже закрыта */ }
+        _out = new DatabaseSync (_dst);
+        const _upd = _out.prepare ('UPDATE keyv SET value = ? WHERE key = ?');
+        for (const [_k, _v] of _fix) { _upd.run (_v, _k); _wrote++; }
+    }
+    catch (e)
+    {
+        console.log ('[unkey] не удалось записать копию: ' + String ((e && e.message) || e));
+        try { if (_out) _out.close (); } catch (e2) { /* пусто */ }
+        return 1;
+    }
+    try { if (_out) _out.close (); } catch (e) { /* уже закрыта */ }
+    // Проверка чтением: в копии не должно остаться ни одной записи с префиксом шифрования.
+    let _left = 0;
+    let _chk = null;
+    try
+    {
+        _chk = new DatabaseSync (_dst, {readOnly: true});
+        for (const _r of _chk.prepare ('SELECT value FROM keyv').all ())
+            if (dbRawStr (_r.value).startsWith (DB_ENC_PREFIX)) _left++;
+    }
+    catch (e) { /* проверить не вышло -- не повод не отчитаться */ }
+    try { if (_chk) _chk.close (); } catch (e) { /* уже закрыта */ }
+    console.log ('[unkey] копия записана: ' + _dst + ' (расшифровано ' + _wrote + ')');
+    console.log ('[unkey] проверка чтением: ' + (_left
+        ? 'остались зашифрованные (' + _left + ') -- их не открыл ни один ключ из config.json'
+        : 'открытого текста -- всё, что можно было, расшифровано'));
+    if (_badKeys.length)
+        console.log ('[unkey] не открылись ключи: ' + _badKeys.slice (0, 10).join (', ') +
+            (_badKeys.length > 10 ? ' и ещё ' + (_badKeys.length - 10) : ''));
+    console.log ('[unkey] [!] ФАЙЛ ОТКРЫТЫМ ТЕКСТОМ. Посмотрел -- УДАЛИ его: ' + _dst);
+    return 0;
+}
+
+if (process.argv.slice (2).some (_a => /^unkey$/i.test (_a)))
+{
+    let _code = 1;
+    try { _code = dbUnkeyCli (dbArgAfter ('unkey')); }
+    catch (e) { console.log ('[unkey] ошибка: ' + ((e && e.message) || e)); }
+    process.exit (_code);
+}
+
 // [v2.5] Привилегированный интент Message Content (в портале приложения включён).
 // Он нужен двум вещам: пересылке из пандалогии и текстовым командам 'panda ...'.
 // Поставь в config.json "MESSAGE_CONTENT": false -- если Discord его отзовёт.
@@ -707,22 +951,27 @@ const STARTUP_DM_TEXT =
     '`/play ссылка или запрос` -- трек, плейлист или прямой эфир (YouTube и др.)\n' +
     '  Добавляется В КОНЕЦ очереди. Стоять в голосовом канале не обязательно:\n' +
     '  DJ может просто собирать плейлист -- бот зайдёт, когда позовёшь.\n' +
-    '`/queue` -- что играет и что дальше: номера, автор каждого трека, сколько уже\n' +
-    '  играет текущий и сколько ещё ждать до конца плейлиста целиком. На странице\n' +
+    '`/queue from:16` -- что играет и что дальше: номера, автор каждого трека,\n' +
+    '  сколько уже играет текущий, сколько ещё ждать до конца плейлиста целиком и\n' +
+    '  сводка ПО АВТОРАМ (у кого сколько треков и на сколько времени). На странице\n' +
     '  по 15 треков (у одного автора подряд он не повторяется), у длинных очередей\n' +
     '  есть кнопки «◀ Назад / Вперёд ▶» (и `from:16`). Сколько на странице --\n' +
-    '  настройка `queue_page` в конфиге (до 25).\n' +
-    '  Под очередью -- быстрые кнопки: «⏭ Пропустить», «🧹 Очистить», меню\n' +
-    '  «🗑 Убрать трек» и «🎚 Двигать трек» (после выбора появляются «⬆ Выше»/«⬇ Ниже»,\n' +
-    '  а номер виден в списке) -- номера те же, что в `/remove`, жмёт тот, у кого права DJ\n' +
+    '  настройка `queue_page` в конфиге.\n' +
+    '  Под очередью -- быстрые кнопки: «⏭ Пропустить», «🧹 Очистить» (спросит\n' +
+    '  подтверждение), «🧹 Чужие» (снять всё, что добавил не ты -- только staff),\n' +
+    '  «⏹ Стоп» (очистить и уйти), меню «🗑 Убрать трек» и «🎚 Двигать трек» (после\n' +
+    '  выбора появляются «⬆ Выше»/«⬇ Ниже», а номер виден в списке) -- номера те же,\n' +
+    '  что в `/remove`, жмёт тот, у кого права DJ\n' +
     '`/remove number` -- убрать трек, `/move number to` -- переставить его,\n' +
-    '`/jump number` -- прыгнуть к треку, `/clear` -- очистить очередь вместе с\n' +
-    '  играющим треком (дальше тишина), `/clear author:@кто` -- убрать только треки\n' +
-    '  этого человека, вместе с его играющим -- он прерывается, а не доигрывает\n' +
+    '`/jump number` -- прыгнуть к треку\n' +
+    '`/clear` -- очистить очередь вместе с играющим треком (дальше тишина), но\n' +
+    '  ОСТАТЬСЯ в канале -- спросит подтверждение; `/stop` -- то же и уйти из канала\n' +
+    '`/clear author:@кто` -- убрать только треки этого человека, вместе с его\n' +
+    '  играющим -- он прерывается, а не доигрывает\n' +
     '  (number/to -- те же номера, что в `/queue`; текущий трек в них не входит)\n' +
     '`/push author:@кто` -- поднять треки одного автора наверх очереди (только\n' +
     '  админы и модеры; без автора -- свои). Порядок внутри поднятых не меняется\n' +
-    '`/skip` -- следующий • `/stop` -- стоп и забыть очередь совсем\n' +
+    '`/skip` -- следующий\n' +
     '`/pause` / `/resume` -- пауза / продолжить\n' +
     '`/join` -- зайти в твой канал и остаться там (даже без музыки)\n' +
     '`/leave` -- выйти из канала (очередь и место помню -- продолжу по `/join`)\n' +
@@ -733,8 +982,8 @@ const STARTUP_DM_TEXT =
     'ОДИН и на паузе (сама «нет слушателей» или её поставил человек, а комната\n' +
     'опустела) -- он ищет, кому он сейчас нужнее: автору недоеденного трека, а если\n' +
     'того в голосовом нет -- автору ближайшего следующего (смотрит вперёд по всей\n' +
-    'очереди) и едет туда. Нашу паузу «нет слушателей» там снимает сам, а\n' +
-    'поставленную человеком -- нет (продолжит он сам, `/resume`). Где есть\n' +
+    'очереди) и едет туда -- и там ИГРАЕТ (паузу, в том числе поставленную\n' +
+    'человеком, снимает: приехали туда, где есть слушатель). Где есть\n' +
     'слушатели -- не уезжает никуда; сам он не заходит и не выходит никогда.\n' +
     '**Бот ничего не забывает:** очередь, текущий трек и место в треке живут в базе,\n' +
     'поэтому перезапуск, обрыв связи и `/leave` музыку не сбрасывают. Если в канале\n' +
@@ -1392,6 +1641,41 @@ for (let _server in SERVERS)
 console.log ('[' + new Date ().toLocaleString () + '] [db] шифрование записей: ' +
     (DB_KEYS.length ? 'ВКЛЮЧЕНО (db_key), AES-256-GCM -- не потеряй config.json: без ключа записи не прочитаются'
                     : 'выключено (нет db_key в config.json)'));
+
+// [v2.28] ОБРАТНАЯ СИТУАЦИЯ к переводу старых записей: ключ из config.json УБРАЛИ
+// (или забыли вписать на новой машине), а в базе лежат зашифрованные записи. Тогда
+// каждое чтение молча пропускает их ([db] запись не расшифровалась), и снаружи это
+// выглядит как «роли, история и очередь исчезли». Говорим об этом прямо при старте:
+// сколько записей не читается и что делать (вписать прежний ключ и перезапустить).
+function dbWarnLocked ()
+{
+    if (DB_KEYS.length) return;
+    let DatabaseSync = null;
+    try { ({ DatabaseSync } = require ('node:sqlite')); } catch (e) { return; } // старый Node -- просто молчим
+    const _fs = require ('fs');
+    for (const _srv of dbServerListOn ())
+    {
+        const _file = dbFileOf (_srv);
+        if (!_fs.existsSync (_file)) continue;
+        let _db = null, _rows = [];
+        try
+        {
+            _db = new DatabaseSync (_file, {readOnly: true});
+            _rows = _db.prepare ('SELECT value FROM keyv').all ();
+        }
+        catch (e) { _rows = []; }
+        try { if (_db) _db.close (); } catch (e) { /* уже закрыта */ }
+        let _n = 0;
+        for (const _r of _rows)
+            if (dbRawStr (_r.value).startsWith (DB_ENC_PREFIX)) _n++;
+        if (_n)
+            console.log ('[' + new Date ().toLocaleString () + '] [db] ВНИМАНИЕ: db_key в config.json ПУСТ, а в базе ' +
+                _srv + ' ' + _n + ' ' + plural (_n, 'зашифрованная запись', 'зашифрованные записи', 'зашифрованных записей') +
+                ' -- они НЕ ЧИТАЮТСЯ (роли для возврата, таймауты, история, очередь музыки).\n' +
+                '     Впиши прежний db_key (или db_key_prev) в config.json и перезапусти бота -- записи целы, они просто ждут ключ.');
+    }
+}
+dbWarnLocked ();
 
 // [v2.20] Перевод СТАРЫХ записей в шифрованный вид -- один раз при старте.
 // Зачем: шифрование не действует задним числом. Записи, сделанные до включения ключа
@@ -3787,6 +4071,12 @@ async function bansOverview (server)
     const bans = await guildBans (server);
     const hist = await bansHistory (server);
     const names = await namesFor ([...active.map (a => a.id), ...hist.map (h => h.id)]);
+    // [v2.28] «Бан не подтверждён Discord»: в базе таймаут есть, а бана у Discord нет,
+    // хотя по конфигу он должен был быть выдан при выходе (onLeaveBanRealy). Значит вызов
+    // бана НЕ прошёл: чаще всего нет права «Банить участников» или роль бота ниже роли
+    // человека. Это не «бог знает что» и не навсегда: при перезаходе бот попробует снова,
+    // а в конце срока запись уйдёт сама (и ложного «разбанил» не будет).
+    const leaveBan = (SERVERS[server].onLeaveBanRealy || false) && (SERVERS[server].onLeaveBanTimeout || 0) > 0;
     const rows = active.map (a =>
     ({
         id: a.id,
@@ -3796,6 +4086,7 @@ async function bansOverview (server)
         name: names.get (a.id) || a.id,
         left: dd (a.until),
         at: d (a.until, true),
+        unconfirmed: leaveBan && !bans.has (a.id),
     }));
     const histRows = hist.slice (0, 10).map (h => Object.assign ({}, h, { name: names.get (h.id) || h.id }));
     return { rows, expired, hist, histRows, histDays: banHistoryDays (server) };
@@ -3837,13 +4128,21 @@ function bansReportText (o, max = 20)
     {
         const lines = o.rows.slice (0, max).map (r =>
             '• **' + r.name + '** -- ' + (r.isBan ? '🚫 бан' : '⏳ таймаут') +
+            (r.unconfirmed ? ' (бан не подтверждён Discord)' : '') +
             ', снимется `' + r.at + '` (через `' + r.left + '`)' +
             (r.reason ? '\n  причина: `' + clipText (oneLine (r.reason, 160), 160) + '`' : ''))
             .join ('\n');
+        const unconf = o.rows.filter (r => r.unconfirmed).length;
         text = '🛡️ **Наказания сейчас (' + o.rows.length + ': ' + banned + ' ' + plural (banned, 'бан', 'бана', 'банов') +
             ', ' + (o.rows.length - banned) + ' ' + plural (o.rows.length - banned, 'таймаут', 'таймаута', 'таймаутов') + ')**\n' +
             lines +
             (o.rows.length > max ? '\n*...и ещё ' + (o.rows.length - max) + '*' : '') +
+            (unconf ? '\n⚠️ **Бан не подтверждён Discord: ' + unconf + '** -- таймаут в базе есть, а бана у Discord нет,\n' +
+                '  хотя по конфигу бот должен был забанить при выходе. Обычно это нехватка права\n' +
+                '  «Банить участников» или роль бота НИЖЕ роли человека. Что делать: выдать право /\n' +
+                '  поднять роль бота -- бан прилетит сам при следующем перезаходе (таймаут сохранится);\n' +
+                '  либо снять наказание вручную: `/unban user:@кто`. Само это не «навсегда»:\n' +
+                '  запись уйдёт в конце срока (`снимется …`), ложного разбана при этом не будет.' : '') +
             (o.expired.length ? '\n_Просроченных записей в базе: ' + o.expired.length + ' -- снимутся сами._' : '');
     }
     // [v2.15] История за окно: кто сколько раз выходил и сколько раз получал наказание.
@@ -3884,7 +4183,10 @@ async function reportStoredBans (server)
                 plural (o.rows.length, 'активное', 'активных', 'активных') + ' (' + banned + ' ' +
                 plural (banned, 'бан', 'бана', 'банов') + ', ' + (o.rows.length - banned) + ' ' +
                 plural (o.rows.length - banned, 'таймаут', 'таймаута', 'таймаутов') + '): ' +
-                o.rows.map (r => r.name + ' до ' + r.at + ' (осталось ' + r.left + (r.isBan ? ', бан' : ', только таймаут') + ')').join (' | ') +
+                o.rows.map (r => r.name + ' до ' + r.at + ' (осталось ' + r.left +
+                    (r.isBan ? ', бан' : (r.unconfirmed
+                        ? ', только таймаут -- бан не подтверждён Discord (нет права «Банить участников» или роль бота ниже?)'
+                        : ', только таймаут')) + ')').join (' | ') +
                 tail);
     }
     catch (e)
@@ -4639,9 +4941,14 @@ async function rolecheckReport (server, target)
     const bans = await guildBans (server);
     const isBan = bans.has (target.id);
     const why = isBan && bans.get (target.id) ? ' (причина: ' + oneLine (bans.get (target.id), 200) + ')' : '';
+    const unconfirmed = !isBan && !!until && until > Date.now () &&
+        (s.onLeaveBanRealy || false) && (s.onLeaveBanTimeout || 0) > 0;
     if (until && until > Date.now ())
         out.push ('\n**Сейчас в наказании:** ' + (isBan ? '🚫 бан' : '⏳ таймаут (бана в Discord нет)') +
-            ' до `' + d (until, true) + '` -- осталось `' + dd (until) + '`' + why);
+            ' до `' + d (until, true) + '` -- осталось `' + dd (until) + '`' + why +
+            (unconfirmed ? '\n• ⚠️ бан не подтверждён Discord: по конфигу бот должен был забанить при выходе,\n' +
+                '  значит вызов не прошёл (обычно нет права «Банить участников» / роль бота ниже).\n' +
+                '  При перезаходе бот попробует снова; в конце срока запись уйдёт сама. Вручную -- `/unban`.' : ''));
     else if (isBan)
         out.push ('\n**Сейчас в наказании:** 🚫 бан в Discord' + why);
     else
@@ -5071,6 +5378,60 @@ async function reportIntents (server)
         (audit ? 'да' : 'НЕТ -- ' + why));
 }
 
+// ============================================================================
+// [v2.28] ПРАВА БОТА -- ОТЧЁТ ПРИ СТАРТЕ. Раньше о нехватке прав было видно только
+// по ПЕРВОЙ ЖИВОЙ ошибке («Missing Permissions») -- то есть в момент, когда кого-то
+// уже наказывают, выдают ключ или переносят. Теперь при старте сразу понятно, чего
+// не хватает и что с этим делать.
+// Проверяем ровно те права, которые код действительно использует:
+//   ManageRoles   -- записи прав в канале (мут/глухота/ключ 🔑) и roles.add при возврате ролей;
+//   ManageChannels-- создание/удаление каналов (новые каналы, общий канал, скрытие);
+//   ManageNicknames-- тег 🔑 в нике;
+//   MoveMembers   -- переносы между каналами (drag-n-drop ботом);
+//   MuteMembers   -- серверный мут голоса; DeafenMembers -- глухота;
+//   KickMembers   -- кик в отдельных случаях модерации;
+//   BanMembers    -- бан за выход (таймаут-механизм) и разбан;
+//   ViewAuditLog  -- авторство мутов/переносов (кто это сделал);
+//   Connect/Speak -- чтобы музыка вообще звучала (в канале, где играет бот).
+// Если всё на месте -- одна строка «всё на месте» (чтобы отсутствие строк было видно).
+// ============================================================================
+async function reportBotPermissions (server)
+{
+    const guild = client.guilds.cache.get (server);
+    if (!guild) return;
+    let me = guild.members.me;
+    if (!me) { try { me = await guild.members.fetchMe (); } catch (e) { return; } }
+    if (!me) return;
+    const P = PermissionsBitField.Flags;
+    const need =
+    [
+        [P.ManageRoles, 'Управлять ролями', 'мут, глухота, ключ 🔑, возврат ролей'],
+        [P.BanMembers, 'Банить участников', 'бан за выход (таймаут) и /unban'],
+        [P.ManageChannels, 'Управлять каналами', 'создание/удаление каналов, права в них'],
+        [P.ManageNicknames, 'Управлять никами', 'тег 🔑 перед ником'],
+        [P.MoveMembers, 'Перемещать участников', 'переносы между каналами'],
+        [P.MuteMembers, 'Выключать микрофон', 'серверный мут'],
+        [P.DeafenMembers, 'Выключать звук', 'глухота'],
+        [P.KickMembers, 'Выгонять участников', 'кик (в отдельных случаях модерации)'],
+        [P.ViewAuditLog, 'Просматривать журнал аудита', 'авторство мутов и переносов'],
+        [P.Connect, 'Подключаться', 'зайти в голосовой канал (иначе тишина)'],
+        [P.Speak, 'Говорить', 'чтобы музыку было слышно'],
+    ];
+    const miss = need.filter (n => !me.permissions.has (n[0]));
+    const name = SERVERS[server].name;
+    if (!miss.length)
+    {
+        console.log ('[' + (d()) + '] [perms] ' + name + ': права на мут, бан, роли, каналы и музыку -- на месте');
+        return;
+    }
+    for (const [flag, label, why] of miss)
+        console.log ('[' + (d()) + '] [perms] ' + name + ': НЕТ права «' + label + '» -- ' + why +
+            ' работать не будет (Discord ответит Missing Permissions). Где включить: Настройки сервера -> ' +
+            'Роли -> роль бота -> Права, и подними эту роль ВЫШЕ ролей тех, кого наказываешь');
+    console.log ('[' + (d()) + '] [perms] ' + name + ': не хватает ' + miss.length + ' ' +
+        plural (miss.length, 'права', 'прав', 'прав') + ' -- это то, что уже будет ломаться в бою');
+}
+
 // Один тик поллера по серверу:
 async function pollMembers (server)
 {
@@ -5219,6 +5580,8 @@ client.on
             await reportIntents (server);
             // [v2.5] заодно проверить id из config.json (молчит, если всё цело):
             await checkConfigChannels (server);
+            // [v2.28] и права бота -- чтобы проблемы были видны ДО первого живого наказания:
+            await reportBotPermissions (server);
             // [v2.14] Сперва отчёт: сколько наказаний поднято из базы (пишется всегда),
             // и только потом снятие просроченных -- чтобы в логе было видно исходное
             // состояние, а не только «уже снял».
@@ -5336,6 +5699,10 @@ const MUSIC_NORMALIZE_FILTER = MUSIC_CFG.filter || 'loudnorm=I=-16:TP=-1.5:LRA=1
 //   его видно везде, даже вне голосового.
 // Свою прежнюю строку можно снять разово: `node . clearstatus <id канала>`.
 const MUSIC_CHANNEL_STATUS = MUSIC_CFG.channel_status !== false;
+// [v2.28] Одинокий бот на паузе не ждёт автора, которого нет в голосовом, а переставляет
+// его треки в конец очереди и играет тому, кто слушает прямо сейчас. По умолчанию ВКЛ;
+// выключается в конфиге: MUSIC.skip_absent_author = false.
+const MUSIC_SKIP_ABSENT = MUSIC_CFG.skip_absent_author !== false;
 // [v2.23] Одна строка при старте о том, как бот ходит на YouTube: видно, что ключ
 // MUSIC.proxy действительно подхватился (промах в этом месте раньше не был заметен).
 console.log ('[' + (d()) + '] [music] YouTube: ' + (MUSIC_PROXY
@@ -6488,7 +6855,41 @@ const QUEUE_GLUE = 60;
 const QUEUE_HINT_SHORT = '_Действия -- кнопками ниже._';
 const QUEUE_HINT_FULL =
     '_Убрать -- `/remove`, переставить -- `/move` или кнопками ниже, прыгнуть -- `/jump`; ' +
-    'чистить всё (вместе с играющим треком) -- `/clear`,_\n_а только треки одного человека -- `/clear author:@кто`._';
+    'чистить всё -- `/clear` (остаться в канале) или `/stop` (уйти совсем), ' +
+    'а только треки одного человека -- `/clear author:@кто`._';
+
+// [v2.28] Сводка ПО АВТОРАМ для /queue: сколько треков и сколько времени у каждого.
+// На миксе из нескольких DJ сразу видно, чья это гора, а кнопкой «🧹 Чужие» чужое
+// снимается одним нажатием. Время -- по известным длительностям; у эфиров его нет,
+// поэтому они показаны отдельно (🔴), а треки без автора (добавлены до этой версии)
+// считаются одной строкой в конце.
+function queueAuthorsText (m)
+{
+    const map = new Map ();
+    let noAuthor = 0;
+    const add = t =>
+    {
+        if (!t) return;
+        const key = t.byId ? String (t.byId) : '';
+        if (!key) { noAuthor++; return; }
+        let o = map.get (key);
+        if (!o) { o = { name: t.byName || u (key), n: 0, sec: 0, live: 0 }; map.set (key, o); }
+        o.n++;
+        if (t.isLive) o.live++;
+        else if (t.duration > 0) o.sec += t.duration;
+    };
+    add (m.current);
+    for (const t of m.tracks) add (t);
+    if (!map.size && !noAuthor) return '';
+    const list = [...map.values ()].sort ((a, b) => b.n - a.n || String (a.name).localeCompare (String (b.name)));
+    const top = list.slice (0, 6).map (o => '**' + o.name + '** — ' + o.n + ' ' +
+        plural (o.n, 'трек', 'трека', 'треков') +
+        (o.sec ? ' (~' + fmtAgo (o.sec * 1000) + ')' : '') +
+        (o.live ? ' + ' + o.live + ' 🔴' : ''));
+    return '👥 **По авторам:** ' + (top.length ? top.join (', ') : 'только треки без автора') +
+        (list.length > 6 ? ' и ещё ' + (list.length - 6) + ' ' + plural (list.length - 6, 'автор', 'автора', 'авторов') : '') +
+        (noAuthor ? (top.length ? ', ' : '') + 'без автора: ' + noAuthor : '');
+}
 
 // Сколько символов остаётся на СПИСОК: лимит минус шапка, «до конца очереди»,
 // подсказка и служебные строки. Считается по живым строкам, поэтому бюджет один и тот
@@ -6496,7 +6897,7 @@ const QUEUE_HINT_FULL =
 function queueListBudget (m)
 {
     const chrome = queueHeadText (m).length + queueWaitText (m).length +
-        QUEUE_GLUE + QUEUE_HINT_SHORT.length;
+        queueAuthorsText (m).length + QUEUE_GLUE + QUEUE_HINT_SHORT.length;
     return Math.max (200, QUEUE_MSG_LIMIT - chrome);
 }
 
@@ -6600,7 +7001,15 @@ function queueComponents (page, m, moveSel = 0)
                 .setDisabled (!m.current),
             new ButtonBuilder ()
                 .setCustomId ('q:clear').setLabel ('🧹 Очистить').setStyle (ButtonStyle.Danger)
-                .setDisabled (!total)
+                .setDisabled (!total && !m.current),
+            // [v2.28] «Чужие» -- снять всё, что добавил не ты (staff). «Стоп» -- то же,
+            // что /clear, но с выходом из канала: разница между /clear и /stop видна прямо
+            // в кнопках, а не только в тексте помощи.
+            new ButtonBuilder ()
+                .setCustomId ('q:co').setLabel ('🧹 Чужие').setStyle (ButtonStyle.Secondary)
+                .setDisabled (!total),
+            new ButtonBuilder ()
+                .setCustomId ('q:stop').setLabel ('⏹ Стоп').setStyle (ButtonStyle.Danger)
         )
     );
     if (count)
@@ -6657,19 +7066,23 @@ function queueSkip (guildId, who)
         (m.current ? ' -- играю **' + (m.current.title || 'трек') + '**' : '') };
 }
 
-// [v2.26] /clear -- убираем И то, что играет. Раньше текущий трек молча доигрывал,
-// и получалось «ничейно»: очередь пуста, а музыка ещё играет то, что из неё убрали
-// (а длинные сеты так и вовсе приходилось добивать /stop). Теперь чистка -- это чистка:
-// играющий трек снимается сразу, ждущий (после /leave или обрыва) тоже, и состояние
-// в базе стирается -- чтобы после перезапуска ничего из убранного не воскресло.
-function queueClear (guildId, who)
+// [v2.26] Очистка -- это очистка: убираем И то, что играет. Раньше текущий трек молча
+// доигрывал, и получалось «ничейно»: очередь пуста, а музыка ещё играет то, что из неё
+// убрали (а длинные сеты так и вовсе приходилось добивать /stop).
+// [v2.28] Теперь чистка общая (queueWipe), а вот /clear и /stop разведены по смыслу:
+//   /clear -- «остаться и забыть»: очередь и музыка стёрты, бот ОСТАЁТСЯ в канале;
+//   /stop  -- «уйти и забыть»: то же плюс выход из голосового канала.
+// Состояние в базе стирается в обоих случаях -- чтобы после перезапуска ничего из
+// убранного не воскресло.
+function queueWipe (guildId)
 {
     const m = musicOf (guildId);
-    const playing = m.current ? (m.current.title || 'трек') : '';
-    const waiting = (!m.current && m.seekTrack) ? (m.seekTrack.title || 'трек') : '';
-    const n = m.tracks.length;
-    if (!n && !playing && !waiting)
-        return { ok: false, text: '🈳 Очередь и так пуста -- чистить нечего.' };
+    const w =
+    {
+        n: m.tracks.length,
+        playing: m.current ? (m.current.title || 'трек') : '',
+        waiting: (!m.current && m.seekTrack) ? (m.seekTrack.title || 'трек') : '',
+    };
     m.tracks = [];
     m.current = null;
     m.seekTrack = null;
@@ -6682,13 +7095,68 @@ function queueClear (guildId, who)
     dropPreload (m);
     m.player.stop (true);     // тишина: играть больше нечего (Idle-хэндлер запустит нечего)
     clearMusicState (guildId); // и из базы -- чтобы убранное не воскресло после перезапуска
+    return w;
+}
+
+function queueClear (guildId, who, opts)
+{
+    const leave = !!(opts && opts.leave);
+    const m = musicOf (guildId);
+    if (!m.tracks.length && !m.current && !m.seekTrack)
+    {
+        if (leave && m.connection)
+        {
+            destroyMusic (guildId, {forget: true});
+            console.log ('[' + (d()) + '] [music] ' + whoText (who) + 'остановил бота: очередь была пуста, вышел из канала');
+            return { ok: true, text: '⏹ Очередь и так пуста -- вышел из голосового канала.' };
+        }
+        return { ok: false, text: '🈳 Очередь и так пуста -- чистить нечего.' };
+    }
+    const w = queueWipe (guildId);
+    if (leave) destroyMusic (guildId, {forget: true});
     scheduleVoiceStatus (guildId, true);
     schedulePresence (true);
-    console.log ('[' + (d()) + '] [music] ' + whoText (who) + 'очистил очередь (' + n + ')' +
-        (playing ? ' и снял играющий трек' : (waiting ? ' и снял ждущий трек' : '')));
-    return { ok: true, text: '🧹 Очистил очередь (' + n + (n === 1 ? ' трек' : ' треков') + ')' +
-        (playing ? ' и снял играющий **' + playing + '** -- тишина.'
-                 : (waiting ? ' (снял и ждущий **' + waiting + '**).' : '.')) };
+    console.log ('[' + (d()) + '] [music] ' + whoText (who) +
+        (leave ? 'остановил и убрал очередь (' : 'очистил очередь (') + w.n + ')' +
+        (w.playing ? ' и снял играющий трек' : (w.waiting ? ' и снял ждущий трек' : '')) +
+        (leave ? ', вышел из канала' : ''));
+    const tail = w.playing ? ' и снял играющий **' + w.playing + '** -- тишина.'
+                 : (w.waiting ? ' (снял и ждущий **' + w.waiting + '**).' : '.');
+    return { ok: true, text: (leave
+        ? '⏹ Остановил и очистил очередь (' + w.n + (w.n === 1 ? ' трек' : ' треков') + ')' + tail + ' Вышел из канала.'
+        : '🧹 Очистил очередь (' + w.n + (w.n === 1 ? ' трек' : ' треков') + ')' + tail) };
+}
+
+// [v2.28] «Убрать чужие» -- снять из очереди (и с играющего места) всё, что добавил НЕ
+// нажавший. Один клик вместо `/clear author:@кто` по каждому имени. Только staff:
+// выкидывать чужие треки -- такое же вмешательство в общую очередь, как /push.
+function queueClearOthers (guildId, userId, who)
+{
+    const m = musicOf (guildId);
+    const mine = t => t && String (t.byId || '') === String (userId);
+    const goneQ = m.tracks.filter (t => !mine (t)).length;
+    const playing = (m.current && !mine (m.current)) ? (m.current.title || 'трек') : '';
+    const waiting = (!playing && m.seekTrack && !mine (m.seekTrack)) ? (m.seekTrack.title || 'трек') : '';
+    if (!goneQ && !playing && !waiting)
+        return { ok: false, text: '🈳 В очереди нет чужих треков -- всё и так твоё (или автор не записан).' };
+    m.tracks = m.tracks.filter (mine);
+    if (waiting) { m.seekTrack = null; m.seekSec = 0; }
+    if (playing)
+    {
+        m.current = null;      // чтобы база не сохранила снятый трек как играющий
+        m.playedMs = 0;
+        m.playingSince = null;
+        m.player.stop (true);  // Idle-хэндлер сразу запустит следующий (если есть)
+    }
+    dropPreload (m);
+    startPreload (guildId);
+    saveMusicState (guildId);
+    scheduleVoiceStatus (guildId, true);
+    schedulePresence (true);
+    console.log ('[' + (d()) + '] [music] ' + whoText (who) + 'убрал чужие треки из очереди (' + goneQ + ')' +
+        (playing ? ' -- и прервал чужой играющий трек' : (waiting ? ' -- и чужой ждущий трек' : '')));
+    return { ok: true, text: '🧹 Убрал чужие треки (' + goneQ + '). В очереди осталось ' + m.tracks.length +
+        (playing ? ' -- чужой **' + playing + '** прерван.' : (waiting ? ', чужой ждущий **' + waiting + '** тоже убран.' : '.')) };
 }
 
 function queueRemove (guildId, n, who)
@@ -6828,9 +7296,11 @@ function queueView (m, start, moveSel = 0)
         ? '\n\n🎚 **Двигаю №' + moveSel + ':** **' + (m.tracks[moveSel - 1].title || 'трек') +
           '** -- жми «⬆ Выше» / «⬇ Ниже» под списком.'
         : '';
+    const authors = queueAuthorsText (m);
     const build = hint => queueHeadText (m) +
         '\n\n**Очередь (' + total + ')**' + (page.start > 1 ? ' с №' + page.start : '') + ':\n' + page.list +
         (rest > 0 ? '\n*...и ещё ' + rest + ': `/queue from:' + (page.start + page.count) + '`*' : '') +
+        (authors ? '\n' + authors : '') +
         '\n\n' + queueWaitText (m) + move + '\n' + hint;
     // Очереди нет -- только шапка (подсказка про действия тогда не нужна).
     // Иначе берём ПОЛНУЮ подсказку, а если она не влезла в лимит Discord -- короткую
@@ -6960,6 +7430,87 @@ function startRestored (server, ch, guild)
     playNext (server);
 }
 
+// [v2.28] Сообщение ЛЮДЯМ про музыку (не в журнал): уходит в тот канал, откуда бота
+// позвали (/play или /join запоминает его в m.textChannelId). Если канала нет или он
+// недоступен -- просто молчим: событие и так есть в логе. Никогда не бросает -- это
+// уведомление, а не работа.
+function musicNotice (guildId, text)
+{
+    const m = $music[guildId];
+    if (!m || !m.textChannelId || !text) return;
+    const ch = client.channels.cache.get (m.textChannelId);
+    if (!ch || typeof ch.send !== 'function') return;
+    ch.send (text).catch (() => {});
+}
+
+// [v2.28] РЕЖИМ «НЕ ЖДАТЬ ОТСУТСТВУЮЩИХ АВТОРОВ» (MUSIC.skip_absent_author).
+// Ситуация: бот один в канале и молчит (пауза: своя «нет слушателей» или человек
+// поставил /pause), а дальше в очереди есть треки тех, кто СЛУШАЕТ прямо сейчас в
+// другом канале. Ждать некому -- поэтому треки отсутствующих авторов (вместе с
+// недоеденным текущим) переставляются в КОНЕЦ очереди (ничего не теряется: вернётся
+// автор -- они снова дойдут по очереди), а бот переезжает к тому, кто есть, и играет.
+// Возвращает true, если переехали и заиграли. Порядок внутри переставленных сохранён.
+function skipAbsentAuthors (guildId, curChId)
+{
+    const m = $music[guildId];
+    if (!m || !m.connection) return false;
+    if (!MUSIC_SKIP_ABSENT) return false;
+    const cand = [];
+    if (m.current) cand.push (m.current);
+    for (const t of (m.tracks || [])) cand.push (t);
+    if (cand.length < 2) return false;
+    let at = -1, ch = null;
+    for (let i = 0; i < cand.length && i < 500; i++)
+    {
+        const aCh = authorVoiceId (guildId, cand[i]);
+        if (!aCh || aCh === curChId) continue;
+        const c = client.channels.cache.get (aCh);
+        if (c) { at = i; ch = c; break; }
+    }
+    // at === 0 -- автор недоеденного трека тут: это обычный переезд (ниже), не пропуск.
+    // at < 0 -- в голосовых никого из авторов: играть не для кого, остаёмся как есть.
+    if (at <= 0 || !ch) return false;
+    const guildMove = client.guilds.cache.get (guildId);
+    if (!guildMove) return false;
+    const withCur = !!m.current;
+    const cut = withCur ? (at - 1) : at;          // сколько треков очереди уходит в конец
+    const moved = cand.slice (0, at);             // недоеденный текущий + треки до нужного
+    const target = cand[at];
+    const whoName = target.byName || u (target.byId);
+    try
+    {
+        joinVoice (guildId, ch, guildMove, 'авторов пропущенных треков нет в голосовом -- ' +
+            whoName + ' слушает здесь');
+    }
+    catch (e)
+    {
+        console.error ('[music] пропуск отсутствующих авторов: переехать не вышло: ' + oneLine (e.message));
+        return false;
+    }
+    m.tracks = m.tracks.slice (cut).concat (moved); // переставленные -- в конец, в своём порядке
+    m.current = null;
+    m.seekTrack = null;
+    m.seekSec = 0;
+    m.playedMs = 0;
+    m.playingSince = null;
+    m.pending = false;
+    m.pausedByNobody = false;
+    dropPreload (m);
+    m.savedChannelId = ch.id;
+    saveMusicState (guildId);
+    try { m.player.stop (true); } catch {} // Idle -> playNext: сразу заиграет трек, которого ждут
+    scheduleVoiceStatus (guildId, true);
+    schedulePresence (true);
+    const names = moved.slice (0, 3).map (t => t.title || 'трек').join (', ');
+    console.log ('[' + (d()) + '] [music] ' + moved.length + ' ' + plural (moved.length, 'трек', 'трека', 'треков') +
+        ' отсутствующих авторов (' + names + (moved.length > 3 ? ' и др.' : '') +
+        ') -- переставил в конец очереди и перешёл в «' + ch.name + '»: ' + whoName + ' ждёт своё');
+    musicNotice (guildId, '⏭ ' + moved.length + ' ' + plural (moved.length, 'трек', 'трека', 'треков') +
+        ' от тех, кого нет в голосовом, -- ждать некому: поставил их в конец очереди и играю **' +
+        (target.title || 'трек') + '** в «' + ch.name + '» (добавил ' + whoName + ').');
+    return true;
+}
+
 // ============================================================================
 // [v2.12] ЖИВЫЕ СЛУШАТЕЛИ: музыка не играет в пустоту и не теряет задуманное.
 //   * никого в канале -> пауза (позиция помнится и сохраняется);
@@ -7023,6 +7574,10 @@ function checkListeners (server, _noFollow = false)
             // вызывается заново и сам снимает паузу обычным путём (ветка выше), а от
             // бесконечной беготни между двумя авторами защищает _noFollow (второй
             // проход уже никого не догоняет).
+            // [v2.28] Сначала -- режим «не ждать отсутствующих авторов»: если дальше по
+            // очереди есть те, кто СЛУШАЕТ (а не просто добавил), их треки переставляются
+            // вперёд, и мы играем именно им (подробности -- skipAbsentAuthors).
+            if (skipAbsentAuthors (server, chId)) return checkListeners (server, true);
             const guildMove = client.guilds.cache.get (server);
             const found = pickAuthorChannel (server, chId);
             if (found && guildMove)
@@ -7032,10 +7587,20 @@ function checkListeners (server, _noFollow = false)
                     joinVoice (server, found.ch, guildMove, 'здесь никого, а автор трека ' +
                         (found.track.byName || u (found.track.byId)) + ' слушает здесь');
                     m.savedChannelId = found.ch.id;
-                    // Паузу, которую поставил ЧЕЛОВЕК, уважаем: переезжаем, но играть не
-                    // начинаем -- продолжит он сам (/resume). Если же это была наша
-                    // пауза «нет слушателей», то снимает её ветка выше: приехали туда,
-                    // где слушатель есть.
+                    // [v2.28] И сразу играем: раз приехали туда, где есть слушатель, пауза
+                    // больше не нужна -- в том числе поставленная ЧЕЛОВЕКОМ (/pause):
+                    // человек пришёл слушать музыку, а не тишину. Наша «нет слушателей»
+                    // снимается веткой выше при повторном вызове, а вот человеческая
+                    // осталась бы -- поэтому снимаем её здесь явно.
+                    if (m.player.state.status === AudioPlayerStatus.Paused && !m.pausedByNobody)
+                    {
+                        m.playingSince = Date.now ();
+                        try { m.player.unpause (); } catch { /* плеер мог быть пуст */ }
+                        console.log ('[' + (d()) + '] [music] приехал туда, где есть слушатель -- снимаю паузу и продолжаю');
+                        saveMusicState (server);
+                        scheduleVoiceStatus (server, true);
+                        schedulePresence (true);
+                    }
                     return checkListeners (server, true);
                 }
                 catch (e)
@@ -7591,7 +8156,7 @@ client.on ('interactionCreate', async (interaction) =>
             return replyView (parseInt (mPage[2], 10) || 1);
         }
         // --- действия: как и слэш-команды, только для админов/модеров и роли DJ ---
-        if (!/^q:(skip|clear|rm|mv|mu|md|mx)(:|$)/.test (cid)) return;
+        if (!/^q:(skip|clear|stop|co|cq|rm|mv|mu|md|mx)(:|$)/.test (cid)) return;
         if (!isDJ (interaction))
         {
             const role_dj = SERVERS[guildId].role_dj || '';
@@ -7628,9 +8193,61 @@ client.on ('interactionCreate', async (interaction) =>
                 return interaction.reply ({ content: '🤔 Не понял, какой трек двигать.', flags: MessageFlags.Ephemeral });
             return replyView (page, sel);
         }
+        // [v2.28] Подтверждение очистки. Случайный клик по «🧹 Очистить» посреди сета
+        // раньше глушил музыку сразу -- теперь сначала спрашиваем. В customId несём id
+        // сообщения очереди (или 0, если очистку позвали командой /clear): по нему
+        // обновляем список, чтобы он не остался старым.
+        const mCq = /^q:cq:([cx])(?::(\d*))?$/.exec (cid);
+        if (mCq)
+        {
+            if (mCq[1] === 'x')
+                return interaction.update ({ content: '✖ Отменено -- очередь на месте.', components: [] });
+            const res = queueClear (guildId, who);
+            const msgId = mCq[2] || '0';
+            if (msgId !== '0' && interaction.channel && typeof interaction.channel.messages.fetch === 'function')
+            {
+                const src = await interaction.channel.messages.fetch (msgId).catch (() => null);
+                if (src && src.editable)
+                {
+                    const view = queueView (m, 1);
+                    await src.edit ({ content: view.content, components: view.components }).catch (() => {});
+                }
+            }
+            return interaction.update ({ content: res.ok ? res.text : '⚠️ ' + res.text, components: [] });
+        }
+        // [v2.28] «🧹 Чужие» -- только staff (выкидывать чужие треки -- как /push).
+        if (cid === 'q:co')
+        {
+            if (!isStaffInteraction (interaction))
+                return interaction.reply
+                ({ content: '🚫 Убирать чужие треки могут только админы и модеры.', flags: MessageFlags.Ephemeral });
+            const res = queueClearOthers (guildId, interaction.user.id, who);
+            await replyView (1);
+            return interaction.followUp ({ content: res.ok ? res.text : '⚠️ ' + res.text, flags: MessageFlags.Ephemeral });
+        }
+        // [v2.28] «🧹 Очистить» -- сначала подтверждение (что именно будет сделано).
+        if (cid === 'q:clear')
+            return interaction.reply
+            ({
+                content: '🧹 Очистить **всю** очередь' + (m.tracks.length ? ' (' + m.tracks.length + ')' : '') +
+                    ' и снять играющий трек?\nБот **останется** в канале -- уйти совсем: `⏹ Стоп` (или `/stop`).',
+                components:
+                [
+                    new ActionRowBuilder ().addComponents
+                    (
+                        new ButtonBuilder ()
+                            .setCustomId ('q:cq:c:' + (interaction.message ? interaction.message.id : '0'))
+                            .setLabel ('✅ Да, очистить').setStyle (ButtonStyle.Danger),
+                        new ButtonBuilder ()
+                            .setCustomId ('q:cq:x:0').setLabel ('✖ Отмена').setStyle (ButtonStyle.Secondary)
+                    ),
+                ],
+                flags: MessageFlags.Ephemeral,
+            });
         let res;
         if (cid === 'q:skip') res = queueSkip (guildId, who);
-        else if (cid === 'q:clear') res = queueClear (guildId, who);
+        // [v2.28] «⏹ Стоп» -- то же, что /clear, но ещё и уходим из канала.
+        else if (cid === 'q:stop') res = queueClear (guildId, who, {leave: true});
         else res = queueRemove (guildId, parseInt ((interaction.values || [])[0], 10), who);
         // Сообщение очереди обновляем для ВСЕХ (видно результат) и коротко
         // подтверждаем нажавшему -- ответ виден только ему.
@@ -8186,23 +8803,14 @@ client.on ('interactionCreate', async (interaction) =>
         }
         else if (name === 'stop')
         {
-            // [v2.12] /stop -- ЕДИНСТВЕННОЕ, что стирает очередь совсем (потому что бот её
-            // запускал -- люди знают, что не будет). /leave и обрывы -- только пауза/память.
-            const was = m.tracks.length;
-            m.tracks = [];
-            m.current = null;
-            m.pending = false;
-            m.seekTrack = null;
-            m.seekSec = 0;
-            m.pausedByNobody = false;
-            m.playedToSomeone = false;
-            dropPreload (m); // [v2.9] очередь очищена -- заготовка больше не нужна
-            m.player.stop (true);
-            m.playedMs = 0; m.playingSince = null; // [v2.10] играть нечего
-            clearMusicState (guildId);              // [v2.12] из базы -- тоже вон
-            scheduleVoiceStatus (guildId, true); // [v2.7] статус: тишина, очередь пустая
-            schedulePresence (true);             // [v2.8] больше не «слушает»
-            return interaction.reply ('⏹ Остановлено. Очередь очищена' + (was ? ' (' + was + ' треков)' : '') + '.');
+            // [v2.12] /stop -- стирает очередь совсем (бот её и запускал -- люди знают,
+            // что не будет). /leave и обрывы -- только пауза/память.
+            // [v2.28] И это ЕДИНСТВЕННОЕ отличие /stop от /clear: /stop ещё и уходит из
+            // канала (раньше обе команды делали ровно одно и то же -- непонятно было, какую
+            // звать). /clear -- «очистить и остаться», /stop -- «очистить и выйти».
+            const res = queueClear (guildId,
+                interaction.member ? uuu (interaction.member) : interaction.user.username, {leave: true});
+            return interaction.reply (res.ok ? res.text : { content: res.text, flags: MessageFlags.Ephemeral });
         }
         else if (name === 'remove')
         {
@@ -8287,9 +8895,27 @@ client.on ('interactionCreate', async (interaction) =>
                 );
             }
             // [v2.15] Очистка всей очереди -- общая логика с кнопкой «🧹 Очистить».
-            const res = queueClear (guildId,
-                interaction.member ? uuu (interaction.member) : interaction.user.username);
-            return interaction.reply (res.ok ? res.text : { content: res.text, flags: MessageFlags.Ephemeral });
+            // [v2.28] Но сначала подтверждение: случайный /clear посреди сета одним
+            // нажатием глушил музыку. Жмёшь «да» -- чищу и остаюсь в канале
+            // (уйти совсем -- `/stop`). Пустую очередь подтверждать незачем.
+            if (!m.tracks.length && !m.current && !m.seekTrack)
+                return interaction.reply ({ content: '🈳 Очередь и так пуста -- чистить нечего.', flags: MessageFlags.Ephemeral });
+            return interaction.reply
+            ({
+                content: '🧹 Очистить **всю** очередь' + (m.tracks.length ? ' (' + m.tracks.length + ')' : '') +
+                    ' и снять играющий трек?\nБот **останется** в канале -- уйти совсем: `/stop` (или `⏹ Стоп` под `/queue`).',
+                components:
+                [
+                    new ActionRowBuilder ().addComponents
+                    (
+                        new ButtonBuilder ()
+                            .setCustomId ('q:cq:c:0').setLabel ('✅ Да, очистить').setStyle (ButtonStyle.Danger),
+                        new ButtonBuilder ()
+                            .setCustomId ('q:cq:x:0').setLabel ('✖ Отмена').setStyle (ButtonStyle.Secondary)
+                    ),
+                ],
+                flags: MessageFlags.Ephemeral,
+            });
         }
         else if (name === 'jump')
         {
