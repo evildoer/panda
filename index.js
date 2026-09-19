@@ -11183,18 +11183,32 @@ client.on ('interactionCreate', async (interaction) =>
                 return interaction.reply ({ content: '🤷 Сейчас ничего не играет -- перематывать нечего.', flags: MessageFlags.Ephemeral });
             if (m.current.isLive)
                 return interaction.reply ({ content: '🔴 Это прямой эфир -- позиции у него нет (`/seek 0` -- перейти к живому краю).', flags: MessageFlags.Ephemeral });
+            // [v2.46] ЧТО ВИДНО В ОКНЕ (владелец: «не выводит всю длину -- не понять, куда
+            // можно перемотать»): в ЗАГОЛОВКЕ -- какой это трек и его полная длина, в
+            // подписи поля -- текущее место, а в поле уже стоит оно же (правится
+            // пальцем). Формат ввода -- в подсказке поля, которая видна, если поле
+            // очистить, и в тексте ошибки.
+            // ЛИМИТЫ DISCORD: заголовок и подпись -- по 45 символов, подсказка поля -- 100.
+            // Прежняя подпись была ровно 45 знаков и ломалась бы на длинном месте
+            // (например 20:30:00), а длине трека места не оставалось вообще.
             const at = Math.max (0, Math.round (playedMsOf (m) / 1000));
+            const tcodeDur = Number (m.current.duration) > 0 ? Number (m.current.duration) : 0;
+            const tcodeTitle = tcodeDur
+                ? (clipText (String (m.current.title || 'трек'), 24) + ' · всего ' + fmtDur (tcodeDur))
+                : ('Перемотать: ' + clipText (String (m.current.title || 'трек'), 30));
             return interaction.showModal
             (
                 new ModalBuilder ().setCustomId ('q:skt:' + mTcodeAsk[1])
-                    .setTitle ('Перемотать трек')
+                    .setTitle (tcodeTitle.slice (0, 45))
                     .addComponents
                     (
                         new ActionRowBuilder ().addComponents
                         (
                             new TextInputBuilder ()
                                 .setCustomId ('time')
-                                .setLabel ('Куда перемотать: 1:30 или 90 (сейчас ' + fmtDur (at) + ')')
+                                .setLabel (('Куда перемотать (сейчас ' + fmtDur (at) + ')').slice (0, 45))
+                                .setPlaceholder (('можно 90, 1:30 или 1:02:03' +
+                                    (tcodeDur ? '; всего ' + fmtDur (tcodeDur) : '')).slice (0, 100))
                                 .setStyle (TextInputStyle.Short)
                                 .setRequired (true).setMaxLength (8)
                                 .setValue (fmtDur (at))
