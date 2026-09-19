@@ -5,6 +5,40 @@
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
+// CHANGELOG v2.32 (вход/выход из очереди, поднять автора, читаемая вёрстка, fixauthors):
+//   * «ВЫХОД» (ОТ /leave) -- МЯГКИЙ: человек просто ОТКЛАДЫВАЕТ СВОИ ТРЕКИ (как
+//     пауза, только до его возвращения), а бот продолжает играть для остальных и
+//     даже переезжает к следующему автору, если тот в другом канале. Место в
+//     отложенном треке НЕ теряется (уезжает вместе с треком: track.seek) и
+//     восстанавливается, когда до него снова дойдёт. Из канала бот выходит только
+//     когда играть больше нечего (тогда -- как раньше: очередь и место в базе).
+//     раньше /leave сразу обрывал чужую музыку на середине.
+//   * ВХОД/ВЫХОД И В КНОПКАХ: «▶ Войти» (`/join`) и «⏏ Выйти» (`/leave`), плюс
+//     «🧹⏏ Очистка/Выход» -- это /stop (/clear + /leave) одной кнопкой. Логика входа
+//     одна на кнопку и команду (joinMusicChannel), вход и выход из кнопки видны
+//     только нажавшему -- иначе каждое нажатие добавляло бы сообщение в чат.
+//   * МЕНЮ АВТОРА: выбрать автора -- и в подтверждении видно, что с ним можно
+//     (⬆ поднять наверх / 🗑 убрать). Список авторов показывается ВСЕМ, а права
+//     проверяются при действии: нет прав -- бот говорит ПРИЧИНУ. `/push` теперь
+//     доступен и обычному DJ, но только по СВОИМ трекам (раньше -- только staff).
+//   * ВЁРСТКА /queue: номера в косых кавычках (`12`), а не «12.» -- Discord считал
+//     это markdown-списком и сам переформатировал строки (первый пункт «уезжал» от
+//     остальных); блоки (Сейчас / Очередь / По авторам / До конца) разделены линиями.
+//   * `node . fixauthors <id> [имя] [--dry]` -- проставить автора трекам, у которых его
+//     нет (у них обычный DJ ничего не может). При старте, если такие треки есть, бот
+//     сам говорит об этом и даёт готовую команду.
+//   * ЛИСТАНИЕ НЕ ЛОМАЕТ ОЧЕРЕДЬ (найдено живым запуском): в customId кнопок был
+//     только НОМЕР страницы, поэтому на первой странице «В начало» и «Влево» давали
+//     один и тот же id (как «Вправо» с «В конец» на последней) -- Discord отвечал
+//     COMPONENT_CUSTOM_ID_DUPLICATED и отбивал ВСЁ сообщение /queue (в лог падал
+//     uncaughtException). Теперь в id есть и сама кнопка: q:p:first / q:p:prev /
+//     q:n:next / q:n:last. Старый вид «q:p:12» из уже отправленных сообщений тоже
+//     понимается, и стенд проверяет уникальность id на размерах от 1 до 200 треков.
+//   * ИНСТРУКЦИЯ БОЛЬШЕ НЕ МОЖЕТ "ПРОПАСТЬ": лимит Discord -- 6000 символов СУММОЙ
+//     по всем embed'ам ОДНОГО сообщения (в одном описании -- 4096). Инструкция
+//     подошла к 6000 вплотную, поэтому теперь она сначала режется на СООБЩЕНИЯ
+//     (helpMessages), а потом каждое -- на embed'ы: переросла -- уйдёт двумя
+//     сообщениями, а не отклонится целиком («бот запустился, а инструкции нет»).
 // CHANGELOG v2.31 (очередь: DJ распоряжается только СВОИМ, листание, меню автора):
 //   * СВОЁ / ЧУЖОЕ. Обычный DJ убирает, переставляет и чистит ТОЛЬКО свои записи --
 //     в меню под /queue ему попадают только они, а чужая чистка (`/clear author:@другой`)
@@ -361,7 +395,10 @@ const DB_ENC_HEX = /^[0-9a-fA-F]{64}$/;
 // игнорировался -- `node . unkey` или опечатка в `node . dum` запускали БОТА, а не
 // давали ошибку: одна случайная строка в консоли = лишний процесс. Список -- ровно то,
 // что обрабатывается ниже; всё остальное считается опечаткой.
-const CONSOLE_CMDS = ['keygen', 'dump', 'files', 'privacy', 'backup', 'checkpoint', 'backups', 'restore', 'clearstatus', 'unkey'];
+const CONSOLE_CMDS = ['keygen', 'dump', 'files', 'privacy', 'backup', 'checkpoint', 'backups', 'restore', 'clearstatus', 'unkey', 'fixauthors'];
+// [v2.32] Единственная консольная команда, которой нужно ДОЖДАТЬСЯ базы (fixauthors):
+// на время её работы вход бота в Discord блокируется (см. проверку у client.login).
+const $cliHold = CONSOLE_CMDS.some (_c => _c === 'fixauthors' && process.argv.slice (2).some (_a => new RegExp ('^' + _c + '$', 'i').test (_a)));
 {
     const _first = String (process.argv[2] === undefined ? '' : process.argv[2]).trim ();
     if (_first && !CONSOLE_CMDS.includes (_first.toLowerCase ()))
@@ -379,6 +416,7 @@ const CONSOLE_CMDS = ['keygen', 'dump', 'files', 'privacy', 'backup', 'checkpoin
         console.log ('  node . backups               -- что есть: база, штатная копия и точки');
         console.log ('  node . restore [метка]       -- вернуть базу из копии или из точки');
         console.log ('  node . clearstatus <id>      -- снять свою строку из статуса голосового канала');
+        console.log ('  node . fixauthors <id> [имя] -- проставить автора трекам в очереди, где его нет');
         process.exit (2);
     }
 }
@@ -1175,39 +1213,39 @@ const STARTUP_DM_TEXT =
     '  сколько уже играет текущий, сколько ещё ждать до конца плейлиста целиком и\n' +
     '  сводка ПО АВТОРАМ (у кого сколько треков и на сколько времени). На странице\n' +
     '  по 15 треков (у одного автора подряд он не повторяется), у длинных очередей\n' +
-    '  есть кнопки листания «⏮ В начало / ◀ Влево / Вправо ▶ / В конец ⏭» (и `from:16`).\n' +
-    '  Сколько на странице -- настройка `queue_page` в конфиге.\n' +
-    '  Под очередью -- кнопки и меню: «⏭ Пропустить»; «🧹 Очистить» и «⏹ Стоп» (обе\n' +
-    '  спросят подтверждение и скажут, что именно уйдёт); «🗑 Убрать трек»;\n' +
-    '  «🗑 Удалить треки автора» -- выбрать, чьи треки убрать; «🎚 Двигать трек»\n' +
-    '  (после выбора -- «⬆ Выше»/«⬇ Ниже»). Номера -- те же, что в `/remove`.\n' +
-    '  **Свои и чужие:** обычный DJ убирает, двигает и чистит ТОЛЬКО свои записи\n' +
-    '  (своя музыка -- своё дело; в меню ему видны только они). Админы и модеры\n' +
-    '  могут всё, включая всю очередь сразу.\n' +
+    '  есть листание «⏮ В начало / ◀ Влево / Вправо ▶ / В конец ⏭» (или `from:16`).\n' +
+    '  Под очередью -- кнопки и меню: листание; «⏭ Пропустить»; «▶ Войти» (`/join`);\n' +
+    '  «⏏ Выйти» (`/leave`: свои треки откладываются, чужое играет дальше);\n' +
+    '  «🧹 Очистить» (`/clear`) и «🧹⏏ Очистка/Выход» (`/clear` + `/leave`) -- обе\n' +
+    '  с подтверждением и точным списком того, что уйдёт; «🗑 Убрать трек»;\n' +
+    '  «👤 Автор…» (⬆ поднять его треки наверх или 🗑 убрать -- с подтверждением)\n' +
+    '  и «🎚 Двигать трек» («⬆ Выше»/«⬇ Ниже»). Номера -- как в `/remove`.\n' +
+    '  **Свои и чужие:** обычный DJ убирает, двигает, поднимает и чистит ТОЛЬКО свои\n' +
+    '  записи (в меню ему видны только они); админы и модеры -- любые и всю очередь сразу.\n' +
     '`/remove number` -- убрать трек, `/move number to` -- переставить его,\n' +
     '`/jump number` -- прыгнуть к треку (number/to -- те же номера, что в `/queue`;\n' +
     '  текущий трек в них не входит). У DJ -- только по своим трекам, у staff -- любые.\n' +
     '`/clear` -- очистить очередь вместе с играющим треком (дальше тишина), но\n' +
     '  ОСТАТЬСЯ в канале -- спросит подтверждение; `/stop` -- то же и уйти из канала.\n' +
     '  DJ чистит только свои записи, админы/модеры выбирают: свои или всю очередь\n' +
-    '`/clear author:@ты` -- убрать свои треки вместе с играющим (он прерывается, а не\n' +
-    '  доигрывает). Чужого автора -- только админы и модеры\n' +
-    '`/push author:@кто` -- поднять треки одного автора наверх очереди (только\n' +
-    '  админы и модеры; без автора -- свои). Порядок внутри поднятых не меняется\n' +
+    '`/clear author:@ты` -- убрать свои треки вместе с играющим (прерывается, а не\n' +
+    '  доигрывает); чужого автора -- только админы/модеры\n' +
+    '`/push [author:@кто]` -- поднять треки автора наверх очереди (свои -- можно и\n' +
+    '  обычному DJ, чужие -- админам/модерам). Порядок внутри поднятых не меняется\n' +
     '`/skip` -- следующий\n' +
     '`/pause` / `/resume` -- пауза / продолжить\n' +
     '`/join` -- зайти в твой канал и остаться там (даже без музыки)\n' +
-    '`/leave` -- выйти из канала (очередь и место помню -- продолжу по `/join`)\n' +
+    '`/leave` -- «выход»: свои треки откладываются в конец очереди (место в треке\n' +
+    '  сохраняется, продолжу с него), чужое играет дальше; из канала ухожу, только если\n' +
+    '  играть больше нечего (очередь и место помню -- вернусь по `/join`)\n' +
     'Управлять музыкой могут админы, модеры и роль DJ (смотреть очередь -- всем).\n' +
-    '**Бот играет там, где слушает автор трека:** если тот, кто добавил трек, сидит\n' +
-    'в голосовом канале, в момент начала этого трека бот сам переезжает к нему и\n' +
-    'остаётся там до трека другого автора (или до `/leave`). Если же бот остался\n' +
-    'ОДИН и на паузе (сама «нет слушателей» или её поставил человек, а комната\n' +
-    'опустела) -- он ищет, кому он сейчас нужнее: автору недоеденного трека, а если\n' +
-    'того в голосовом нет -- автору ближайшего следующего (смотрит вперёд по всей\n' +
-    'очереди) и едет туда -- и там ИГРАЕТ (паузу, в том числе поставленную\n' +
-    'человеком, снимает: приехали туда, где есть слушатель). Где есть\n' +
-    'слушатели -- не уезжает никуда; сам он не заходит и не выходит никогда.\n' +
+    '**Бот играет там, где слушает автор трека:** когда начинается трек человека,\n' +
+    'который сидит в голосовом, бот сам переезжает к нему и остаётся до трека\n' +
+    'другого автора (или до `/leave`). Если он остался ОДИН и на паузе -- ищет,\n' +
+    'кому нужнее: автору недоеденного трека, а если того в голосовом нет --\n' +
+    'автору ближайшего следующего (вперёд по всей очереди), едет туда и ИГРАЕТ\n' +
+    '(паузу, даже поставленную человеком, снимает). Где есть слушатели -- не\n' +
+    'уезжает; сам он не заходит и не выходит никогда.\n' +
     '**Бот ничего не забывает:** очередь, текущий трек и место в треке живут в базе,\n' +
     'поэтому перезапуск, обрыв связи и `/leave` музыку не сбрасывают. Если в канале\n' +
     'никого -- пауза, а когда слушатель вернётся -- продолжит с того же места.\n' +
@@ -1271,31 +1309,56 @@ function helpText (server)
 // владельцу не слал). Поэтому текст режется на несколько embed'ов по границам строк:
 // в одном сообщении их может быть до 10 и до 6000 символов суммарно.
 const HELP_EMBED_MAX = 3900;
-function helpEmbeds (server)
+// Режем текст по границам строк на куски не длиннее max (последняя строка может
+// оказаться длиннее max сама по себе -- это лучше, чем потерять её).
+function sliceByLines (text, max)
+{
+    const out = [];
+    let cur = '';
+    for (const line of text.split ('\n'))
+    {
+        if (cur && cur.length + line.length + 1 > max) { out.push (cur); cur = ''; }
+        cur += (cur ? '\n' : '') + line;
+    }
+    if (cur) out.push (cur);
+    return out;
+}
+
+// [v2.32] ОДНО СООБЩЕНИЕ -- ЭТО НЕ ОДИН EMBED. Лимит 6000 символов Discord считает
+// СУММОЙ по всем embed'ам ОДНОГО сообщения (в описании одного -- 4096), и embed'ов
+// в сообщении не больше 10. Инструкция уже подошла к 6000 вплотную, и любая новая
+// строка обрушила бы её ЦЕЛИКОМ ('Invalid Form Body') -- и /help, и `panda help`,
+// и стартовую ЛС (ровно это и случалось раньше с лимитом 4096). Поэтому сначала
+// текст режется на СООБЩЕНИЯ (HELP_MSG_MAX), потом каждое -- на embed'ы
+// (HELP_EMBED_MAX). Переросла -- станет двумя сообщениями, а не пропадёт.
+const HELP_MSG_MAX = 5800; // запас к 6000: подпись с именем сервера тоже считается
+function helpMessages (server)
 {
     const s = SERVERS[server];
     const first = server && s ? server : Object.keys (SERVERS)[0];
-    const parts = [];
-    let cur = '';
-    for (const line of helpText (first).split ('\n'))
-    {
-        if (cur && cur.length + line.length + 1 > HELP_EMBED_MAX) { parts.push (cur); cur = ''; }
-        cur += (cur ? '\n' : '') + line;
-    }
-    if (cur) parts.push (cur);
-    return parts.map ((part, i) =>
-    {
-        const last = i === parts.length - 1;
-        const emb = { color: 0x00CCFF, description: part };
-        if (i === 0) emb.title = '🐼 PANDAMIA Bot: инструкция';
-        // Подпись и время -- только у последнего куска: это одна инструкция, а не несколько.
-        if (last)
-        {
-            emb.footer = { text: (first && SERVERS[first]) ? SERVERS[first].name : 'PANDAMIA Bot' };
-            emb.timestamp = dt(); // [v14] только Date/number (locale-строка кидала 'Invalid time value'),
-        }
-        return emb;
-    });
+    const msgs = sliceByLines (helpText (first), HELP_MSG_MAX)
+        .map (chunk => sliceByLines (chunk, HELP_EMBED_MAX)
+            .map (desc => ({ color: 0x00CCFF, description: desc })));
+    if (!msgs.length) return [[{ color: 0x00CCFF, description: helpText (first) }]];
+    // Заголовок -- у первого embed'а всей инструкции, подпись и время -- у последнего:
+    // это ОДНА инструкция, даже если она разошлась на несколько сообщений.
+    msgs[0][0].title = '🐼 PANDAMIA Bot: инструкция';
+    const tail = msgs[msgs.length - 1];
+    tail[tail.length - 1].footer =
+        { text: (first && SERVERS[first]) ? SERVERS[first].name : 'PANDAMIA Bot' };
+    tail[tail.length - 1].timestamp = dt(); // [v14] только Date/number (locale-строка кидала 'Invalid time value')
+    return msgs;
+}
+
+// Все куски инструкции одним списком (кому нужно ровно одно сообщение -- helpEmbed).
+function helpEmbeds (server) { return helpMessages (server).flat (); }
+
+// Отправить инструкцию человеку в ЛС (сколько бы сообщений ни вышло).
+async function sendHelpDm (user, server)
+{
+    const msgs = helpMessages (server);
+    for (const embeds of msgs) await user.send ({ embeds });
+    return msgs.length;
 }
 
 // Первый кусок -- для случаев, когда нужен ровно один embed (совместимость).
@@ -1859,6 +1922,98 @@ for (let _server in SERVERS)
     $db[_server]['banHistory']        = dbMake (_server, 'banHistory');
 }
 
+// ============================================================================
+// `node . fixauthors <id> [имя] [--dry]` -- ПРОСТАВИТЬ АВТОРА ТРЕКАМ В ОЧЕРЕДИ, где его
+// нет. [v2.31] автор пишется при добавлении и есть у каждого НОВОГО трека, но треки
+// из старых баз (до v2.31) остались без него -- в /queue они показаны как «без автора»,
+// и обычный DJ их не трогает (считаются ничьими). Команда один раз дописывает автора
+// в сохранённую очередь (musicState/queue) каждого рабочего сервера:
+//   node . fixauthors 123456789012345678                -- id добавившего эти треки
+//   node . fixauthors 123456789012345678 "fantazer._."  -- так имя будет видно в /queue
+//   node . fixauthors 123456789012345678 --dry          -- только посчитать, ничего не писать
+// Бот при этом НЕ запускается (иначе это был бы второй процесс на тот же гейтвей).
+// ============================================================================
+async function dbFixAuthorsCli ()
+{
+    const _args = process.argv.slice (2).filter (_x => !/^fixauthors$/i.test (_x));
+    const _dry = _args.some (_x => /^--dry$/i.test (_x));
+    const _id = _args.find (_x => /^\d{17,20}$/.test (_x)) || '';
+    const _name = _args.find (_x => !/^--/.test (_x) && !/^\d{17,20}$/.test (_x)) || '';
+    console.log ('[fixauthors] режим: ' + (_dry ? 'только посчитать (--dry), база не меняется' : 'дописать автора трекам, у которых его нет'));
+    if (!_id)
+    {
+        console.log ('[fixauthors] нужен id того, кто добавлял эти треки.');
+        console.log ('[fixauthors] пример: node . fixauthors 123456789012345678 "fantazer._."');
+        console.log ('[fixauthors] id берётся в Discord: правый клик по человеку -> «Копировать ID пользователя».');
+        return 2;
+    }
+    console.log ('[fixauthors] автор, которого дописываю: ' + _id + (_name ? ' («' + _name + '»)' : ' (без имени -- в /queue будет виден id)'));
+    let _total = 0, _servers = 0;
+    for (const _srv of dbServerListOn ())
+    {
+        const _title = _srv + ((SERVERS[_srv] || {}).name ? ' («' + SERVERS[_srv].name + '»)' : '');
+        let _st = null;
+        try { _st = await db (_srv, 'musicState', 'queue'); }
+        catch (e)
+        {
+            console.log ('[fixauthors] ' + _title + ': не смог прочитать очередь: ' + oneLine ((e && e.message) || e));
+            continue;
+        }
+        if (!_st || typeof _st !== 'object')
+        {
+            console.log ('[fixauthors] ' + _title + ': очереди в базе нет -- ничего не делаю');
+            continue;
+        }
+        let _fixed = 0, _had = 0;
+        const _mark = t =>
+        {
+            if (!t || typeof t !== 'object') return;
+            if (t.byId) { _had++; return; }
+            t.byId = _id;
+            t.byName = _name || _id;
+            _fixed++;
+        };
+        _mark (_st.current);
+        for (const _t of (_st.tracks || [])) _mark (_t);
+        if (!_fixed)
+        {
+            console.log ('[fixauthors] ' + _title + ': без автора ничего нет (у ' + _had + ' треков автор уже есть) -- ничего не менял');
+            continue;
+        }
+        if (!_dry)
+        {
+            try { await db (_srv, 'musicState', 'queue', _st); }
+            catch (e)
+            {
+                console.log ('[fixauthors] ' + _title + ': не смог записать: ' + oneLine ((e && e.message) || e));
+                continue;
+            }
+        }
+        _total += _fixed;
+        _servers++;
+        console.log ('[fixauthors] ' + _title + ': дописал автора ' + _fixed + ' ' +
+            plural (_fixed, 'треку', 'трекам', 'трекам') + (_had ? ', у ' + _had + ' автор уже был' : '') +
+            (_dry ? ' [--dry: НЕ записывал]' : ' -- сохранено'));
+    }
+    console.log ('[fixauthors] итог: ' + _total + ' ' + plural (_total, 'трек', 'трека', 'треков') +
+        ' на ' + _servers + ' ' + plural (_servers, 'сервере', 'серверах', 'серверах') +
+        (_dry ? ' (ничего не записано)' : ''));
+    if (_total && !_dry)
+    {
+        console.log ('[fixauthors] готово. В /queue у этих треков теперь будет автор, а обычный DJ сможет их убирать и двигать.');
+        console.log ('[fixauthors] на всякий случай: копию базы можно сделать до/после --  node . checkpoint before-fixauthors');
+    }
+    return 0;
+}
+
+// Вызываем ДО всего остального (и выходим): иначе дальше поднялся бы второй бот.
+if (process.argv.slice (2).some (_a => /^fixauthors$/i.test (_a)))
+{
+    dbFixAuthorsCli ()
+        .then (_code => process.exit (_code || 0))
+        .catch (e => { console.log ('[fixauthors] ошибка: ' + oneLine ((e && e.message) || e)); process.exit (1); });
+}
+
 // [v2.20] Состояние шифрования базы -- одной строкой при старте (как остальные отчёты):
 // чтобы после перезапуска было видно, что база не вдруг стала открытой (или наоборот).
 console.log ('[' + new Date ().toLocaleString () + '] [db] шифрование записей: ' +
@@ -2174,6 +2329,14 @@ const INTENT_NAMES = new Map
 // here you go...
 (async () =>
 {
+    // [v2.32] Консольная команда (fixauthors) пишет в базу и ждёт ответа асинхронно:
+    // пока она работает, бот не должен логиниться -- иначе рядом с ней поднялся бы ВТОРОЙ
+    // процесс на тот же гейтвей, а это хуже всего, что может сделать такая команда.
+    if ($cliHold)
+    {
+        console.log ('[' + (d()) + '] [login] пропускаю вход: сейчас работает консольная команда');
+        return;
+    }
     // Message Content можно проверить ЗАРАНЕЕ (флаги приложения), чтобы не тратить вход:
     if (USE_MESSAGE_CONTENT && !(await messageContentAllowed ()))
     {
@@ -2249,8 +2412,9 @@ client.on
             await client.users.fetch (uid)
             .then
             (
-                user =>
-                user.send ({ embeds: helpEmbeds (Object.keys (SERVERS)[0]) }) // [v2.6] тот же текст, что у /help
+                // [v2.6] тот же текст, что у /help; [v2.32] -- в несколько сообщений,
+                // если инструкция переросла лимит одного сообщения (6000 символов)
+                user => sendHelpDm (user, Object.keys (SERVERS)[0])
             )
             .then (() => console.log ('[' + (d()) + '] стартовая ЛС отправлена ' + uid))
             .catch (e => console.error ('[' + (d()) + '] стартовая ЛС не ушла ' + uid + ': ' + e.message));
@@ -2446,7 +2610,7 @@ client.on ('messageCreate', async message =>
         // В чат её не льём (20 строк шума); саму команду в канале уберёт блок ниже.
         if (isCmd (message.content, 'help'))
         {
-            message.author.send ({ embeds: helpEmbeds (message.guild ? message.guild.id : null) })
+            sendHelpDm (message.author, message.guild ? message.guild.id : null)
             .then (() => console.log ('[' + (d()) + '] [dm] help -> ' + uu (message.author) + ' -- отправлено'))
             .catch (e => console.error
             (
@@ -7235,10 +7399,14 @@ function queuePageSize (m)
 }
 const QUEUE_MSG_LIMIT = 1980;
 // Запас на служебные строки: заголовок «Очередь (N)», переводы строк, хвост
-// «...и ещё N: /queue from:M» (самая длинная часть -- сам хвост).
-const QUEUE_GLUE = 60;
+// «...и ещё N: /queue from:M» (самая длинная часть -- сам хвост) и РАЗДЕЛИТЕЛИ
+// блоков [v2.32] (до трёх линий QSEP по 12 символов).
+const QUEUE_GLUE = 120;
 // Подсказка внизу. Короткая -- когда очередь не влезла в одну страницу (все действия
 // и так есть кнопками), полная -- когда всё видно сразу.
+// [v2.32] Визуальный разделитель блоков в сообщении /queue: «Сейчас», «Очередь»,
+// «По авторам», «До конца очереди» -- раньше всё сливалось в один поток строк.
+const QSEP = '────────────';
 const QUEUE_HINT_SHORT = '_Действия -- кнопками ниже._';
 const QUEUE_HINT_FULL =
     '_Убрать -- `/remove`, переставить -- `/move` или кнопками ниже, прыгнуть -- `/jump`; ' +
@@ -7301,7 +7469,11 @@ function queueLines (slice, start, titleClip)
         const by = byNameOf (t); // [v2.31] автор есть всегда; соседние треки одного автора -- один раз
         const label = (by && by !== prevBy) ? ' · 👤 ' + by : '';
         prevBy = by;
-        lines.push ((start + i) + '. **' + clipText (t.title || 'трек', titleClip) + '** `' +
+        // [v2.32] Номер -- в косых кавычках (`12`), а не «12.»: Discord принимает «12.»
+        // за начало markdown-СПИСКА и сам переформатирует строки (первый пункт «уезжал»
+        // от остальных и в логе, и на экране). В кавычках номер ровный, моноширинный,
+        // и рендер его не трогает; нумерацию это не меняет (/remove ждёт те же числа).
+        lines.push ('`' + (start + i) + '` · **' + clipText (t.title || 'трек', titleClip) + '** `' +
             fmtDur (t.duration, t.isLive) + '`' + label);
     }
     return lines;
@@ -7394,26 +7566,35 @@ function queueComponents (page, m, moveSel = 0, opts = {})
     if (total > 0)
     {
         const atEnd = (start + count) > total;
+        // [v2.32] В customId -- не только целевая страница, но и САМА КНОПКА
+        // (q:p:first / q:p:prev / q:n:next / q:n:last). Раньше было просто «q:p:страница»,
+        // и на первой странице «В начало» и «Влево» давали ОДИН customId (как и
+        // «Вправо» с «В конец» на последней) -- Discord отбивал всё сообщение:
+        // COMPONENT_CUSTOM_ID_DUPLICATED, и `/queue` не открывался вовсе.
         rows.push
         (
             new ActionRowBuilder ().addComponents
             (
                 new ButtonBuilder ()
-                    .setCustomId ('q:p:1').setLabel ('⏮ В начало')
+                    .setCustomId ('q:p:first:1').setLabel ('⏮ В начало')
                     .setStyle (ButtonStyle.Secondary).setDisabled (start <= 1),
                 new ButtonBuilder ()
-                    .setCustomId ('q:p:' + Math.max (1, start - step)).setLabel ('◀ Влево')
+                    .setCustomId ('q:p:prev:' + Math.max (1, start - step)).setLabel ('◀ Влево')
                     .setStyle (ButtonStyle.Secondary).setDisabled (start <= 1),
                 new ButtonBuilder ()
-                    .setCustomId ('q:n:' + (start + count)).setLabel ('Вправо ▶')
+                    .setCustomId ('q:n:next:' + (start + count)).setLabel ('Вправо ▶')
                     .setStyle (ButtonStyle.Secondary).setDisabled (atEnd),
                 new ButtonBuilder ()
-                    .setCustomId ('q:n:' + queueLastStart (m)).setLabel ('В конец ⏭')
+                    .setCustomId ('q:n:last:' + queueLastStart (m)).setLabel ('В конец ⏭')
                     .setStyle (ButtonStyle.Secondary).setDisabled (atEnd)
             )
         );
     }
-    // Действия не зависят от страницы -- отдельный ряд (одинаковый на всех страницах):
+    // Действия не зависят от страницы -- отдельный ряд (одинаковый на всех страницах).
+    // [v2.32] Здесь же ВХОД и ВЫХОД: «Войти» -- это /join (зайти и остаться),
+    // «Выйти» -- /leave (отложить СВОИ треки и играть дальше; совсем выйти из
+    // канала -- только когда играть больше нечего), а «Очистка/Выход» -- /stop,
+    // т.е. /clear + /leave одной кнопкой (с подтверждением).
     rows.push
     (
         new ActionRowBuilder ().addComponents
@@ -7422,10 +7603,15 @@ function queueComponents (page, m, moveSel = 0, opts = {})
                 .setCustomId ('q:skip').setLabel ('⏭ Пропустить').setStyle (ButtonStyle.Secondary)
                 .setDisabled (!m.current),
             new ButtonBuilder ()
+                .setCustomId ('q:join').setLabel ('▶ Войти').setStyle (ButtonStyle.Success),
+            new ButtonBuilder ()
+                .setCustomId ('q:leave').setLabel ('⏏ Выйти').setStyle (ButtonStyle.Secondary),
+            new ButtonBuilder ()
                 .setCustomId ('q:clear').setLabel ('🧹 Очистить').setStyle (ButtonStyle.Danger)
                 .setDisabled (!total && !m.current),
             new ButtonBuilder ()
-                .setCustomId ('q:stop').setLabel ('⏹ Стоп').setStyle (ButtonStyle.Danger)
+                .setCustomId ('q:stop').setLabel ('🧹⏏ Очистка/Выход').setStyle (ButtonStyle.Danger)
+                .setDisabled (!total && !m.current && !m.connection)
         )
     );
     if (count)
@@ -7459,41 +7645,27 @@ function queueComponents (page, m, moveSel = 0, opts = {})
             rows.push (new ActionRowBuilder ().addComponents (mv));
         }
     }
-    // [v2.31] Меню «Удалить треки автора»: обычному DJ -- только он сам (даже если
-    // треков нет -- в подтверждении так и будет сказано), staff -- все авторы и
-    // отдельно ничьи треки из старых баз. В режиме перестановки ряд скрыт: рядов
-    // компонентов не может быть больше пяти.
+    // [v2.32] МЕНЮ АВТОРА -- ДЛЯ ВСЕХ, а права проверяются при действии. Так видно,
+    // ЧТО вообще можно (и почему нельзя, если нельзя): выбрать автора и получить
+    // подтверждение с описанием того, что произойдёт. В режиме перестановки ряд скрыт:
+    // рядов компонентов не может быть больше пяти.
     if (!moveSel)
     {
-        const authorOpts = [];
-        if (!staff)
-        {
-            const ownN = (m.tracks.filter (t => isBy (t, actorId)).length) + (isBy (m.current, actorId) ? 1 : 0);
-            authorOpts.push
-            ({
-                label: ('👤 ' + (opts.actorName || 'ты')).slice (0, 100),
-                description: ownN ? (ownN + ' ' + plural (ownN, 'трек', 'трека', 'треков') + ' (твои)') : 'треков нет',
-                value: String (actorId),
-            });
-        }
-        else
-        {
-            // value не может быть пустым (Discord такое меню отвергает), поэтому
-            // ничьи треки (треки из старых баз) идут со значением '0' -- снежинкой
-            // такой id быть не может, а в обработчике '0' снова читается как «без автора».
-            for (const o of queueAuthorList (m, actorId, true))
-                authorOpts.push
-                ({
-                    label: ('👤 ' + o.name).slice (0, 100),
-                    description: o.n + ' ' + plural (o.n, 'трек', 'трека', 'треков'),
-                    value: (o.id || '0'),
-                });
-        }
+        // value не может быть пустым (Discord такое меню отвергает), поэтому ничьи
+        // треки (из старых баз) идут со значением '0' -- снежинкой такой id быть не
+        // может, а в обработчике '0' снова читается как «без автора».
+        const authorOpts = queueAuthorList (m, actorId, true).map (o =>
+        ({
+            label: ('👤 ' + o.name).slice (0, 100),
+            description: o.n + ' ' + plural (o.n, 'трек', 'трека', 'треков') +
+                (o.id === String (actorId) ? ' (твои)' : ''),
+            value: (o.id || '0'),
+        }));
         if (authorOpts.length)
         {
             const da = new StringSelectMenuBuilder ()
                 .setCustomId ('q:da')
-                .setPlaceholder ('🗑 Удалить треки автора…');
+                .setPlaceholder ('👤 Автор: поднять или убрать…');
             da.addOptions (authorOpts.slice (0, 25));
             rows.push (new ActionRowBuilder ().addComponents (da));
         }
@@ -7890,18 +8062,25 @@ function queuePush (guildId, targetId, who)
 {
     const m = musicOf (guildId);
     const total = m.tracks.length;
+    // [v2.32] targetId === '' -- треки без автора (из старых баз): их упоминать нечем.
+    // whoTxt -- для «в скобках» (без автора / <@id>), whoWhat -- начало фразы
+    // («Треки <@id>» / «Треки без автора»): так в тексте нет «Треки треков ...».
+    const whoTxt = targetId ? u (targetId) : 'без автора';
+    const whoWhat = targetId ? 'Треки ' + u (targetId) : 'Треки без автора';
     const same = t => t && String (t.byId || '') === String (targetId);
     if (!total)
         return { ok: false, text: '🈳 В очереди нет треков' +
             (m.current ? ' (играет только **' + (m.current.title || 'трек') + '**).' : ' -- двигать нечего.') };
     const mine = m.tracks.filter (same);
     if (!mine.length)
-        return { ok: false, text: '🤔 В очереди нет треков от ' + u (targetId) + '.' +
+        return { ok: false, text: '🤔 В очереди нет ' + (targetId ? 'треков от ' + u (targetId) : 'треков без автора') + '.' +
             (m.current && same (m.current) ? ' Его трек и так играет прямо сейчас.' : '') +
-            (m.tracks.some (t => !t.byId)
-                ? '\n(у части треков автор не записан -- они добавлены до этой версии)' : '') };
+            (m.tracks.some (t => !t.byId) && targetId
+                ? '\n(у части треков автор не записан -- они добавлены до этой версии: `node . fixauthors <id>`)' : '') };
+    // Ничего не меняем -- это не ошибка, а ответ «уже так»: без него /push отвечал
+    // предупреждением «⚠️» и писал в журнал событие, которого не было.
     if (m.tracks.slice (0, mine.length).every (same))
-        return { ok: false, text: '✅ Треки ' + u (targetId) + ' уже наверху (' + mine.length + ' ' +
+        return { ok: true, text: '✅ ' + whoWhat + ' и так наверху (' + mine.length + ' ' +
             plural (mine.length, 'трек', 'трека', 'треков') + ').' };
     const rest = m.tracks.filter (t => !same (t));
     m.tracks = mine.concat (rest);
@@ -7912,11 +8091,11 @@ function queuePush (guildId, targetId, who)
     schedulePresence (true);
     const titles = mine.slice (0, 3).map (t => '**' + (t.title || 'трек') + '**').join (', ');
     console.log ('[' + (d()) + '] [music] ' + whoText (who) + 'поднял наверх треки ' +
-        (m.current && same (m.current) ? '<играет сейчас> + ' : '') + mine.length + ' шт. (' + u (targetId) + ')');
+        (m.current && same (m.current) ? '<играет сейчас> + ' : '') + mine.length + ' шт. (' + whoTxt + ')');
     return {
         ok: true,
         text: '⬆️ Поднял наверх ' + mine.length + ' ' + plural (mine.length, 'трек', 'трека', 'треков') +
-            ' от ' + u (targetId) + ':' + (titles ? ' ' + titles + (mine.length > 3 ? ' и ещё ' + (mine.length - 3) : '') : '') +
+            ' (' + whoTxt + '):' + (titles ? ' ' + titles + (mine.length > 3 ? ' и ещё ' + (mine.length - 3) : '') : '') +
             (m.current && same (m.current) ? '\n(играющий трек остаётся как есть)' : '') +
             '\n' + queuePreview (m),
     };
@@ -7968,11 +8147,14 @@ function queueView (m, start, moveSel = 0, opts = {})
           '** -- жми «⬆ Выше» / «⬇ Ниже» под списком.'
         : '';
     const authors = queueAuthorsText (m);
+    // [v2.32] Блоки разделены линией (QSEP): «Сейчас» / «Очередь» / «По авторам» /
+    // «До конца очереди» -- по одному взгляду видно, где что.
     const build = hint => queueHeadText (m) +
-        '\n\n**Очередь (' + total + ')**' + (page.start > 1 ? ' с №' + page.start : '') + ':\n' + page.list +
+        '\n' + QSEP +
+        '\n**Очередь (' + total + ')**' + (page.start > 1 ? ' · с №' + page.start : '') + ':\n' + page.list +
         (rest > 0 ? '\n*...и ещё ' + rest + ': `/queue from:' + (page.start + page.count) + '`*' : '') +
-        (authors ? '\n' + authors : '') +
-        '\n\n' + queueWaitText (m) + move + '\n' + hint;
+        (authors ? '\n' + QSEP + '\n' + authors : '') +
+        '\n' + QSEP + '\n' + queueWaitText (m) + move + '\n' + hint;
     // Очереди нет -- только шапка (подсказка про действия тогда не нужна).
     // Иначе берём ПОЛНУЮ подсказку, а если она не влезла в лимит Discord -- короткую
     // (бюджет списка считался по короткой, поэтому длинную проверяем по факту).
@@ -8047,6 +8229,14 @@ async function resumeMusic (server)
         // уже вернулись в канал (присутствие выше) -- значит точно не «выходили по /leave»
         m.leftByUser = vch ? false : !!saved.left;
         m.pending = true;
+        // [v2.32] Треки без автора (из старых баз) -- обычный DJ их не трогает: говорим
+        // об этом при старте и даём готовую команду, иначе непонятно, почему такой трек
+        // нельзя ни убрать, ни подвинуть.
+        const _noAuth = (current && !current.byId ? 1 : 0) + tracks.filter (t => !t.byId).length;
+        if (_noAuth)
+            console.log ('[' + (d()) + '] [music] в очереди ' + _noAuth + ' ' +
+                plural (_noAuth, 'трек', 'трека', 'треков') + ' без автора (добавлены до v2.31): обычный DJ их не уберёт и не подвинет -- только админы и модеры.\n' +
+                '     Проставить автора сразу всем:  node . fixauthors <его id> [имя]   (сначала можно — --dry)');
         // живо ли место: и трек, и место в треке, и очередь целиком остаются в памяти
         let ch = m.savedChannelId
             ? (guild.channels.cache.get (m.savedChannelId) ||
@@ -8520,6 +8710,164 @@ function connectTo (interaction)
     return joinVoice (interaction.guildId, interaction.member.voice.channel, interaction.guild);
 }
 
+// ============================================================================
+// [v2.32] ВХОД И ВЫХОД ОДНОЙ ДОРОГОЙ: и для слэш-команд, и для кнопок под /queue.
+// /join («Вход») и /leave («Выход») раньше жили только в обработчике слэша, а кнопки
+// были бы их второй копией -- две копии одной логики разъезжаются (уже проходили).
+// ============================================================================
+
+// «Вход»: зайти в канал того, кто позвал, и остаться там. Вся защита от перехвата --
+// здесь, поэтому кнопка и команда ведут себя одинаково.
+async function joinMusicChannel (interaction)
+{
+    const guildId = interaction.guildId;
+    const m = musicOf (guildId);
+    const voiceChannel = interaction.member && interaction.member.voice ? interaction.member.voice.channel : null;
+    if (!voiceChannel)
+        return interaction.reply ({ content: '🔊 Сначала зайди в голосовой канал!', flags: MessageFlags.Ephemeral });
+    const here = !!m.connection && m.connection.joinConfig.channelId === voiceChannel.id;
+    // [v2.18] ЗАЩИТА ОТ ПЕРЕХВАТА. Бот играет для АВТОРА трека: тот, кто его
+    // добавил, слушает его в своей комнате. Значит /join от другого DJ увёл бы
+    // бота прямо посреди прослушивания -- отказываем (тот же смысл, что «кто
+    // первый, тот и прав» у /play). Уйти можно только по-честному: /skip, /stop,
+    // когда автор сам уйдёт или когда дойдёт до трека другого автора.
+    // Если автор ушёл (или его и не было), а бот играет кому-то в другой комнате --
+    // /join разрешён, но в ответе и в логе будет сказано, что слушатели остаются.
+    const myChId = m.connection ? m.connection.joinConfig.channelId : null;
+    let stoleNote = '';
+    if (myChId && myChId !== voiceChannel.id && m.current && !m.leaving)
+    {
+        const whoCall = interaction.member ? uuu (interaction.member) : interaction.user.username;
+        const mineCh0 = client.channels.cache.get (myChId);
+        const mineName0 = mineCh0 ? '«' + mineCh0.name + '»' : 'другом канале';
+        if (authorVoiceId (guildId, m.current) === myChId)
+        {
+            const title = m.current.title || 'трек';
+            const authorName = m.current.byName || u (m.current.byId);
+            console.log ('[' + (d()) + '] [music] (кто: ' + whoCall + ') /join отклонён: играю для автора трека ' +
+                authorName + ' в ' + mineName0);
+            return interaction.reply
+            ({
+                content: '🎧 Не перееду: я играю **' + title + '** в ' + mineName0 +
+                    ' для автора трека (' + authorName + ').\n' +
+                    'Увести можно, когда он уйдёт, или командами `/skip` / `/stop` ✌️',
+                flags: MessageFlags.Ephemeral,
+            });
+        }
+        if (humansInChannel (guildId, myChId) > 0)
+        {
+            stoleNote = '🎧 В ' + mineName0 + ' оставались слушатели -- теперь они без музыки';
+            console.log ('[' + (d()) + '] [music] (кто: ' + whoCall + ') /join увёл бота из ' + mineName0 +
+                ' (автора трека там нет, но слушатели оставались)');
+        }
+    }
+    connectTo (interaction);
+    // [v2.7] куда писать уведомления (например «трек не воспроизвёлся»), если
+    // /join был первым вызовом, а /play никто не делал:
+    m.textChannelId = interaction.channelId;
+    // [v2.12] у бота может быть сохранённая очередь (после /leave, обрыва или
+    // перезапуска) -- продолжаем её С МЕСТА, а не с чистого листа
+    let resume = '';
+    if (!m.current && m.tracks.length)
+    {
+        const next = m.tracks[0];
+        const at = (m.seekTrack === next && m.seekSec) ? (next.isLive ? '' : ' с ' + fmtDur (m.seekSec)) : '';
+        playNext (guildId);
+        resume = ' Продолжаю очередь: **' + (next.title || 'трек') + '**' + at +
+            (m.tracks.length ? ' (далее ещё ' + m.tracks.length + ')' : '');
+    }
+    // Из слэш-команды ответ видят все (это событие в канале), а из кнопки -- только
+    // нажавший: иначе каждое нажатие «Войти» добавляло бы в чат новое сообщение.
+    const fromButton = typeof interaction.isButton === 'function' && interaction.isButton ();
+    return interaction.reply
+    ({
+        content: (here
+            ? '🎧 Я уже тут: **' + voiceChannel.name + '**. Выйти -- `/leave`.'
+            : '🎧 Зашёл в **' + voiceChannel.name + '** и остаюсь. Выйти -- `/leave`.') +
+            (stoleNote ? '\n' + stoleNote : '') +
+            resume,
+        ...(fromButton ? { flags: MessageFlags.Ephemeral } : {}),
+    });
+}
+
+// ============================================================================
+// [v2.32] «ВЫХОД» (ОТ /leave) ГЛАЗАМИ АВТОРА -- МЯГКИЙ, А НЕ ГРУБЫЙ.
+// Раньше /leave сразу выводил бота из канала, и чужая музыка обрывалась на середине:
+// один DJ ушёл -- слушают тишину. Теперь смысл тот, что и задумывался: человек просто
+// ОТКЛАДЫВАЕТ СВОИ ТРЕКИ (как /pause, только до его возвращения), а бот продолжает
+// играть для остальных -- и даже переезжает к следующему автору, если тот в другом
+// канале (переезд делает сам playNext: см. followTrackAuthor).
+// Место в отложенном треке НЕ теряется: оно уезжает вместе с ним (track.seek) и
+// восстанавливается, когда до него снова дойдёт (и перезапуск это переживает).
+// Крайний случай: кроме его треков играть нечего -- тогда это обычный выход из канала
+// (очередь и место остаются в базе, продолжит по /join|«Вход»).
+// ============================================================================
+function leaveMusicVoice (guildId, actorId, who)
+{
+    const m = musicOf (guildId);
+    if (!m.connection) return { ok: false, text: '🤷 Я и так не в голосовом канале.' };
+    const mine = t => !!t && isBy (t, actorId);
+    const mineNow = !!(m.current && mine (m.current));
+    const mineQ = m.tracks.filter (mine).length;
+    const othersLeft = m.tracks.some (t => !mine (t)) || (!!m.current && !mine (m.current));
+    // Откладывать нечего (у него вообще нет треков) ИЛИ, кроме его записей, играть
+    // нечего -- это честный выход из канала, как раньше.
+    if ((!mineNow && !mineQ) || !othersLeft)
+    {
+        destroyMusic (guildId); // очередь и место при этом НЕ теряются
+        const rest = m.tracks.length;
+        return {
+            ok: true,
+            text: '👋 Вышел из голосового канала.' +
+                (rest
+                    ? ' Очередь помню: ' + rest + ' ' + plural (rest, 'трек', 'трека', 'треков') +
+                      (m.seekTrack ? ' (начиная с **' + (m.seekTrack.title || 'трек') + '**' +
+                          (m.seekSec && !m.seekTrack.isLive ? ' с ' + fmtDur (m.seekSec) : '') + ')' : '') +
+                      ' -- продолжу по «Вход» (`/join`).'
+                    : ''),
+        };
+    }
+    // --- мягкий выход: его треки -- в конец очереди, играющий -- с сохранением места ---
+    const pos = m.current ? Math.max (0, Math.round (playedMsOf (m) / 1000)) : 0;
+    const moved = [], rest = [];
+    for (const t of m.tracks) (mine (t) ? moved : rest).push (t);
+    if (m.current && mine (m.current))
+    {
+        const t = m.current;
+        if (pos > 0 && !t.isLive) t.seek = pos; // место едет вместе с треком
+        moved.unshift (t);
+    }
+    if (m.seekTrack && mine (m.seekTrack))
+    {
+        if (!m.seekTrack.seek) m.seekTrack.seek = Math.max (0, Math.round (m.seekSec || 0));
+        m.seekTrack = null;
+        m.seekSec = 0;
+    }
+    m.tracks = rest.concat (moved);
+    m.current = null;
+    m.playedMs = 0;
+    m.playingSince = null;
+    m.pausedByNobody = false;
+    dropPreload (m);
+    saveMusicState (guildId);
+    try { m.player.stop (true); } catch (e) { /* плеер мог быть пуст -- не страшно */ }
+    scheduleVoiceStatus (guildId, true);
+    schedulePresence (true);
+    const next = m.tracks[0];
+    const posTxt = pos ? ' (продолжу с ' + fmtDur (pos) + ')' : '';
+    console.log ('[' + (d()) + '] [music] ' + whoText (who) + 'отложил свои треки (' + moved.length + ')' +
+        (pos ? ' вместе с местом в треке ' + fmtDur (pos) : '') +
+        ' -- они уехали в конец очереди' + (next ? '; играю дальше: ' + (next.title || 'трек') : ''));
+    return {
+        ok: true,
+        text: '⏸ Отложил твои треки (' + moved.length + ' ' + plural (moved.length, 'трек', 'трека', 'треков') +
+            ')' + posTxt + ' -- они в конце очереди, уберутся сами, когда доиграют.' +
+            (next ? ' Играю дальше: **' + (next.title || 'трек') + '**' : '') +
+            '\n_Это не выход бота: чтобы он ушёл из канала -- `⏹ Очистка/Выход` (или `/stop`),' +
+            ' а чтобы вернуть свои треки назад -- `⬆ Поднять` в меню автора._',
+    };
+}
+
 // Выход из канала. [v2.12] Очередь при этом НЕ стирается: забывает её только /stop
 // (forget: true) . По /leave бот запоминает и очередь, и место в треке и продолжит,
 // когда его позовут /join (или попросят /play); при обрыве связи -- попробует сам.
@@ -8684,10 +9032,10 @@ const musicCommands =
     // бардак). Без аргумента -- свои треки (удобно тестировать, не ища свой ник).
     new SlashCommandBuilder ()
         .setName ('push')
-        .setDescription ('Поднять треки одного автора наверх очереди (админы/модеры)')
+        .setDescription ('Поднять треки автора наверх очереди (DJ -- свои, админы/модеры -- любые)')
         .addUserOption (o =>
             o.setName ('author')
-             .setDescription ('Чьи треки поднять (без него -- твои)')),
+             .setDescription ('Чьи треки поднять (без него -- твои; чужого -- только админы/модеры)')),
     new SlashCommandBuilder ()
         .setName ('jump')
         .setDescription ('Перейти сразу к треку под этим номером')
@@ -8810,7 +9158,7 @@ const musicCommands =
              .setMinValue (1)),
     new SlashCommandBuilder ()
         .setName ('leave')
-        .setDescription ('Выйти из голосового канала'),
+        .setDescription ('Отложить свои треки и играть чужое; из канала выхожу, если играть нечего'),
 ].map (c => c.toJSON ());
 
 // Регистрация команд на всех разрешённых серверах (guild-команды -- мгновенно):
@@ -8867,8 +9215,10 @@ client.on ('interactionCreate', async (interaction) =>
             const view = queueView (m, at, moveSel, ctx);
             return interaction.update ({ content: view.content, components: view.components });
         };
-        // --- листание: в customId -- ЦЕЛЕВАЯ страница; чужие нажатия не трогают чужое сообщение ---
-        const mPage = /^q:([pn]):(\d+)$/.exec (cid);
+        // --- листание: в customId -- кнопка и ЦЕЛЕВАЯ страница; чужие нажатия не
+        // трогают чужое сообщение. Старый вид («q:p:12», без имени кнопки) тоже
+        // понимаем: такие кнопки ещё висят в старых сообщениях с очередью. ---
+        const mPage = /^q:([pn])(?::(?:first|prev|next|last))?:(\d+)$/.exec (cid);
         if (mPage)
         {
             const opener = interaction.message && interaction.message.interaction && interaction.message.interaction.user
@@ -8882,7 +9232,7 @@ client.on ('interactionCreate', async (interaction) =>
             return replyView (parseInt (mPage[2], 10) || 1);
         }
         // --- действия: как и слэш-команды, только для админов/модеров и роли DJ ---
-        if (!/^q:(skip|clear|stop|da|dc|cq|rm|mv|mu|md|mx)(:|$)/.test (cid)) return;
+        if (!/^q:(skip|join|leave|clear|stop|da|dau|dax|dx|cq|rm|mv|mu|md|mx)(:|$)/.test (cid)) return;
         if (!isDJ (interaction))
         {
             const role_dj = SERVERS[guildId].role_dj || '';
@@ -8947,6 +9297,16 @@ client.on ('interactionCreate', async (interaction) =>
         // видно, ЧТО именно уйдёт, а staff выбирает «только свои» или «всю очередь».
         // В customId несём id сообщения очереди (или 0, если пришли командой).
         const msgId = interaction.message ? interaction.message.id : '0';
+        // [v2.32] Кнопки ВХОД и ВЫХОД -- те же функции, что у /join и /leave.
+        // «Выйти» -- мягкий выход: свои треки в конец (место сохраняется), чужая
+        // музыка играет дальше; бот уходит из канала только когда играть нечего.
+        if (cid === 'q:join') return joinMusicChannel (interaction);
+        if (cid === 'q:leave')
+        {
+            const res = leaveMusicVoice (guildId, ctx.actorId, who);
+            await refreshQueueMsg (msgId);
+            return interaction.reply ({ content: res.ok ? res.text : '⚠️ ' + res.text, flags: MessageFlags.Ephemeral });
+        }
         const askClear = leave =>
         {
             const c = queueClearConfirm (m, ctx.actorId, staff, { leave: leave, msgId: msgId });
@@ -8964,70 +9324,93 @@ client.on ('interactionCreate', async (interaction) =>
             await refreshQueueMsg (mCq[2]);
             return interaction.update ({ content: res.ok ? res.text : '⚠️ ' + res.text, components: [] });
         }
-        // [v2.31] Меню «🗑 Удалить треки автора»: выбран автор -- спрашиваем подтверждение
-        // (обычному DJ показывается только он сам, поэтому и спрашиваем только за него).
+        // [v2.32] МЕНЮ АВТОРА: выбрали автора -- показываем, ЧТО с ним можно сделать
+        // (⬆ поднять наверх / 🗑 убрать), и спрашиваем подтверждение. Массовые действия
+        // без подтверждения нельзя, а если прав нет -- говорим ПРИЧИНУ, а не молчим.
         if (cid === 'q:da')
         {
             // '0' в меню -- это «без автора» (пустое value Discord не принимает):
             const raw = String ((interaction.values || [])[0] === undefined ? '' : (interaction.values || [])[0]);
             const target = (raw === '0') ? '' : raw;
-            if (!staff && target !== ctx.actorId)
-                return interaction.reply
-                ({ content: '🚫 Удалять треки других могут только админы и модеры.', flags: MessageFlags.Ephemeral });
             const hit = t => !!t && byIdOf (t) === target;
-            const found = queueAuthorList (m, ctx.actorId, staff).find (o => o.id === target);
-            // Автор мог исчезнуть из очереди между показом меню и нажатием -- тогда в
-            // подтверждении честный упоминание, а не чужое имя из играющего трека.
+            const found = queueAuthorList (m, ctx.actorId, true).find (o => o.id === target);
+            // Автор мог исчезнуть из очереди между показом меню и нажатием -- тогда
+            // говорим упоминанием, а не чужим именем из играющего трека.
             const name = found ? found.name : (target ? u (target) : 'без автора');
+            const can = staff || (!!target && target === ctx.actorId);
             const n = m.tracks.filter (hit).length;
             const playing = hit (m.current) ? (m.current.title || 'трек') : '';
             const waiting = (!playing && hit (m.seekTrack)) ? (m.seekTrack.title || 'трек') : '';
-            if (!n && !playing && !waiting)
+            const all = n + (playing ? 1 : 0) + (waiting ? 1 : 0);
+            if (!all)
                 return interaction.reply
                 ({
-                    content: (target === ctx.actorId
-                        ? '🈳 Своих треков в очереди нет -- удалять нечего.'
-                        : '🈳 У ' + (target ? u (target) : 'треков без автора') + ' ничего в очереди нет -- удалять нечего.') +
+                    content: (target === ctx.actorId ? '🈳 Своих треков в очереди нет -- ничего не сделать.'
+                             : '🈳 У ' + (target ? '**' + name + '**' : 'треков без автора') + ' ничего в очереди нет.') +
                         (target === ctx.actorId && m.tracks.length
                             ? '\nВ очереди ' + m.tracks.length + ' ' +
-                              plural (m.tracks.length, 'чужой трек', 'чужих трека', 'чужих треков') +
-                              ' -- ими распоряжаются админы и модеры.' : ''),
+                              plural (m.tracks.length, 'чужой трек', 'чужих трека', 'чужих треков') + '.'
+                            : ''),
+                    flags: MessageFlags.Ephemeral,
+                });
+            if (!can)
+                return interaction.reply
+                ({
+                    content: '🚫 **' + name + '** -- чужие треки: поднимать и убирать их могут только админы и модеры.\n' +
+                        '_Свои треки можно и самому -- выбери в списке себя: каждый распоряжается своим._' +
+                        (target === '' ? '\n_Треки без автора тоже чужие: проставить автора -- `node . fixauthors <id>`._' : ''),
                     flags: MessageFlags.Ephemeral,
                 });
             return interaction.reply
             ({
-                content: '🗑 Удалить треки ' + (target ? '**' + name + '**' : '**без автора**') + '?\n' +
-                    '• из очереди: ' + n + ' ' + plural (n, 'трек', 'трека', 'треков') + '\n' +
-                    (playing ? '• играющий: **' + playing + '** -- прерву (дослушать не смогу)\n' : '') +
-                    (waiting ? '• ждущий: **' + waiting + '** -- тоже уйдёт\n' : '') +
-                    '_Останется в очереди: ' + (m.tracks.length - n) + '._',
+                content: '👤 **' + name + '** -- ' + all + ' ' + plural (all, 'трек', 'трека', 'треков') + ':\n' +
+                    (n ? '• в очереди: ' + n + '\n' : '') +
+                    (playing ? '• играющий: **' + playing + '**\n' : '') +
+                    (waiting ? '• ждущий: **' + waiting + '**\n' : '') +
+                    '_⬆ Поднять -- встанут в начало очереди (в своём порядке); 🗑 Удалить -- уйдут совсем ' +
+                    '(играющий прервётся). Пока трек не доиграл, лучше сначала «⬆ Поднять»._',
                 components:
                 [
                     new ActionRowBuilder ().addComponents
                     (
                         new ButtonBuilder ()
-                            .setCustomId ('q:dc:' + target + ':' + msgId)
-                            .setLabel ('✅ Да, удалить (' + (n + (playing || waiting ? 1 : 0)) + ')')
-                            .setStyle (ButtonStyle.Danger),
+                            .setCustomId ('q:dau:' + (target || '0') + ':' + msgId)
+                            .setLabel ('⬆ Поднять наверх (' + n + ')').setStyle (ButtonStyle.Primary).setDisabled (!n),
                         new ButtonBuilder ()
-                            .setCustomId ('q:cq:x').setLabel ('✖ Отмена').setStyle (ButtonStyle.Secondary)
+                            .setCustomId ('q:dax:' + (target || '0') + ':' + msgId)
+                            .setLabel ('🗑 Удалить (' + all + ')').setStyle (ButtonStyle.Danger),
+                        new ButtonBuilder ()
+                            .setCustomId ('q:dx').setLabel ('✖ Отмена').setStyle (ButtonStyle.Secondary)
                     ),
                 ],
                 flags: MessageFlags.Ephemeral,
             });
         }
-        // Подтверждено: убираем треки выбранного автора.
-        const mDc = /^q:dc:([^:]*):(\d*)$/.exec (cid);
-        if (mDc)
+        // Подтверждено: поднять треки выбранного автора наверх очереди.
+        const mDau = /^q:dau:([^:]*):(\d*)$/.exec (cid);
+        if (mDau)
         {
-            const target = mDc[1];
+            const target = (mDau[1] === '0') ? '' : mDau[1];
+            if (!staff && (!target || target !== ctx.actorId))
+                return interaction.reply
+                ({ content: '🚫 Поднимать чужие треки могут только админы и модеры.', flags: MessageFlags.Ephemeral });
+            const res = queuePush (guildId, target, who);
+            await refreshQueueMsg (mDau[2]);
+            return interaction.update ({ content: res.ok ? res.text : '⚠️ ' + res.text, components: [] });
+        }
+        // Подтверждено: убираем треки выбранного автора.
+        const mDax = /^q:dax:([^:]*):(\d*)$/.exec (cid);
+        if (mDax)
+        {
+            const target = (mDax[1] === '0') ? '' : mDax[1];
             if (!staff && target !== ctx.actorId)
                 return interaction.reply
                 ({ content: '🚫 Удалять треки других могут только админы и модеры.', flags: MessageFlags.Ephemeral });
             const res = queueClearAuthor (guildId, target, who);
-            await refreshQueueMsg (mDc[2]);
+            await refreshQueueMsg (mDax[2]);
             return interaction.update ({ content: res.ok ? res.text : '⚠️ ' + res.text, components: [] });
         }
+        if (cid === 'q:dx') return interaction.update ({ content: '✖ Отменено -- очередь на месте.', components: [] });
         // [v2.31] «🧹 Очистить» и «⏹ Стоп» -- сначала подтверждение (что именно уйдёт).
         if (cid === 'q:clear') return askClear (false);
         if (cid === 'q:stop') return askClear (true);
@@ -9093,7 +9476,15 @@ client.on ('interactionCreate', async (interaction) =>
     );
     // [v2.6] /help -- всем и всегда: без DJ-роли и без голосового канала, ephemeral.
     if (name === 'help')
-        return interaction.reply ({ embeds: helpEmbeds (interaction.guildId), flags: MessageFlags.Ephemeral });
+    {
+        // [v2.32] Инструкция может не влезть в одно сообщение (лимит 6000 символов на
+        // все embed'ы вместе): тогда она уходит несколькими ответами, а не отбивается.
+        const groups = helpMessages (interaction.guildId);
+        await interaction.reply ({ embeds: groups[0], flags: MessageFlags.Ephemeral });
+        for (const embeds of groups.slice (1))
+            await interaction.followUp ({ embeds, flags: MessageFlags.Ephemeral });
+        return;
+    }
     // [v2.14] /bans -- до всего остального (это не музыка, а модерация): ответ
     // виден только вызвавшему, права -- админ/модер.
     if (name === 'bans')
@@ -9456,70 +9847,7 @@ client.on ('interactionCreate', async (interaction) =>
         // Уходит только по /leave или когда его позвали в другую комнату (тогда connectTo
         // делает rejoin). Проверяем «уже здесь?» ДО connectTo -- иначе ответ соврёт.
         if (name === 'join')
-        {
-            const voiceChannel = interaction.member && interaction.member.voice ? interaction.member.voice.channel : null;
-            if (!voiceChannel)
-                return interaction.reply ({ content: '🔊 Сначала зайди в голосовой канал!', flags: MessageFlags.Ephemeral });
-            const here = !!m.connection && m.connection.joinConfig.channelId === voiceChannel.id;
-            // [v2.18] ЗАЩИТА ОТ ПЕРЕХВАТА. Бот играет для АВТОРА трека: тот, кто его
-            // добавил, слушает его в своей комнате. Значит /join от другого DJ увёл бы
-            // бота прямо посреди прослушивания -- отказываем (тот же смысл, что «кто
-            // первый, тот и прав» у /play). Уйти можно только по-честному: /skip, /stop,
-            // когда автор сам уйдёт или когда дойдёт до трека другого автора.
-            // Если автор ушёл (или его и не было), а бот играет кому-то в другой комнате --
-            // /join разрешён, но в ответе и в логе будет сказано, что слушатели остаются.
-            const myChId = m.connection ? m.connection.joinConfig.channelId : null;
-            let stoleNote = '';
-            if (myChId && myChId !== voiceChannel.id && m.current && !m.leaving)
-            {
-                const whoCall = interaction.member ? uuu (interaction.member) : interaction.user.username;
-                const mineCh0 = client.channels.cache.get (myChId);
-                const mineName0 = mineCh0 ? '«' + mineCh0.name + '»' : 'другом канале';
-                if (authorVoiceId (guildId, m.current) === myChId)
-                {
-                    const title = m.current.title || 'трек';
-                    const authorName = m.current.byName || u (m.current.byId);
-                    console.log ('[' + (d()) + '] [music] (кто: ' + whoCall + ') /join отклонён: играю для автора трека ' +
-                        authorName + ' в ' + mineName0);
-                    return interaction.reply
-                    ({
-                        content: '🎧 Не перееду: я играю **' + title + '** в ' + mineName0 +
-                            ' для автора трека (' + authorName + ').\n' +
-                            'Увести можно, когда он уйдёт, или командами `/skip` / `/stop` ✌️',
-                        flags: MessageFlags.Ephemeral,
-                    });
-                }
-                if (humansInChannel (guildId, myChId) > 0)
-                {
-                    stoleNote = '🎧 В ' + mineName0 + ' оставались слушатели -- теперь они без музыки';
-                    console.log ('[' + (d()) + '] [music] (кто: ' + whoCall + ') /join увёл бота из ' + mineName0 +
-                        ' (автора трека там нет, но слушатели оставались)');
-                }
-            }
-            connectTo (interaction);
-            // [v2.7] куда писать уведомления (например «трек не воспроизвёлся»), если
-            // /join был первым вызовом, а /play никто не делал:
-            m.textChannelId = interaction.channelId;
-            // [v2.12] у бота может быть сохранённая очередь (после /leave, обрыва или
-            // перезапуска) -- продолжаем её С МЕСТА, а не с чистого листа
-            let resume = '';
-            if (!m.current && m.tracks.length)
-            {
-                const next = m.tracks[0];
-                const at = (m.seekTrack === next && m.seekSec) ? (next.isLive ? '' : ' с ' + fmtDur (m.seekSec)) : '';
-                playNext (guildId);
-                resume = ' Продолжаю очередь: **' + (next.title || 'трек') + '**' + at +
-                    (m.tracks.length ? ' (далее ещё ' + m.tracks.length + ')' : '');
-            }
-            return interaction.reply
-            (
-                (here
-                    ? '🎧 Я уже тут: **' + voiceChannel.name + '**. Выйти -- `/leave`.'
-                    : '🎧 Зашёл в **' + voiceChannel.name + '** и остаюсь. Выйти -- `/leave`.') +
-                (stoleNote ? '\n' + stoleNote : '') +
-                resume
-            );
-        }
+            return joinMusicChannel (interaction); // [v2.32] логика одна с кнопкой «▶ Войти»
 
         if (name === 'play')
         {
@@ -9627,14 +9955,20 @@ client.on ('interactionCreate', async (interaction) =>
             // [v2.27] Поднять треки одного автора наверх очереди -- ТОЛЬКО админы/модеры
             // (обычному DJ это позволило бы переставлять чужие треки и превращать очередь
             // в бардак). Без аргумента -- свои: удобно слушать/тестировать свой плейлист.
-            if (!isStaffInteraction (interaction))
+            // [v2.32] Обычный DJ может поднять СВОИ треки (это распоряжение только своим),
+            // а чужие -- админы и модеры. Раньше /push была совсем закрыта для DJ, и
+            // поднять свой длинный плейлист можно было только админом.
+            const staff = isStaffInteraction (interaction);
+            const pick = interaction.options.getUser ('author');
+            const targetId = pick ? pick.id : interaction.user.id;
+            if (!staff && String (targetId) !== String (interaction.user.id))
                 return interaction.reply
                 ({
-                    content: '🚫 Поднимать треки наверх могут только админы и модеры -- у обычного DJ очередь остаётся общей.',
+                    content: '🚫 Поднимать чужие треки могут только админы и модеры.\n' +
+                        '_Свои -- можно: `/push` без аргумента, или кнопка меню автора под `/queue`._',
                     flags: MessageFlags.Ephemeral,
                 });
-            const pick = interaction.options.getUser ('author');
-            const res = queuePush (guildId, pick ? pick.id : interaction.user.id,
+            const res = queuePush (guildId, targetId,
                 interaction.member ? uuu (interaction.member) : interaction.user.username);
             return interaction.reply (res.ok ? res.text : { content: res.text, flags: MessageFlags.Ephemeral });
         }
@@ -9765,20 +10099,11 @@ client.on ('interactionCreate', async (interaction) =>
         }
         else if (name === 'leave')
         {
-            // [v2.7] раньше бот отвечал «вышел», даже если нигде не сидел:
-            if (!m.connection)
-                return interaction.reply ({ content: '🤷 Я и так не в голосовом канале.', flags: MessageFlags.Ephemeral });
-            destroyMusic (guildId); // [v2.12] очередь при этом НЕ теряется
-            return interaction.reply
-            (
-                '👋 Вышел из голосового канала.' +
-                (m.tracks.length
-                    ? ' Очередь помню: ' + m.tracks.length + (m.tracks.length === 1 ? ' трек' : ' треков') +
-                      (m.seekTrack ? ' (начиная с **' + (m.seekTrack.title || 'трек') + '**' +
-                          (m.seekSec && !m.seekTrack.isLive ? ' с ' + fmtDur (m.seekSec) : '') + ')' : '') +
-                      ' -- продолжу по `/join`.'
-                    : '')
-            );
+            // [v2.32] «Выход» -- мягкий: свои треки откладываются, чужая музыка играет
+            // дальше (см. leaveMusicVoice). Грубый выход -- только когда играть нечего.
+            const res = leaveMusicVoice (guildId, interaction.user.id,
+                interaction.member ? uuu (interaction.member) : interaction.user.username);
+            return interaction.reply (res.ok ? res.text : { content: res.text, flags: MessageFlags.Ephemeral });
         }
     }
     catch (e)
