@@ -293,6 +293,27 @@ const DB_ENC_PREFIX = 'enc1:';// маркер формата: нет префи�
 const DB_ENC_SALT = 'pandamia-db-v1';
 const DB_ENC_HEX = /^[0-9a-fA-F]{64}$/;
 
+// [v2.27] КОНСОЛЬНЫЕ КОМАНДЫ ПРОВЕРЯЮТСЯ СТРОГО. Раньше неизвестный аргумент просто
+// игнорировался -- `node . unkey` или опечатка в `node . dum` запускали БОТА, а не
+// давали ошибку: одна случайная строка в консоли = лишний процесс. Список -- ровно то,
+// что обрабатывается ниже; всё остальное считается опечаткой.
+const CONSOLE_CMDS = ['keygen', 'dump', 'backup', 'restore', 'clearstatus'];
+{
+    const _first = String (process.argv[2] === undefined ? '' : process.argv[2]).trim ();
+    if (_first && !CONSOLE_CMDS.includes (_first.toLowerCase ()))
+    {
+        console.log ('Неизвестная команда: ' + _first);
+        console.log ('Без команды (node .) запускается ОТДЕЛЬНО бот -- и больше ничего.');
+        console.log ('Есть только эти команды:');
+        console.log ('  node . keygen              -- напечатать новый ключ шифрования базы (db_key)');
+        console.log ('  node . dump [id]            -- посмотреть базу глазами (только чтение)');
+        console.log ('  node . backup               -- обновить резервную копию базы');
+        console.log ('  node . restore              -- восстановить базу из копии');
+        console.log ('  node . clearstatus <id>     -- снять свою строку из статуса голосового канала');
+        process.exit (2);
+    }
+}
+
 if (process.argv.slice (2).some (_a => /^keygen$/i.test (_a)))
 {
     console.log ('новый db_key (вставь его в config.json в строку "db_key"):');
