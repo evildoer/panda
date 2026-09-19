@@ -480,6 +480,11 @@ const
     db_key, db_key_prev,
     // [v2.22] Ссылка на публичную политику конфиденциальности (её показывают /mydata и /help).
     privacy_url,
+    // [v2.36] Показывать ли эту ссылку в /help и /mydata. По умолчанию -- да, если ссылка
+    // есть, но её можно СКРЫТЬ, не убирая адрес из конфига (например, пока проверяют
+    // привилегированные интенты, а рядом с ботом светить своей страницей не хочется).
+    // У сервера можно переопределить своим show_privacy_url.
+    show_privacy_url,
     // [v2.27] Сколько минут между ПЛАНОВЫМИ копиями базы, пока бот работает.
     // По умолчанию 60; 0 -- как было раньше, копия только при старте (и вручную).
     backup_minutes,
@@ -1322,6 +1327,18 @@ const STARTUP_DMS = (Array.isArray (STARTUP_DM) ? STARTUP_DM
 const PRIVACY_URL = /^https?:\/\/\S+$/i.test (String (privacy_url || '').trim ())
     ? String (privacy_url).trim () : '';
 
+// [v2.36] ПОКАЗЫВАТЬ ЛИ ССЫЛКУ И КОНТАКТ. Ссылка на политику -- только если она есть в
+// конфиге И её не выключили (`show_privacy_url: false`; у сервера значение своё, если задано).
+// Контакты (кто крутит бота / чей сервер) -- по своим флагам show_owner_hoster и
+// show_owner_server, они уже были и по умолчанию включены.
+const SHOW_PRIVACY_URL = show_privacy_url !== false;
+function showPrivacyUrl (server)
+{
+    const s = SERVERS[server] || {};
+    return (s.show_privacy_url === undefined) ? SHOW_PRIVACY_URL : (s.show_privacy_url !== false);
+}
+function privacyUrlOf (server) { return (PRIVACY_URL && showPrivacyUrl (server)) ? PRIVACY_URL : ''; }
+
 // [v2.22] Владелец бота -- единственный, кому доступна /rekey (смена ключа шифрования базы):
 // операция идёт сразу по всем данным, и новый ключ после неё печатается в консоль.
 function isBotOwner (_id) { return !!OWNER_HOSTER && String (_id) === OWNER_HOSTER; }
@@ -1405,8 +1422,9 @@ function helpText (server)
 {
     // [v2.22] Ссылка на политику конфиденциальности -- если она есть в конфиге (privacy_url):
     // человеку видно, где прочитать, что бот хранит и как это удалить.
+    const _purl = privacyUrlOf (server);
     return STARTUP_DM_TEXT + contactsText (server) + '.' +
-        (PRIVACY_URL ? '\n\n📄 **Что бот хранит и как это удалить:** ' + PRIVACY_URL : '');
+        (_purl ? '\n\n📄 **Что бот хранит и как это удалить:** ' + _purl : '');
 }
 
 // [v2.6] Инструкция одним объектом -- чтобы /help, `panda help` и стартовая ЛС
@@ -2124,6 +2142,7 @@ if (process.argv.slice (2).some (_a => /^fixauthors$/i.test (_a)))
         .then (_code => process.exit (_code || 0))
         .catch (e => { console.log ('[fixauthors] ошибка: ' + oneLine ((e && e.message) || e)); process.exit (1); });
 }
+
 
 // [v2.20] Состояние шифрования базы -- одной строкой при старте (как остальные отчёты):
 // чтобы после перезапуска было видно, что база не вдруг стала открытой (или наоборот).
@@ -5602,7 +5621,7 @@ async function myDataReport (server, target, self)
         '` стирает сразу роли, историю и треки из очереди (авторство играющего трека тоже стирается); ' +
         'либо напиши владельцу бота (контакт есть в `/help`).\n' +
         '_Активное наказание `/forget` не трогает: это уже не хранение данных, а действие модерации -- его снимает `/unban`._');
-    if (PRIVACY_URL) out.push ('📄 Полная политика конфиденциальности: ' + PRIVACY_URL);
+    if (privacyUrlOf (server)) out.push ('📄 Полная политика конфиденциальности: ' + privacyUrlOf (server));
     return out.join ('\n');
 }
 
