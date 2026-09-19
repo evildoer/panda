@@ -5,11 +5,19 @@
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
-// CHANGELOG v2.41 (очередь проверяется заранее -- мёртвые видео убираются до эфира):
-//   * МЁРТВОЕ ВИДЕО НАХОДИТСЯ ДО ЭФИРА, А НЕ В ЕГО МОМЕНТ. Раньше единственным местом,
+// CHANGELOG v2.43 (проверка очереди только ПРЕДУПРЕЖДАЕТ, её итог виден в /queue):
+//   * ЗАРАНЕЕ НИЧЕГО НЕ УДАЛЯЕТСЯ. Приговор «видео недоступно» зависит от НАШЕГО IP и
+//     прокси: владелец меняет прокси, видео закрыто по региону СЕЙЧАС -- а когда до
+//     трека дойдёт очередь, оно уже отдаётся. Поэтому проверка заранее только ПОМЕЧАЕТ
+//     трек (⚠ в /queue) и говорит автору в его канал, а убирается трек ровно по факту:
+//     не запустился при воспроизведении -- тогда и уходит из очереди с настоящей причиной.
+//   * ИТОГ ВИДЕН ПРЯМО В /queue: сколько просмотрено (и когда), сколько сейчас «под
+//     вопросом», сколько убрано при воспроизведении и когда следующий проход.
+// CHANGELOG v2.41 (очередь проверяется заранее -- проблемы видно до эфира):
+//   * О ПРОБЛЕМЕ С ТРЕКОМ УЗНАЮТ ДО ЭФИРА, А НЕ В ЕГО МОМЕНТ. Раньше единственным местом,
 //     где выяснялось «видео больше нет», была предзагрузка: человек ждал свою песню,
 //     чтобы услышать, что её не будет. Теперь бот сам прочёсывает очередь от начала
-//     (MUSIC.queue_check, по умолчанию включено) и вычищает мёртвое заранее, а автору
+//     (MUSIC.queue_check, по умолчанию включено) и предупреждает заранее, а автору
 //     говорит в ТОТ канал, откуда трек добавили (v2.39), одним сообщением на канал.
 //   * ЛИМИТЫ YOUTUBE -- ГЛАВНАЯ ЗАБОТА ВЛАДЕЛЬЦА, И ОНА УЧТЕНА:
 //       - сначала дешёвый публичный oEmbed (крошечный запрос, без скачивания и без плеера),
@@ -31,8 +39,9 @@
 //         НЕ приговор: трек остаётся в очереди, а перепроверим не раньше чем через полчаса.
 //   * В ЛОГЕ И В КОНФИГЕ ЭТО ВИДНО: строка при старте ('проверка очереди заранее:
 //     ВКЛЮЧЕНА -- смотрю 20 треков от начала, пауза 5 с'), строка на каждый найденный
-//     мертвяк ('видео больше нет на YouTube (проверено заранее, задолго до эфира) --
-//     убрал из очереди'), сообщение в канал автора и два предупреждения в [config]-аудите
+//     подозрительный трек ('проверка очереди: похоже, видео недоступно (...) -- оставляю
+//     в очереди и проверю при воспроизведении'), сообщение в канал автора и два
+//     предупреждения в [config]-аудите
 //     (слишком большая глубина; слишком маленькая пауза).
 // CHANGELOG v2.40 (приветствие ведёт в публичный канал, а не в закрытую «архивную»):
 //   * ССЫЛКА ДЛЯ НОВИЧКА -- ОТДЕЛЬНАЯ НАСТРОЙКА. `welcome_channel` -- служебный: в нём
@@ -7573,8 +7582,10 @@ async function playNext (guildId)
     while (m.tracks.length && m.tracks[0] && m.tracks[0].gone)
     {
         const dead = m.tracks.shift ();
+        deadDropNote (guildId); // [v2.43] по факту не запустился -- в /queue видно, сколько таких
         console.error ('[' + (d()) + '] [music] видео больше нет на YouTube (проверено предзагрузкой): ' +
-            (dead.title || 'трек') + ' -- убрал из очереди');
+            (dead.title || 'трек') + ' -- убрал из очереди' +
+            (dead.warn ? ' (этот трек проверка заранее помечала подозрительным)' : ''));
         // [v2.39] Про это уже сказали в канал автора, как только выяснили (см. предзагрузку)
         // -- второй раз то же самое человеку не нужно.
         if (!dead.goneTold)
@@ -7742,6 +7753,16 @@ async function playNext (guildId)
         m.streamHandle = handle; // [v2.14] чем глушить этот трек (см. killStream)
         m.player.play (resource);
         m.playFailStreak = 0; // трек заиграл -- цепочка неудач сброшена (см. catch ниже)
+        // [v2.43] ПРОВЕРКА ЗАРАНЕЕ ОШИБЛАСЬ -- И ЭТО НОРМАЛЬНО. Трек доехал до эфира и
+        // заиграл (прокси поменяли, регион отпустил): снимаем пометку «под вопросом»,
+        // чтобы ⚠ в /queue не пугала зря.
+        if (track.warn)
+        {
+            console.log ('[' + (d()) + '] [music] проверка очереди: трек заиграл -- снимаю пометку «под вопросом» (' +
+                (track.title || 'трек') + ')');
+            track.warn = '';
+            track.warnAt = 0;
+        }
         startPreload (guildId); // [v2.9] пока играет -- готовим следующий трек
         cacheDropUnused (); // [v2.39] проигранное уходит с диска -- остаёмся при текущем и предзагрузке
         // [v2.12] играет кому-то живому? тогда естественный конец очереди = забыть её;
@@ -7758,6 +7779,17 @@ async function playNext (guildId)
         console.error ('[' + (d()) + '] [music] трек не заиграл: ' + (track.title || track.url || 'трек') +
             ' -- ' + oneLine (e.message) + ' (беру следующий)');
         m.current = null;
+        // [v2.43] ТРЕК ДОШЁЛ ДО ОЧЕРЕДИ И НЕ ЗАПУСТИЛСЯ -- вот теперь это ФАКТ, а не догадка.
+        // Ровно этого и ждёт проверка заранее: из очереди она ничего не убирает (ответ
+        // зависит от нашего IP и прокси), а здесь трек уходит по делу -- с настоящей
+        // причиной в канал его автора и в счёт для /queue.
+        deadDropNote (guildId);
+        {
+            const _why = isGoneError (e) ? 'видео больше нет на YouTube' : ytDlpErr (e, 160);
+            trackNotice (guildId, track, (isGoneError (e) ? '🗑 **' : '⚠️ **') + (track.title || 'Трек') +
+                '** -- ' + (isGoneError (e) ? 'видео больше нет на YouTube: убрал из очереди.'
+                    : 'не запустился, пропускаю.' + (_why ? ' Причина: ' + _why : '')));
+        }
         // [v2.35] ПРЕДОХРАНИТЕЛЬ ОТ БЕСКОНЕЧНОГО КРУГА: если причина не в одном битом
         // треке (а, скажем, сломалась сама подготовка потока), эта цепочка не кончалась
         // -- бот рекурсивно звал сам себя и вычерпывал память до падения всего процесса
@@ -7953,6 +7985,7 @@ function wireStreamErrors (m, track, resource, viaProxy, guildId)
         {
             console.error ('[' + (d()) + '] [music] видео больше нет на YouTube (' + (track.title || 'трек') +
                 ') -- убираю из очереди: ' + ytDlpErr (e, 120));
+            deadDropNote (guildId); // [v2.43] реальная причина убрать трек -- он не сыграл
             trackNotice (guildId, track, '🗑 **' + (track.title || 'Трек') + '** -- видео больше нет на YouTube, убираю из очереди.');
             m.current = null;
             m.playedMs = 0;
@@ -8600,7 +8633,8 @@ function queueAddsText (m)
 function queueListBudget (m)
 {
     const chrome = queueHeadText (m).length + queueWaitText (m).length +
-        queueAuthorsText (m).length + queueAddsText (m).length + QUEUE_GLUE + QUEUE_HINT_SHORT.length;
+        queueAuthorsText (m).length + queueAddsText (m).length + queueCheckText (m).length +
+        QUEUE_GLUE + QUEUE_HINT_SHORT.length;
     return Math.max (200, QUEUE_MSG_LIMIT - chrome);
 }
 
@@ -8624,7 +8658,10 @@ function queueLines (slice, start, titleClip)
         // за начало markdown-СПИСКА и сам переформатирует строки (первый пункт «уезжал»
         // от остальных и в логе, и на экране). В кавычках номер ровный, моноширинный,
         // и рендер его не трогает; нумерацию это не меняет (/remove ждёт те же числа).
-        lines.push ('`' + (start + i) + '` · **' + clipText (t.title || 'трек', titleClip) + '** `' +
+        // [v2.43] ⚠ -- трек, который проверка заранее сочла недоступным. Он остаётся
+        // в очереди (удаляем только по факту), но человеку видно, что с ним может быть беда.
+        lines.push ('`' + (start + i) + '` · ' + (t.warn ? '⚠ ' : '') + '**' +
+            clipText (t.title || 'трек', titleClip) + '** `' +
             fmtDur (t.duration, t.isLive) + '`' + label);
     }
     return lines;
@@ -9437,6 +9474,34 @@ function queueWaitText (m)
     return wait;
 }
 
+// [v2.43] ИТОГ ПРОВЕРКИ ОЧЕРЕДИ -- прямо в /queue, чтобы не читать лог. Что видно:
+// сколько треков проверено и КОГДА, сколько сейчас «под вопросом» (⚠ в списке),
+// сколько убрано по факту (уже при воспроизведении) и когда следующий проход.
+// Убирать заранее бот больше не берётся: ответ зависит от нашего IP и прокси.
+function queueCheckText (m)
+{
+    if (!MUSIC_QUEUE_CHECK || !QUEUE_CHECK_DEPTH) return '';
+    const c = m.check || null;
+    const warned = (m.tracks || []).filter (t => t && t.warn).length;
+    const left = queueUncheckedLeft (m);
+    const parts = [];
+    if (c && c.checked) parts.push ('просмотрено ' + c.checked + ' (в ' + hhmm (c.at) + ')');
+    if (warned) parts.push ('⚠ под вопросом: ' + warned + ', убирать не стал');
+    if (c && c.dropped) parts.push ('убрано при воспроизведении: ' + c.dropped);
+    // Когда следующий проход: ждём уже назначенное время, а если его нет, а непроверенное
+    // осталось -- его найдёт тихий проход по таймеру.
+    const pending = Number (m.deadScanAt) || 0;
+    const soon = (pending > Date.now () ? pending : (left ? Date.now () + DEAD_RESCAN_MS : 0));
+    const inMin = soon ? Math.max (1, Math.round ((soon - Date.now ()) / 60000)) : 0;
+    let when;
+    if (!m.tracks.length) when = 'проверять нечего: очередь пуста';
+    else if (left) when = 'ещё ' + left + ' ' + plural (left, 'трек', 'трека', 'треков') +
+        (inMin ? ' -- проход примерно через ' + inMin + ' мин' : '');
+    else when = 'всё проверено, новых пока нет';
+    return '🔎 **Проверка очереди заранее:** ' +
+        (parts.length ? parts.join (', ') + '; ' : 'ещё не проходила; ') + when;
+}
+
 function queueView (m, start, moveSel = 0, opts = {})
 {
     const page = queuePage (m, start);
@@ -9451,6 +9516,7 @@ function queueView (m, start, moveSel = 0, opts = {})
         : '';
     const authors = queueAuthorsText (m);
     const adds = queueAddsText (m); // [v2.35] кто и когда поставил (свежие вставки)
+    const check = queueCheckText (m); // [v2.43] итог проверки очереди заранее
     // [v2.32] Блоки разделены линией (QSEP): «Сейчас» / «Очередь» / «По авторам» /
     // «До конца очереди» -- по одному взгляду видно, где что.
     const build = hint => queueHeadText (m) +
@@ -9459,6 +9525,7 @@ function queueView (m, start, moveSel = 0, opts = {})
         (rest > 0 ? '\n*...и ещё ' + rest + ': `/queue from:' + (page.start + page.count) + '`*' : '') +
         (authors ? '\n' + QSEP + '\n' + authors : '') +
         (adds ? '\n' + QSEP + '\n' + adds : '') +
+        (check ? '\n' + QSEP + '\n' + check : '') +
         '\n' + QSEP + '\n' + queueWaitText (m) + move + '\n' + hint;
     // Очереди нет -- только шапка (подсказка про действия тогда не нужна).
     // Иначе берём ПОЛНУЮ подсказку, а если она не влезла в лимит Discord -- короткую
@@ -9658,10 +9725,13 @@ function trackNotice (guildId, track, text)
 }
 
 // ============================================================================
-// [v2.41] ЗАРАНЕЕ ПРОЧЁСЫВАЕМ ОЧЕРЕДЬ: МЁРТВЫЕ ВИДЕО УБИРАЕМ ДО ЭФИРА.
+// [v2.41] ЗАРАНЕЕ ПРОЧЁСЫВАЕМ ОЧЕРЕДЬ И ПРЕДУПРЕЖДАЕМ О ПРОБЛЕМАХ [v2.43].
 // Раньше бот узнавал «видео больше нет» только когда трек подходил к предзагрузке:
 // человек ждал свою песню, чтобы услышать, что её не будет. Теперь бот смотрит вперёд
-// сам и вычищает мёртвое заранее, а автору говорит в ТОТ канал, откуда он трек добавил.
+// сам, но НИЧЕГО НЕ УБИРАЕТ по своей проверке: ответ зависит от нашего IP и прокси
+// (регион, VPN) и меняется на ходу -- трек только помечается «под вопросом» (⚠ в /queue),
+// а уходит из очереди ровно по факту (не запустился при воспроизведении). Автору бот
+// говорит в ТОТ канал, откуда он трек добавил.
 //
 // ПОЧЕМУ ЭТО НЕ ГРОЗИТ ОГРАНИЧЕНИЯМИ YOUTUBE (главный вопрос владельца):
 //   * сначала ДЕШЁВЫЙ публичный oEmbed (один крошечный запрос, без скачивания, без плеера);
@@ -9677,6 +9747,7 @@ function trackNotice (guildId, track, text)
 // ============================================================================
 const $deadChecked = new Map ();        // адрес трека -> { state: 'alive'|'dead'|'unknown', at }
 const DEAD_UNKNOWN_RETRY = 30 * 60 * 1000; // «не поняли» -- переспросим не раньше чем через полчаса
+const DEAD_RESCAN_MS = 3 * 60 * 1000;       // [v2.43] период тихого прохода (см. setInterval ниже)
 const DEAD_PROBE_TIMEOUT = 8000;
 const $deadScan = {};                   // guildId -> true, пока идёт проход
 
@@ -9791,9 +9862,9 @@ async function deadProbe (url, strict = false)
     finally { ytDlpQuiet--; }
 }
 
-// Одним сообщением на канал: если в очереди нашлось сразу несколько мёртвых -- это спам,
+// Одним сообщением на канал: если в очереди нашлось сразу несколько подозрительных -- это спам,
 // а не событие.
-function deadToldAdd (told, guildId, track)
+function deadWarnAdd (told, guildId, track)
 {
     const m = $music[guildId];
     const want = track && track.addIn ? String (track.addIn) : '';
@@ -9804,16 +9875,20 @@ function deadToldAdd (told, guildId, track)
     if (!told.has (id)) told.set (id, []);
     told.get (id).push (track.title || 'трек');
 }
-function deadToldSend (told)
+// [v2.43] Это ПРЕДУПРЕЖДЕНИЕ, а не приговор: трек остаётся в очереди, и в тексте это
+// сказано прямо -- иначе человек пойдёт ставить заново то, что и так на месте.
+function deadWarnSend (told)
 {
     for (const [id, titles] of told)
     {
         const ch = client.channels.cache.get (id);
         if (!ch || typeof ch.send !== 'function') continue;
-        ch.send ('🗑 Видео больше нет на YouTube -- убрал из очереди: ' +
+        ch.send ('⚠️ **Возможно, это видео недоступно:** ' +
             titles.slice (0, 8).map (t => '**' + oneLine (t, 60) + '**').join (', ') +
             (titles.length > 8 ? ' и ещё ' + (titles.length - 8) : '') +
-            '. Поставь другое, если это нужно.').catch (() => {});
+            '. Проверка идёт заранее и через мой прокси -- бывает, что видео просто не\n' +
+            'отдаётся сейчас (регион, VPN). **Из очереди не убираю:** проверю, когда дойдёт\n' +
+            'очередь, и если не сыграет -- скажу причину и уберу. Ставлять заново не надо.').catch (() => {});
     }
 }
 
@@ -9822,8 +9897,27 @@ function scheduleDeadScan (guildId, delay = 8000)
     if (!MUSIC_QUEUE_CHECK || !QUEUE_CHECK_DEPTH) return;
     const m = $music[guildId];
     if (!m || m.deadScanTimer) return; // уже запланировано
+    m.deadScanAt = Date.now () + delay; // [v2.43] для строки в /queue: когда будет проход
     m.deadScanTimer = setTimeout (() => { m.deadScanTimer = null; deadScan (guildId).catch (() => {}); }, delay);
     if (m.deadScanTimer && m.deadScanTimer.unref) m.deadScanTimer.unref (); // проверка не держит процесс
+}
+
+// [v2.43] СБОР ИТОГА ДЛЯ /queue. Проверка заранее больше ничего не убирает, поэтому счёт
+// «мёртвых убрано» -- это про реальные случаи: трек доехал до эфира и НЕ ЗАПУСТИЛСЯ.
+// Сюда же пишем, когда прошёл последний проход.
+function deadCheckNote (guildId, fields)
+{
+    const m = $music[guildId];
+    if (!m) return;
+    const c = m.check || (m.check = { at: 0, checked: 0, dropped: 0 });
+    for (const k in fields) c[k] = fields[k];
+}
+function deadDropNote (guildId)
+{
+    const m = $music[guildId];
+    if (!m) return;
+    const c = m.check || (m.check = { at: 0, checked: 0, dropped: 0 });
+    c.dropped = (c.dropped || 0) + 1;
 }
 
 async function deadScan (guildId)
@@ -9831,7 +9925,7 @@ async function deadScan (guildId)
     if (!MUSIC_QUEUE_CHECK || !QUEUE_CHECK_DEPTH || $deadScan[guildId]) return;
     $deadScan[guildId] = true;
     const told = new Map ();
-    let checked = 0, removed = 0;
+    let checked = 0, warned = 0;
     try
     {
         for (;;)
@@ -9861,21 +9955,23 @@ async function deadScan (guildId)
             if (!now) break;
             if (verdict === 'dead')
             {
+                // [v2.43] НЕ УБИРАЕМ, А ПОМЕЧАЕМ. Именно на предварительной проверке это
+                // плавающий ответ: он зависит от нашего IP и прокси (регион, VPN) и от
+                // того, как сейчас отвечает YouTube. Владелец меняет прокси -- и трек,
+                // «мёртвый» пять минут назад, спокойно играет. Удаляем только по факту:
+                // не запустился при воспроизведении -- тогда и уходит из очереди.
                 const at = now.tracks.indexOf (target);
                 if (at >= 0)
                 {
-                    now.tracks.splice (at, 1);
-                    target.gone = true;
-                    removed++;
-                    console.error ('[' + (d()) + '] [music] видео больше нет на YouTube (проверено заранее, задолго до эфира): ' +
-                        (target.title || 'трек') + ' -- убрал из очереди');
+                    target.warn = 'проверка заранее: видео не отдаётся (регион/прокси или удалено)';
+                    target.warnAt = Date.now ();
+                    warned++;
+                    if (!target.warnTold)
+                        console.error ('[' + (d()) + '] [music] проверка очереди: похоже, видео недоступно -- ' +
+                            (target.title || 'трек') + ' -- оставляю в очереди, проверю при воспроизведении');
+                    target.warnTold = true;
                 }
-                if (now.seekTrack === target) { now.seekTrack = null; now.seekSec = 0; }
-                if (now.preload && now.preload.track === target) { dropPreload (now); startPreload (guildId); }
-                deadToldAdd (told, guildId, target);
-                saveMusicState (guildId);
-                scheduleVoiceStatus (guildId);
-                schedulePresence ();
+                deadWarnAdd (told, guildId, target);
             }
             await new Promise (r => setTimeout (r, QUEUE_CHECK_GAP_MS)); // пауза: не залпом
         }
@@ -9885,10 +9981,13 @@ async function deadScan (guildId)
         $deadScan[guildId] = false;
         // Одна строка на проход: видно, что проверка жива и что она нашла.
         if (checked)
+        {
             console.log ('[' + (d()) + '] [music] проверка очереди: проверено ' + checked + ' ' +
                 plural (checked, 'трек', 'трека', 'треков') + ' -- ' +
-                (removed ? 'мёртвых убрано: ' + removed : 'мёртвых нет'));
-        deadToldSend (told);
+                (warned ? 'под вопросом: ' + warned + ' (из очереди не убрал)' : 'подозрительных нет'));
+            deadCheckNote (guildId, { at: Date.now (), checked: checked });
+        }
+        deadWarnSend (told);
     }
 }
 
@@ -9897,7 +9996,25 @@ async function deadScan (guildId)
 setInterval (() =>
 {
     for (const id of Object.keys ($music)) scheduleDeadScan (id, 1000);
-}, 3 * 60 * 1000).unref ();
+}, DEAD_RESCAN_MS).unref ();
+
+// [v2.43] СКОЛЬКО ТРЕКОВ ЕЩЁ НЕ ПРОВЕРЯЛОСЬ в этой сессии -- для строки в /queue
+// («осталось проверить N»). Считаем по тому же правилу, что и сам проход: у трека есть
+// адрес и он не эфир; уже проверенное (в т.ч. «не поняли») сюда не попадает до тех пор,
+// пока пометка не устареет (DEAD_UNKNOWN_RETRY).
+function queueUncheckedLeft (m)
+{
+    if (!m || !m.tracks) return 0;
+    let left = 0;
+    for (const t of m.tracks)
+    {
+        if (!t || t.isLive) continue;
+        const u = t.url || t.streamUrl;
+        if (!u || deadStateOf (u)) continue;
+        left++;
+    }
+    return left;
+}
 
 // [v2.28] РЕЖИМ «НЕ ЖДАТЬ ОТСУТСТВУЮЩИХ АВТОРОВ» (MUSIC.skip_absent_author).
 // Ситуация: бот один в канале и молчит (пауза: своя «нет слушателей» или человек
@@ -10245,6 +10362,7 @@ function joinVoiceNow (guildId, voiceChannel, guild, reason = '')
                 {
                     console.error ('[' + (d()) + '] [music] видео больше нет на YouTube (' + (playing.title || 'трек') +
                         ') -- убираю из очереди: ' + ytDlpErr (_deadErr, 120));
+                    deadDropNote (guildId); // [v2.43] реальная причина убрать трек -- он не сыграл
                     trackNotice (guildId, playing, '🗑 **' + (playing.title || 'Трек') + '** -- видео больше нет на YouTube, убираю из очереди.');
                     m.current = null;
                     m.playedMs = 0;
