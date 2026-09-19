@@ -5,6 +5,31 @@
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
+// CHANGELOG v2.30 (лог: время на каждой строке, читаемые коды, без шума от своих же глушений):
+//   * МЕТКА ВРЕМЕНИ НА КАЖДОЙ СТРОКЕ. Часть сообщений (ошибки yt-dlp и ffmpeg, сбои прав,
+//     непереданные ЛС) печаталась в обход общего вида строки и стояла в живом логе без
+//     времени. Теперь console.log/console.error обёрнуты один раз: строка со штампом
+//     остаётся как есть, остальным штамп добавляется (CLI-команды печатают как раньше).
+//   * КОДЫ ВЫХОДА ЧИТАЕМО: 'код 3199971767' -> 'код -1094995529 (ffmpeg: не смог прочитать
+//     поток)', 'exited with code 4294967274' -> 'code -22 (неверные данные)', адреса
+//     буферов ('[in#0 @ 0x...]') из строки убраны. Обрезка длинных строк -- по слову, а не
+//     посередине ('...Error opening input files: In' больше не будет).
+//   * ШУМ ОТ СВОИХ ЖЕ ДЕЙСТВИЙ УБРАН: когда поток глушит сам бот (/skip, /stop, /leave,
+//     конец очереди), смерть yt-dlp и ffmpeg больше не пишется как ошибка ('Broken pipe').
+//   * [FIX] ВЫХОД БОТА БОЛЬШЕ НЕ ВЫГЛЯДИТ КАК «ВЫКИНУЛИ». После /stop (и /leave) событие
+//     voiceStateUpdate принимало наш собственный выход за чужое действие и писало
+//     'бота выключили/выкинули -- очередь помню' -- сразу после того, как очередь была
+//     стёрта. Отметка о нашем выходе ставится в destroyMusic; если бота выкинул человек,
+//     строка остаётся (это по-прежнему видно в логе).
+//   * [FIX] трек, который не удалось запустить, называется в логе по имени, и сказано,
+//     что бот берёт следующий (раньше были только ошибки yt-dlp/ffmpeg без контекста).
+//   * [FIX] СМЕРТЬ ПОТОКА БОЛЬШЕ НЕ СЪЕДАЕТ ТРЕК. Если yt-dlp/ffmpeg умирали на середине
+//     (в том числе при возобновлении «с места»), плеер видел не ошибку, а обычный конец
+//     трека: очередь ехала дальше, и трек молча пропадал (поймано живым прогоном:
+//     возобновлённый сет умер через 7 секунд и пропустился). Теперь такой трек
+//     возвращается в очередь и играет снова; если продолжение с места явно не вышло
+//     (замолчал почти сразу после возобновления) -- с НАЧАЛА, чтобы не потерять его.
+//     Осознанные /skip и /jump к этому не относятся (у них своя отметка).
 // CHANGELOG v2.29 (политика из шаблона, минимальный конфиг, боевой конфиг против примера):
 //   * `node . privacy [--check] [--offline]` -- PRIVACY.md собирается из шаблона
 //     privacy.template.md: название приложения и ник владельца спрашиваются у Discord,
@@ -2101,6 +2126,28 @@ const INTENT_NAMES = new Map
     [GatewayIntentBits.MessageContent, 'Message Content (текст сообщений и команды "panda ...")'],
 ]);
 
+// ============================================================================
+// [v2.30] ОДНА МЕТКА ВРЕМЕНИ НА КАЖДОЙ СТРОКЕ ЖИВОГО ЛОГА.
+// Часть сообщений печаталась в обход общего вида строки ('[' + d() + '] ...') -- и как
+// назло это были ошибки, которые нужнее всего видеть вовремя: 'yt-dlp завершился',
+// 'ffmpeg (громкость) остановился', сбои прав, непереданные ЛС. В живом логе они стояли
+// вперемешку с событиями БЕЗ времени, и по ним нельзя было понять, когда это было.
+// Править сотню вызовов -- лишний риск, поэтому оборачиваем сами console.log/error:
+// строка, УЖЕ начинающаяся со штампа, остаётся как есть, остальным штамп добавляется.
+// CLI-команды (dump/files/privacy/backup/restore/unkey) выходят раньше этой точки и
+// печатают без времени, как и раньше.
+{
+    const _alreadyStamped = s => /^\[\s*\d{1,4}[.\/]\d{1,2}[.\/]\d{1,4}/.test (s);
+    const _withStamp = fn => (...args) =>
+    {
+        if (args.length && typeof args[0] === 'string' && !_alreadyStamped (args[0]))
+            args[0] = '[' + d () + '] ' + args[0];
+        return fn (...args);
+    };
+    console.log = _withStamp (console.log.bind (console));
+    console.error = _withStamp (console.error.bind (console));
+}
+
 // Heavy GO! +D
 // here you go...
 (async () =>
@@ -3393,7 +3440,15 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                 setTimeout (() => checkListeners (server), 500);
             }
             else if (from && !to)
-                console.log ('[' + (d()) + '] [music] бота выключили/выкинули из голосового канала -- очередь помню');
+            {
+                // [v2.30] Наш собственный выход уже описан строкой '[music] вышел из ...'
+                // (см. destroyMusic) -- второй строки быть не должно: тем более
+                // «очередь помню» после /stop, который её и стёр.
+                const selfLeft = !!(mSelf && mSelf.selfLeftAt && Date.now () - mSelf.selfLeftAt < 15000);
+                if (mSelf) mSelf.selfLeftAt = 0;
+                if (!selfLeft)
+                    console.log ('[' + (d()) + '] [music] бота выключили/выкинули из голосового канала -- очередь помню');
+            }
         }
         scheduleVoiceStatus (server); // [v2.7] «в канале: N» в статусе канала (дебаунс)
         checkListeners (server);     // [v2.12] никого -- пауза; вернулся -- продолжаем
@@ -5952,17 +6007,56 @@ function pingProxy (timeoutMs = MUSIC_PROXY_TIMEOUT)
     });
 }
 
+// [v2.30] Обрезать по СЛОВУ, а не посередине: в логе стоял хвост вида
+// '... Error opening input files: In', по которому ничего не понять.
+function clipWords (s, max)
+{
+    const _s = String (s === undefined || s === null ? '' : s).trim ();
+    if (_s.length <= max) return _s;
+    const _cut = _s.slice (0, max);
+    const _sp = _cut.lastIndexOf (' ');
+    return (_sp > max * 0.6 ? _cut.slice (0, _sp) : _cut) + '...';
+}
+
 // [v2.9.2] Лог -- ОДНА строка. tinyspawn кладёт в message ошибки команду и stderr целиком
 // (несколько строк), а журнал должен читаться построчно.
 function oneLine (s, max = 200)
 {
-    return String (s === undefined || s === null ? '' : s).replace (/\s+/g, ' ').trim ().slice (0, max);
+    return clipWords (String (s === undefined || s === null ? '' : s).replace (/\s+/g, ' '), max);
 }
 
-// Самое полезное из ошибки yt-dlp -- его stderr ('ERROR: [youtube] ...: Video unavailable'):
+// [v2.30] КОДЫ ВЫХОДА ПО-ЧЕЛОВЕЧЕСКИ. ffmpeg печатает свои коды как беззнаковое
+// 32-битное число ('3199971767', '4294967274') -- понять по нему нельзя ничего, а в
+// логе оказывался именно он. Приводим к знаковому виду и, если код известный,
+// добавляем словами.
+const EXIT_HINTS =
+{
+    '-1':         'ffmpeg: общая ошибка',
+    '-9':         'процесс убит (KILL)',
+    '-13':        'нет доступа (EACCES)',
+    '-15':        'процесс завершён (TERM)',
+    '-22':        'неверные данные (EINVAL)',
+    '-1094995529':'ffmpeg: не смог прочитать поток (Invalid data)',
+};
+function exitCodeText (code)
+{
+    let _n = Number (code);
+    if (!Number.isFinite (_n)) return String (code);
+    if (_n > 2147483647) _n -= 4294967296; // Windows отдаёт код беззнаковым
+    const _h = EXIT_HINTS[String (_n)];
+    return String (_n) + (_h ? ' (' + _h + ')' : '');
+}
+
+// Самое полезное из ошибки yt-dlp -- его stderr ('ERROR: [youtube] ...: Video unavailable').
+// [v2.30] Выкидываем то, что человеку не нужно: адреса буферов ffmpeg ('[in#0 @ 0x...]')
+// и нечитаемые коды ('exited with code 4294967274' -> 'code -22 (неверные данные)').
 function ytDlpErr (e, max = 200)
 {
-    return oneLine ((e && (e.stderr || e.message)) || e, max);
+    let _s = oneLine ((e && (e.stderr || e.message)) || e, max + 120);
+    // адрес буфера печатается и как '0x...', и просто цифрами: '[in#0 @ 00000267706ed600]'
+    _s = _s.replace (/\[[^\]]*@\s*(?:0x)?[0-9a-fA-F]{6,}\]/g, '').replace (/\s+/g, ' ').trim ();
+    _s = _s.replace (/\bcode (\d{6,})/g, (_m, _n) => 'code ' + exitCodeText (_n));
+    return clipWords (_s, max);
 }
 
 // [v2.10] Процесс yt-dlp упал в первые секунды? (нужно для продолжения с места: если
@@ -6039,6 +6133,12 @@ function musicOf (guildId)
             pausedByNobody: false,  // пауза из-за отсутствия живых слушателей
             playedToSomeone: false, // очередь реально кому-то играла
             streamRetries: 0,       // попытки продолжить трек с места обрыва потока
+            // [v2.30] помощь Idle-обработчику: отличить «трек доиграл/пропущен» от
+            // «поток умер». skipRequested ставится /skip и /jump, startedAtSec/
+            // startedFromSeek -- в playNext (с какой секунды начали играть).
+            skipRequested: false,
+            startedAtSec: 0,
+            startedFromSeek: false,
             // [v2.18] когда бот подключился по просьбе человека (/join, /play): сразу после
             // этого к автору трека НЕ переезжаем (иначе уехали бы от того, кто позвал)
             justJoinedAt: 0,
@@ -6235,7 +6335,13 @@ async function createTrackStream (track, seekSec = 0, seekMode = 'sections')
     // никто не ловил, и НЕПОЙМАННЫЙ reject убивал весь процесс бота. Гасим здесь.
     // [v2.9.2] В лог -- одна строка (см. ytDlpErr): читаемая причина, без простыни.
     if (ytdlpStream && typeof ytdlpStream.catch === 'function')
-        ytdlpStream.catch (e => console.error ('[music] yt-dlp завершился: ' + ytDlpErr (e)));
+        ytdlpStream.catch (e =>
+        {
+            // [v2.30] Поток глушили мы сами (/skip, /stop, /leave, переезд) -- это не
+            // событие: yt-dlp просто не смог дописать в уже закрытый пайп ('Broken pipe').
+            if (ytdlpStream.weKilled) return;
+            console.error ('[music] yt-dlp завершился: ' + ytDlpErr (e));
+        });
     // [v2.14] Громкость: yt-dlp -> ffmpeg(loudnorm) -> PCM 48k/stereo (StreamType.Raw).
     // Не смогли поднять ffmpeg -- тихо откатываемся к обычному пути (Arbitrary),
     // который сами конвертирует внутри @discordjs/voice.
@@ -6273,8 +6379,10 @@ async function createTrackStream (track, seekSec = 0, seekMode = 'sections')
             ff.on ('close', code =>
             {
                 if (code === 0 || code === null) return; // нормально отработал
-                console.error ('[music] ffmpeg (громкость) остановился: код ' + code +
-                    (ffErr.trim () ? ' -- ' + ytDlpErr ({ stderr: ffErr }, 150) : ''));
+                if (ff.weKilled) return; // [v2.30] глушили мы сами -- не событие
+                console.error ('[' + (d()) + '] [music] выравнивание громкости оборвалось: код ' + exitCodeText (code) +
+                    (ffErr.trim () ? ' -- ' + ytDlpErr ({ stderr: ffErr }, 160) : '') +
+                    ' -- звук этого трека оборвётся раньше, дальше иду по очереди');
             });
             input = ff.stdout;
             raw = true;
@@ -6384,6 +6492,21 @@ function followTrackAuthor (guildId, track)
     }
 }
 
+// [v2.30] «Трек кончился» раньше, чем мог? Значит поток умер (см. Idle-обработчик).
+// Для трека с известной длительностью признак один: до конца ещё явно далеко
+// (запас 5 сек -- на неточную длительность в метаданных).
+// У эфира/потока длительности нет и быть не может, и там нельзя сравнивать с нулём:
+// трек мог быть продолжен С МЕСТА (startedAt), поэтому считаем «почти сразу» от той
+// секунды, с которой реально начали играть.
+function streamEndedEarly (track, at, startedAt = 0)
+{
+    if (!track) return false;
+    if (!track.isLive && Number (track.duration) > 0)
+        return at < Number (track.duration) - 5;
+    const from = Number (startedAt) > 0 ? Number (startedAt) : 0;
+    return at < from + 20;
+}
+
 async function playNext (guildId)
 {
     const m = musicOf (guildId);
@@ -6485,6 +6608,11 @@ async function playNext (guildId)
         // следующее сохранение «теряло» уже прослушанное (было: всегда 0)
         m.playedMs = startedAt * 1000;
         m.playingSince = Date.now ();
+        // [v2.30] помним, С КАКОЙ секунды начали и было ли это продолжением с места:
+        // по этому Idle-обработчик решает, стоит ли пробовать с места снова или
+        // начать трек с начала (см. streamEndedEarly).
+        m.startedAtSec = startedAt;
+        m.startedFromSeek = startedAt >= 1;
         m.pausedByNobody = false;
         wireStreamErrors (m, track, resource, viaProxy, guildId);
         m.streamHandle = handle; // [v2.14] чем глушить этот трек (см. killStream)
@@ -6499,7 +6627,10 @@ async function playNext (guildId)
     }
     catch (e)
     {
-        console.error ('[music] ошибка воспроизведения: ' + oneLine (e.message));
+        // [v2.30] Сказать и ЧТО не заиграло, и что дальше: раньше строка молчала об
+        // обоих, и в логе были только «непонятные» ошибки от yt-dlp/ffmpeg.
+        console.error ('[' + (d()) + '] [music] трек не заиграл: ' + (track.title || track.url || 'трек') +
+            ' -- ' + oneLine (e.message) + ' (беру следующий)');
         m.current = null;
         playNext (guildId); // пропустить битый трек
     }
@@ -6527,6 +6658,11 @@ function dropPreload (m)
 function killStream (r)
 {
     if (!r) return;
+    // [v2.30] Помечаем процессы, которые глушим МЫ САМИ: иначе их смерть (/skip, /stop,
+    // /leave, конец очереди) сыпала в лог 'yt-dlp завершился: ... Broken pipe' и
+    // 'ffmpeg остановился' -- это не события, а шум от собственного же действия.
+    try { if (r.proc) r.proc.weKilled = true; } catch {}
+    try { if (r.ff) r.ff.weKilled = true; } catch {}
     try { if (r.resource) r.resource.playStream.destroy (); } catch {}
     try { if (r.source) r.source.destroy (); } catch {}
     try { if (r.proc && typeof r.proc.kill === 'function') r.proc.kill (); } catch {}
@@ -7275,6 +7411,8 @@ function queueSkip (guildId, who)
     const m = musicOf (guildId);
     if (!m.current) return { ok: false, text: '🤷 Сейчас ничего не играет.' };
     const skipped = m.current.title || 'трек';
+    m.skipRequested = true; // [v2.30] это осознанный пропуск, а не обрыв потока:
+                            // Idle-обработчик не должен возвращать трек в очередь
     m.player.stop (true); // Idle-хэндлер запустит следующий (он же выставит m.current)
     console.log ('[' + (d()) + '] [music] ' + whoText (who) + 'пропустил: ' + skipped);
     return { ok: true, text: '⏭ Пропущено: **' + skipped + '**' +
@@ -7960,6 +8098,7 @@ function joinVoiceNow (guildId, voiceChannel, guild, reason = '')
         m.leaving = false;
         m.pending = false;
         m.leftByUser = false;
+        m.selfLeftAt = 0; // [v2.30] зашли заново -- старую отметку о выходе забываем
         m.savedChannelId = voiceChannel.id;
         // [v2.12] обработчики плеера -- ОДИН раз на плеер (раньше вешались при каждом
         // новом подключении, а теперь состояние живёт дольше соединения)
@@ -7974,6 +8113,46 @@ function joinVoiceNow (guildId, voiceChannel, guild, reason = '')
                 killStream (m.streamHandle);
                 m.streamHandle = null;
                 if (m.leaving) return; // [v2.9] это Idle от нашего же выхода, а не конец трека
+                // [v2.30] СМЕРТЬ ПОТОКА ВЫГЛЯДИТ КАК КОНЕЦ ТРЕКА -- И ТРЕК МОЛЧА ПРОПАДАЛ.
+                // Когда yt-dlp/ffmpeg умирают на середине (или возобновление «с места»
+                // отдаёт пустой фрагмент), 'error' у потока не приходит: приходит Idle,
+                // и очередь просто ехала дальше -- а человек терял свой трек (нашёл
+                // живой прогон: возобновлённый сет умер через 7 секунд и пропустился).
+                // Ошибки потока ловил только wireStreamErrors, а этот путь был пуст.
+                // Теперь трек, который ФИЗИЧЕСКИ не мог кончиться, возвращается в очередь
+                // и играет снова (бюджет повторов -- тот же, что у обрыва потока).
+                const playing = m.current;
+                const at = playing ? Math.round (playedMsOf (m) / 1000) : 0;
+                const asked = !!m.skipRequested; // /skip и /jump -- осознанный уход вперёд
+                m.skipRequested = false;
+                if (playing && !asked && streamEndedEarly (playing, at, m.startedAtSec))
+                {
+                    const attempt = (m.streamRetries || 0) + 1;
+                    if (attempt <= MUSIC_STREAM_RETRIES)
+                    {
+                        // Возобновили с места -- и почти сразу замолчало? Значит сдвиг
+                        // этому источнику противопоказан: играем тот же трек С НАЧАЛА,
+                        // лишь бы не потерять его совсем (как обещано владельцу).
+                        const fromStart = !!(m.startedFromSeek && at < (m.startedAtSec || 0) + 15);
+                        const seekTo = fromStart ? 0 : at;
+                        m.streamRetries = attempt;
+                        m.playedMs = seekTo * 1000;
+                        m.playingSince = null;
+                        m.current = null;
+                        m.tracks.unshift (playing);
+                        m.seekTrack = playing;
+                        m.seekSec = seekTo;
+                        console.error ('[' + (d()) + '] [music] поток оборвался (' +
+                            (at ? 'на ' + fmtDur (at) : 'в самом начале') + ') -- трек не бросаю: играю его ' +
+                            (fromStart ? 'с начала (продолжение с места не вышло)' : 'с этой же секунды') +
+                            ', попытка ' + attempt + '/' + MUSIC_STREAM_RETRIES);
+                        saveMusicState (guildId);
+                        playNext (guildId); // плеер уже Idle -- сразу к тому же треку
+                        return;
+                    }
+                    console.error ('[' + (d()) + '] [music] поток обрывается снова (' + attempt +
+                        ' раз) -- пропускаю: ' + (playing.title || 'трек'));
+                }
                 // трек кончился -- следующий:
                 m.current = null;
                 m.playedMs = 0;
@@ -8030,6 +8209,11 @@ function destroyMusic (guildId, opts = {})
 {
     const m = $music[guildId];
     if (!m) return;
+    // [v2.30] Выход инициировали МЫ (это /stop, /leave, конец очереди или обработчик
+    // обрыва), а не админ, выкинувший бота из канала. Без этой отметки следующее
+    // событие voiceStateUpdate принимало наш собственный выход за «бота выкинули» и
+    // писало 'очередь помню' даже сразу после /stop, который очередь как раз стёр.
+    m.selfLeftAt = Date.now ();
     // [v2.7] активное событие в лог: «вышел» раньше нигде не писалось,
     // а по логу должно быть видно и заход, и выход:
     const chId = (m.connection && m.connection.joinConfig ? m.connection.joinConfig.channelId : null) ||
@@ -9150,7 +9334,7 @@ client.on ('interactionCreate', async (interaction) =>
             dropPreload (m);
             const target = m.tracks[0];
             console.log ('[' + (d()) + '] [music] прыжок к №' + n + ': ' + (target.title || 'трек'));
-            if (m.current) m.player.stop (true); // Idle-хэндлер запустит то, к чему прыгнули
+            if (m.current) { m.skipRequested = true; m.player.stop (true); } // [v2.30] прыжок -- не обрыв; Idle-хэндлер запустит то, к чему прыгнули
             else playNext (guildId);
             return interaction.reply ('⏭ Перехожу к №' + n + ': **' + (target.title || 'трек') + '**');
         }
