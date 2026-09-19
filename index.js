@@ -1488,6 +1488,7 @@ const STARTUP_DM_TEXT =
     'Заходи в голосовой канал, где сидит бот, -- и слушай. Включает и добавляет музыку тот, у кого есть роль **DJ** (её выдают администраторы и модеры).\n' +
     '`/play` ссылка или запрос -- поставить трек, плейлист или прямой эфир\n' +
     '`/queue` -- что играет сейчас и что дальше: кто что поставил и сколько ещё ждать\n' +
+    '`/nowplaying` -- коротко про текущий трек: позиция, кто поставил, что дальше\n' +
     'Если в канале никого, музыка встаёт на паузу и продолжается, когда кто-то зашёл: бот помнит и трек, и место в нём -- перезапуск и обрыв связи их не сбрасывают.\n' +
     '\n' +
     '🔑 **Свой голосовой канал**\n' +
@@ -7388,7 +7389,7 @@ async function createTrackStream (track, seekSec = 0, seekMode = 'sections')
                 if (ffNoiseIfGone ()) return; // [v2.35] причина уже названа yt-dlp-ом
                 console.error ('[' + (d()) + '] [music] выравнивание громкости оборвалось: код ' + exitCodeText (code) +
                     (ffErr.trim () ? ' -- ' + ytDlpErr ({ stderr: ffErr }, 160) : '') +
-                    ' -- звук этого трека оборвётся раньше, дальше иду по очереди');
+                    ' -- звук этого трека оборвался: до конца он не доиграет, очередь продолжаю со следующего');
             });
             input = ff.stdout;
             raw = true;
@@ -7607,8 +7608,13 @@ async function playNext (guildId)
     const fromPreload = !!(m.preload && m.preload.track === track);
     // [v2.37] файл уже на диске? тогда так и пишем: видно, что трек играет без YouTube
     const fromDisk = !!(MUSIC_CACHE && !track.isLive && cacheFind (track));
+    // [v2.44] ПЕРЕМОТКА ВИДНА В САМОЙ СТРОКЕ «играю». После /seek трек запускается заново,
+    // и в логе появлялась ВТОРАЯ, ничем не отличающаяся строка «играю: тот же трек» --
+    // по ней нельзя было понять, перемотка это или повторный запуск. Теперь так и пишем.
+    const seekFrom = (m.seekTrack === track && (m.seekSec || 0) >= 1) ? Math.round (m.seekSec) : 0;
     console.log ('[' + (d()) + '] [music] играю: ' + (track.title || track.url || 'трек') +
-        (fromDisk ? ' (с диска)' : (fromPreload ? ' (из предзагрузки, без паузы)' : ''))); // [v2.4] активное событие в лог
+        (seekFrom ? ' (продолжаю с ' + fmtDur (seekFrom) + ')'
+                  : (fromDisk ? ' (с диска)' : (fromPreload ? ' (из предзагрузки, без паузы)' : '')))); // [v2.4] активное событие в лог
     scheduleVoiceStatus (guildId, true); // [v2.7] сразу показать новый трек и очередь
     schedulePresence (true);             // [v2.8] «слушает» этот трек
     try
@@ -7824,7 +7830,11 @@ function dropPreload (m)
     // [v2.37] если предзагрузка -- это скачивание на диск, его тоже надо прервать
     // (иначе yt-dlp до качает файл, который уже никому не нужен)
     try { if (p.dlStop) p.dlStop (); } catch {}
-    killStream ({ resource: p.resource, source: p.source, proc: p.proc, tee: p.tee });
+    // [v2.44] ff: p.ff -- ОБЯЗАТЕЛЬНО. В списке его не было, и ffmpeg выравнивания
+    // громкости этой заготовки не помечался «убит нами»: после /seek, /clear и любой
+    // смены трека в лог летело ложное «выравнивание громкости оборвалось: код -22 ...
+    // звук этого трека оборвётся раньше» (а трек в этот момент даже не играл).
+    killStream ({ resource: p.resource, source: p.source, proc: p.proc, ff: p.ff, tee: p.tee });
 }
 
 // Глушим поток трека целиком: сам ресурс, поток yt-dlp и его процесс (а также наш
@@ -8549,14 +8559,22 @@ const QUEUE_GLUE = 150;
 // [v2.32] Визуальный разделитель блоков в сообщении /queue: «Сейчас», «Очередь»,
 // «По авторам», «До конца очереди» -- раньше всё сливалось в один поток строк.
 const QSEP = '────────────';
-const QUEUE_HINT_SHORT = '_Действия -- кнопками ниже._';
+// [v2.44] СПРАВОЧНЫЕ БЛОКИ -- МЕЛКИМ ШРИФТОМ (`-#` -- subtext Discord) и СВЕРХУ
+// списка. Просьба владельца: «это справка, уменьшить шрифт и поднять выше, чтобы
+// видеть треки и кнопки одновременно». Раньше сводки стояли МЕЖДУ списком и кнопками,
+// и на длинной очереди приходилось скроллить между треками и элементами управления.
+// В subtext кладём ТОЛЬКО простой текст (без `**` и без косых кавычек): так он
+// одинаково выглядит в любом клиенте, а не превращается в звёздочки.
+const QSMALL = '-# ';
+const QUEUE_HINT_SHORT = QSMALL + 'Действия -- кнопками ниже.';
 const QUEUE_HINT_FULL =
-    '_Перемотать внутри трека -- `/seek` или кнопки «◀ 30 с / 30 с ▶»;\n' +
-    'убрать или подвинуть -- выбери трек в списке ниже (вверх/вниз, сразу «⏫ В начало»\n' +
-    'или «⏬ В конец», а точный номер -- «#️⃣ На позицию…»); прыгнуть по очереди --\n' +
-    '`/jump` (админы/модеры); чистить -- `/clear` (остаться) или `/stop` (уйти):\n' +
-    'спросят подтверждение. DJ распоряжается только своими треками (и ставит их\n' +
-    'только на свои же места), админы и модеры -- любыми._';
+    QSMALL + 'Перемотать внутри трека -- /seek или кнопки «◀ 30 с» / «30 с ▶».' + '\n' +
+    QSMALL + 'Подвинуть -- выбери трек в меню ниже (выше/ниже, в начало, в конец' +
+    ' или «На позицию…»), либо командой /move номер to номер.' + '\n' +
+    QSMALL + 'Прыгнуть по очереди -- /jump (админы и модеры).' + '\n' +
+    QSMALL + 'Чистить -- /clear (остаться) или /stop (уйти): спросят подтверждение.' + '\n' +
+    QSMALL + 'DJ распоряжается только своими треками (и ставит их только на свои же' +
+    ' места), админы и модеры -- любыми.';
 
 // [v2.28] Сводка ПО АВТОРАМ для /queue: сколько треков и сколько времени у каждого.
 // На миксе из нескольких DJ сразу видно, чья это гора; убрать чужое/своё можно через
@@ -8582,11 +8600,11 @@ function queueAuthorsText (m)
     for (const t of m.tracks) add (t);
     if (!map.size && !noAuthor) return '';
     const list = [...map.values ()].sort ((a, b) => b.n - a.n || String (a.name).localeCompare (String (b.name)));
-    const top = list.slice (0, 6).map (o => '**' + o.name + '** — ' + o.n + ' ' +
+    const top = list.slice (0, 6).map (o => o.name + ' — ' + o.n + ' ' +
         plural (o.n, 'трек', 'трека', 'треков') +
         (o.sec ? ' (~' + fmtAgo (o.sec * 1000) + ')' : '') +
         (o.live ? ' + ' + o.live + ' 🔴' : ''));
-    return '👥 **По авторам:** ' + (top.length ? top.join (', ') : 'только треки без автора') +
+    return QSMALL + '👥 По авторам: ' + (top.length ? top.join (', ') : 'только треки без автора') +
         (list.length > 6 ? ' и ещё ' + (list.length - 6) + ' ' + plural (list.length - 6, 'автор', 'автора', 'авторов') : '') +
         (noAuthor ? (top.length ? ', ' : '') + 'без автора: ' + noAuthor : '');
 }
@@ -8618,11 +8636,11 @@ function queueAddsText (m)
         const nums = b.nums.length > 3
             ? b.nums.slice (0, 3).join (', ') + ' и ещё ' + (b.nums.length - 3)
             : b.nums.join (', ');
-        return '`' + hhmm (b.at) + '` **' + b.name + '** -- ' + b.nums.length + ' ' +
+        return hhmm (b.at) + ' ' + b.name + ' -- ' + b.nums.length + ' ' +
             plural (b.nums.length, 'трек', 'трека', 'треков') + ' (№' + nums + ')';
     });
     const older = batches.size - list.length;
-    return '🕘 **Последние добавления:** ' + parts.join ('; ') +
+    return QSMALL + '🕘 Последние добавления: ' + parts.join ('; ') +
         (older ? '; и ещё ' + older + ' ' + plural (older, 'пачка', 'пачки', 'пачек') + ' раньше' : '') +
         (noStamp ? '; без отметки: ' + noStamp + ' (поставлены раньше, чем бот их начал писать)' : '');
 }
@@ -9467,8 +9485,8 @@ function queueHeadText (m)
 function queueWaitText (m)
 {
     const q = queueLeft (m);
-    let wait = '⏳ **До конца очереди:** ' + (q.sec ? fmtAgo (q.sec * 1000) : '0 сек');
-    if (q.curLeft) wait += ' (включая `' + fmtDur (q.curLeft) + '` текущего)';
+    let wait = QSMALL + '⏳ До конца очереди: ' + (q.sec ? fmtAgo (q.sec * 1000) : '0 сек');
+    if (q.curLeft) wait += ' (включая ' + fmtDur (q.curLeft) + ' текущего)';
     if (q.live) wait += ' + ' + q.live + ' 🔴 ' + plural (q.live, 'эфир', 'эфира', 'эфиров') + ' (без конца)';
     if (q.unknown) wait += ' + ' + q.unknown + ' ' + plural (q.unknown, 'трек', 'трека', 'треков') + ' без длительности';
     return wait;
@@ -9498,8 +9516,51 @@ function queueCheckText (m)
     else if (left) when = 'ещё ' + left + ' ' + plural (left, 'трек', 'трека', 'треков') +
         (inMin ? ' -- проход примерно через ' + inMin + ' мин' : '');
     else when = 'всё проверено, новых пока нет';
-    return '🔎 **Проверка очереди заранее:** ' +
+    return QSMALL + '🔎 Проверка очереди заранее: ' +
         (parts.length ? parts.join (', ') + '; ' : 'ещё не проходила; ') + when;
+}
+
+// [v2.44] /nowplaying -- ОДНА КАРТОЧКА «ЧТО ИГРАЕТ ПРЯМО СЕЙЧАС», не открывая /queue
+// целиком: трек, позиция и остаток, кто его поставил и в каком канале, сколько людей
+// слушает, сколько всего в очереди и когда она закончится, что будет дальше. Доступна
+// всем (как /queue) -- это просто информация. Внимание: позиция берётся тем же счётом,
+// что и в /queue (playedMsOf), поэтому цифры в двух ответах совпадают.
+function nowPlayingText (m, guildId)
+{
+    const t = m.current || m.seekTrack || null;
+    const paused = !!(m.player && m.player.state && m.player.state.status === AudioPlayerStatus.Paused);
+    if (!t)
+        return m.connection
+            ? '🎧 В канале тишина -- играть нечего. Поставить трек: `/play`, позвать меня: `/join`.'
+            : '🈳 Ничего не играет, и я не в канале.';
+    const live = !!t.isLive;
+    const dur = Number (t.duration) > 0 ? Number (t.duration) : 0;
+    const at = Math.max (0, Math.round (playedMsOf (m) / 1000));
+    const lines = [];
+    lines.push ((paused ? '⏸ ' : (live ? '🔴 ' : '🎶 ')) + '**' + (t.title || 'трек') + '**' +
+        (live ? ' -- прямой эфир' : (dur ? ' -- ' + fmtDur (dur) : '')));
+    if (live)
+        lines.push (QSMALL + 'позиции у эфира нет -- играю с живого края');
+    else if (dur)
+        lines.push (QSMALL + 'позиция ' + fmtDur (Math.min (at, dur)) + ' из ' + fmtDur (dur) +
+            ' · до конца трека ' + fmtDur (Math.max (0, dur - at)));
+    else
+        lines.push (QSMALL + 'позиция ' + fmtDur (at) + ' (длительность неизвестна)');
+    if (paused)
+        lines.push (QSMALL + (m.pausedByNobody
+            ? 'пауза: в канале нет живых слушателей -- зайди, и я продолжу'
+            : 'пауза по просьбе человека: /resume продолжит'));
+    lines.push (QSMALL + '👤 поставил: ' + byNameOf (t) + (t.addIn ? ' · в <#' + t.addIn + '>' : ''));
+    const chId = (m.connection && m.connection.joinConfig) ? m.connection.joinConfig.channelId : null;
+    const ch = chId ? client.channels.cache.get (chId) : null;
+    lines.push (QSMALL + '🎧 ' + (ch ? 'пою в «' + ch.name + '»' : (chId ? 'пою в <#' + chId + '>' : 'в канале не сижу')) +
+        ' · слушателей: ' + (chId ? humansInChannel (guildId, chId) : 0) +
+        ' · в очереди: ' + m.tracks.length);
+    lines.push (queueWaitText (m));
+    // Дальше: сперва то, что уже готово (предзагрузка), иначе первый в очереди.
+    const next = (m.preload && m.preload.track) || m.tracks[0] || null;
+    if (next) lines.push (QSMALL + '⏭ Дальше: ' + (next.title || 'трек'));
+    return lines.join ('\n');
 }
 
 function queueView (m, start, moveSel = 0, opts = {})
@@ -9507,26 +9568,24 @@ function queueView (m, start, moveSel = 0, opts = {})
     const page = queuePage (m, start);
     const total = page.total;
     const rest = total - (page.start - 1 + page.count);
-    // выбранный для перестановки трек -- строкой внизу (видно, что именно двигаешь):
+    // [v2.44] «что именно двигаем» -- мелким текстом СВЕРХУ (кнопки переноса стоят под
+    // списком, и раньше эта подпись читалась только после прокрутки).
     const move = (moveSel >= 1 && moveSel <= total)
-        ? '\n\n🗂 **№' + moveSel + ':** **' + (m.tracks[moveSel - 1].title || 'трек') +
-          '** -- выбран.\n' +
-          '_Двигай его кнопками ниже (`⬆ Выше`, `⬇ Ниже`, `⏫ В начало`, `⏬ В конец`,' +
-          '`#️⃣ На позицию…`). Когда закончишь -- `✖ Вернуться`: вернутся обычные кнопки очереди._'
+        ? QSMALL + '🗂 Выбран №' + moveSel + ': ' + (m.tracks[moveSel - 1].title || 'трек') +
+          ' -- двигай его кнопками ниже; «✖ Вернуться» вернёт обычные кнопки очереди.'
         : '';
     const authors = queueAuthorsText (m);
     const adds = queueAddsText (m); // [v2.35] кто и когда поставил (свежие вставки)
     const check = queueCheckText (m); // [v2.43] итог проверки очереди заранее
-    // [v2.32] Блоки разделены линией (QSEP): «Сейчас» / «Очередь» / «По авторам» /
-    // «До конца очереди» -- по одному взгляду видно, где что.
+    // [v2.32] Блоки разделены линией (QSEP): «Сейчас» / справка / «Очередь».
+    // [v2.44] ПОРЯДОК: шапка -> справка (мелким) -> подсказка -> СПИСОК (он теперь
+    // последний, вплотную к кнопкам: треки и управление видны на одном экране).
     const build = hint => queueHeadText (m) +
+        '\n' + QSEP + '\n' +
+        [check, authors, adds, queueWaitText (m), move, hint].filter (Boolean).join ('\n') +
         '\n' + QSEP +
         '\n**Очередь (' + total + ')**' + (page.start > 1 ? ' · с №' + page.start : '') + ':\n' + page.list +
-        (rest > 0 ? '\n*...и ещё ' + rest + ': `/queue from:' + (page.start + page.count) + '`*' : '') +
-        (authors ? '\n' + QSEP + '\n' + authors : '') +
-        (adds ? '\n' + QSEP + '\n' + adds : '') +
-        (check ? '\n' + QSEP + '\n' + check : '') +
-        '\n' + QSEP + '\n' + queueWaitText (m) + move + '\n' + hint;
+        (rest > 0 ? '\n*...и ещё ' + rest + ': `/queue from:' + (page.start + page.count) + '`*' : '');
     // Очереди нет -- только шапка (подсказка про действия тогда не нужна).
     // Иначе берём ПОЛНУЮ подсказку, а если она не влезла в лимит Discord -- короткую
     // (бюджет списка считался по короткой, поэтому длинную проверяем по факту).
@@ -10904,6 +10963,11 @@ const musicCommands =
             o.setName ('from')
              .setDescription ('С какого номера показать (сколько на странице -- ключ queue_page, по умолчанию 15)')
              .setMinValue (1)),
+    // [v2.44] /nowplaying -- «что играет ПРЯМО СЕЙЧАС» одной карточкой (для всех, как
+    // /queue): трек, позиция и остаток, кто поставил, сколько слушает, что дальше.
+    new SlashCommandBuilder ()
+        .setName ('nowplaying')
+        .setDescription ('Что играет сейчас: трек, позиция, кто поставил и что дальше'),
     new SlashCommandBuilder ()
         .setName ('leave')
         .setDescription ('Отложить свои треки и играть чужое; из канала выхожу, если играть нечего'),
@@ -11008,7 +11072,11 @@ client.on ('interactionCreate', async (interaction) =>
             return replyView (parseInt (mPage[2], 10) || 1);
         }
         // --- действия: как и слэш-команды, только для админов/модеров и роли DJ ---
-        if (!/^q:(skip|join|leave|clear|stop|da|dau|dax|dx|cq|rm|mv|mu|md|mx|s|tr|rx)(:|$)/.test (cid)) return;
+        // [v2.44] mt/mb/mp -- «⏫ В начало», «⏬ В конец», «#️⃣ На позицию…». Их в списке
+        // не было, и нажатие молча уходило в return: Discord показывал «взаимодействие
+        // не удалось», а перенос кнопками не работал (при этом /move работал -- это и
+        // сбивало с толку). Теперь все три пути перестановки разрешены одинаково.
+        if (!/^q:(skip|join|leave|clear|stop|da|dau|dax|dx|cq|rm|mv|mt|mb|mp|mu|md|mx|s|tr|rx)(:|$)/.test (cid)) return;
         if (!isDJ (interaction))
         {
             const role_dj = SERVERS[guildId].role_dj || '';
@@ -11707,14 +11775,14 @@ client.on ('interactionCreate', async (interaction) =>
             '\nСохрани его отдельно от config.json -- без него записи базы не читаются. Перезапуск не нужен.');
     }
     // [v2.32] seek -- в том же списке, что музыка (проверка прав ниже общая)
-    if (!['play','join','stop','skip','pause','resume','seek','queue','leave','remove','clear','jump','move','push'].includes (name)) return;
+    if (!['play','join','stop','skip','pause','resume','seek','queue','nowplaying','leave','remove','clear','jump','move','push'].includes (name)) return;
     const guildId = interaction.guildId;
     const m = musicOf (guildId);
 
     try
     {
-        // DJ-проверка (смотреть /queue может каждый):
-        if (name !== 'queue' && !isDJ (interaction))
+        // DJ-проверка (смотреть /queue и /nowplaying может каждый):
+        if (name !== 'queue' && name !== 'nowplaying' && !isDJ (interaction))
         {
             let role_dj = SERVERS[guildId].role_dj || '';
             return interaction.reply ({ content: '🚫 Музыка только для ' + (role_dj ? '<@&' + role_dj + '>' : 'DJ'), flags: MessageFlags.Ephemeral });
@@ -12009,6 +12077,12 @@ client.on ('interactionCreate', async (interaction) =>
             scheduleVoiceStatus (guildId, true);
             schedulePresence (true);
             return interaction.reply ('▶️ Продолжаем.');
+        }
+        else if (name === 'nowplaying')
+        {
+            // [v2.44] Короткая карточка вместо целой очереди: что звучит, откуда,
+            // сколько слушает и что будет дальше. Доступна всем (без DJ).
+            return interaction.reply (nowPlayingText (m, guildId));
         }
         else if (name === 'queue')
         {
