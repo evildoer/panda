@@ -5,6 +5,13 @@
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
+// CHANGELOG v2.40 (приветствие ведёт в публичный канал, а не в закрытую «архивную»):
+//   * ССЫЛКА ДЛЯ НОВИЧКА -- ОТДЕЛЬНАЯ НАСТРОЙКА. `welcome_channel` -- служебный: в нём
+//     лежит сообщение с текстом правил, и часто он ЗАКРЫТ. Текст в ЛС доезжал, а на
+//     ссылку человек получал «нет доступа». Ключ `welcome_public_channel` (и
+//     необязательный `welcome_public_message`) уводит ссылку и название канала в
+//     публичный канал -- например «о сервере», куда обычно идут приглашения. Пусто --
+//     поведение прежнее.
 // CHANGELOG v2.39 (проблема трека -- в канал его автора, проигранное не копится, конфиг целиком):
 //   * ОШИБКА ТРЕКА УХОДИТ В КАНАЛ, ОТКУДА ЕГО ДОБАВИЛИ. Раньше любое «видео больше нет»
 //     и «не удалось воспроизвести» писалось в ОДИН канал -- тот, откуда шла последняя
@@ -4901,15 +4908,33 @@ async function fetchAllMembersRest (guildId)
 // Нет id сообщения -- ссылка на канал. Пустой/неверный welcome_channel -- приветствие
 // выключено целиком. Кому: всем, кто заходит НЕ в таймауте за выход (перезаходы идут
 // своим путём, см. handleMemberJoin).
+// [v2.40] А КУДА ВЕСТИ -- отдельный ключ: welcome_public_channel (+ необязательный
+// welcome_public_message). Служебный канал с текстом правил часто ЗАКРЫТ («#архивная»):
+// текст в ЛС доедет, а по ссылке новичок увидит «нет доступа». Задан публичный канал
+// (например «о сервере» -- туда обычно идут приглашения) -- ссылка и название в
+// приветствии берутся оттуда, а текст и картинки всё равно читаются из служебного.
 // ============================================================================
 const WELCOME_SRC_TTL = 10 * 60 * 1000; // не дёргать REST на каждый вход
 const $welcomeSrc = {};                 // server -> { at, data }
 
+// [v2.40] КУДА ВЕСТИ НОВИЧКА. `welcome_channel` -- СЛУЖЕБНЫЙ: в нём лежит сообщение с
+// текстом правил, и часто он ЗАКРЫТ ("#архивная"): текст в ЛС доедет, а по ссылке
+// новичок не увидит НИЧЕГО -- «нет доступа». Поэтому ссылку и название канала можно
+// брать из ПУБЛИЧНОГО канала (`welcome_public_channel`, например «о сервере» -- туда
+// обычно и падают приглашения и правила). Текст и картинки при этом по-прежнему
+// читаются из служебного сообщения (`welcome_channel` + `welcome_message`).
+function welcomePublicChannel (server)
+{
+    const s = SERVERS[server] || {};
+    const pub = String (s.welcome_public_channel || '');
+    return /^\d{17,20}$/.test (pub) ? pub : '';
+}
 function welcomeLink (server)
 {
     const s = SERVERS[server] || {};
-    const channel = String (s.welcome_channel || '');
-    const message = String (s.welcome_message || '');
+    const pub = welcomePublicChannel (server);
+    const channel = pub || String (s.welcome_channel || '');
+    const message = pub ? String (s.welcome_public_message || '') : String (s.welcome_message || '');
     if (!/^\d{17,20}$/.test (channel)) return null;
     return 'https://discord.com/channels/' + server + '/' + channel +
         (/^\d{17,20}$/.test (message) ? '/' + message : '');
@@ -4962,12 +4987,15 @@ async function welcomeEmbed (server, user, refresh = false)
 {
     const s = SERVERS[server] || {};
     const link = welcomeLink (server);
-    // название канала знакомства: «зайди в #канал» понятнее одной ссылки
+    // название канала знакомства: «зайди в #канал» понятнее одной ссылки.
+    // [v2.40] Показываем тот канал, на который ведёт ссылка: задан публичный --
+    // значит он и называется (в служебном имени новичку нет смысла).
     let chName = '';
+    const nameChId = welcomePublicChannel (server) || String (s.welcome_channel || '');
     try
     {
-        let ch = client.channels.cache.get (s.welcome_channel) ||
-                 await client.channels.fetch (s.welcome_channel);
+        let ch = client.channels.cache.get (nameChId) ||
+                 await client.channels.fetch (nameChId);
         if (ch && ch.name) chName = '#' + ch.name;
     }
     catch (e) { /* канал не отдался -- обойдёмся ссылкой */ }
@@ -5895,6 +5923,13 @@ function configSanityIssues ()
         if (idOk (s.welcome_message) && !idOk (s.welcome_channel))
             out.push ('сервер ' + nm + ': welcome_message задан, а welcome_channel пуст/неверен -- ' +
                 'сообщение с правилами найти негде, приветствие новичкам ВЫКЛЮЧЕНО');
+        if (s.welcome_public_channel !== undefined && String (s.welcome_public_channel).trim () !== '' &&
+            !idOk (s.welcome_public_channel))
+            out.push ('сервер ' + nm + ': welcome_public_channel не id канала -- ' +
+                'ссылка в приветствии будет вести в служебный канал (welcome_channel)');
+        if (idOk (s.welcome_public_message) && !idOk (s.welcome_public_channel))
+            out.push ('сервер ' + nm + ': welcome_public_message задан, а welcome_public_channel пуст -- ' +
+                'ссылка на сообщение потеряется (укажи и канал, или очисти message)');
         if (idOk (s.temp_lobby) && !idOk (s.temp_category))
             out.push ('сервер ' + nm + ': temp_lobby задан, а temp_category пуст/неверен -- ' +
                 'личные каналы (@ник) создаваться не будут');
