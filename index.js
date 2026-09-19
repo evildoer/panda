@@ -9066,7 +9066,7 @@ function checkListeners (server, _noFollow = false)
             {
                 try
                 {
-                    joinVoice (server, found.ch, guildMove, 'здесь никого, а автор трека ' +
+                    joinVoice (server, found.ch, guildMove, 'в прошлой комнате никого, а автор трека ' +
                         (found.track.byName || u (found.track.byId)) + ' слушает здесь');
                     m.savedChannelId = found.ch.id;
                     // [v2.28] И сразу играем: раз приехали туда, где есть слушатель, пауза
