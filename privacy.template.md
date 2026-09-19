@@ -1,13 +1,42 @@
-# Privacy Policy — Pandamia Discord bot
+<!--
+  ЭТО ШАБЛОН политики конфиденциальности. Сам PRIVACY.md собирается из него:
 
-_Last updated: 19.09.2026_
+      node . privacy            -- пересобрать (имя приложения и ники спросит у Discord)
+      node . privacy --offline  -- без сети: значения из блока «по умолчанию» ниже
+      node . privacy --check    -- только проверить, разошлись ли PRIVACY.md и шаблон
 
-This bot (Discord application name: "Pandamia", bot username "pandamia") is a **private, self-hosted**
+  Подставляется само:
+      {{DATE}}              сегодняшняя дата
+      {{MARK}}              значок «ключ» перед ником (берётся из кода бота, сейчас 🔑)
+      {{APP}}               название приложения в Discord           (без сети -- значение ниже)
+      {{BOT_NICK}}          ник бота                               (без сети -- значение ниже)
+      {{OWNER_NICK}}        ник владельца бота                     (без сети -- значение ниже)
+      {{OWNER_ID}}          id владельца бота (config.json -> OWNER)
+      {{SERVERS}}           названия рабочих серверов (config.json)
+      {{SERVERS_COUNT}}     сколько их
+      {{TIMEOUT_MIN}}       минуты таймаута за выход (config.json)
+      {{ROLES_RETENTION_EN}} / {{ROLES_RETENTION_RU}}       срок хранения ролей
+      {{HISTORY_RETENTION_EN}} / {{HISTORY_RETENTION_RU}}   срок хранения истории наказаний
+      {{FORGET_CMD}}        команда удаления данных
+
+  Значения по умолчанию -- только на случай, когда нет сети или в config.json пусто:
+      APP = Pandamia
+      BOT_NICK = pandamia
+      OWNER_NICK = lapulya666
+
+  Эту шапку команда в PRIVACY.md НЕ переносит: в публичном файле никакого мусора.
+-->
+
+# Privacy Policy — {{APP}} Discord bot
+
+_Last updated: {{DATE}}_
+
+This bot (Discord application name: "{{APP}}", bot username "{{BOT_NICK}}") is a **private, self-hosted**
 Discord bot operated by one person for one community. It is not listed in any bot directory, is not
 offered as a service to the public, and is not used for advertising, analytics or profiling. This page
 describes exactly what the bot stores and how it can be deleted.
 
-It runs on the operator's community server(s): 🐼PANDAMIA🐼 (1 in total).
+It runs on the operator's community server(s): {{SERVERS}} ({{SERVERS_COUNT}} in total).
 
 ## What the bot stores
 
@@ -15,19 +44,19 @@ Everything is keyed by **Discord IDs** (user IDs, role IDs, channel IDs, message
 stored in the cloud: there is no external database, no analytics service, no third-party API.
 
 1. **Voice-room state and appearance** — which member currently owns which voice room, and the
-   key mark (🔑) that the bot puts in front of a member's nickname while that member has rights in a
+   key mark ({{MARK}}) that the bot puts in front of a member's nickname while that member has rights in a
    channel. Derived from the current state and re-checked continuously; removed as soon as the
    rights are gone.
-2. **Moderation timers** — when a member leaves the server, the bot records a 20-minute timeout
+2. **Moderation timers** — when a member leaves the server, the bot records a {{TIMEOUT_MIN}}-minute timeout
    (configurable by the operator) under that member's user ID, so that leaving and instantly
    rejoining cannot bypass an active moderation. The record is deleted as soon as the timeout is
    lifted or expires.
 3. **Roles for restoration** — the IDs of the roles a member had when they left, so those roles can be
-   given back when the member returns. Kept indefinitely; the operator can set an expiry in
+   given back when the member returns. Kept {{ROLES_RETENTION_EN}}; the operator can set an expiry in
    days in the bot's configuration file (`save_roles_days`) if he prefers a shorter period.
 4. **Punishment counters** — for each user ID, how many times the member left the server, was timed
    out or banned, and had a punishment lifted. Used by the staff-only `/bans` summary. Kept
-   indefinitely, with the same optional expiry in days (`bans_history_days`).
+   {{HISTORY_RETENTION_EN}}, with the same optional expiry in days (`bans_history_days`).
 5. **Music queue** — the queue of tracks (their titles and links), the position in the current track
    and which member added each track. Stored so that a restart, a crash or a temporary disconnect does
    not reset the music. Cleared when a DJ stops the bot (`/stop`) or when the queue finishes.
@@ -82,9 +111,9 @@ running machine under the operator's own account.
 | Data | Default | Configurable |
 |---|---|---|
 | Moderation timers | deleted when the timeout is lifted or expires | yes |
-| Key marks (🔑) | removed as soon as the rights are gone | — |
-| Role IDs for restoration | kept indefinitely | yes, in days (`save_roles_days`) |
-| Punishment counters | kept indefinitely | yes, in days (`bans_history_days`) |
+| Key marks ({{MARK}}) | removed as soon as the rights are gone | — |
+| Role IDs for restoration | kept {{ROLES_RETENTION_EN}} | yes, in days (`save_roles_days`) |
+| Punishment counters | kept {{HISTORY_RETENTION_EN}} | yes, in days (`bans_history_days`) |
 | Current music queue | until `/stop` or the end of the queue | — |
 | Plain-text event log | the bot only prints it to its own console; nothing is uploaded and the bot keeps no log files itself (the operator may redirect the console to a local file) | — |
 
@@ -93,7 +122,7 @@ running machine under the operator's own account.
 Any member can request deletion of everything the bot stores about them, in two ways:
 
 1. **In Discord:** ask the staff of the server where the bot runs. They have the command
-   `/forget user:@кто`, which immediately deletes the stored role IDs, the punishment counters and the
+   `{{FORGET_CMD}}`, which immediately deletes the stored role IDs, the punishment counters and the
    queue entries (track titles/links and the author tag) added by that member. The command is
    available to server administrators/moderators only, the reply is visible only to them, and the
    deletion is written to the bot log. An active punishment is not affected by this command — it is
@@ -121,7 +150,7 @@ last change is at the top.
 
 The operator of this bot and the contact for any privacy request:
 
-- **Discord: `lapulya666`** (user ID `247110936115150848`) -- direct messages are open, so this works
+- **Discord: `{{OWNER_NICK}}`** (user ID `{{OWNER_ID}}`) -- direct messages are open, so this works
   for anyone, including people who are not in the server where the bot runs.
 
 The bot also prints this contact by itself in the `/help` message on every server it runs on, so the
@@ -134,10 +163,10 @@ contact can be found without opening this page (it is configured by the operator
 _Полная версия -- выше по-английски; здесь -- то же самое коротко._
 
 Бот приватный, крутится на машине владельца и хранит только это (по **id** участника/роли/канала):
-таймер таймаута за выход (20 минут, снимается сразу), id ролей -- чтобы вернуть их при
+таймер таймаута за выход ({{TIMEOUT_MIN}} минут, снимается сразу), id ролей -- чтобы вернуть их при
 возврате человека на сервер, счётчики наказаний для сводки `/bans`, текущую очередь музыки (названия,
 позиция, кто поставил) и настройки сервера из конфига. По умолчанию роли хранятся
-**бессрочно**, счётчики наказаний -- **бессрочно**: человек, вернувшийся
+**{{ROLES_RETENTION_RU}}**, счётчики наказаний -- **{{HISTORY_RETENTION_RU}}**: человек, вернувшийся
 через месяцы, всё равно получает свои роли. Владелец может поставить срок в днях в файле конфигурации.
 
 **Шифрование:** записи в базе -- AES-256-GCM, ключ в `config.json` (`db_key`); без ключа файл базы
@@ -151,10 +180,10 @@ _Полная версия -- выше по-английски; здесь -- т
 аналитики, профилирования, обучения моделей и передачи данных на сторону -- сторонних сервисов нет
 вообще, база одна и лежит локально.
 
-**Удалить свои данные:** попросить staff сервера -- у них есть команда `/forget user:@кто`, она сразу
+**Удалить свои данные:** попросить staff сервера -- у них есть команда `{{FORGET_CMD}}`, она сразу
 стирает id ролей, счётчики наказаний и добавленные этим человеком треки в очереди музыки
 (активное наказание не трогает: его снимает `/unban`); либо написать владельцу (контакт есть и здесь,
 и в `/help`), и те же записи удаляют вручную.
 
-**Значок 🔑 перед ником** означает, что у человека есть права в голосовом канале: это видно
+**Значок {{MARK}} перед ником** означает, что у человека есть права в голосовом канале: это видно
 всем, и он снимается сам, как только прав больше нет.

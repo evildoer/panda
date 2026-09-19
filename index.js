@@ -1,9 +1,23 @@
 // Discord-бот PANDAMIA: модерация голосовых каналов (права владельцев, мут/глухота,
 // тег 🔑), бан-таймаут за выход с сервера, музыка и мост между серверами (pipe).
-// Всё, что зависит от конкретного сервера, -- в config.json (шаблон: config.example.json).
+// Всё, что зависит от конкретного сервера, -- в config.json (шаблоны: config.example.json --
+// со всеми пояснениями и значениями, config.minimal.json -- минимум: токен и id сервера).
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
+// CHANGELOG v2.29 (политика из шаблона, минимальный конфиг, боевой конфиг против примера):
+//   * `node . privacy [--check] [--offline]` -- PRIVACY.md собирается из шаблона
+//     privacy.template.md: название приложения и ник владельца спрашиваются у Discord,
+//     серверы/таймаут/сроки хранения берутся из config.json, значок ключа -- из этого
+//     файла, дата -- сегодняшняя. Подстановка без значения = отказ писать файл (лучше понятная
+//     ошибка, чем дырка в публичном тексте), а шапка-инструкция шаблона в PRIVACY.md
+//     не попадает. Руками политику больше не правят: в ней именно так и осталось старое
+//     название приложения -- руками такое не заметишь.
+//   * config.minimal.json -- конфиг-скелет: обязательные поля и значения по умолчанию,
+//     чтобы на чистом сервере хватило вписать TOKEN и id сервера.
+//   * [FIX] при старте видно, если боевой config.json отстал от config.example.json
+//     (строки-подсказки и ключи со значениями по умолчанию): 'в config.json нет N строк
+//     из config.example.json -- сервер ...: ...'. Раньше расхождение замечалось случайно.
 // CHANGELOG v2 (переход на discord.js v14 / keyv v5 / node 24):
 //   * intents строками (v13-стиль) + partials: ['Channel'] (иначе ЛС не работают)
 //   * keyv v5: const { Keyv } = require('keyv');
@@ -303,7 +317,7 @@ const DB_ENC_HEX = /^[0-9a-fA-F]{64}$/;
 // игнорировался -- `node . unkey` или опечатка в `node . dum` запускали БОТА, а не
 // давали ошибку: одна случайная строка в консоли = лишний процесс. Список -- ровно то,
 // что обрабатывается ниже; всё остальное считается опечаткой.
-const CONSOLE_CMDS = ['keygen', 'dump', 'files', 'backup', 'checkpoint', 'backups', 'restore', 'clearstatus', 'unkey'];
+const CONSOLE_CMDS = ['keygen', 'dump', 'files', 'privacy', 'backup', 'checkpoint', 'backups', 'restore', 'clearstatus', 'unkey'];
 {
     const _first = String (process.argv[2] === undefined ? '' : process.argv[2]).trim ();
     if (_first && !CONSOLE_CMDS.includes (_first.toLowerCase ()))
@@ -314,6 +328,8 @@ const CONSOLE_CMDS = ['keygen', 'dump', 'files', 'backup', 'checkpoint', 'backup
         console.log ('  node . keygen               -- напечатать новый ключ шифрования базы (db_key)');
         console.log ('  node . dump [id]             -- посмотреть базу глазами (только чтение)');
         console.log ('  node . files                 -- что за каждый файл в папке и что можно удалять');
+        console.log ('  node . privacy [--check]     -- пересобрать PRIVACY.md из шаблона (--check -- только проверить)');
+        console.log ('  node . privacy --offline     -- то же, но без обращения к Discord за именами');
         console.log ('  node . backup                -- обновить штатную копию базы (одна, перезаписывается)');
         console.log ('  node . checkpoint [метка]    -- сделать контрольную точку (файл с датой в имени)');
         console.log ('  node . backups               -- что есть: база, штатная копия и точки');
@@ -657,9 +673,11 @@ function filesCli ()
     {
         if (_name === 'index.js') return ['сам бот -- весь код: сообщения, музыка, модерация, база', 'НЕТ'];
         if (_name === 'README.md') return ['инструкция: запуск, команды, хранение данных', 'НЕТ'];
-        if (_name === 'PRIVACY.md') return ['политика конфиденциальности: что и зачем бот хранит', 'НЕТ'];
+        if (_name === 'PRIVACY.md') return ['политика конфиденциальности: что и зачем бот хранит (собрана командой `node . privacy`)', 'НЕТ'];
         if (_name === 'config.json') return ['ТВОИ настройки: токен, ключ базы (db_key), каналы, роли (в git не попадает)', 'НЕТ -- потеряешь db_key, и зашифрованные записи не прочитаются'];
         if (_name === 'config.example.json') return ['образец конфига с комментариями (для тех, кто ставит бота с нуля)', 'МОЖНО -- вернётся из репозитория'];
+        if (_name === 'config.minimal.json') return ['самый короткий конфиг: только обязательные поля (token и id сервера)', 'МОЖНО -- вернётся из репозитория'];
+        if (_name === 'privacy.template.md') return ['шаблон политики: из него команда `node . privacy` собирает PRIVACY.md', 'НЕТ -- без него политику не пересобрать'];
         if (_name === 'package.json' || _name === 'package-lock.json') return ['список зависимостей для npm', 'МОЖНО -- npm i восстановит'];
         if (/^node\.(cmd|exe|bat)$/i.test (_name)) return ['«шим»/портативный Node: благодаря ему привычное `node .` запускает бота', 'НЕТ -- сломается запуск'];
         if (/^console\.bat$/i.test (_name)) return ['личная мелочь владельца (в git не попадает)', 'можно, если не нужна'];
@@ -728,6 +746,8 @@ function filesCli ()
     console.log ('  node . restore                -- вернуть базу из штатной копии');
     console.log ('  node . restore before-cleanup -- вернуть из контрольной точки (метка -- часть имени или дата)');
     console.log ('  node . clearstatus 1414754348139020359 -- снять свою строку из шапки канала (id канала)');
+    console.log ('  node . privacy                -- пересобрать PRIVACY.md из шаблона (имена спросит у Discord)');
+    console.log ('  node . privacy --offline      -- то же, но без обращения к сети');
     console.log ('  node . files                  -- этот отчёт');
     return 0;
 }
@@ -736,6 +756,162 @@ if (process.argv.slice (2).some (_a => /^files$/i.test (_a)))
 {
     let _code = 1;
     try { _code = filesCli (); } catch (e) { console.log ('[files] ошибка: ' + ((e && e.message) || e)); }
+    process.exit (_code);
+}
+
+// ============================================================================
+// `node . privacy [--check] [--offline]` -- ПЕРЕСОБРАТЬ PRIVACY.md ИЗ ШАБЛОНА
+// privacy.template.md.
+// Зачем командой, а не руками: публичная политика конфиденциальности наполовину состоит
+// из фактов, которые лежат в ДРУГИХ местах -- название приложения и ники живут в Discord,
+// серверы, таймаут и сроки хранения -- в config.json, значок ключа -- в самом коде.
+// Руками такое расходится (так и вышло: в файле осталось старое имя приложения).
+// Что делает: берёт текст шаблона, подставляет факты, убирает из него шапку-инструкцию
+// (она нужна только человеку) и записывает PRIVACY.md. Больше ничего не трогает: бот не
+// запускается, база не читается.
+// Аргументы:
+//   --check    -- только проверить, разошлись ли PRIVACY.md и шаблон (ничего не пишет);
+//   --offline  -- не обращаться в Discord: имена взять из блока «по умолчанию» шаблона.
+//             APP = Pandamia
+//             BOT_NICK = pandamia
+//             OWNER_NICK = lapulya666
+// ============================================================================
+function privacyRetention (days, ru)
+{
+    const _d = Number (days);
+    if (!isFinite (_d) || _d <= 0) return ru ? 'бессрочно' : 'indefinitely';
+    if (!ru) return _d + ' day' + (_d === 1 ? '' : 's');
+    const _t = _d % 10, _h = _d % 100;
+    const _w = (_t === 1 && _h !== 11) ? 'день'
+        : (_t >= 2 && _t <= 4 && (_h < 12 || _h > 14)) ? 'дня' : 'дней';
+    return _d + ' ' + _w;
+}
+// Имена, которых в config.json нет: спросить у Discord (дочерним node -- синхронно и с таймаутом).
+function privacyDiscordNames ()
+{
+    if (!String (TOKEN || '').trim ()) return null;
+    const _script = [
+        "const H = { Authorization: 'Bot ' + (process.env.PB_TOKEN || '') };",
+        "const g = (p) => fetch ('https://discord.com/api/v10' + p, { headers: H })",
+        "    .then (r => r.ok ? r.json () : null).catch (() => null);",
+        "(async () => {",
+        "    const app = await g ('/applications/@me');",
+        "    const bot = await g ('/users/@me');",
+        "    const own = process.env.PB_OWNER ? await g ('/users/' + process.env.PB_OWNER) : null;",
+        "    process.stdout.write (JSON.stringify ({ app: (app && app.name) || null,",
+        "        bot: (bot && bot.username) || null, owner: (own && own.username) || null }));",
+        "}) ();"
+    ].join ('\n');
+    try
+    {
+        const _env = Object.assign ({}, process.env,
+            { PB_TOKEN: String (TOKEN), PB_OWNER: String (OWNER || '') });
+        const _out = require ('child_process').execFileSync (process.execPath, ['-e', _script],
+            { timeout: 9000, stdio: ['ignore', 'pipe', 'ignore'], env: _env }).toString ();
+        return JSON.parse (_out);
+    }
+    catch (e) { return null; }
+}
+function privacyCli (_check, _offline)
+{
+    const _fs = require ('fs'), _path = require ('path');
+    const _tplFile = _path.join (__dirname, 'privacy.template.md');
+    const _outFile = _path.join (__dirname, 'PRIVACY.md');
+    if (!_fs.existsSync (_tplFile))
+    {
+        console.log ('[privacy] нет файла privacy.template.md -- это шаблон политики, без него собирать нечего');
+        return 1;
+    }
+    const _tpl = _fs.readFileSync (_tplFile, 'utf8');
+    // Значения по умолчанию -- из шапки шаблона (строки вида «APP = Pandamia»).
+    const _def = {};
+    const _head = /^\s*<!--([\s\S]*?)-->/.exec (_tpl);
+    if (_head) for (const _m of _head[1].matchAll (/^\s*([A-Z][A-Z_0-9]*)\s*=\s*(.+?)\s*$/gm)) _def[_m[1]] = _m[2];
+    // Значок ключа -- прямо из кода (он там один и тот же в двух местах).
+    // точку с запятой требуем специально: так регулярка не находит саму себя в этом файле
+    const _markM = /const tag = '([^']+)';/.exec (_fs.readFileSync (_path.join (__dirname, 'index.js'), 'utf8'));
+    const _mark = _markM ? _markM[1] : (_def.MARK || '🔑');
+    // Серверы и сроки -- из config.json (берём только включённые экземпляры).
+    const _srv = Object.keys (SERVERS).filter (_k => /^\d{17,20}$/.test (_k) && SERVERS[_k].allow !== false);
+    const _names = _srv.map (_k => SERVERS[_k].name || ('сервер ' + _k));
+    const _timeouts = _srv.map (_k => Number (SERVERS[_k].onLeaveBanTimeout) || 0);
+    const _timeout = _timeouts.length ? Math.max.apply (null, _timeouts) : 0;
+    const _rolesOff = _srv.length > 0 && _srv.every (_k => SERVERS[_k].save_roles === false);
+    const _days = _srv.map (_k => Number (SERVERS[_k].save_roles_days) || 0);
+    const _histDays = _srv.map (_k => Number (SERVERS[_k].bans_history_days) || 0);
+    const _pick = (_a) => _a.every (_v => !_v) ? 0 : Math.max.apply (null, _a);
+    console.log ('[privacy] шаблон: privacy.template.md, значок ключа из кода: ' + _mark);
+    console.log ('[privacy] из config.json: серверы ' + (_names.join (', ') || '--') +
+        ' (' + _srv.length + '), таймаут за выход: ' + (_timeout ? _timeout + ' мин' : 'выключен') +
+        ', роли: ' + (_rolesOff ? 'НЕ хранятся' : privacyRetention (_pick (_days), true)) +
+        ', история: ' + privacyRetention (_pick (_histDays), true));
+    let _dc = null;
+    if (_offline) console.log ('[privacy] --offline: к Discord не обращаюсь, имена беру из шаблона');
+    else
+    {
+        _dc = privacyDiscordNames ();
+        if (_dc) console.log ('[privacy] из Discord: приложение «' + (_dc.app || '?') + '», бот ' +
+            (_dc.bot || '?') + ', владелец ' + (_dc.owner || '?') + (OWNER ? '' : ' (OWNER не задан в config.json)'));
+        else console.log ('[privacy] Discord не ответил (нет сети?): имена беру из шаблона');
+    }
+    const _facts = Object.assign ({}, _def, {
+        DATE: new Date ().toLocaleDateString ('ru-RU'),
+        MARK: _mark,
+        OWNER_ID: /^\d{17,20}$/.test (String (OWNER || '')) ? String (OWNER) : (_def.OWNER_ID || ''),
+        SERVERS: _names.join (', '),
+        SERVERS_COUNT: String (_srv.length),
+        TIMEOUT_MIN: String (_timeout || _def.TIMEOUT_MIN || 20),
+        ROLES_RETENTION_EN: privacyRetention (_pick (_days), false),
+        ROLES_RETENTION_RU: privacyRetention (_pick (_days), true),
+        HISTORY_RETENTION_EN: privacyRetention (_pick (_histDays), false),
+        HISTORY_RETENTION_RU: privacyRetention (_pick (_histDays), true),
+        FORGET_CMD: '/forget user:@кто'
+    });
+    if (_dc)
+    {
+        if (_dc.app) _facts.APP = _dc.app;
+        if (_dc.bot) _facts.BOT_NICK = _dc.bot;
+        if (_dc.owner) _facts.OWNER_NICK = _dc.owner;
+    }
+    let _text = _tpl.replace (/\{\{([A-Z_0-9]+)\}\}/g, (_all, _n) => (_n in _facts ? _facts[_n] : _all));
+    _text = _text.replace (/^\s*<!--[\s\S]*?-->\s*/, '');// шапка-инструкция -- только для человека
+    _text = _text.replace (/\r\n/g, '\n');
+    const _left = Array.from (new Set ((_text.match (/\{\{[^}]+\}\}/g) || [])));
+    if (_left.length)
+    {
+        console.log ('[privacy] в шаблоне есть подстановки без значения: ' + _left.join (', '));
+        console.log ('[privacy] ничего не записываю: допиши их в шапку шаблона (строки вида «ИМЯ = значение»)');
+        return 1;
+    }
+    const _old = _fs.existsSync (_outFile) ? _fs.readFileSync (_outFile, 'utf8').replace (/\r\n/g, '\n') : '';
+    if (_check)
+    {
+        if (_old === _text)
+        {
+            console.log ('[privacy] PRIVACY.md совпадает с шаблоном -- обновлять нечего');
+            return 0;
+        }
+        console.log ('[privacy] PRIVACY.md ОТЛИЧАЕТСЯ от шаблона (' + Buffer.byteLength (_old) + ' байт -> ' +
+            Buffer.byteLength (_text) + '): пересобрать -- `node . privacy`');
+        return 1;
+    }
+    _fs.writeFileSync (_outFile, _text);
+    console.log ('[privacy] PRIVACY.md собран: ' + Buffer.byteLength (_text) + ' байт (было ' +
+        Buffer.byteLength (_old) + ')');
+    if (_rolesOff) console.log ('[privacy] ВНИМАНИЕ: роли не сохраняются ни на одном сервере, ' +
+        'а в тексте шаблона они описаны -- поправь privacy.template.md');
+    if (_srv.length && !_timeout) console.log ('[privacy] ВНИМАНИЕ: таймаут за выход выключен ' +
+        '(onLeaveBanTimeout: 0 у всех рабочих серверов), а в тексте шаблона он описан -- ' +
+        'поправь privacy.template.md');
+    console.log ('[privacy] если политика выложена по ссылке (privacy_url), обнови и ту копию');
+    return 0;
+}
+
+if (process.argv.slice (2).some (_a => /^privacy$/i.test (_a)))
+{
+    let _code = 1;
+    try { _code = privacyCli (process.argv.includes ('--check'), process.argv.includes ('--offline')); }
+    catch (e) { console.log ('[privacy] ошибка: ' + ((e && e.message) || e)); }
     process.exit (_code);
 }
 
@@ -5307,6 +5483,45 @@ function configSanityIssues ()
     return out;
 }
 
+// [v2.29] ОТСТАЛ ЛИ БОЕВОЙ config.json ОТ config.example.json.
+// Зачем: подсказки и новые ключи со значениями по умолчанию живут в примере, а в боевой
+// файл их никто не переносит сам -- расхождение замечаешь случайно (так и случилось:
+// backup_keep был в примере, а в конфиге его не было, и владелец искал его руками).
+// Сравниваем ключи по блокам: верхний уровень, MUSIC и каждый рабочий сервер -- с блоком
+// ID_СЕРВЕРА из примера. Молчим, когда всё на месте: нет расхождения -- нет строки.
+// Предупреждаем только о СТРОКАХ файла: подсказка это (_comment) или значение,
+// которое бот применит и без ключа, -- решает владелец, это не ошибка.
+function configDriftIssues ()
+{
+    const _fs = require ('fs'), _path = require ('path');
+    const _exFile = _path.join (__dirname, 'config.example.json');
+    if (!_fs.existsSync (_exFile)) return [];
+    let _ex = null;
+    try { _ex = JSON.parse (_fs.readFileSync (_exFile, 'utf8')); } catch (e) { return []; }
+    const _cfg = require ('./config.json');
+    const _miss = (a, b) => Object.keys (b || {}).filter (_k => !(_k in (a || {})));
+    const out = [];
+    const _say = (where, keys) =>
+    {
+        if (!keys.length) return;
+        out.push ('в config.json нет ' + keys.length + (keys.length === 1 ? ' строки' : ' строк') +
+            ' из config.example.json -- ' + where + ': ' + keys.slice (0, 8).join (', ') +
+            (keys.length > 8 ? ', ...и ещё ' + (keys.length - 8) : ''));
+    };
+    _say ('верхний уровень', _miss (_cfg, _ex));
+    _say ('MUSIC', _miss (_cfg.MUSIC, _ex.MUSIC));
+    const _srvEx = (_ex.SERVERS || {})['ID_СЕРВЕРА'];
+    if (_srvEx)
+        for (const _id of Object.keys (SERVERS))
+            if (/^\d{17,20}$/.test (_id) && SERVERS[_id].allow !== false)
+                _say ('сервер ' + _id + (SERVERS[_id].name ? ' («' + SERVERS[_id].name + '»)' : ''),
+                    _miss (SERVERS[_id], _srvEx));
+    if (out.length)
+        out.push ('это строки-подсказки (_comment) и ключи со значениями по умолчанию: без них бот работает, ' +
+            'но значения берёт из кода, а не из примера -- перенести их проще всего копией из config.example.json');
+    return out;
+}
+
 // [v2.5] Проверка id из config.json при старте: битый id вылезет сразу,
 // а не загадочной ошибкой переноса/лога через час. Молчим, если всё цело.
 async function checkConfigChannels (server)
@@ -9021,3 +9236,8 @@ client.once ('clientReady', () => registerMusicCommands ());
 // и «ни на что не влияет»). Если всё настроено правильно -- ниже ни одной строки.
 for (const _cfgIssue of configSanityIssues ())
     console.log ('[' + (d()) + '] [config] ' + _cfgIssue);
+
+// [v2.29] И там же -- не отстал ли боевой config.json от config.example.json (подсказки
+// и новые ключи). Тоже молчит, когда расхождения нет.
+for (const _cfgDrift of configDriftIssues ())
+    console.log ('[' + (d()) + '] [config] ' + _cfgDrift);
