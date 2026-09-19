@@ -8568,7 +8568,7 @@ const QSEP = '────────────';
 const QSMALL = '-# ';
 const QUEUE_HINT_SHORT = QSMALL + 'Действия -- кнопками ниже.';
 const QUEUE_HINT_FULL =
-    QSMALL + 'Перемотать внутри трека -- /seek или кнопки «◀ 30 с» / «30 с ▶».' + '\n' +
+    QSMALL + 'Перемотать внутри трека -- кнопки «◀ 30 с» / «30 с ▶» / «⏱ На таймкод…» или /seek.' + '\n' +
     QSMALL + 'Подвинуть -- выбери трек в меню ниже (выше/ниже, в начало, в конец' +
     ' или «На позицию…»), либо командой /move номер to номер.' + '\n' +
     QSMALL + 'Прыгнуть по очереди -- /jump (админы и модеры).' + '\n' +
@@ -8650,9 +8650,12 @@ function queueAddsText (m)
 // бюджет один и тот же при отрисовке страницы и в queuePageOf (один и тот же m).
 function queueListBudget (m)
 {
+    // [v2.44] В бюджете -- ПОЛНАЯ подсказка, а не короткая: она теперь стоит в письме
+    // ВСЕГДА (раньше выбиралась по длине, и владелец видел «примечания то есть, то нет»).
+    // Не влезает -- укорачивается САМ СПИСОК, а не справка (см. queueView).
     const chrome = queueHeadText (m).length + queueWaitText (m).length +
         queueAuthorsText (m).length + queueAddsText (m).length + queueCheckText (m).length +
-        QUEUE_GLUE + QUEUE_HINT_SHORT.length;
+        QUEUE_GLUE + QUEUE_HINT_FULL.length;
     return Math.max (200, QUEUE_MSG_LIMIT - chrome);
 }
 
@@ -8803,11 +8806,15 @@ function queueComponents (page, m, moveSel = 0, opts = {})
     // [v2.35] РЯДЫ ПЕРЕСОБРАНЫ ПОД ЖЁСТКИЙ ЛИМИТ DISCORD (не больше пяти). До этого
     // в ряду действий стояли пять кнопок (пропуск, вход, выход, чистка, стоп/выход) --
     // для перемотки ±30 с там места не было, а убирать что-то из них нельзя.
-    // Теперь: [перемотка + управление] [чистка] ... [список треков] [авторы].
-    //   * «◀ 30» / «30 ▶» -- перемотка ВНУТРИ текущего трека той же логикой, что /seek
-    //     (у прямого эфира позиции нет -- кнопки погашены);
+    // [v2.44] ЛИМИТ -- ПЯТЬ РЯДОВ И ПЯТЬ КНОПОК В РЯДУ, и он тут вплотную:
+    //   [1] листание (4)   [2] ВНУТРИ ТРЕКА: ◀ 30 с / 30 с ▶ / ⏱ На таймкод… (3)
+    //   [3] ⏭ Пропустить / ▶ Войти / ⏏ Выйти / 🧹 Очистить / 🧹⏏ Очистка/Выход (5)
+    //   [4] список треков, [5] меню автора.
+    // Так «⏱ На таймкод…» (просьба владельца: кнопками ±30 с до нужного места идти
+    // долго, а /seek вручную неудобно) получил своё место, а листание и меню автора
+    // остались на виду: раньше при шестом ряде Discord молча выбрасывал последний.
     //   * «Войти» -- /join (зайти и остаться), «Выйти» -- /leave (отложить СВОИ треки
-    //     и играть дальше), а «Очистка/Выход» в ряду ниже -- /stop (/clear + /leave).
+    //     и играть дальше), а «Очистка/Выход» -- /stop (/clear + /leave).
     const liveNoSeek = !m.current || m.current.isLive;
     rows.push
     (
@@ -8819,19 +8826,24 @@ function queueComponents (page, m, moveSel = 0, opts = {})
             new ButtonBuilder ()
                 .setCustomId ('q:s:p').setLabel ('30 с ▶').setStyle (ButtonStyle.Secondary)
                 .setDisabled (liveNoSeek),
+            // [v2.44] Точное место -- окном ввода, совсем как «#️⃣ На позицию…» у трека
+            // в очереди: та же логика перемотки, что у /seek (см. seekMusic).
             new ButtonBuilder ()
-                .setCustomId ('q:skip').setLabel ('⏭ Пропустить').setStyle (ButtonStyle.Secondary)
-                .setDisabled (!m.current),
-            new ButtonBuilder ()
-                .setCustomId ('q:join').setLabel ('▶ Войти').setStyle (ButtonStyle.Success),
-            new ButtonBuilder ()
-                .setCustomId ('q:leave').setLabel ('⏏ Выйти').setStyle (ButtonStyle.Secondary)
+                .setCustomId ('q:sk:' + start).setLabel ('⏱ На таймкод…').setStyle (ButtonStyle.Secondary)
+                .setDisabled (liveNoSeek)
         )
     );
     rows.push
     (
         new ActionRowBuilder ().addComponents
         (
+            new ButtonBuilder ()
+                .setCustomId ('q:skip').setLabel ('⏭ Пропустить').setStyle (ButtonStyle.Secondary)
+                .setDisabled (!m.current),
+            new ButtonBuilder ()
+                .setCustomId ('q:join').setLabel ('▶ Войти').setStyle (ButtonStyle.Success),
+            new ButtonBuilder ()
+                .setCustomId ('q:leave').setLabel ('⏏ Выйти').setStyle (ButtonStyle.Secondary),
             new ButtonBuilder ()
                 .setCustomId ('q:clear').setLabel ('🧹 Очистить').setStyle (ButtonStyle.Danger)
                 .setDisabled (!total && !m.current),
@@ -9593,20 +9605,26 @@ function queueView (m, start, moveSel = 0, opts = {})
     if (!total) content = queueHeadText (m);
     else
     {
-        // Сперва пробуем полную подсказку, потом короткую...
+        // [v2.44] ПОДСКАЗКА ОДНА И ВСЕГДА. Раньше она выбиралась по длине сообщения
+        // (влезла полная -- показываем её, не влезла -- короткую), и в живом чате это
+        // читалось как «примечания к командам то есть, то нет». Бюджет страницы считает
+        // полную подсказку, поэтому она есть всегда, а укорачивается при нехватке места
+        // СПИСОК. Срезаем хвост списка -- только при ОДНОВРЕМЕННЫХ крайностях: queue_page
+        // выставлен большим, все названия страницы длиннющие и у каждого трека свой
+        // длинный ник (ник не укорачиваем -- он адресат). Ничего не теряется: хвост
+        // сообщения ведёт на реальный следующий номер.
         content = build (QUEUE_HINT_FULL);
-        if (content.length > QUEUE_MSG_LIMIT) content = build (QUEUE_HINT_SHORT);
-        // ...и только в самом конце срезаем хвост списка. Сюда попадаем только при
-        // ОДНОВРЕМЕННЫХ крайностях: queue_page выставлен большим, все названия страницы
-        // длиннющие и у каждого трека свой длинный ник (ник не укорачиваем -- он адресат).
-        // Ничего не теряется: хвост сообщения ведёт на реальный следующий номер.
         let guard = 0;
         while (content.length > QUEUE_MSG_LIMIT && page.count > 1 && guard++ < 50)
         {
             page.count--;
             page.list = page.list.split ('\n').slice (0, page.count).join ('\n');
-            content = build (QUEUE_HINT_SHORT);
+            content = build (QUEUE_HINT_FULL);
         }
+        // Крайний случай (нужны сразу: максимальный queue_page, названия-монстры и
+        // длинный ник у каждого трека): список уже из одного трека, сокращаем подсказку.
+        // Лучше короткая справка, чем отбитое Discord по длине сообщение.
+        if (content.length > QUEUE_MSG_LIMIT) content = build (QUEUE_HINT_SHORT);
     }
     return { content: content, components: queueComponents (page, m, moveSel, opts) };
 }
@@ -11008,8 +11026,54 @@ client.on ('interactionCreate', async (interaction) =>
     if (typeof interaction.isModalSubmit === 'function' && interaction.isModalSubmit ())
     {
         const guildId = interaction.guildId;
+        if (!(guildId in SERVERS)) return;
+        // [v2.44] «⏱ На таймкод…» -- перемотка ВНУТРИ текущего трека тем же путём, что
+        // /seek (никакой второй логики). Права те же, что у остальной музыки (DJ),
+        // и проверяются здесь сами, потому что seekMusic их не смотрит (из слэша
+        // команда приходит уже после общей DJ-проверки).
+        if (/^q:skt:(\d+)$/.test (interaction.customId || ''))
+        {
+            const page0 = parseInt (/^q:skt:(\d+)$/.exec (interaction.customId)[1], 10) || 1;
+            if (!isDJ (interaction))
+            {
+                const role_dj = SERVERS[guildId].role_dj || '';
+                return interaction.reply
+                (
+                    {
+                        content: '🚫 Музыка только для ' + (role_dj ? '<@&' + role_dj + '>' : 'DJ'),
+                        flags: MessageFlags.Ephemeral,
+                    }
+                );
+            }
+            const m0 = musicOf (guildId);
+            const raw0 = String (interaction.fields.getTextInputValue ('time') || '').trim ();
+            const who0 = interaction.member ? uuu (interaction.member) : interaction.user.username;
+            const to0 = parseSeekTime (raw0);
+            if (to0 === null)
+                return interaction.reply
+                (
+                    {
+                        content: '🤔 Не понял время: `' + raw0.slice (0, 20) + '`.\n' +
+                            'Напиши, куда перемотать: `90` (секунды), `1:30` (минуты) или `1:02:03`.',
+                        flags: MessageFlags.Ephemeral,
+                    }
+                );
+            const res0 = seekMusic (guildId, to0, who0);
+            if (!res0.ok)
+                return interaction.reply ({ content: res0.text, flags: MessageFlags.Ephemeral });
+            // [v2.35] Сообщение очереди перерисовываем ЧУТЬ ПОЗЖЕ: сразу после перемотки
+            // плеер ещё перезапускается, и в строке «Сейчас» стоял бы прочерк.
+            const ctx0 = { actorId: interaction.user.id, actorName: who0, staff: isStaffInteraction (interaction) };
+            setTimeout (() =>
+            {
+                const view0 = queueView (m0, page0, 0, ctx0);
+                if (interaction.message && typeof interaction.message.edit === 'function')
+                    interaction.message.edit ({ content: view0.content, components: view0.components }).catch (() => {});
+            }, 1500);
+            return interaction.reply ({ content: res0.text, flags: MessageFlags.Ephemeral });
+        }
         const mMpos = /^q:mpos:(\d+)$/.exec (interaction.customId || '');
-        if (!mMpos || !(guildId in SERVERS)) return;
+        if (!mMpos) return;
         const m = musicOf (guildId);
         const n = parseInt (mMpos[1], 10) || 0;
         const who = interaction.member ? uuu (interaction.member) : interaction.user.username;
@@ -11076,7 +11140,7 @@ client.on ('interactionCreate', async (interaction) =>
         // не было, и нажатие молча уходило в return: Discord показывал «взаимодействие
         // не удалось», а перенос кнопками не работал (при этом /move работал -- это и
         // сбивало с толку). Теперь все три пути перестановки разрешены одинаково.
-        if (!/^q:(skip|join|leave|clear|stop|da|dau|dax|dx|cq|rm|mv|mt|mb|mp|mu|md|mx|s|tr|rx)(:|$)/.test (cid)) return;
+        if (!/^q:(skip|join|leave|clear|stop|da|dau|dax|dx|cq|rm|mv|mt|mb|mp|mu|md|mx|s|sk|tr|rx)(:|$)/.test (cid)) return;
         if (!isDJ (interaction))
         {
             const role_dj = SERVERS[guildId].role_dj || '';
@@ -11102,6 +11166,35 @@ client.on ('interactionCreate', async (interaction) =>
             const at = queuePageOf (m, res.to);
             await replyView (at, res.to);
             return interaction.followUp ({ content: res.text, flags: MessageFlags.Ephemeral });
+        }
+        // [v2.44] «⏱ На таймкод…» -- окно ввода времени для ТЕКУЩЕГО трека (та же
+        // перемотка, что у /seek и у «◀ 30 с / 30 с ▶»). Страница очереди зашита в
+        // customId: после перемотки сообщение перерисуется на той же странице.
+        const mTcodeAsk = /^q:sk:(\d+)$/.exec (cid);
+        if (mTcodeAsk)
+        {
+            if (!m.current)
+                return interaction.reply ({ content: '🤷 Сейчас ничего не играет -- перематывать нечего.', flags: MessageFlags.Ephemeral });
+            if (m.current.isLive)
+                return interaction.reply ({ content: '🔴 Это прямой эфир -- позиции у него нет (`/seek 0` -- перейти к живому краю).', flags: MessageFlags.Ephemeral });
+            const at = Math.max (0, Math.round (playedMsOf (m) / 1000));
+            return interaction.showModal
+            (
+                new ModalBuilder ().setCustomId ('q:skt:' + mTcodeAsk[1])
+                    .setTitle ('Перемотать трек')
+                    .addComponents
+                    (
+                        new ActionRowBuilder ().addComponents
+                        (
+                            new TextInputBuilder ()
+                                .setCustomId ('time')
+                                .setLabel ('Куда перемотать: 1:30 или 90 (сейчас ' + fmtDur (at) + ')')
+                                .setStyle (TextInputStyle.Short)
+                                .setRequired (true).setMaxLength (8)
+                                .setValue (fmtDur (at))
+                        )
+                    )
+            );
         }
         const mPosAsk = /^q:mp:(\d+)$/.exec (cid);
         if (mPosAsk)
