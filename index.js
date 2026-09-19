@@ -3666,6 +3666,15 @@ async function sweepExpiredBans (server)
                     await db (server, 'membersBanTimeout', id, null);
                     unbannedAny = true;
                 }
+                else if (/Missing Permissions|50013|Missing Access|50001/i.test (e.message))
+                {
+                    // [v2.26] Прав не хватает -- повторять каждый тик (45 сек) смысла нет:
+                    // в логе был бы бесконечный спам. Говорим один раз и запись убираем,
+                    // честно сказав, что бан (если он есть) надо снять руками.
+                    await db (server, 'membersBanTimeout', id, null);
+                    console.error ('[' + (d()) + '] участник ' + id + ' НЕ разбанен (срок истёк): ' + banWhy (e) +
+                        ' -- запись убрал, чтобы не спамить каждый тик; разбань вручную, если бан есть');
+                }
                 else
                     console.error ('[sweepExpiredBans] ' + id + ': не смог снять бан (' + e.message + ') -- запись оставлена, попробую в следующем тике');
             }
@@ -3875,6 +3884,25 @@ async function welcomeDM (server, uid, raw)
     }
 }
 
+// [v2.26] ПОЧЕМУ БАН (или РАЗБАН) НЕ ПОЛУЧИЛСЯ -- одной строкой и с подсказкой, что
+// делать. Discord на разные случаи отвечает одним и тем же «Missing Permissions»,
+// а по логу должно быть видно, это права бота, его позиция в списке ролей или что-то ещё.
+function banWhy (e)
+{
+    const msg = oneLine (String ((e && e.message) || e), 160);
+    if (/Missing Permissions|50013/i.test (msg))
+        return msg + ' [у бота нет права «Банить/Разбанивать участников» ИЛИ его роль стоит НИЖЕ роли человека -- проверь права роли бота]';
+    if (/Unknown Member|10007/i.test (msg))
+        return msg + ' [человека нет на сервере]';
+    if (/Unknown Ban|10026/i.test (msg))
+        return msg + ' [бана и не было -- снимать нечего]';
+    if (/higher|hierarchy/i.test (msg))
+        return msg + ' [роль бота должна стоять ВЫШЕ роли человека в списке ролей]';
+    if (/Missing Access|50001/i.test (msg))
+        return msg + ' [у бота нет доступа к действию -- проверь права и роль]';
+    return msg;
+}
+
 // Обработка ВХОДА (бывший guildMemberAdd): бан-таймаут при перезаходе.
 // [v2.13] Всё, что бот пишет в ЛС и в журнал, -- по факту: если бана не будет
 // (onEnterBanRealy выключен), то и «ограничения входа» в письме не будет; если
@@ -3943,18 +3971,31 @@ async function handleMemberJoin (server, uid, raw)
                 // [v2.15] таймер снятия -- через реестр, чтобы /unban мог его отменить
                 banTimerSet (server, uid, left, async () =>
                 {
-                    await db (server, 'membersBanTimeout', uid, null);
-                    guild.members.unban (uid)
-                    .then (u =>
+                    // [v2.26] Сперва снимаем бан, только потом стираем запись (в другом
+                    // порядке неудачное снятие оставило бы человека в бане, а бот бы о нём забыл)
+                    try
                     {
+                        const u = await guild.members.unban (uid, 'Таймаут истёк');
+                        await db (server, 'membersBanTimeout', uid, null);
                         banHistoryAdd (server, uid, 'unban');
                         console.log ('[' + (d()) + '] участник ' + (u ? u.username : uid) + ' разбанен (срок истёк)');
-                    })
-                    .catch (e => console.error ('[memberJoin] разбан: ' + e.message + ' -- возможно, уже разбанен'));
+                    }
+                    catch (e)
+                    {
+                        if (/Unknown Ban|10026|404/i.test (String (e && e.message)))
+                        {
+                            await db (server, 'membersBanTimeout', uid, null);
+                            console.log ('[' + (d()) + '] участник ' + username + ' уже не в бане (разбанен вручную или раньше) -- запись убрал');
+                        }
+                        else
+                            console.error ('[' + (d()) + '] участник ' + username + ' НЕ разбанен (срок истёк): ' + banWhy (e) +
+                                ' -- запись оставил, сниму при следующей проверке/запуске');
+                    }
                 });
             }
         )
-        .catch (e => console.error ('[memberJoin] ошибка бана: ' + e.message));
+        .catch (e => console.error ('[' + (d()) + '] участник ' + username + ' НЕ забанен (перезаход): ' + banWhy (e) +
+            ' -- таймаут в базе остался, значит при следующем входе до конца срока попробую снова (и снова напишу в ЛС)'));
         return;
     }
     // [v2.13] Таймаут записан, но бана по конфигу нет (onEnterBanRealy выключен):
@@ -3972,6 +4013,9 @@ async function handleMemberLeave (server, uid, raw, since = 0)
     let log_channel = SERVERS[server].log_channel || '';
     let onLeaveBanTimeout = SERVERS[server].onLeaveBanTimeout || 0;
     let onLeaveBanRealy = SERVERS[server].onLeaveBanRealy || false;
+    // [v2.26] Нужен только для честной подсказки в логе: что будет с человеком дальше
+    // (попробует ли бот забанить его при перезаходе).
+    const onEnterBanRealy = SERVERS[server].onEnterBanRealy || false;
     // [v2.14] Сначала запоминаем роли выходящего -- ДО таймаута и до любых банов.
     // Это делает сама PANDAMIA (раньше это умел только сторонний бот), см. saveMemberRoles.
     // [v2.15] since -- время снимка поллера: роль, снятая за секунды до выхода, в базу
@@ -3991,40 +4035,78 @@ async function handleMemberLeave (server, uid, raw, since = 0)
     {
         // [v2.14] точный срок бана: и причина в аудите Discord, и строка в логе.
         const untilLeave = Date.now () + onLeaveBanTimeout * 60 * 1000;
-        guild.members.ban
-        (
-            uid,
-            {
-                days: 0,
-                reason: 'Забанен ботом до ' + d (untilLeave, true) + ' (выход с сервера, таймаут ' + onLeaveBanTimeout + ' мин.)',
-            }
-        )
-        .then
-        (
-            async () =>
-            {
-                await db (server, 'membersBanTimeout', uid, untilLeave);
-                banHistoryAdd (server, uid, 'ban');
-                // [v2.13] бан выдан сразу при выходе (onLeaveBanRealy: true)
-                console.log ('[' + (d()) + '] участник ' + username + ' забанен до ' + d (untilLeave, true) +
-                    ' (' + onLeaveBanTimeout + ' мин., при выходе)');
-                banTimerSet (server, uid, onLeaveBanTimeout * 60 * 1000, async () =>
+        // [v2.26] СНАЧАЛА фиксируем сам таймаут (запись в базе), и только потом пробуем
+        // забанить. Раньше запись жила ВНУТРИ .then после успешного бана: если бан не
+        // получился (у бота нет права «Банить участников», его роль ниже роли человека,
+        // сбой сети или Discord), не оставалось ВООБЩЕ ничего -- ни таймаута, ни события
+        // в историю, ни бана при перезаходе. Человек заходил как обычно, а в логе была
+        // одна строка про ошибку. Теперь факт наказания не зависит от того, удался ли
+        // вызов: запись есть всегда, и при перезаходе бот попробует забанить снова.
+        await db (server, 'membersBanTimeout', uid, untilLeave);
+        let banned = false;
+        try
+        {
+            await guild.members.ban
+            (
+                uid,
                 {
-                    await db (server, 'membersBanTimeout', uid, null);
-                    guild.members.unban (uid)
-                    .then
-                    (
-                        user =>
-                        {
-                            banHistoryAdd (server, uid, 'unban');
-                            console.log ('[' + (d()) + '] участник ' + (user ? user.username : uid) + ' разбанен (срок истёк)');
-                        }
-                    )
-                    .catch (e => console.error ('[memberLeave] разбан: ' + e.message + ' -- возможно, уже разбанен'));
-                });
+                    days: 0,
+                    reason: 'Забанен ботом до ' + d (untilLeave, true) + ' (выход с сервера, таймаут ' + onLeaveBanTimeout + ' мин.)',
+                }
+            );
+            banned = true;
+            banHistoryAdd (server, uid, 'ban');
+            // [v2.13] бан выдан сразу при выходе (onLeaveBanRealy: true)
+            console.log ('[' + (d()) + '] участник ' + username + ' забанен до ' + d (untilLeave, true) +
+                ' (' + onLeaveBanTimeout + ' мин., при выходе)');
+        }
+        catch (e)
+        {
+            // [v2.26] Неудавшийся бан -- это НЕ «ничего»: таймаут уже записан (значит
+            // человек попадёт в проверку при перезаходе), а в историю идёт событие «таймаут»,
+            // чтобы в /bans было видно, что наказание было, просто Discord его не принял.
+            // Причину и что будет дальше пишем прямо в лог.
+            banHistoryAdd (server, uid, 'timeout');
+            console.error ('[' + (d()) + '] участник ' + username + ' НЕ забанен (бан при выходе не выдался): ' + banWhy (e) +
+                ' -- таймаут ' + onLeaveBanTimeout + ' мин. всё равно записан: вернётся раньше срока -- ' +
+                (onEnterBanRealy
+                    ? 'попробую забанить снова (onEnterBanRealy)'
+                    : 'будет только строка в логе, бан не выдам (onEnterBanRealy выключен)'));
+        }
+        banTimerSet (server, uid, onLeaveBanTimeout * 60 * 1000, async () =>
+        {
+            if (!banned)
+            {
+                // [v2.26] Бана не было (вызов не удался) -- снимать нечего: забываем таймаут
+                // и пишем это прямо, чтобы в конце срока не было попытки снять несуществующий бан.
+                await db (server, 'membersBanTimeout', uid, null);
+                console.log ('[' + (d()) + '] участник ' + username + ' таймаут истёк спустя ' + onLeaveBanTimeout +
+                    ' мин. (бана не было -- снимать нечего)');
+                return;
             }
-        )
-        .catch (e => console.error ('[memberLeave] ошибка бана: ' + e.message));
+            // [v2.26] ПОРЯДОК ВАЖЕН: сперва снимаем бан, и только потом стираем запись.
+            // Раньше было наоборот: если снятие не прошло (права/сеть), запись уже стёрта,
+            // и человек остался бы в бане навсегда, а бот бы про него «забыл».
+            try
+            {
+                const user = await guild.members.unban (uid, 'Таймаут истёк');
+                await db (server, 'membersBanTimeout', uid, null);
+                banHistoryAdd (server, uid, 'unban');
+                console.log ('[' + (d()) + '] участник ' + (user ? user.username : uid) + ' разбанен (срок истёк)');
+            }
+            catch (e)
+            {
+                if (/Unknown Ban|10026|404/i.test (String (e && e.message)))
+                {
+                    // человека уже разбанили (руками или раньше) -- это не ошибка
+                    await db (server, 'membersBanTimeout', uid, null);
+                    console.log ('[' + (d()) + '] участник ' + username + ' уже не в бане (разбанен вручную или раньше) -- запись убрал');
+                }
+                else
+                    console.error ('[' + (d()) + '] участник ' + username + ' НЕ разбанен (срок истёк): ' + banWhy (e) +
+                        ' -- запись оставил, сниму при следующей проверке/запуске');
+            }
+        });
     }
     else
     {
