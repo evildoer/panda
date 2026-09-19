@@ -859,6 +859,9 @@ function dbFileOf (_srv)   { return __dirname + '/' + _srv + '.sqlite'; }
 function dbBackupOf (_srv) { return __dirname + '/' + _srv + '.backup.sqlite'; }
 function dbBrokenOf (_srv) { return __dirname + '/' + _srv + '.broken.sqlite'; }
 function dbServerList ()   { return Object.keys (SERVERS).filter (_k => /^\d{17,20}$/.test (_k)); }
+// [v2.26] Включённые серверы (allow: false -- сознательно выключен, базы у него нет):
+// проверки целостности, копии и `node . backup`/`restore` его не касаются.
+function dbServerListOn ()  { return dbServerList ().filter (_k => (SERVERS[_k] || {}).allow !== false); }
 
 // Прочитать базу отдельным соединением и сказать, цела ли она и сколько в ней записей.
 // Только чтение: сама проверка ничего не меняет. Нет node:sqlite (старый Node) --
@@ -943,7 +946,7 @@ function dbStartupGuard ()
 {
     const _f = require ('fs');
     const _good = [], _bad = [];
-    for (const _srv of dbServerList ())
+    for (const _srv of dbServerListOn ())
     {
         const _file = dbFileOf (_srv), _bak = dbBackupOf (_srv);
         const _nm = (_srv + ((SERVERS[_srv] || {}).name ? ' («' + SERVERS[_srv].name + '»)' : ''));
@@ -973,6 +976,20 @@ function dbStartupGuard ()
     // этапе загрузки ещё не определён (как и в строке [db] про шифрование).
     if (_good.length)
         console.log ('[' + new Date ().toLocaleString () + '] [db] базы: ' + _good.join (' | '));
+    // [v2.26] Выключенные серверы базы не ведут -- но если от прежних версий остались
+    // файлы, скажем об этом ОДНОЙ строкой и с готовой командой (иначе они годами лежат
+    // в папке и непонятно, чьи они и можно ли удалить).
+    for (const _srv of dbServerList ())
+    {
+        if ((SERVERS[_srv] || {}).allow !== false) continue;
+        const _left = [_srv + '.sqlite', _srv + '.backup.sqlite'].filter (_x => _f.existsSync (_x));
+        if (!_left.length) continue;
+        console.log ('[' + new Date ().toLocaleString () + '] [db] ' + _srv +
+            ((SERVERS[_srv] || {}).name ? ' («' + SERVERS[_srv].name + '»)' : '') +
+            ' выключен в конфиге (allow: false) -- базу ему не веду' +
+            (_left.length === 2 ? ', а от прежних версий остались пустые ' + _srv + '.sqlite и ' + _srv + '.backup.sqlite' +
+                ' (не нужны -- удали их)' : ', но лежит ' + _left[0] + ' (не нужен -- удали)'));
+    }
     if (!_bad.length) return;
     console.log ('' + '='.repeat (72));
     console.log ('[db] БАЗА ПОВРЕЖДЕНА -- БОТ НЕ ЗАПУСКАЕТСЯ, чтобы не потерять данные.');
@@ -993,7 +1010,7 @@ function dbBackupCli ()
 {
     let _fail = 0;
     console.log ('[backup] копия базы: <имя>.sqlite -> <имя>.backup.sqlite (одна на сервер, перезаписывается)');
-    for (const _srv of dbServerList ())
+    for (const _srv of dbServerListOn ())
     {
         const _file = dbFileOf (_srv), _bak = dbBackupOf (_srv);
         const _cur = dbIntegrity (_file);
@@ -1013,7 +1030,7 @@ function dbRestoreCli ()
 {
     const _f = require ('fs');
     let _fail = 0;
-    for (const _srv of dbServerList ())
+    for (const _srv of dbServerListOn ())
     {
         const _file = dbFileOf (_srv), _bak = dbBackupOf (_srv), _broken = dbBrokenOf (_srv);
         const _b = dbIntegrity (_bak);
@@ -1064,7 +1081,16 @@ const { KeyvSqlite } = require ('@keyv/sqlite');
 // так ключи на диске остаются в прежнем виде ('membersBanTimeout:<id>'), то есть
 // уже сохранённые баны читаются по-старому.
 function dbMake (_server, _namespace)
-{    const kv = new Keyv
+{
+    // [v2.26] СЕРВЕР ВЫКЛЮЧЕН в конфиге (allow: false) -- базу ему НЕ заводим: файл
+    // создаётся уже в конструкторе KeyvSqlite, поэтому у заброшенного сервера годами
+    // лежала пара пустых файлов (<id>.sqlite и <id>.backup.sqlite), и они возвращались
+    // после удаления. Теперь для него всё живёт в ПАМЯТИ: код работает как раньше
+    // (ничего не падает, если что-то случайно обратится), а на диск не пишется ни байта.
+    // Включишь сервер обратно (allow: true) -- база и копия создадутся сами.
+    if ((SERVERS[_server] || {}).allow === false)
+        return new Keyv ({ namespace: _namespace, serialize: dbSerialize, deserialize: dbDeserialize });
+    const kv = new Keyv
     (
         {
             store: new KeyvSqlite ({ uri: 'sqlite://' + __dirname + '/' + _server + '.sqlite' }),
