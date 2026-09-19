@@ -274,6 +274,9 @@ const
     // [v2.27] Сколько минут между ПЛАНОВЫМИ копиями базы, пока бот работает.
     // По умолчанию 60; 0 -- как было раньше, копия только при старте (и вручную).
     backup_minutes,
+    // [v2.28] Сколько контрольных точек (файлов <id>.check-<дата>.sqlite) держать.
+    // По умолчанию 10; 0 -- не убирать старые вовсе.
+    backup_keep,
 }
 = require ('./config.json');
 const space = ' ';
@@ -300,7 +303,7 @@ const DB_ENC_HEX = /^[0-9a-fA-F]{64}$/;
 // игнорировался -- `node . unkey` или опечатка в `node . dum` запускали БОТА, а не
 // давали ошибку: одна случайная строка в консоли = лишний процесс. Список -- ровно то,
 // что обрабатывается ниже; всё остальное считается опечаткой.
-const CONSOLE_CMDS = ['keygen', 'dump', 'backup', 'restore', 'clearstatus'];
+const CONSOLE_CMDS = ['keygen', 'dump', 'backup', 'checkpoint', 'backups', 'restore', 'clearstatus'];
 {
     const _first = String (process.argv[2] === undefined ? '' : process.argv[2]).trim ();
     if (_first && !CONSOLE_CMDS.includes (_first.toLowerCase ()))
@@ -308,11 +311,13 @@ const CONSOLE_CMDS = ['keygen', 'dump', 'backup', 'restore', 'clearstatus'];
         console.log ('Неизвестная команда: ' + _first);
         console.log ('Без команды (node .) запускается ОТДЕЛЬНО бот -- и больше ничего.');
         console.log ('Есть только эти команды:');
-        console.log ('  node . keygen              -- напечатать новый ключ шифрования базы (db_key)');
-        console.log ('  node . dump [id]            -- посмотреть базу глазами (только чтение)');
-        console.log ('  node . backup               -- обновить резервную копию базы');
-        console.log ('  node . restore              -- восстановить базу из копии');
-        console.log ('  node . clearstatus <id>     -- снять свою строку из статуса голосового канала');
+        console.log ('  node . keygen               -- напечатать новый ключ шифрования базы (db_key)');
+        console.log ('  node . dump [id]             -- посмотреть базу глазами (только чтение)');
+        console.log ('  node . backup                -- обновить штатную копию базы (одна, перезаписывается)');
+        console.log ('  node . checkpoint [метка]    -- сделать контрольную точку (файл с датой в имени)');
+        console.log ('  node . backups               -- что есть: база, штатная копия и точки');
+        console.log ('  node . restore [метка]       -- вернуть базу из копии или из точки');
+        console.log ('  node . clearstatus <id>      -- снять свою строку из статуса голосового канала');
         process.exit (2);
     }
 }
@@ -1056,30 +1061,202 @@ function dbBackupCli ()
     return _fail ? 1 : 0;
 }
 
-// `node . restore` -- положить копию на место базы.
-function dbRestoreCli ()
+// ============================================================================
+// [v2.28] КОНТРОЛЬНЫЕ ТОЧКИ БАЗЫ: отдельные файлы с датой в имени.
+// Штатная копия (<id>.backup.sqlite) одна и перезаписывается -- это защита «от обрыва».
+// Точки -- другое: они остаются, чтобы вернуться к конкретному моменту (перед большой
+// чисткой, перед сменой ключа, просто «на всякий случай»):
+//     node . checkpoint [метка]   -- сделать точку сейчас
+//     node . backups              -- посмотреть, что есть
+//     node . restore [метка]      -- вернуть базу из точки (без метки -- из штатной копии)
+// Больше backup_keep точек на сервер не держим (по умолчанию 10; 0 -- не убирать
+// старые вовсе): когда появляется новая сверх лимита, самая старая удаляется.
+// Автоматически по расписанию точки НЕ делаются -- только по команде: в папке не
+// появляется ничего, чего бы владелец не попросил.
+// ВАЖНО про ключ: файл точки зашифрован тем ключом, который действовал в момент её
+// создания. После смены ключа (/rekey) старая точка читается только если прежний ключ
+// остался в config.json (db_key_prev) -- иначе записи в ней не расшифровать.
+// ============================================================================
+const BACKUP_KEEP = (() =>
+{
+    const _v = Number (backup_keep);
+    if (!Number.isFinite (_v) || _v < 0) return 10;
+    return Math.floor (_v);
+}) ();
+const dbTail = _p => String (_p).replace (/^.*[\\/]/, '');
+function dbCheckStamp ()
+{
+    const _d = new Date (), _p = _n => ('0' + _n).slice (-2);
+    return _d.getFullYear () + '-' + _p (_d.getMonth () + 1) + '-' + _p (_d.getDate ()) + '_' +
+        _p (_d.getHours ()) + '-' + _p (_d.getMinutes ()) + '-' + _p (_d.getSeconds ());
+}
+// Точки сервера, отсортированные по времени создания.
+// ВАЖНО: сортировать по имени целиком НЕЛЬЗЯ -- у точек бывают метки, и тогда
+// «...-before-restore.sqlite» оказался бы ПЕРЕД «....sqlite» (дефис младше точки),
+// то есть ротация удаляла бы самую новую точку. Поэтому сравниваем штамп времени
+// (первые 19 символов после '.check-'), а внутри одной секунды -- время файла и имя.
+function dbCheckFiles (_srv)
 {
     const _f = require ('fs');
+    let _list = [];
+    try { _list = _f.readdirSync (__dirname); } catch (e) { return []; }
+    const _pref = _srv + '.check-';
+    const _stamp = _n => _n.slice (_pref.length, _pref.length + 19); // YYYY-MM-DD_HH-MM-SS
+    const _mtime = _p => { try { return _f.statSync (_p).mtimeMs; } catch (e) { return 0; } };
+    return _list
+        .filter (_n => _n.startsWith (_pref) && _n.endsWith ('.sqlite'))
+        .map (_n => ({ name: _n, path: __dirname + '/' + _n }))
+        .sort ((a, b) =>
+        {
+            const _sa = _stamp (a.name), _sb = _stamp (b.name);
+            if (_sa !== _sb) return _sa < _sb ? -1 : 1;
+            const _ma = _mtime (a.path), _mb = _mtime (b.path);
+            if (_ma !== _mb) return _ma - _mb;
+            return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0);
+        });
+}
+function dbCheckRotate (_srv)
+{
+    const _f = require ('fs');
+    if (!BACKUP_KEEP) return [];
+    const _all = dbCheckFiles (_srv);
+    const _gone = [];
+    while (_all.length > BACKUP_KEEP)
+    {
+        const _old = _all.shift ();
+        try { _f.rmSync (_old.path, { force: true }); _gone.push (_old.name); } catch (e) { }
+    }
+    return _gone;
+}
+function dbCheckpointMake (_srv, _label)
+{
+    const _file = dbFileOf (_srv);
+    const _cur = dbIntegrity (_file);
+    if (!_cur.exists) return { ok: false, why: 'базы ещё нет -- точку делать не из чего' };
+    if (!_cur.ok) return { ok: false, why: 'база ПОВРЕЖДЕНА (' + _cur.why + ')' };
+    if (_cur.rows === 0) return { ok: false, why: 'в базе 0 записей -- точка не нужна' };
+    // Метка идёт в имя файла, поэтому оставляем только безопасные символы.
+    const _lab = String (_label === undefined || _label === null ? '' : _label).trim ()
+        .replace (/[^\w\u0400-\u04FF-]+/g, '-').replace (/^-+|-+$/g, '').slice (0, 24);
+    // Имя с датой. Если две точки получаются в одну секунду (частые команды, страховка
+    // перед restore), вторая НЕ перезатирает первую -- добавляем номер.
+    const _f = require ('fs');
+    const _base = __dirname + '/' + _srv + '.check-' + dbCheckStamp () + (_lab ? '-' + _lab : '');
+    let _dst = _base + '.sqlite', _n = 1;
+    while (_f.existsSync (_dst)) { _n++; _dst = _base + '-' + _n + '.sqlite'; }
+    const _res = dbCopyAndVerify (_file, _dst, _cur.rows);
+    if (!_res.ok) return { ok: false, why: _res.why };
+    return { ok: true, path: _dst, rows: _res.rows, gone: dbCheckRotate (_srv) };
+}
+
+// `node . checkpoint [метка]` -- сделать точку вручную.
+function dbCheckpointCli (_label)
+{
     let _fail = 0;
     for (const _srv of dbServerListOn ())
     {
-        const _file = dbFileOf (_srv), _bak = dbBackupOf (_srv), _broken = dbBrokenOf (_srv);
-        const _b = dbIntegrity (_bak);
-        if (!_b.exists) { console.log ('[restore] ' + _srv + ': копии нет -- восстанавливать нечего'); _fail++; continue; }
-        if (!_b.ok) { console.log ('[restore] ' + _srv + ': копия сама не читается (' + _b.why + ')'); _fail++; continue; }
-        if (_b.rows === 0) { console.log ('[restore] ' + _srv + ': копия пустая -- восстанавливать нечего'); _fail++; continue; }
-        const _cur = dbIntegrity (_file);
-        if (_cur.exists)
-        {
-            try { _f.copyFileSync (_file, _broken); console.log ('[restore] ' + _srv + ': текущая база отложена в ' + _broken); }
-            catch (e) { console.log ('[restore] ' + _srv + ': не смог отложить текущую базу: ' + clipText (String ((e && e.message) || e), 160) + ' -- ничего не трогаю'); _fail++; continue; }
-        }
-        const _res = dbCopyAndVerify (_bak, _file, _b.rows);
-        if (_res.ok) console.log ('[restore] ' + _srv + ': база восстановлена из копии -- ' + _res.rows + ' ' +
-            plural (_res.rows, 'запись', 'записи', 'записей') + ', файл прочитан');
-        else { console.log ('[restore] ' + _srv + ': не вышло: ' + _res.why + ' (копия цела, можно повторить)'); _fail++; }
+        const _r = dbCheckpointMake (_srv, _label);
+        if (!_r.ok) { console.log ('[checkpoint] ' + _srv + ': ' + _r.why); _fail++; continue; }
+        console.log ('[checkpoint] ' + _srv + ': точка создана -- ' + dbTail (_r.path) + ' (' + _r.rows + ' ' +
+            plural (_r.rows, 'запись', 'записи', 'записей') + ', файл прочитан)');
+        if (_r.gone.length)
+            console.log ('[checkpoint] ' + _srv + ': старых точек убрал ' + _r.gone.length +
+                ' -- держу не больше ' + BACKUP_KEEP + ' (backup_keep)');
     }
     return _fail ? 1 : 0;
+}
+
+// `node . backups` -- что вообще есть в папке (и что можно вернуть).
+function dbBackupsCli ()
+{
+    const _f = require ('fs');
+    const _size = _p => { try { return Math.max (1, Math.round (_f.statSync (_p).size / 1024)) + ' КБ'; } catch (e) { return '?'; } };
+    const _when = _p => { try { return _f.statSync (_p).mtime.toLocaleString (); } catch (e) { return '?'; } };
+    const _line = (_tag, _p, _i) => '[backups]   ' + _tag + ' ' + (_i.exists
+        ? _i.rows + ' ' + plural (_i.rows, 'запись', 'записи', 'записей') + ', ' + _size (_p) + ', изменена ' + _when (_p) +
+          (_i.ok ? '' : ' -- НЕ ЧИТАЕТСЯ (' + _i.why + ')')
+        : 'нет');
+    for (const _srv of dbServerListOn ())
+    {
+        const _nm = _srv + ((SERVERS[_srv] || {}).name ? ' («' + SERVERS[_srv].name + '»)' : '');
+        console.log ('[backups] ' + _nm + ':');
+        const _file = dbFileOf (_srv), _bak = dbBackupOf (_srv);
+        console.log (_line ('база сейчас  ', _file, dbIntegrity (_file)));
+        console.log (_line ('штатная копия', _bak, dbIntegrity (_bak)));
+        const _ch = dbCheckFiles (_srv);
+        if (!_ch.length)
+            console.log ('[backups]   точек нет (сделать: node . checkpoint [метка])');
+        else
+            for (const _c of _ch)
+                console.log (_line ('точка ' + dbTail (_c.name).replace (_srv + '.check-', ''), _c.path, dbIntegrity (_c.path)));
+        console.log ('[backups]   вернуть: node . restore -- из штатной копии' +
+            (_ch.length ? ' | node . restore <метка> -- из точки (метка -- часть имени: ' + dbTail (_ch[_ch.length - 1].name).replace (_srv + '.check-', '').replace (/\.sqlite$/, '') + ' или просто дата)' : ''));
+    }
+    return 0;
+}
+
+// `node . restore [метка]` -- положить на место базы штатную копию (без метки) или точку.
+function dbRestoreCli (_sel)
+{
+    const _f = require ('fs');
+    const _want = String (_sel === undefined || _sel === null ? '' : _sel).trim ();
+    let _fail = 0;
+    for (const _srv of dbServerListOn ())
+    {
+        const _file = dbFileOf (_srv), _broken = dbBrokenOf (_srv);
+        let _src = dbBackupOf (_srv), _what = 'штатной копии';
+        if (_want && !/^latest$/i.test (_want) && _want !== '-')
+        {
+            const _low = _want.toLowerCase ();
+            const _all = dbCheckFiles (_srv);
+            const _hit = _all.filter (_c => _c.name.toLowerCase ().includes (_low));
+            if (!_hit.length)
+            {
+                console.log ('[restore] ' + _srv + ': точки по запросу «' + _want + '» не нашёл' +
+                    (_all.length ? '. Есть: ' + _all.map (_c => dbTail (_c.name).replace (_srv + '.check-', '')).join (', ')
+                                 : ' -- точек вообще нет'));
+                _fail++; continue;
+            }
+            if (_hit.length > 1)
+            {
+                console.log ('[restore] ' + _srv + ': по запросу «' + _want + '» нашлось несколько точек -- уточни запрос: ' +
+                    _hit.map (_c => dbTail (_c.name).replace (_srv + '.check-', '')).join (', '));
+                _fail++; continue;
+            }
+            _src = _hit[0].path;
+            _what = 'точки ' + dbTail (_hit[0].name).replace (_srv + '.check-', '');
+        }
+        const _b = dbIntegrity (_src);
+        if (!_b.exists) { console.log ('[restore] ' + _srv + ': восстанавливать нечего -- нет ' + _what); _fail++; continue; }
+        if (!_b.ok) { console.log ('[restore] ' + _srv + ': ' + _what + ' сама не читается (' + _b.why + ') -- ничего не трогаю'); _fail++; continue; }
+        if (_b.rows === 0) { console.log ('[restore] ' + _srv + ': ' + _what + ' пустая -- восстанавливать нечего'); _fail++; continue; }
+        // Страховка: перед подменой фиксируем ТЕКУЩУЮ базу точкой -- если восстановили
+        // не то, будет куда вернуться. Не вышло (нет файла / уже побита) -- просто идём дальше.
+        const _cur = dbIntegrity (_file);
+        if (_cur.exists && _cur.ok && _cur.rows > 0)
+        {
+            const _c = dbCheckpointMake (_srv, 'before-restore');
+            if (_c.ok) console.log ('[restore] ' + _srv + ': на всякий случай сохранил текущую базу точкой ' + dbTail (_c.path));
+        }
+        if (_cur.exists)
+        {
+            try { _f.copyFileSync (_file, _broken); console.log ('[restore] ' + _srv + ': текущая база отложена в ' + dbTail (_broken)); }
+            catch (e) { console.log ('[restore] ' + _srv + ': не смог отложить текущую базу: ' + clipText (String ((e && e.message) || e), 160) + ' -- ничего не трогаю'); _fail++; continue; }
+        }
+        const _res = dbCopyAndVerify (_src, _file, _b.rows);
+        if (_res.ok) console.log ('[restore] ' + _srv + ': база восстановлена из ' + _what + ' -- ' + _res.rows + ' ' +
+            plural (_res.rows, 'запись', 'записи', 'записей') + ', файл прочитан');
+        else { console.log ('[restore] ' + _srv + ': не вышло: ' + _res.why + ' (' + _what + ' цела, можно повторить)'); _fail++; }
+    }
+    return _fail ? 1 : 0;
+}
+
+// Аргумент после имени команды (метка точки для checkpoint/restore).
+function dbArgAfter (_cmd)
+{
+    const _a = process.argv.slice (2);
+    const _i = _a.findIndex (_x => new RegExp ('^' + _cmd + '$', 'i').test (_x));
+    return _i >= 0 ? (_a[_i + 1] || '') : '';
 }
 
 if (process.argv.slice (2).some (_a => /^backup$/i.test (_a)))
@@ -1088,10 +1265,22 @@ if (process.argv.slice (2).some (_a => /^backup$/i.test (_a)))
     try { _code = dbBackupCli (); } catch (e) { console.log ('[backup] ошибка: ' + ((e && e.message) || e)); }
     process.exit (_code);
 }
+if (process.argv.slice (2).some (_a => /^checkpoint$/i.test (_a)))
+{
+    let _code = 1;
+    try { _code = dbCheckpointCli (dbArgAfter ('checkpoint')); } catch (e) { console.log ('[checkpoint] ошибка: ' + ((e && e.message) || e)); }
+    process.exit (_code);
+}
+if (process.argv.slice (2).some (_a => /^backups$/i.test (_a)))
+{
+    let _code = 1;
+    try { _code = dbBackupsCli (); } catch (e) { console.log ('[backups] ошибка: ' + ((e && e.message) || e)); }
+    process.exit (_code);
+}
 if (process.argv.slice (2).some (_a => /^restore$/i.test (_a)))
 {
     let _code = 1;
-    try { _code = dbRestoreCli (); } catch (e) { console.log ('[restore] ошибка: ' + ((e && e.message) || e)); }
+    try { _code = dbRestoreCli (dbArgAfter ('restore')); } catch (e) { console.log ('[restore] ошибка: ' + ((e && e.message) || e)); }
     process.exit (_code);
 }
 // Проверка целостности и обновление копии -- ПЕРЕД тем, как бот откроет базы на запись.
