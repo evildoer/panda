@@ -5,6 +5,35 @@
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
+// CHANGELOG v2.41 (очередь проверяется заранее -- мёртвые видео убираются до эфира):
+//   * МЁРТВОЕ ВИДЕО НАХОДИТСЯ ДО ЭФИРА, А НЕ В ЕГО МОМЕНТ. Раньше единственным местом,
+//     где выяснялось «видео больше нет», была предзагрузка: человек ждал свою песню,
+//     чтобы услышать, что её не будет. Теперь бот сам прочёсывает очередь от начала
+//     (MUSIC.queue_check, по умолчанию включено) и вычищает мёртвое заранее, а автору
+//     говорит в ТОТ канал, откуда трек добавили (v2.39), одним сообщением на канал.
+//   * ЛИМИТЫ YOUTUBE -- ГЛАВНАЯ ЗАБОТА ВЛАДЕЛЬЦА, И ОНА УЧТЕНА:
+//       - сначала дешёвый публичный oEmbed (крошечный запрос, без скачивания и без плеера),
+//         и ТОЛЬКО при его отказе запускается yt-dlp -- подтвердить приговор тем же
+//         инструментом, который бы играл трек (значит без ложных срабатываний на видео,
+//         которые просто нельзя встроить);
+//       - ПЕРЕДНИЙ КРАЙ (3 трека) спрашивают сразу у yt-dlp: о том, что видео закрыто
+//         для этого IP по региону, oEmbed не знает -- отвечает «есть», хотя бот его не
+//         сыграет (живой случай: тот самый DJ-сет «Video unavailable»). Это один запуск
+//         на трек -- как раз перед тем, как его поставят в эфир;
+//       - на машинах, где youtube.com не резолвится локально (весь YouTube ходят через
+//         VPN), запрос идёт через прокси со схемой socks5h (DNS резолвит прокси) -- без
+//         этого проверка вообще не уходила бы (найдено живым прогоном);
+//       - за проход не больше MUSIC.queue_check_depth треков (по умолчанию 20) и с паузой
+//         MUSIC.queue_check_gap_ms (по умолчанию 5 с) -- меньше, чем один запуск yt-dlp
+//         на каждый сыгранный трек, который бот делает и без этой проверки;
+//       - тот же адрес за сессию проверяется ОДИН раз;
+//       - прямые эфиры не проверяются; сеть/«подтвердите, что вы не робот»/возраст --
+//         НЕ приговор: трек остаётся в очереди, а перепроверим не раньше чем через полчаса.
+//   * В ЛОГЕ И В КОНФИГЕ ЭТО ВИДНО: строка при старте ('проверка очереди заранее:
+//     ВКЛЮЧЕНА -- смотрю 20 треков от начала, пауза 5 с'), строка на каждый найденный
+//     мертвяк ('видео больше нет на YouTube (проверено заранее, задолго до эфира) --
+//     убрал из очереди'), сообщение в канал автора и два предупреждения в [config]-аудите
+//     (слишком большая глубина; слишком маленькая пауза).
 // CHANGELOG v2.40 (приветствие ведёт в публичный канал, а не в закрытую «архивную»):
 //   * ССЫЛКА ДЛЯ НОВИЧКА -- ОТДЕЛЬНАЯ НАСТРОЙКА. `welcome_channel` -- служебный: в нём
 //     лежит сообщение с текстом правил, и часто он ЗАКРЫТ. Текст в ЛС доезжал, а на
@@ -5907,6 +5936,13 @@ function configSanityIssues ()
         out.push ('privacy_url: не похоже на ссылку http(s) -- /mydata и /help её не покажут');
     if (has (MUSIC_CFG.filter) && MUSIC_CFG.normalize === false)
         out.push ('MUSIC.filter задан, но MUSIC.normalize: false -- фильтр не применяется (играю как записано)');
+    // [v2.41] Проверка очереди заранее: слишком большая глубина -- лишние запросы к YouTube
+    if (MUSIC_QUEUE_CHECK && QUEUE_CHECK_DEPTH > 100)
+        out.push ('MUSIC.queue_check_depth: ' + QUEUE_CHECK_DEPTH + ' -- это много запросов к YouTube ' +
+            'на один проход; держи 20-30 (0 -- не проверять очередь заранее)');
+    if (MUSIC_QUEUE_CHECK && MUSIC_CFG.queue_check_gap_ms !== undefined &&
+        Number (MUSIC_CFG.queue_check_gap_ms) < 1000)
+        out.push ('MUSIC.queue_check_gap_ms меньше 1000 -- поднимаю до 1000 (чаще не надо: это защита от лимитов YouTube)');
     for (let server in SERVERS)
     {
         // Значение не объект (в конфиг случайно попала строка/число) -- не падаем:
@@ -6392,6 +6428,30 @@ const MUSIC_CHANNEL_STATUS = MUSIC_CFG.channel_status !== false;
 // его треки в конец очереди и играет тому, кто слушает прямо сейчас. По умолчанию ВКЛ;
 // выключается в конфиге: MUSIC.skip_absent_author = false.
 const MUSIC_SKIP_ABSENT = MUSIC_CFG.skip_absent_author !== false;
+// [v2.41] ЗАРАНЕЕ ПРОЧЁСЫВАЕМ ОЧЕРЕДЬ: мёртвые видео узнаём и убираем ДО эфира, а не
+// когда до трека дошла предзагрузка (человек ждал свою песню, чтобы услышать «её нет»).
+// Настройки -- с заботой о лимитах YouTube (главный вопрос владельца):
+//   queue_check     -- включено ли (true по умолчанию);
+//   queue_check_depth -- сколько треков проверять ЗА ОДИН ПРОХОД (по умолчанию 20);
+//   queue_check_gap_ms -- пауза между проверками (по умолчанию 5 сек).
+// Так это «не больше 20 запросов за проход», а не «не дальше 20-го трека»: длинный
+// плейлист разбирается целиком, просто за несколько проходов, швов почти не видно.
+const MUSIC_QUEUE_CHECK = MUSIC_CFG.queue_check !== false;
+const QUEUE_CHECK_DEPTH = Math.max (0, Math.min (200,
+    Math.round (Number (MUSIC_CFG.queue_check_depth === undefined ? 20 : MUSIC_CFG.queue_check_depth) || 0)));
+const QUEUE_CHECK_GAP_MS = Math.max (1000, Math.min (60000,
+    Math.round (Number (MUSIC_CFG.queue_check_gap_ms === undefined ? 5000 : MUSIC_CFG.queue_check_gap_ms) || 5000)));
+// Насколько передний край очереди проверять САМИМ yt-dlp (а не дешёвым oEmbed): у первых
+// треков ошибка стоит дорого -- их будут слушать через считанные минуты, а oEmbed про
+// региональные блокировки не знает (отвечает «есть», хотя бот её не сыграет). 0 -- только
+// oEmbed; больше 5 -- уже заметная доля от обычной работы бота, смысла нет.
+const QUEUE_CHECK_STRICT = 3;
+if (MUSIC_QUEUE_CHECK && QUEUE_CHECK_DEPTH)
+    console.log ('[' + (d()) + '] [music] проверка очереди заранее: ВКЛЮЧЕНА -- до ' + QUEUE_CHECK_DEPTH +
+        ' треков за проход, пауза ' + Math.round (QUEUE_CHECK_GAP_MS / 1000) + ' с (первые ' + QUEUE_CHECK_STRICT +
+        ' трека -- сразу через yt-dlp, остальные -- дешёвым oEmbed)');
+else
+    console.log ('[' + (d()) + '] [music] проверка очереди заранее: выключена (MUSIC.queue_check) -- мёртвые видео узнаём, когда трек подходит к эфиру');
 // [v2.23] Одна строка при старте о том, как бот ходит на YouTube: видно, что ключ
 // MUSIC.proxy действительно подхватился (промах в этом месте раньше не был заметен).
 console.log ('[' + (d()) + '] [music] YouTube: ' + (MUSIC_PROXY
@@ -6501,7 +6561,10 @@ function failedFast (proc, ms = 1500)
 function isGoneError (e)
 {
     const s = String ((e && (e.stderr || e.message)) || e);
-    return /video unavailable|has been removed|removed by the uploader|is not available|private video|no longer available|has been terminated|blocked (?:it )?(?:on copyright|in your country)|not available in your country/i.test (s);
+    // [v2.41] «THIS video is unavailable» -- так YouTube отвечает про видео, которого
+    // просто нет (удалено/никогда не существовало); раньше оно не считалось «мертвым»,
+    // потому что шаблон ждал «is NOT available». Ловится на живом yt-dlp.
+    return /video unavailable|this video is unavailable|has been removed|removed by the uploader|is not available|private video|no longer available|has been terminated|blocked (?:it )?(?:on copyright|in your country)|not available in your country/i.test (s);
 }
 
 // [v2.35] СДВИГ СЧИТАЕТСЯ УДАВШИМСЯ ТОЛЬКО ЕСЛИ ЧТО-ТО ПРИШЛО. `--download-sections`
@@ -6552,6 +6615,9 @@ function isNetworkError (e)
 }
 
 // [v2.2.2] yt-dlp для метаданных: сначала прокси (проверка 3 сек), не вышло -- DIRECT:
+// [v2.41] Проверка очереди не должна сыпать в лог «proxy не сработал» на каждый мёртвый
+// трек: она сама пишет итог одной строкой (а строка эта -- про трек, а не про маршрут).
+let ytDlpQuiet = 0;
 async function ytDlpRun (query, optsBase)
 {
     let viaProxy = !proxyStreamDead && await pingProxy ();
@@ -6571,7 +6637,8 @@ async function ytDlpRun (query, optsBase)
         catch (e)
         {
             lastErr = e;
-            console.error ('[music] ' + route + ' не сработал: ' + ytDlpErr (e, 150));
+            if (!ytDlpQuiet)
+                console.error ('[music] ' + route + ' не сработал: ' + ytDlpErr (e, 150));
             if (!isNetworkError (e)) throw e; // реальная ошибка YouTube -- повторять бессмысленно
         }
     }
@@ -9535,6 +9602,7 @@ function startRestored (server, ch, guild)
     console.log ('[' + (d()) + '] [music] возобновляю очередь в «' + ch.name + '»: ' + where);
     schedulePresence (true);
     playNext (server);
+    scheduleDeadScan (server); // [v2.41] очередь вернулась -- посмотрим, живы ли треки впереди
 }
 
 // [v2.28] Сообщение ЛЮДЯМ про музыку (не в журнал): уходит в тот канал, откуда бота
@@ -9566,6 +9634,248 @@ function trackNotice (guildId, track, text)
     if (ch && typeof ch.send === 'function') { ch.send (text).catch (() => {}); return; }
     musicNotice (guildId, text);
 }
+
+// ============================================================================
+// [v2.41] ЗАРАНЕЕ ПРОЧЁСЫВАЕМ ОЧЕРЕДЬ: МЁРТВЫЕ ВИДЕО УБИРАЕМ ДО ЭФИРА.
+// Раньше бот узнавал «видео больше нет» только когда трек подходил к предзагрузке:
+// человек ждал свою песню, чтобы услышать, что её не будет. Теперь бот смотрит вперёд
+// сам и вычищает мёртвое заранее, а автору говорит в ТОТ канал, откуда он трек добавил.
+//
+// ПОЧЕМУ ЭТО НЕ ГРОЗИТ ОГРАНИЧЕНИЯМИ YOUTUBE (главный вопрос владельца):
+//   * сначала ДЕШЁВЫЙ публичный oEmbed (один крошечный запрос, без скачивания, без плеера);
+//     yt-dlp запускается ТОЛЬКО если oEmbed отказал, то есть чтобы ПОДТВЕРДИТЬ приговор --
+//     и делает ровно то же, что и перед обычным проигрыванием трека;
+//   * за один проход смотрим не больше `queue_check_depth` треков (по умолчанию 20)
+//     от начала очереди и с паузой `queue_check_gap_ms` (по умолчанию 5 с) -- это меньше,
+//     чем один запуск yt-dlp на каждый сыгранный трек, который бот делает и так;
+//   * один и тот же адрес за сессию проверяется один раз ($deadChecked);
+//   * прямые эфиры не проверяются вообще (у них «конца» нет);
+//   * сетевая ошибка, «подтвердите, что вы не робот», возрастное ограничение -- НЕ приговор:
+//     трек остаётся в очереди и может быть проверен позже.
+// ============================================================================
+const $deadChecked = new Map ();        // адрес трека -> { state: 'alive'|'dead'|'unknown', at }
+const DEAD_UNKNOWN_RETRY = 30 * 60 * 1000; // «не поняли» -- переспросим не раньше чем через полчаса
+const DEAD_PROBE_TIMEOUT = 8000;
+const $deadScan = {};                   // guildId -> true, пока идёт проход
+
+function deadStateOf (url)
+{
+    const v = url ? $deadChecked.get (url) : null;
+    if (!v) return null;
+    if (v.state === 'unknown' && Date.now () - v.at > DEAD_UNKNOWN_RETRY) return null;
+    return v.state;
+}
+function deadRemember (url, state)
+{
+    if (!url) return;
+    if ($deadChecked.size > 5000) $deadChecked.clear (); // сессия длинная -- память не растим
+    $deadChecked.set (url, { state, at: Date.now () });
+}
+
+// АДРЕС ПРОКСИ ДЛЯ НАШЕГО ЗАПРОСА. В URL вида `socks5://` SOCKS-агент Node резолвит имя
+// САМ (так устроен socks-proxy-agent v6), а на машине, где youtube.com не резолвится
+// локально -- обычная история, когда весь YouTube ходят через VPN, -- запрос вообще не
+// уйдёт. `socks5h://` резолвит имя НА СТОРОНЕ прокси, ровно как делает yt-dlp со своим
+// `--proxy`. Поэтому для своей проверки мы поднимаем схему до *h (сам конфиг не трогаем:
+// он же уходит в yt-dlp, которому своё).
+function proxyForAgent (proxyUrl)
+{
+    const s = String (proxyUrl || '').trim ();
+    if (/^socks4:\/\//i.test (s)) return s.replace (/^socks4:\/\//i, 'socks4a://');
+    if (/^socks5:\/\//i.test (s)) return s.replace (/^socks5:\/\//i, 'socks5h://');
+    if (/^socks:\/\//i.test (s)) return s.replace (/^socks:\/\//i, 'socks5h://');
+    return s;
+}
+
+// oEmbed: маленький публичный запрос. 'ok' -- видео есть, 'gone' -- удалено/закрыто,
+// 'unknown' -- не смогли узнать (403/429/5xx), 'neterr' -- до YouTube вообще не дошли
+// (DNS, сокет): это не про видео, и по такому ответу ничего не убираем.
+// Проверяем ТОЛЬКО адреса самого YouTube: у чужого адреса (или «голого» id из старой
+// базы) ответ ничего не значит, и убирать по нему трек нельзя ни в каком случае.
+const YT_URL_RE = /^https?:\/\/(?:www\.|m\.|music\.)?youtube\.com\/(?:watch|shorts|live|embed)|^https?:\/\/youtu\.be\//i;
+async function oembedProbe (url)
+{
+    if (!YT_URL_RE.test (String (url || ''))) return 'unknown';
+    return new Promise (resolve =>
+    {
+        let httpsMod;
+        try { httpsMod = require ('https'); } catch { return resolve ('neterr'); }
+        let agent = null;
+        if (MUSIC_PROXY && !proxyStreamDead)
+            try
+            {
+                const M = require ('socks-proxy-agent'); // рядом с discord.js -- берём, если есть
+                const A = M.SocksProxyAgent || M;
+                agent = new A (proxyForAgent (MUSIC_PROXY));
+            }
+            catch { agent = null; } // модуля рядом нет -- идём напрямую, проверить это не мешает
+        let done = false;
+        const fin = v => { if (done) return; done = true; resolve (v); };
+        let req;
+        try
+        {
+            req = httpsMod.get ('https://www.youtube.com/oembed?format=json&url=' + encodeURIComponent (url),
+                { agent, timeout: DEAD_PROBE_TIMEOUT },
+                res =>
+                {
+                    res.resume (); // тело не нужно: важен только код ответа
+                    if (res.statusCode === 200) return fin ('ok');
+                    // 400 (нет такого видео), 401 (закрытое), 404 (удалено) -- это приговор,
+                    // который всё равно подтвердит yt-dlp. А 403 -- часто «встраивание
+                    // запрещено», и такое видео прекрасно играется: это НЕ смерть.
+                    if (res.statusCode === 400 || res.statusCode === 401 || res.statusCode === 404) return fin ('gone');
+                    fin ('unknown');
+                });
+        }
+        catch { return fin ('neterr'); }
+        req.on ('timeout', () => { try { req.destroy (); } catch {} fin ('neterr'); });
+        req.on ('error', () => fin ('neterr'));
+    });
+}
+
+// Один раз за сессию: если до YouTube не достучаться ВООБЩЕ, сказать об этом прямо --
+// иначе выглядело бы, будто проверка работает, а просто ничего не находит.
+let oembedFails = 0, oembedOkEver = 0, oembedHintTold = false;
+function oembedNote (verdict)
+{
+    if (verdict === 'ok' || verdict === 'gone') { oembedOkEver++; oembedFails = 0; return; }
+    if (verdict !== 'neterr') return;
+    if (++oembedFails < 5 || oembedOkEver || oembedHintTold) return;
+    oembedHintTold = true;
+    console.error ('[' + (d()) + '] [music] проверка очереди: не могу достучаться до YouTube (DNS/сеть) -- ' +
+        'мёртвые видео, как и раньше, узнаются только при подходе к эфиру. ' +
+        'Проверь MUSIC.proxy (запрос идёт через socks5h) или выключи MUSIC.queue_check вовсе');
+}
+
+// Приговор выносит yt-dlp -- тот же инструмент, что играет музыку. Значит «мёртвый» трек --
+// ровно тот, который бот и в эфире не открыл бы; видео «нельзя встроить» останется в очереди.
+// strict -- для первых треков очереди: там мало oEmbed, потому что он отвечает «есть» и про
+// видео, которое этому IP не отдаётся (регион, блокировка) -- а оно не сыграет, и человек
+// узнал бы об этом только в момент перехода. Поэтому передний край очереди (STRICT_DEPTH
+// треков) спрашивают у самого yt-dlp -- один раз на трек, как перед проигрыванием.
+async function deadProbe (url, strict = false)
+{
+    const oe = await oembedProbe (url);
+    oembedNote (oe);
+    if (oe === 'ok' && !strict) return 'alive';
+    if (oe !== 'ok' && oe !== 'gone') return 'unknown'; // 403/429/5xx или вообще не дошли -- не трогаем
+    ytDlpQuiet++;
+    try
+    {
+        await ytDlpRun (url, { simulate: true, quiet: true, noWarnings: true, noPlaylist: true });
+        return 'alive'; // oEmbed отказал, а играется -- значит дело во встраивании
+    }
+    catch (e) { return isGoneError (e) ? 'dead' : 'unknown'; }
+    finally { ytDlpQuiet--; }
+}
+
+// Одним сообщением на канал: если в очереди нашлось сразу несколько мёртвых -- это спам,
+// а не событие.
+function deadToldAdd (told, guildId, track)
+{
+    const m = $music[guildId];
+    const want = track && track.addIn ? String (track.addIn) : '';
+    const ch = want ? client.channels.cache.get (want) : null;
+    const id = (ch && typeof ch.send === 'function') ? want
+        : (m && m.textChannelId ? String (m.textChannelId) : '');
+    if (!id) return;
+    if (!told.has (id)) told.set (id, []);
+    told.get (id).push (track.title || 'трек');
+}
+function deadToldSend (told)
+{
+    for (const [id, titles] of told)
+    {
+        const ch = client.channels.cache.get (id);
+        if (!ch || typeof ch.send !== 'function') continue;
+        ch.send ('🗑 Видео больше нет на YouTube -- убрал из очереди: ' +
+            titles.slice (0, 8).map (t => '**' + oneLine (t, 60) + '**').join (', ') +
+            (titles.length > 8 ? ' и ещё ' + (titles.length - 8) : '') +
+            '. Поставь другое, если это нужно.').catch (() => {});
+    }
+}
+
+function scheduleDeadScan (guildId, delay = 8000)
+{
+    if (!MUSIC_QUEUE_CHECK || !QUEUE_CHECK_DEPTH) return;
+    const m = $music[guildId];
+    if (!m || m.deadScanTimer) return; // уже запланировано
+    m.deadScanTimer = setTimeout (() => { m.deadScanTimer = null; deadScan (guildId).catch (() => {}); }, delay);
+    if (m.deadScanTimer && m.deadScanTimer.unref) m.deadScanTimer.unref (); // проверка не держит процесс
+}
+
+async function deadScan (guildId)
+{
+    if (!MUSIC_QUEUE_CHECK || !QUEUE_CHECK_DEPTH || $deadScan[guildId]) return;
+    $deadScan[guildId] = true;
+    const told = new Map ();
+    let checked = 0, removed = 0;
+    try
+    {
+        for (;;)
+        {
+            const m = $music[guildId];
+            if (!m || !m.tracks || !m.tracks.length) break;
+            if (checked >= QUEUE_CHECK_DEPTH) break;
+            // Ближайший непроверенный трек -- от начала очереди и дальше (что ближе к эфиру,
+            // то и важнее). Уже проверенное пропускаем: так глубина получается «не больше N
+            // ЗАПРОСОВ за проход», а не «не дальше N-го трека» -- и длинный плейлист
+            // разбирается целиком, просто за несколько проходов.
+            let target = null, targetAt = -1;
+            for (let i = 0; i < m.tracks.length; i++)
+            {
+                const t = m.tracks[i];
+                if (!t || t.isLive || t.gone) continue;
+                const _u = t.url || t.streamUrl;
+                if (!_u || deadStateOf (_u)) continue;
+                target = t; targetAt = i; break;
+            }
+            if (!target) break;
+            const url = target.url || target.streamUrl;
+            const verdict = await deadProbe (url, targetAt < QUEUE_CHECK_STRICT);
+            deadRemember (url, verdict);
+            checked++;
+            const now = $music[guildId];
+            if (!now) break;
+            if (verdict === 'dead')
+            {
+                const at = now.tracks.indexOf (target);
+                if (at >= 0)
+                {
+                    now.tracks.splice (at, 1);
+                    target.gone = true;
+                    removed++;
+                    console.error ('[' + (d()) + '] [music] видео больше нет на YouTube (проверено заранее, задолго до эфира): ' +
+                        (target.title || 'трек') + ' -- убрал из очереди');
+                }
+                if (now.seekTrack === target) { now.seekTrack = null; now.seekSec = 0; }
+                if (now.preload && now.preload.track === target) { dropPreload (now); startPreload (guildId); }
+                deadToldAdd (told, guildId, target);
+                saveMusicState (guildId);
+                scheduleVoiceStatus (guildId);
+                schedulePresence ();
+            }
+            await new Promise (r => setTimeout (r, QUEUE_CHECK_GAP_MS)); // пауза: не залпом
+        }
+    }
+    finally
+    {
+        $deadScan[guildId] = false;
+        // Одна строка на проход: видно, что проверка жива и что она нашла.
+        if (checked)
+            console.log ('[' + (d()) + '] [music] проверка очереди: проверено ' + checked + ' ' +
+                plural (checked, 'трек', 'трека', 'треков') + ' -- ' +
+                (removed ? 'мёртвых убрано: ' + removed : 'мёртвых нет'));
+        deadToldSend (told);
+    }
+}
+
+// Повторный тихий проход: подхватывает то, что в прошлый раз не поняли (сеть, «не робот»).
+// Если проверять нечего, он выходит сразу (все адреса уже в $deadChecked) и ничего не стоит.
+setInterval (() =>
+{
+    for (const id of Object.keys ($music)) scheduleDeadScan (id, 1000);
+}, 3 * 60 * 1000).unref ();
 
 // [v2.28] РЕЖИМ «НЕ ЖДАТЬ ОТСУТСТВУЮЩИХ АВТОРОВ» (MUSIC.skip_absent_author).
 // Ситуация: бот один в канале и молчит (пауза: своя «нет слушателей» или человек
@@ -10053,6 +10363,7 @@ async function joinMusicChannel (interaction)
     // [v2.7] куда писать уведомления (например «трек не воспроизвёлся»), если
     // /join был первым вызовом, а /play никто не делал:
     m.textChannelId = interaction.channelId;
+    scheduleDeadScan (guildId); // [v2.41] собрались играть -- проверим очередь заранее
     // [v2.12] у бота может быть сохранённая очередь (после /leave, обрыва или
     // перезапуска) -- продолжаем её С МЕСТА, а не с чистого листа
     let resume = '';
@@ -11354,6 +11665,7 @@ client.on ('interactionCreate', async (interaction) =>
             m.tracks.splice (_insAt, 0, ...tracks);
             scheduleVoiceStatus (guildId); // [v2.7] очередь изменилась -- обновим статус канала
             schedulePresence ();           // [v2.8] «ещё N в очереди»
+            scheduleDeadScan (guildId);    // [v2.41] свежая пачка -- сразу проверим, что в ней играется
             if (!shouldStart) startPreload (guildId); // [v2.9] уже играет что-то -- готовим следующий
             saveMusicState (guildId);             // [v2.10] очередь -- на диск
             await interaction.editReply
