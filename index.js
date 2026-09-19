@@ -691,6 +691,8 @@ const STARTUP_DM_TEXT =
     '  играющим треком (дальше тишина), `/clear author:@кто` -- убрать только треки\n' +
     '  этого человека, вместе с его играющим -- он прерывается, а не доигрывает\n' +
     '  (number/to -- те же номера, что в `/queue`; текущий трек в них не входит)\n' +
+    '`/push author:@кто` -- поднять треки одного автора наверх очереди (только\n' +
+    '  админы и модеры; без автора -- свои). Порядок внутри поднятых не меняется\n' +
     '`/skip` -- следующий • `/stop` -- стоп и забыть очередь совсем\n' +
     '`/pause` / `/resume` -- пауза / продолжить\n' +
     '`/join` -- зайти в твой канал и остаться там (даже без музыки)\n' +
@@ -698,8 +700,13 @@ const STARTUP_DM_TEXT =
     'Управлять музыкой могут админы, модеры и роль DJ (смотреть очередь -- всем).\n' +
     '**Бот играет там, где слушает автор трека:** если тот, кто добавил трек, сидит\n' +
     'в голосовом канале, в момент начала этого трека бот сам переезжает к нему и\n' +
-    'остаётся там до трека другого автора (или до `/leave`). Автора в голосе нет --\n' +
-    'бот никуда не идёт; сам он не заходит и не выходит никогда.\n' +
+    'остаётся там до трека другого автора (или до `/leave`). Если же бот остался\n' +
+    'ОДИН и на паузе (сама «нет слушателей» или её поставил человек, а комната\n' +
+    'опустела) -- он ищет, кому он сейчас нужнее: автору недоеденного трека, а если\n' +
+    'того в голосовом нет -- автору ближайшего следующего (смотрит вперёд по всей\n' +
+    'очереди) и едет туда. Нашу паузу «нет слушателей» там снимает сам, а\n' +
+    'поставленную человеком -- нет (продолжит он сам, `/resume`). Где есть\n' +
+    'слушатели -- не уезжает никуда; сам он не заходит и не выходит никогда.\n' +
     '**Бот ничего не забывает:** очередь, текущий трек и место в треке живут в базе,\n' +
     'поэтому перезапуск, обрыв связи и `/leave` музыку не сбрасывают. Если в канале\n' +
     'никого -- пауза, а когда слушатель вернётся -- продолжит с того же места.\n' +
@@ -5479,6 +5486,32 @@ function authorVoiceId (guildId, track)
     return ch.id;
 }
 
+// [v2.27] К КОМУ ЕХАТЬ, ЕСЛИ БОТ ОДИН. Ищем самого «нужного» слушателя: сперва автора
+// НЕДОИГРАННОГО трека, потом -- автора ближайшего СЛЕДУЮЩЕГО, и так дальше по очереди.
+// Так пауза не запирает бота в пустой комнате, когда дальше есть человек, которому эти
+// же треки и адресованы. Канал считается только голосовой и только не тот, где бот уже
+// сидит. Возвращает { ch, track } или null (ехать некуда -- остаёмся как есть).
+function pickAuthorChannel (guildId, curChId)
+{
+    const m = $music[guildId];
+    if (!m) return null;
+    const cand = [];
+    if (m.current) cand.push (m.current);
+    for (const t of (m.tracks || []))
+    {
+        if (t !== m.current) cand.push (t);
+        if (cand.length > 500) break; // защита от патологически длинной очереди
+    }
+    for (const t of cand)
+    {
+        const aCh = authorVoiceId (guildId, t);
+        if (!aCh || aCh === curChId) continue;
+        const ch = client.channels.cache.get (aCh);
+        if (ch) return { ch: ch, track: t };
+    }
+    return null;
+}
+
 // Переехать к автору трека. Возвращает название канала, куда переехали (или null).
 function followTrackAuthor (guildId, track)
 {
@@ -6452,6 +6485,46 @@ function queueMove (guildId, n, to, who)
     };
 }
 
+// [v2.27] /push -- поднять треки одного автора наверх очереди (только ADM/MOD).
+// Длинные плейлисты часто собирают вперемешку, и «своё» хочется и послушать, и
+// протестировать сразу, не пролистывая чужие вставки. Порядок ВНУТРИ поднятых
+// треков не меняется -- переносим их пачкой, как они и лежали.
+function queuePush (guildId, targetId, who)
+{
+    const m = musicOf (guildId);
+    const total = m.tracks.length;
+    const same = t => t && String (t.byId || '') === String (targetId);
+    if (!total)
+        return { ok: false, text: '🈳 В очереди нет треков' +
+            (m.current ? ' (играет только **' + (m.current.title || 'трек') + '**).' : ' -- двигать нечего.') };
+    const mine = m.tracks.filter (same);
+    if (!mine.length)
+        return { ok: false, text: '🤔 В очереди нет треков от ' + u (targetId) + '.' +
+            (m.current && same (m.current) ? ' Его трек и так играет прямо сейчас.' : '') +
+            (m.tracks.some (t => !t.byId)
+                ? '\n(у части треков автор не записан -- они добавлены до этой версии)' : '') };
+    if (m.tracks.slice (0, mine.length).every (same))
+        return { ok: false, text: '✅ Треки ' + u (targetId) + ' уже наверху (' + mine.length + ' ' +
+            plural (mine.length, 'трек', 'трека', 'треков') + ').' };
+    const rest = m.tracks.filter (t => !same (t));
+    m.tracks = mine.concat (rest);
+    dropPreload (m);   // следующий трек сменился -- заготовка была не та
+    startPreload (guildId);
+    saveMusicState (guildId);
+    scheduleVoiceStatus (guildId, true);
+    schedulePresence (true);
+    const titles = mine.slice (0, 3).map (t => '**' + (t.title || 'трек') + '**').join (', ');
+    console.log ('[' + (d()) + '] [music] ' + whoText (who) + 'поднял наверх треки ' +
+        (m.current && same (m.current) ? '<играет сейчас> + ' : '') + mine.length + ' шт. (' + u (targetId) + ')');
+    return {
+        ok: true,
+        text: '⬆️ Поднял наверх ' + mine.length + ' ' + plural (mine.length, 'трек', 'трека', 'треков') +
+            ' от ' + u (targetId) + ':' + (titles ? ' ' + titles + (mine.length > 3 ? ' и ещё ' + (mine.length - 3) : '') : '') +
+            (m.current && same (m.current) ? '\n(играющий трек остаётся как есть)' : '') +
+            '\n' + queuePreview (m),
+    };
+}
+
 // Одна страница очереди: номера (те же, что в /remove,/move,/jump), автор каждого
 // трека, позиция внутри текущего трека и ОБЩИЙ остаток по времени.
 // moveSel -- номер выбранного для перестановки трека (0 -- ничего не выбрано):
@@ -6659,6 +6732,10 @@ function checkListeners (server, _noFollow = false)
             saveMusicState (server);
             scheduleVoiceStatus (server, true);
             schedulePresence (true);
+            // [v2.27] Не ждём следующего события в голосовых: раз комната опустела,
+            // сразу смотрим, не нужно ли уехать к автору (ветка ниже). Без этого бот
+            // стоял бы один до чьего-то следующего захода/выхода.
+            if (!_noFollow) return checkListeners (server, false);
         }
         else if (people > 0 && m.pausedByNobody)
         {
@@ -6670,37 +6747,37 @@ function checkListeners (server, _noFollow = false)
             scheduleVoiceStatus (server, true);
             schedulePresence (true);
         }
-        else if (!people && m.pausedByNobody && !_noFollow)
+        else if (!people && !playing && !_noFollow && (m.current || m.tracks.length))
         {
-            // [v2.18] Бот один и на паузе, а автор музыки сидит в другом голосовом канале --
-            // едем к нему: кто поставил трек, тот его и слушает. Сначала смотрим на
-            // НЕДОИГРАННЫЙ трек (он сейчас играет), а если его автора в голосовом нет --
-            // на СЛЕДУЮЩИЙ в очереди: иначе пауза запирала бы бота в пустой комнате и
-            // трек следующего автора просто никогда бы не начался (именно это ломало
-            // «бот ходит за авторами» на длинных чужих плейлистах).
+            // [v2.18] Бот один и молчит, а автор музыки сидит в другом голосовом канале --
+            // едем к нему: кто поставил трек, тот его и слушает.
+            // [v2.27] Смотрим ВСЮ очередь вперёд, а не только текущий и следующий трек:
+            // на длинном чужом плейлисте автор ближайшего нужного трека может быть и
+            // третьим, и десятым -- раньше бот оставался в пустой комнате и очередь
+            // стояла (см. pickAuthorChannel). Приоритет -- у автора НЕДОИГРАННОГО трека,
+            // потом -- у автора ближайшего следующего.
+            // [v2.27] Теперь это срабатывает на ЛЮБОЙ паузе, а не только на «нет
+            // слушателей»: если человек сам поставил /pause и комната опустела, бот тоже
+            // не должен стоять один там, где его никто не слышит. Паузу ЧЕЛОВЕКА при
+            // переезде не снимаем (продолжит он сам), а нашу (pausedByNobody) снимает
+            // ветка выше -- приехали туда, где слушатель есть.
             // Логика паузы/продолжения тут НЕ дублируется: после переезда checkListeners
             // вызывается заново и сам снимает паузу обычным путём (ветка выше), а от
             // бесконечной беготни между двумя авторами защищает _noFollow (второй
             // проход уже никого не догоняет).
-            const cand = [];
-            if (m.current) cand.push (m.current);
-            if (m.tracks[0] && m.tracks[0] !== m.current) cand.push (m.tracks[0]);
-            let bc = null, target = null, authorCh = null;
             const guildMove = client.guilds.cache.get (server);
-            for (const t of cand)
-            {
-                const aCh = authorVoiceId (server, t);
-                if (!aCh || aCh === chId) continue;
-                const ch2 = client.channels.cache.get (aCh);
-                if (ch2) { bc = ch2; target = t; authorCh = aCh; break; }
-            }
-            if (bc && guildMove)
+            const found = pickAuthorChannel (server, chId);
+            if (found && guildMove)
             {
                 try
                 {
-                    joinVoice (server, bc, guildMove, 'здесь никого, а автор трека ' +
-                        (target.byName || u (target.byId)) + ' слушает здесь');
-                    m.savedChannelId = bc.id;
+                    joinVoice (server, found.ch, guildMove, 'здесь никого, а автор трека ' +
+                        (found.track.byName || u (found.track.byId)) + ' слушает здесь');
+                    m.savedChannelId = found.ch.id;
+                    // Паузу, которую поставил ЧЕЛОВЕК, уважаем: переезжаем, но играть не
+                    // начинаем -- продолжит он сам (/resume). Если же это была наша
+                    // пауза «нет слушателей», то снимает её ветка выше: приехали туда,
+                    // где слушатель есть.
                     return checkListeners (server, true);
                 }
                 catch (e)
@@ -7054,12 +7131,23 @@ const musicCommands =
              .setDescription ('На какое место поставить (номер из /queue)')
              .setMinValue (1)
              .setRequired (true)),
+    // [v2.26] /clear теперь глушит и играющий трек (раньше он «доигрывал» и получалось
+    // ничейно), поэтому и описание говорит ровно это.
     new SlashCommandBuilder ()
         .setName ('clear')
-        .setDescription ('Очистить очередь (текущий трек доиграет; совсем остановить -- /stop)')
+        .setDescription ('Очистить очередь и остановить музыку (выйти, но помнить -- /leave)')
         .addUserOption (o =>
             o.setName ('author')
              .setDescription ('Убрать ТОЛЬКО треки этого человека (без него -- вся очередь)')),
+    // [v2.27] /push -- поднять треки одного автора наверх очереди (только админы/модеры:
+    // обычному DJ это дало бы возможность переставлять чужое и превратило бы очередь в
+    // бардак). Без аргумента -- свои треки (удобно тестировать, не ища свой ник).
+    new SlashCommandBuilder ()
+        .setName ('push')
+        .setDescription ('Поднять треки одного автора наверх очереди (админы/модеры)')
+        .addUserOption (o =>
+            o.setName ('author')
+             .setDescription ('Чьи треки поднять (без него -- твои)')),
     new SlashCommandBuilder ()
         .setName ('jump')
         .setDescription ('Перейти сразу к треку под этим номером')
@@ -7691,7 +7779,7 @@ client.on ('interactionCreate', async (interaction) =>
             '; ключ также напечатан **в консоли бота** (в Discord не отправляю: оттуда он ушёл бы на серверы Discord).' +
             '\nСохрани его отдельно от config.json -- без него записи базы не читаются. Перезапуск не нужен.');
     }
-    if (!['play','join','stop','skip','pause','resume','queue','leave','remove','clear','jump','move'].includes (name)) return;
+    if (!['play','join','stop','skip','pause','resume','queue','leave','remove','clear','jump','move','push'].includes (name)) return;
     const guildId = interaction.guildId;
     const m = musicOf (guildId);
 
@@ -7877,6 +7965,22 @@ client.on ('interactionCreate', async (interaction) =>
                 interaction.member ? uuu (interaction.member) : interaction.user.username);
             return interaction.reply (res.ok ? res.text : { content: res.text, flags: MessageFlags.Ephemeral });
         }
+        else if (name === 'push')
+        {
+            // [v2.27] Поднять треки одного автора наверх очереди -- ТОЛЬКО админы/модеры
+            // (обычному DJ это позволило бы переставлять чужие треки и превращать очередь
+            // в бардак). Без аргумента -- свои: удобно слушать/тестировать свой плейлист.
+            if (!isStaffInteraction (interaction))
+                return interaction.reply
+                ({
+                    content: '🚫 Поднимать треки наверх могут только админы и модеры -- у обычного DJ очередь остаётся общей.',
+                    flags: MessageFlags.Ephemeral,
+                });
+            const pick = interaction.options.getUser ('author');
+            const res = queuePush (guildId, pick ? pick.id : interaction.user.id,
+                interaction.member ? uuu (interaction.member) : interaction.user.username);
+            return interaction.reply (res.ok ? res.text : { content: res.text, flags: MessageFlags.Ephemeral });
+        }
         else if (name === 'clear')
         {
             // [v2.14] /clear author:@кто -- убрать из очереди только ЕГО треки
@@ -7966,6 +8070,11 @@ client.on ('interactionCreate', async (interaction) =>
             saveMusicState (guildId);
             scheduleVoiceStatus (guildId, true); // [v2.7] статус: ⏸
             schedulePresence (true);             // [v2.8] статус: ⏸ трек
+            // [v2.27] Если бот стоит ОДИН, пауза - момент пересмотреть, где он
+            // нужнее: автор недоеденного трека или автор ближайшего следующего может
+            // сидеть в другом канале уже сейчас, и нового события в голосовых не будет.
+            // Есть живые слушатели - checkListeners ничего не тронет.
+            checkListeners (guildId);
             return interaction.reply ('⏸ Пауза.');
         }
         else if (name === 'resume')
