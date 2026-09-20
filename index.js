@@ -31,6 +31,18 @@
 //     стоит в чьём-то config.json): [config] подскажет новое, бот не сломается. Этот ключ и
 //     cache_long_sets -- про разное: первый решает, какие треки качать ЦЕЛИКОМ ДО старта,
 //     второй -- качать ли длинные сеты в ФОНЕ, пока играет текущий.
+// CHANGELOG v2.85 (`allow: true` -- единственный способ включить экземпляр):
+//   * ОДНО ПРАВИЛО ВКЛЮЧЁННОСТИ ВМЕСТО ДВУХ. Нашлось на чистке боевого конфига по
+//     просьбе владельца («только обязательное и отклонения от умолчаний»): убрав
+//     строку "allow": true, бот ПЕРЕСТАЛ бы обслуживать сервер (все события ждут
+//     именно true), а `node . config` при этом честно писал «обслуживается» -- там
+//     условие было «не false». Теперь везде одно: экземпляр обслуживается только
+//     при явном allow: true, и это же требуют [config] и config.minimal.json.
+//   * ЧТО ЭТО ЧИНИТ НА ПРАКТИКЕ: экземпляр без ключа allow больше не попадает в
+//     политику конфиденциальности, не получает базу/копию на диске и в отчёте
+//     `node . config` подписан как НЕ обслуживаемый (с готовым советом).
+//   * В `node . privacy` строка про серверы стала читаемой («включённых экземпляров N»,
+//     а рядом -- какие именно выключены и почему), раньше это было загадочное «(1)».
 // CHANGELOG v2.84 (ключ в нике -- только явным true; символ ключа можно менять):
 //   * В ПРИМЕРЕ КОНФИГА addTag ТЕПЕРЬ false (и в коде то же умолчание -- как у
 //     channel_status): ключ -- это про права в ЛИЧНЫХ каналах, и включать его там, где он
@@ -1813,7 +1825,10 @@ function privacyCli (_check, _offline)
     const _markM = /const TAG_DEFAULT = '([^']+)';/.exec (_fs.readFileSync (_path.join (__dirname, 'index.js'), 'utf8'));
     const _mark = _markM ? _markM[1] : (_def.MARK || '🔑');
     // Серверы и сроки -- из config.json (берём только включённые экземпляры).
-    const _srv = Object.keys (SERVERS).filter (_k => /^\d{17,20}$/.test (_k) && SERVERS[_k].allow !== false);
+    // [v2.85] «Включён» -- это ровно `allow: true` (см. serverOn). Раньше здесь стояло
+    // «не false», и экземпляр БЕЗ ключа попадал в политику как рабочий, хотя события его
+    // не обслуживают -- а [config] при этом прямо советовал владельцу поставить allow.
+    const _srv = Object.keys (SERVERS).filter (_k => /^\d{17,20}$/.test (_k) && serverOn (_k));
     const _names = _srv.map (_k => SERVERS[_k].name || ('сервер ' + _k));
     const _timeouts = _srv.map (_k => Number (SERVERS[_k].onLeaveBanTimeout) || 0);
     const _timeout = _timeouts.length ? Math.max.apply (null, _timeouts) : 0;
@@ -1822,10 +1837,19 @@ function privacyCli (_check, _offline)
     const _histDays = _srv.map (_k => Number (SERVERS[_k].bans_history_days) || 0);
     const _pick = (_a) => _a.every (_v => !_v) ? 0 : Math.max.apply (null, _a);
     console.log ('[privacy] шаблон: privacy.template.md, значок ключа из кода: ' + _mark);
-    console.log ('[privacy] из config.json: серверы ' + (_names.join (', ') || '--') +
-        ' (' + _srv.length + '), таймаут за выход: ' + (_timeout ? _timeout + ' мин' : 'выключен') +
+    // Владелец спросил: «серверы 🐼PANDAMIA🐼 (1) -- что за (1)?» -- это было число
+    // ВКЛЮЧЁННЫХ экземпляров, но рядом с названием читалось как тайное число. Теперь
+    // подписано словами, а выключенные называются отдельной строкой (в политику они
+    // не попадают -- бот их не обслуживает).
+    console.log ('[privacy] из config.json: включённых экземпляров ' + _srv.length + ': ' + (_names.join (', ') || '--') +
+        ', таймаут за выход: ' + (_timeout ? _timeout + ' мин' : 'выключен') +
         ', роли: ' + (_rolesOff ? 'НЕ хранятся' : privacyRetention (_pick (_days), true)) +
         ', история: ' + privacyRetention (_pick (_histDays), true));
+    const _off = Object.keys (SERVERS).filter (_k => /^\d{17,20}$/.test (_k) && !serverOn (_k));
+    if (_off.length)
+        console.log ('[privacy] в политику не попали выключенные (' + _off.length + '): ' +
+            _off.map (_k => (_k + (SERVERS[_k] && SERVERS[_k].name ? ' («' + SERVERS[_k].name + '»)' : ''))).join (', ') +
+            ' -- бот их не обслуживает (allow: false или ключа нет)');
     let _dc = null;
     if (_offline) console.log ('[privacy] --offline: к Discord не обращаюсь, имена беру из шаблона');
     else
@@ -2317,9 +2341,16 @@ function dbFileOf (_srv)   { return __dirname + '/' + _srv + '.sqlite'; }
 function dbBackupOf (_srv) { return __dirname + '/' + _srv + '.backup.sqlite'; }
 function dbBrokenOf (_srv) { return __dirname + '/' + _srv + '.broken.sqlite'; }
 function dbServerList ()   { return Object.keys (SERVERS).filter (_k => /^\d{17,20}$/.test (_k)); }
+// [v2.85] ЕДИНОЕ ПРАВИЛО ВКЛЮЧЁННОСТИ: экземпляр обслуживается только при ЯВНОМ
+// `allow: true`. Раньше это читалось в разных местах по-разному: события (guildMemberAdd,
+// музыка, опрос участников) требовали именно true, а этот список, политика и отчёт
+// `node . config` считали рабочим и экземпляр БЕЗ ключа. Из-за этого конфиг без allow
+// выглядел в отчётах живым, хотя бот его не трогал (а [config] просил поставить allow).
+// Теперь отчёты, проверки и правда на диске говорят одно и то же.
+function serverOn (_srv) { return !!(SERVERS[_srv] && SERVERS[_srv].allow === true); }
 // [v2.26] Включённые серверы (allow: false -- сознательно выключен, базы у него нет):
 // проверки целостности, копии и `node . backup`/`restore` его не касаются.
-function dbServerListOn ()  { return dbServerList ().filter (_k => (SERVERS[_k] || {}).allow !== false); }
+function dbServerListOn ()  { return dbServerList ().filter (_k => serverOn (_k)); }
 
 // Прочитать базу отдельным соединением и сказать, цела ли она и сколько в ней записей.
 // Только чтение: сама проверка ничего не меняет. Нет node:sqlite (старый Node) --
@@ -2439,12 +2470,12 @@ function dbStartupGuard ()
     // в папке и непонятно, чьи они и можно ли удалить).
     for (const _srv of dbServerList ())
     {
-        if ((SERVERS[_srv] || {}).allow !== false) continue;
+        if (serverOn (_srv)) continue;   // [v2.85] см. serverOn: обслуживается только явный true
         const _left = [_srv + '.sqlite', _srv + '.backup.sqlite'].filter (_x => _f.existsSync (_x));
         if (!_left.length) continue;
         console.log ('[' + new Date ().toLocaleString () + '] [db] ' + _srv +
             ((SERVERS[_srv] || {}).name ? ' («' + SERVERS[_srv].name + '»)' : '') +
-            ' выключен в конфиге (allow: false) -- базу ему не веду' +
+            ' выключен в конфиге (allow: false или ключа нет) -- базу ему не веду' +
             (_left.length === 2 ? ', а от прежних версий остались пустые ' + _srv + '.sqlite и ' + _srv + '.backup.sqlite' +
                 ' (не нужны -- удали их)' : ', но лежит ' + _left[0] + ' (не нужен -- удали)'));
     }
@@ -2777,7 +2808,10 @@ function dbMake (_server, _namespace)
     // после удаления. Теперь для него всё живёт в ПАМЯТИ: код работает как раньше
     // (ничего не падает, если что-то случайно обратится), а на диск не пишется ни байта.
     // Включишь сервер обратно (allow: true) -- база и копия создадутся сами.
-    if ((SERVERS[_server] || {}).allow === false)
+    // [v2.85] Условие стало строгим (см. serverOn): экземпляр без ключа `allow` не
+    // обслуживается, значит и базу ему держать незачем -- раньше такой сервер получал
+    // файл на диске, хотя все события его пропускали.
+    if (!serverOn (_server))
         return new Keyv ({ namespace: _namespace, serialize: dbSerialize, deserialize: dbDeserialize });
     const kv = new Keyv
     (
@@ -8767,8 +8801,13 @@ function configCli ()
         if (!/^\d{17,20}$/.test (id)) continue;
         const s = SERVERS[id], has = _k => Object.prototype.hasOwnProperty.call (s, _k);
         const nm = s.name ? ' («' + s.name + '»)' : '';
-        sec ('сервер ' + id + nm + (s.allow === false ? ' -- ВЫКЛЮЧЕН (allow: false): бот его не обслуживает' : ' -- обслуживается'));
-        row ('allow', s.allow === false ? 'false' : 'true', has ('allow') ? 'config.json' : 'по умолчанию (вкл)');
+        // [v2.85] «Обслуживается» -- это ровно allow: true (см. serverOn): экземпляр без
+        // ключа раньше подписывался как рабочий, хотя события его не обслуживают.
+        const on = s.allow === true;
+        sec ('сервер ' + id + nm + (on ? ' -- обслуживается'
+            : (has ('allow') ? ' -- ВЫКЛЮЧЕН (allow: false): бот его не обслуживает'
+                : ' -- НЕ ОБСЛУЖИВАЕТСЯ: нет ключа "allow" (поставь "allow": true)')));
+        row ('allow', YN (on), has ('allow') ? 'config.json' : 'в файле нет -- экземпляр не обслуживается');
         row ('name', orDash (s.name), has ('name') ? 'config.json' : '-- (в файле нет)');
         for (const k of ['log_channel', 'pipe_channel_source', 'pipe_channel_target', 'channel_common',
                          'role_admin', 'role_moder', 'role_dj', 'role_for_manage', 'role_for_no_speak',
