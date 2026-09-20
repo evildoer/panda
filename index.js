@@ -6167,6 +6167,15 @@ function configSanityIssues ()
             'иначе выходит 0, и /history будет отвечать, что история выключена (ставь 25 или не пиши ключ вовсе)');
     else if (Number (MUSIC_CFG.history_len) > 200)
         out.push ('MUSIC.history_len: ' + MUSIC_CFG.history_len + ' -- держу 200 (это запись в базе и текст сообщения, а не архив)');
+    // [v2.56] Второй лимит истории -- по трекам: мусор в ключе превратился бы в 0
+    // (то есть «без лимита»), и длинные плейлисты снова вытеснили бы одиночные заходы.
+    if (MUSIC_CFG.history_tracks !== undefined &&
+        !(Number.isFinite (Number (MUSIC_CFG.history_tracks)) && String (MUSIC_CFG.history_tracks).trim () !== ''))
+        out.push ('MUSIC.history_tracks = "' + MUSIC_CFG.history_tracks + '": ожидается число -- ' +
+            'иначе выходит 0, и лимита по трекам не будет (ставь 500 или не пиши ключ вовсе)');
+    else if (Number (MUSIC_CFG.history_tracks) > 5000)
+        out.push ('MUSIC.history_tracks: ' + MUSIC_CFG.history_tracks + ' -- держу 5000 ' +
+            '(это запись в базе и текст сообщения, а не архив)');
     // [v2.55] Живой лог в файл: мусор в ключе не должен молча менять поведение --
     // строка "шесть" превратилась бы в 0 (не удалять ничего) или "no" в NaN.
     if (log_keep_months !== undefined &&
@@ -6696,6 +6705,12 @@ const QUEUE_CHECK_STRICT = 3;
 // /stop, и перезапуск. Верхняя граница -- чтобы запись в базу не распухала.
 const MUSIC_HISTORY_LEN = Math.max (0, Math.min (200,
     Math.round (Number (MUSIC_CFG.history_len === undefined ? 25 : MUSIC_CFG.history_len) || 0)));
+// [v2.56] ВТОРОЙ ЛИМИТ ИСТОРИИ -- сколько ТРЕКОВ помнить суммарно (просьба владельца):
+// пачка с 50 треками занимает вчетверо больше места, чем длинная очередь одиночных
+// заходов, поэтому одного лимита по пачкам мало. 0 -- без этого лимита (только пачки).
+// Верхняя граница -- 5000: это уже сотни килобайт в базе и текст на сотни строк.
+const MUSIC_HISTORY_TRACKS = Math.max (0, Math.min (5000,
+    Math.round (Number (MUSIC_CFG.history_tracks === undefined ? 500 : MUSIC_CFG.history_tracks) || 0)));
 if (MUSIC_QUEUE_CHECK && QUEUE_CHECK_DEPTH)
     console.log ('[' + (d()) + '] [music] проверка очереди заранее: ВКЛЮЧЕНА -- до ' + QUEUE_CHECK_DEPTH +
         ' треков за проход, пауза ' + Math.round (QUEUE_CHECK_GAP_MS / 1000) + ' с (первые ' + QUEUE_CHECK_STRICT +
@@ -6945,24 +6960,39 @@ let ytDlpQuiet = 0;
 async function ytDlpRun (query, optsBase)
 {
     let routes = await ytRoutes ();   // [v2.52] маршруты с учётом того, резолвится ли имя локально
+    // [v2.56] ПРОКСИ ИНОГДА «ИКАЕТ»: одна неудачная попытка на живом прокси -- ещё не
+    // повод отдать трек «потоком» (живой случай владельца: прокси отвалился на минуту,
+    // и песня ушла в запасной путь с невнятной ошибкой). Если маршрут ОДИН (DIRECT на
+    // этой машине невозможен -- имя не резолвится), даём ему вторую попытку через
+    // паузу, но только на сетевую ошибку: ошибку самого видео повторять бессмысленно.
     let lastErr;
     for (let route of routes)
     {
-        try
+        const tries = (route === 'proxy' && routes.length === 1) ? 2 : 1;
+        for (let attempt = 1; attempt <= tries; attempt++)
         {
-            let opts = Object.assign ({}, optsBase, route === 'proxy'
-                ? { proxy: MUSIC_PROXY, socketTimeout: 10 } // не висим вечно в мёртвом прокси
-                : {});
-            let r = await ytdlp (query, opts);
-            if (route === 'proxy') proxyStreamDead = false; // прокси ожил
-            return r;
-        }
-        catch (e)
-        {
-            lastErr = e;
-            if (!ytDlpQuiet)
-                console.error ('[music] ' + route + ' не сработал: ' + ytDlpErr (e, 150));
-            if (!isNetworkError (e)) throw e; // реальная ошибка YouTube -- повторять бессмысленно
+            if (attempt > 1)
+            {
+                if (!ytDlpQuiet)
+                    console.log ('[' + (d()) + '] [music] прокси не ответил -- пробую ещё раз');
+                await new Promise (res => setTimeout (res, 1200));
+            }
+            try
+            {
+                let opts = Object.assign ({}, optsBase, route === 'proxy'
+                    ? { proxy: MUSIC_PROXY, socketTimeout: 10 } // не висим вечно в мёртвом прокси
+                    : {});
+                let r = await ytdlp (query, opts);
+                if (route === 'proxy') proxyStreamDead = false; // прокси ожил
+                return r;
+            }
+            catch (e)
+            {
+                lastErr = e;
+                if (!ytDlpQuiet)
+                    console.error ('[music] ' + route + ' не сработал: ' + ytDlpErr (e, 150));
+                if (!isNetworkError (e)) throw e; // реальная ошибка YouTube -- повторять бессмысленно
+            }
         }
     }
     throw lastErr;
@@ -8758,6 +8788,37 @@ async function clearMusicState (guildId)
 // история -- своё: /stop и /clear очередь стирают, а историю не трогают.
 // ============================================================================
 const HISTORY_MSG_LIMIT = 1800; // сколько символов отдаём под список -- с запасом до лимита Discord
+
+// [v2.56] ЛИМИТОВ У ИСТОРИИ ДВА, И РЕЖЕМ МЫ ЦЕЛЫМИ ПАЧКАМИ.
+//   history_len    -- сколько ПАЧЕК помнить (как было);
+//   history_tracks -- сколько ТРЕКОВ помнить суммарно: пачка из 50 треков съедает
+//                     впятеро больше места, чем пять одиночных заходов, и без второго
+//                     лимита именно такие плейлисты вытесняют из истории мелкие добавки.
+// Половина пачки в истории смысла не имеет (её состав и её авторство -- одно целое),
+// поэтому уходят пачки ЦЕЛИКОМ, от самых старых. НОВЕЙШАЯ пачка не выбрасывается
+// никогда, даже если одна перебирает лимит: иначе история окажется пустой сразу после
+// /play, а это выглядит как «/history не работает».
+function historyTrim (list)
+{
+    const out = (Array.isArray (list) ? list : []).slice ();
+    if (out.length > MUSIC_HISTORY_LEN) out.length = MUSIC_HISTORY_LEN;
+    if (MUSIC_HISTORY_TRACKS)
+    {
+        let total = 0;
+        for (let i = 0; i < out.length; i++)
+        {
+            total += historyTracksOf (out[i]);
+            if (total > MUSIC_HISTORY_TRACKS && i > 0) { out.length = i; break; }
+        }
+    }
+    return out;
+}
+function historyTracksOf (e) { return Math.max (1, Number (e && e.n) || 1); }
+function historyTotalTracks (list)
+{
+    return (Array.isArray (list) ? list : []).reduce ((s, e) => s + historyTracksOf (e), 0);
+}
+
 async function historyLoad (guildId)
 {
     const m = musicOf (guildId);
@@ -8769,8 +8830,7 @@ async function historyLoad (guildId)
     {
         const rec = await db (guildId, 'musicState', 'history');
         const list = rec && Array.isArray (rec.list) ? rec.list : [];
-        m.history = list.filter (e => e && typeof e === 'object' && Number (e.at))
-            .slice (0, MUSIC_HISTORY_LEN);
+        m.history = historyTrim (list.filter (e => e && typeof e === 'object' && Number (e.at)));
         m.historyFromDb = !!rec;
     }
     catch (e) { console.error ('[music] не смог прочитать историю добавлений: ' + oneLine ((e && e.message) || e)); }
@@ -8805,12 +8865,18 @@ async function historySeedFromQueue (guildId)
         const key = byIdOf (t) + '@' + at;
         let b = byKey.get (key);
         if (!b) { b = { at: at, byId: byIdOf (t), byName: byNameOf (t), inCh: t.addIn ? String (t.addIn) : '',
-                         n: 0, live: 0, titles: [] }; byKey.set (key, b); }
+                         n: 0, live: 0, titles: [], urls: [], ids: [], q: '' }; byKey.set (key, b); }
         b.n++;
         if (t.isLive) b.live++;
         if (b.titles.length < 3) b.titles.push (t.title || t.url || '');
+        // [v2.56] Ключи треков -- чтобы у перенесённых из очереди пачек тоже работала
+        // «судьба» (см. historyFate). Метка добавления у пачки общая, треки -- свои.
+        if (b.ids.length < 500) b.ids.push (ytKey (t.url));
+        // [v2.56] ссылки переносим вместе с названиями -- чтобы из /history можно было
+        // добавить пачку заново, не разыскивая её в YouTube (то же, что у новых пачек).
+        if (b.urls.length < 3 && /^https?:/i.test (String (t.url || ''))) b.urls.push (String (t.url).slice (0, 200));
     }
-    const list = [...byKey.values ()].sort ((a, b) => b.at - a.at).slice (0, MUSIC_HISTORY_LEN);
+    const list = historyTrim ([...byKey.values ()].sort ((a, b) => b.at - a.at));
     if (!list.length) return 0;
     m.history = list;
     await historySave (guildId);
@@ -8823,7 +8889,7 @@ async function historySave (guildId)
 {
     const m = $music[guildId];
     if (!m || !Array.isArray (m.history)) return;
-    try { await db (guildId, 'musicState', 'history', { at: Date.now (), list: m.history.slice (0, MUSIC_HISTORY_LEN) }); }
+    try { await db (guildId, 'musicState', 'history', { at: Date.now (), list: historyTrim (m.history) }); }
     catch (e) { console.error ('[music] не смог сохранить историю добавлений: ' + oneLine ((e && e.message) || e)); }
 }
 
@@ -8842,15 +8908,79 @@ async function historyAdd (guildId, entry)
         inCh: entry.inCh ? String (entry.inCh) : '',
         n: Math.max (1, Number (entry.n) || 1),
         live: Math.max (0, Number (entry.live) || 0),
+        // [v2.56] ЧТО ЧЕЛОВЕК НАПИСАЛ В /play (ссылка, запрос или адрес плейлиста): по
+        // этому видно, откуда пачка, и это же можно вставить в /play второй раз, не
+        // разыскивая трек заново. У плейлистов тут адрес плейлиста, а сами треки -- в
+        // titles/urls (их первые три, иначе одна пачка съела бы всё сообщение).
+        q: String (entry.q || '').replace (/\s+/g, ' ').trim ().slice (0, 120),
         titles: (entry.titles || []).slice (0, 3).map (t => String (t || '').slice (0, 90)),
+        urls: (entry.urls || []).filter (u => /^https?:/i.test (String (u || '')))
+            .slice (0, 3).map (u => String (u).slice (0, 200)),
+        // [v2.56] КЛЮЧИ ТРЕКОВ ПАЧКИ -- по ним /history и отвечает на «а что с ней
+        // стало»: сколько ещё ждёт в очереди, что играет прямо сейчас, а что уже
+        // доиграно или убрано. Сравнение по видео-id, а не по названию: одноимённых
+        // треков у одного автора бывает много (тогда «судьба» врала бы). 500 --
+        // верхняя граница, она же предел MUSIC.history_tracks: длиннее пачки в
+        // истории всё равно не живут.
+        ids: (entry.ids || []).slice (0, 500).map (s => String (s || '')).filter (Boolean),
     });
-    if (m.history.length > MUSIC_HISTORY_LEN) m.history.length = MUSIC_HISTORY_LEN;
+    m.history = historyTrim (m.history);
     await historySave (guildId);
 }
 
-// Текст /history. Ограничен и по числу пачек (history_len), и по длине сообщения:
-// Discord в 2000 символов не влезет двадцатью пятью пачками плейлистов, поэтому
-// строки идут от свежих к старым, а остаток честно называется.
+// Ключ трека для сверки с очередью: у треков нет отдельного поля с id, зато есть
+// канонический адрес (webpage_url у одиночного, watch-ссылка у плейлиста), по нему
+// и достаём видео-id. «Голый» id из старой базы возвращается как есть.
+function ytKey (url)
+{
+    const s = String (url || '');
+    let m = s.match (/[?&]v=([\w-]{6,20})/);            if (m) return m[1];
+    m = s.match (/youtu\.be\/([\w-]{6,20})/);           if (m) return m[1];
+    m = s.match (/\/live\/([\w-]{6,20})/);              if (m) return m[1];
+    m = s.match (/\/shorts\/([\w-]{6,20})/);            if (m) return m[1];
+    m = s.match (/^([\w-]{6,20})$/);                    if (m) return m[1];
+    return s.slice (0, 60);
+}
+
+// СУДЬБА ПАЧКИ (v2.56): что из неё ещё ждёт в очереди, что играет сейчас, а что уже
+// доиграно или убрано. Считается по ключам треков (e.ids), а не по числам: пачка из
+// 33 треков после /clear выглядит как «в очереди уже нет», и это правда.
+function historyFate (m, e)
+{
+    const ids = Array.isArray (e.ids) ? e.ids.filter (Boolean) : [];
+    if (!ids.length) return '';   // пачка из старой базы -- ключей нет, обещать нечего
+    const total = Math.max (Number (e.n) || ids.length, ids.length);
+    const cur = m.current ? ytKey (m.current.url) : '';
+    const wait = new Set (m.tracks.map (t => ytKey (t.url)));
+    let inQ = 0;
+    for (const id of ids) if (wait.has (id)) inQ++;
+    if (cur && ids.includes (cur))
+        return '▶ сейчас в эфире' + (inQ ? ', в очереди ещё ' + inQ + ' из ' + total : '');
+    if (!inQ) return 'в очереди уже нет (доиграно или убрано)';
+    if (inQ >= total) return 'в очереди: вся пачка';
+    return 'в очереди: ' + inQ + ' из ' + total;
+}
+
+// Ссылки для повторного добавления: берём только короткие адреса (длинный не влезет,
+// а обрезанная ссылка бесполезна) -- не больше двух. Ссылку-запуск (e.q) показываем
+// отдельно, поэтому её тут не дублируем.
+function historyLinks (e)
+{
+    const out = [];
+    for (const u of (e.urls || []))
+    {
+        const s = String (u || '');
+        if (s.length <= 90 && !out.includes (s)) out.push (s);
+        if (out.length >= 2) break;
+    }
+    return out;
+}
+
+// Текст /history. Ограничен по числу пачек (history_len), по числу треков
+// (history_tracks) и по длине сообщения: Discord в 2000 символов не влезет двадцатью
+// пятью пачками плейлистов, поэтому строки идут от свежих к старым, а остаток честно
+// называется. У каждой пачки может быть вторая строка «↳» -- судьба, запрос /play и
+// ссылки; если она не влезает, пачка уходит в «Раньше -- ещё N» целиком.
 function historyText (guildId)
 {
     const m = musicOf (guildId);
@@ -8865,9 +8995,13 @@ function historyText (guildId)
         return '🕘 Истории добавлений пока нет -- её начнут писать новые `/play`.\n_' +
             'Помню последние ' + MUSIC_HISTORY_LEN + ' ' + plural (MUSIC_HISTORY_LEN, 'пачку', 'пачки', 'пачек') +
             ' (`MUSIC.history_len`); очередь -- отдельно: `/queue`._';
+    const sum = historyTotalTracks (list);
     const head = '🕘 **История добавлений** -- ' + plural (list.length, 'последняя', 'последние', 'последние') +
-        ' ' + list.length + ' ' + plural (list.length, 'пачка', 'пачки', 'пачек') + (list.length >= MUSIC_HISTORY_LEN
-            ? ' (_MUSIC.history_len_: ' + MUSIC_HISTORY_LEN + ')' : '') + ':\n' + QSEP;
+        ' ' + list.length + ' ' + plural (list.length, 'пачка', 'пачки', 'пачек') + ', ' + sum + ' ' +
+        plural (sum, 'трек', 'трека', 'треков') + (list.length >= MUSIC_HISTORY_LEN ||
+            (MUSIC_HISTORY_TRACKS && sum >= MUSIC_HISTORY_TRACKS)
+            ? ' (_MUSIC.history_len_: ' + MUSIC_HISTORY_LEN +
+              (MUSIC_HISTORY_TRACKS ? ', _history_tracks_: ' + MUSIC_HISTORY_TRACKS : '') + ')' : '') + ':\n' + QSEP;
     const shown = [];
     let len = head.length, hidden = 0;
     for (const e of list)
@@ -8879,19 +9013,30 @@ function historyText (guildId)
                   (e.n > e.titles.length ? ' и ещё ' + (e.n - e.titles.length) : '') : '')
             : (e.live ? 'эфир: ' : 'трек: ') + ((e.titles || [])[0] || 'без названия');
         const line = '`' + stamp (e.at) + '` **' + (e.byName || 'без автора') + '** -- ' + what;
-        if (len + line.length + 2 > HISTORY_MSG_LIMIT)
+        // [v2.56] Вторая строка -- что стало с пачкой, что человек написал в /play и
+        // адреса для повторного добавления. Собирается только из того, что есть.
+        const sub = [];
+        const fate = historyFate (m, e);
+        if (fate) sub.push (fate);
+        if (e.q) sub.push ('запуск: `' + String (e.q).slice (0, 80) + '`');
+        const links = historyLinks (e);
+        if (links.length && !/^https?:/i.test (String (e.q || ''))) sub.push (links.join (' '));
+        const subLine = sub.length ? '\n   ↳ ' + sub.join (' · ') : '';
+        if (len + line.length + subLine.length + 2 > HISTORY_MSG_LIMIT)
         {
             hidden = list.length - shown.length;
             break;
         }
-        shown.push (line);
-        len += line.length + 1;
+        shown.push (line + subLine);
+        len += line.length + subLine.length + 1;
     }
     const tail = '\n' + QSEP + '\n_Один `/play` = одна пачка: кто, когда и что поставил.\n' +
-        'Очередь -- отдельно (`/queue`); тут остаётся и то, что уже доиграно или убрано.\n' +
-        (hidden ? 'Раньше -- ещё ' + hidden + ' ' + plural (hidden, 'пачка', 'пачки', 'пачек') +
-            ' (всего помню ' + MUSIC_HISTORY_LEN + ' -- ключ `MUSIC.history_len`).\n' : '') +
-        'Старое уходит само: помню последние ' + MUSIC_HISTORY_LEN + ' ' + plural (MUSIC_HISTORY_LEN, 'пачку', 'пачки', 'пачек') + '._';
+        'Строка «↳» -- судьба пачки (что ждёт в очереди, что доиграно и убрано),\n' +
+        'что ты написал в `/play` -- это можно вставить заново, ссылки на сами треки.\n' +
+        (hidden ? 'Раньше -- ещё ' + hidden + ' ' + plural (hidden, 'пачка', 'пачки', 'пачек') + '.\n' : '') +
+        'Старое уходит само: помню ' + MUSIC_HISTORY_LEN + ' ' + plural (MUSIC_HISTORY_LEN, 'пачку', 'пачки', 'пачек') +
+        (MUSIC_HISTORY_TRACKS ? ' и до ' + MUSIC_HISTORY_TRACKS + ' треков суммарно (пачка уходит целиком)' : '') +
+        ' -- ключи `MUSIC.history_len`' + (MUSIC_HISTORY_TRACKS ? ' и `MUSIC.history_tracks`' : '') + '._';
     return head + '\n' + shown.join ('\n') + tail;
 }
 
@@ -9024,7 +9169,8 @@ const QUEUE_HINT_FULL =
     ' свой трек (у админов и модеров -- любой).' + '\n' +
     QSMALL + 'Подвинуть -- выбери трек в меню ниже (выше/ниже, в начало, в конец' +
     ' или «На позицию…»), либо командой /move номер to номер.' + '\n' +
-    QSMALL + 'Прыгнуть по очереди -- /jump (админы и модеры).' + '\n' +
+    QSMALL + 'Прыгнуть по очереди -- /jump (админы и модеры): по умолчанию срочный' +
+    ' переход (прерванный трек -- в конец очереди), либо «Обрезать до трека» (всё до него убрать).' + '\n' +
     QSMALL + 'Чистить -- /clear (остаться) или /stop (уйти): спросят подтверждение.' + '\n' +
     QSMALL + 'DJ распоряжается только своими треками (и ставит их только на свои же' +
     ' места), админы и модеры -- любыми.';
@@ -11357,12 +11503,22 @@ const musicCommands =
              .setDescription ('Чьи треки поднять (без него -- твои; чужого -- только админы/модеры)')),
     new SlashCommandBuilder ()
         .setName ('jump')
-        .setDescription ('Перейти сразу к треку под этим номером')
+        .setDescription ('Перейти сразу к треку под этим номером (только админы и модеры)')
         .addIntegerOption (o =>
             o.setName ('number')
              .setDescription ('Номер трека в очереди (см. /queue)')
              .setMinValue (1)
-             .setRequired (true)),
+             .setRequired (true))
+        // [v2.56] ДВА ВАРИАНТА ПЕРЕХОДА. По умолчанию -- «срочный»: ничего не теряется,
+        // прерванный трек уезжает в конец очереди вместе с местом в нём. Второй --
+        // «обрезать до трека»: прежнее поведение /jump, когда всё до цели убирается
+        // насовсем (это и есть «чистка», только одним движением).
+        .addStringOption (o =>
+            o.setName ('mode')
+             .setDescription ('Что делать с тем, что стояло до него (без ответа -- срочный переход)')
+             .addChoices (
+                 { name: 'Срочный переход -- прерванный трек в конец очереди', value: 'urgent' },
+                 { name: 'Обрезать до трека -- всё до него убрать насовсем', value: 'cut' })),
     // [v2.32] /seek -- перейти к другому месту ВНУТРИ текущего трека (у DJ были
     // только «следующий» и «прыжок по очереди», а перемотать было нечем).
     new SlashCommandBuilder ()
@@ -12510,6 +12666,12 @@ client.on ('interactionCreate', async (interaction) =>
                 n: tracks.length,
                 live: tracks.filter (t => t.isLive).length,
                 titles: tracks.map (t => t.title || t.url || ''),
+                // [v2.56] Что человек написал в /play (ссылку, адрес плейлиста или
+                // запрос -- из /history это можно вставить заново), адреса самих треков
+                // и их ключи -- для «судьбы пачки» (что ещё в очереди, что доиграно).
+                q: query,
+                urls: tracks.map (t => t.url || ''),
+                ids: tracks.map (t => ytKey (t.url)),
             }).catch (e => console.error ('[music] история добавлений: ' + oneLine ((e && e.message) || e)));
             await interaction.editReply
             (
@@ -12643,6 +12805,25 @@ client.on ('interactionCreate', async (interaction) =>
                         '_Свой трек можно поднять -- `/push` или «⬆ Поднять» в меню автора под `/queue`; один трек пропускается кнопкой «⏭ Пропустить»._',
                     flags: MessageFlags.Ephemeral,
                 });
+            // [v2.56] ОБРЕЗАТЬ (второй вариант, mode: «Обрезать до трека») = прежнее
+            // поведение /jump: всё до цели уходит НАСОВСЕМ (вместе с прерванным).
+            // Срочный переход (по умолчанию) ничего не теряет -- см. ниже.
+            const cut = interaction.options.getString ('mode') === 'cut';
+            if (cut)
+            {
+                const gone = m.tracks.splice (0, n - 1);
+                const wasCut = m.current;
+                dropPreload (m);
+                const targetCut = m.tracks[0];
+                const cutTxt = (gone.length ? gone.length + ' ' + plural (gone.length, 'трек', 'трека', 'треков') + ' до него' : '') +
+                    (gone.length && wasCut ? ' и ' : '') + (wasCut ? 'прерванный **' + (wasCut.title || 'трек') + '**' : '');
+                console.log ('[' + (d()) + '] [music] обрезал очередь до №' + n + ': ' + (targetCut.title || 'трек') +
+                    (cutTxt ? ' (убрано насовсем: ' + cutTxt + ')' : ''));
+                if (wasCut) { m.skipRequested = true; m.player.stop (true); }
+                else playNext (guildId);
+                return interaction.reply ('✂ Обрезал до №' + n + ': **' + (targetCut.title || 'трек') + '**' +
+                    (cutTxt ? '\n_Убрано насовсем: ' + cutTxt + '._' : ''));
+            }
             const before = m.tracks.splice (0, n - 1); // всё, что стояло до цели
             const was = m.current;                     // что играло (его не выбрасываем)
             const wasAt = was ? Math.max (0, Math.round (playedMsOf (m) / 1000)) : 0;
@@ -12663,7 +12844,8 @@ client.on ('interactionCreate', async (interaction) =>
             if (was) { m.skipRequested = true; m.player.stop (true); } // [v2.30] прыжок -- не обрыв; Idle-хэндлер запустит то, к чему прыгнули
             else playNext (guildId);
             return interaction.reply ('⏭ Перехожу к №' + n + ': **' + (target.title || 'трек') + '**' +
-                (movedTxt ? '\n_Ничего не выброшено: ' + movedTxt + ' -- в конце очереди (вернуть -- `/move`)._' : ''));
+                (movedTxt ? '\n_Ничего не выброшено: ' + movedTxt + ' -- в конце очереди (вернуть -- `/move`)._' : '') +
+                '\n_Убрать всё до него насовсем -- тот же `/jump` с вариантом «Обрезать до трека»._');
         }
         else if (name === 'skip')
         {
