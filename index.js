@@ -5,6 +5,12 @@
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
+// CHANGELOG v2.64 (живое сообщение /queue -- раз в полминуты по умолчанию):
+//   * MUSIC.queue_live_ms по умолчанию 30000 (было 60000) -- просьба владельца: чаще
+//     видеть живые счётчики. Это ~120 правок в час против допустимых Discord ~3600.
+//   * Про hosts-файл (вопрос владельца про YouTube) -- разбор в README: помогает только
+//     при чисто DNS-блоке, требует ещё *.googlevideo.com, и при IP/DPI-блоке только сбивает
+//     нашу проверку «DIRECT: есть».
 // CHANGELOG v2.63 (срочный переход трогает ровно два трека):
 //   * УТОЧНЕНИЕ ВЛАДЕЛЬЦА: «трогались только два трека» -- выбранный становится текущим,
 //     а играющий -- СЛЕДУЮЩИМ, и всё. Раньше «то, что стояло до цели», уезжало в конец,
@@ -6422,10 +6428,10 @@ function configSanityIssues ()
     if (MUSIC_CFG.queue_live_ms !== undefined &&
         !(Number.isFinite (Number (MUSIC_CFG.queue_live_ms)) && String (MUSIC_CFG.queue_live_ms).trim () !== ''))
         out.push ('MUSIC.queue_live_ms = "' + MUSIC_CFG.queue_live_ms + '": ожидается число МИЛЛИСЕКУНД -- ' +
-            'иначе выходит 0 и /queue перестанет обновляться сам (ставь 60000 или не пиши ключ вовсе)');
+            'иначе выходит 0 и /queue перестанет обновляться сам (ставь 30000 или не пиши ключ вовсе)');
     else if (Number (MUSIC_CFG.queue_live_ms) > 0 && Number (MUSIC_CFG.queue_live_ms) < 10000)
         out.push ('MUSIC.queue_live_ms: ' + MUSIC_CFG.queue_live_ms + ' -- это МИЛЛИСЕКУНДЫ, и меньше 10 секунд не беру: ' +
-            'поднимаю до 10000. Похоже, ты указал секунды -- тогда пиши 60000 для минуты (правки сообщений в Discord ' +
+            'поднимаю до 10000. Похоже, ты указал секунды -- тогда пиши 30000 для полминуты или 60000 для минуты (правки сообщений в Discord ' +
             'ограничены примерно 5 за 5 секунд на канал)');
     // [v2.55] Живой лог в файл: мусор в ключе не должен молча менять поведение --
     // строка "шесть" превратилась бы в 0 (не удалять ничего) или "no" в NaN.
@@ -6989,13 +6995,13 @@ const MUSIC_HISTORY_LEN = Math.max (0, Math.min (200,
 const MUSIC_HISTORY_TRACKS = Math.max (0, Math.min (5000,
     Math.round (Number (MUSIC_CFG.history_tracks === undefined ? 500 : MUSIC_CFG.history_tracks) || 0)));
 // [v2.57] ЖИВОЕ СООБЩЕНИЕ /queue: как часто бот сам перерисовывает его, пока висит
-// (ключ MUSIC.queue_live_ms; по умолчанию 60000 = минута, 0 -- не обновлять само).
+// (ключ MUSIC.queue_live_ms; по умолчанию 30000 = полминуты, 0 -- не обновлять само).
 // Discord меняет сообщение ТОЛЬКО по нашему запросу, поэтому без этого текст застывал
 // на моменте вызова и оживал лишь при листании или «🔄 Обновить». Ниже 10 секунд не
 // опускаю даже по конфигу -- про лимиты Discord см. комментарий у queueLiveTick.
 const QUEUE_LIVE_MS = (function ()
 {
-    const raw = Number (MUSIC_CFG.queue_live_ms === undefined ? 60000 : MUSIC_CFG.queue_live_ms) || 0;
+    const raw = Number (MUSIC_CFG.queue_live_ms === undefined ? 30000 : MUSIC_CFG.queue_live_ms) || 0;
     if (!raw) return 0;
     return Math.max (10000, Math.round (raw));
 })();
