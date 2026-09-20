@@ -10,6 +10,20 @@
 // номером просто не было -- номер мог быть пропущен, когда правки шли вперемешку. История
 // читается по блокам, а не по номерам: у одной партии может быть много коммитов, а блок
 // пишется только на то, что видно владельцу.
+// CHANGELOG v2.90 (пачки пронумерованы, /push по номеру пачки, запрет -- только у DJ):
+//   * ЗАПРЕТ НА РАЗРЫВ ПАЧКИ -- ТОЛЬКО У ОБЫЧНОГО DJ (уточнение владельца). DJ и так
+//     ставит свои треки только на свои места, а пачка оберегает его же слушателей; а у
+//     админов и модеров это право остаётся -- им «сложно что-то запретить». `/push`
+//     при этом по-прежнему СГРЕБАЕТ пачку автора в один поток и двигает её вверх.
+//   * ПАЧКИ ПРОНУМЕРОВАНЫ (queuePacks/queuePacksText): в /queue есть строка
+//     «📚 Пачки: 1) <автор> -- 5, 2) ...» -- по ней видно и размер, и порядок, и место
+//     играющего трека (он голова своей пачки). Одна пачка -- строки нет.
+//   * /PUSH NUMBER:N -- поставить пачку ПЕРЕД выбранной (только staff): место выбирается
+//     одним числом даже в очереди из сотни треков (в пачке бывает 50 треков, позиция
+//     «между ними» ничего не значит). Место №1 -- это ЭФИР: тогда работает та же
+//     механика, что у «▶ Играющим» и срочного перехода -- играть начинает ПЕРВЫЙ трек
+//     новой пачки, а прерванный трек возвращается в СВОЮ пачку со своей секундой
+//     (то есть пачка, в которой играет трек, сдвигается вместе с ним).
 // CHANGELOG v2.89 (пачки не разрываются; играющий трек -- №0 плейлиста):
 //   * ЖИВОЕ: в эфире играл длинный сет одного автора, второй DJ поднял свои треки наверх --
 //     и оказался ВНУТРИ чужой пачки: играющий трек, чужие треки, опять играющий трек.
@@ -10685,6 +10699,45 @@ function qWouldSplit (list, idx, key, leftKey)
     return left !== key;                                 // внутри чужой пачки -- разорвёт
 }
 
+// [v2.90] ПАЧКИ ПО ПОРЯДКУ ПЛЕЙЛИСТА И ИХ НОМЕРА. Владелец: «надо собрать все пачки,
+// расставить в порядок начиная от первого трека, пронумеровать, и тогда можно выбирать,
+// вместо чьей пачки встанет та, для которой делается /push». Номера -- это места ПАЧЕК
+// в очереди (№1 -- та, с которой очередь начинается), а не номера треков: так доступно
+// любое место в плейлисте одним выбором, даже когда пачка длиной 50 треков.
+// Играющий трек -- голова своей пачки (№0 плейлиста), поэтому его пачка в списке первая.
+function queuePacks (m)
+{
+    const list = [];
+    for (let i = 0; i < m.tracks.length; i++)
+    {
+        const t = m.tracks[i], k = qKey (t);
+        const last = list[list.length - 1];
+        if (last && last.key === k) { last.to = i + 1; last.n++; }
+        else list.push ({ key: k, name: byNameOf (t), from: i, to: i + 1, n: 1 });
+    }
+    return list;
+}
+
+// Короткая строка про пачки для /queue и ответов /push: номера нужны, чтобы выбирать
+// место («поставить перед пачкой №3»). Одна строка -- место в сообщении дорогое
+// (в бюджете /queue она считается живьём, см. queueListBudget), поэтому пояснение
+// короткое, а всё остальное говорит сам /push в ответе.
+function queuePacksText (m, max = 8)
+{
+    const packs = queuePacks (m);
+    if (packs.length < 2) return '';
+    const parts = packs.slice (0, max).map ((p, i) => (i + 1) + ') ' + (p.key ? u (p.key) : 'без автора') + ' -- ' + p.n);
+    return QSMALL + '📚 Пачки (куда ставить -- `/push number:N`): ' + parts.join (', ') +
+        (packs.length > max ? ', ...и ещё ' + (packs.length - max) : '');
+}
+
+// Отказ «выше не поставлю» для обычного DJ (у staff такого нет).
+function qPackStaffText ()
+{
+    return '🚫 **Двигать пачки между чужими могут админы и модеры.**\n' +
+        '_Обычному DJ доступно «вверх» -- `/push` без номера: твоя пачка встанет сразу за играющим треком (или первой, если он твой).';
+}
+
 // Подпись автора для отказа ('' -- трек без автора).
 function qWhoText (key) { return key ? u (key) : 'треки без автора'; }
 
@@ -11725,6 +11778,9 @@ function queueListBudget (m)
     // и без этого длинная очередь могла упереться в лимит Discord.
     const chrome = queueHeadText (m).length + queueWaitText (m).length +
         queueAuthorsText (m).length + queueCheckText (m).length +
+        // [v2.90] Строка пачек (номера для /push) тоже входит в бюджет: она длинная
+        // и стоит в каждом сообщении, где пачек больше одной.
+        queuePacksText (m).length +
         // [v2.80] Маршрут видят только владельцы -- считаем его длину ДЛЯ НИХ (как самый
         // длинный вариант): иначе у владельца страница могла бы вылезти за лимит.
         netWaitText (m).length + netRouteText (m.guildId, OWNER_HOSTER).length +
@@ -12845,16 +12901,16 @@ function queueMove (guildId, n, to, who, opts = {})
     // чужую музыку в общей очереди.
     if (!opts.staff && !isBy (m.tracks[n - 1], opts.actorId))
         return { ok: false, text: ownOnlyText ('Переставить трек', m.tracks[n - 1]) };
-    // [v2.89] ПАЧКА НЕ РАЗРЫВАЕТСЯ -- проверка идёт ПЕРВОЙ (она объясняет самый частый
-    // отказ: трек встал бы между двумя треками одного автора). Порядок примеряем на копии
-    // списка: перемещаемый трек из неё уже убран (он и так часть своей пачки), а слева
-    // может оказаться играющий трек -- он №0 плейлиста, то есть голова своей пачки.
+    // [v2.89] ПАЧКА НЕ РАЗРЫВАЕТСЯ -- но ТОЛЬКО У ОБЫЧНОГО DJ [v2.90]: ему и так нельзя
+    // ставить свои треки на чужие места, а пачка оберегает его же слушателей от рваного
+    // плейлиста. У админов и модеров это право остаётся (владелец: «им сложно что-то
+    // запретить») -- они могут собирать очередь как захотят.
     const moved = m.tracks[n - 1];
     const dry = m.tracks.slice ();
     dry.splice (n - 1, 1);
     const idx = to - 1;
     const leftKey = (idx > 0) ? qKey (dry[idx - 1]) : (m.current ? qKey (m.current) : null);
-    if (qWouldSplit (dry, idx, qKey (moved), leftKey))
+    if (!opts.staff && qWouldSplit (dry, idx, qKey (moved), leftKey))
         return { ok: false, text: qSplitText (qKey (dry[idx]), '**' + (moved.title || 'трек') + '**') };
     // [v2.32] И СТАВИТЬ ЕГО ТОЛЬКО НА СВОЁ ЖЕ МЕСТО: цель должна быть занята его треком.
     // Иначе DJ мог бы выдвинуть любую свою песню вперёд чужого плейлиста (или загнать
@@ -12969,7 +13025,8 @@ function queueDemote (guildId, to, who, opts = {})
     {
         const j = to - 1;
         const leftKey = (j > 0) ? qKey (arr[j - 1]) : null;
-        if (qWouldSplit (arr, j, key, leftKey))
+        // [v2.90] Пачку оберегаем только у обычного DJ -- staff ставит куда хочет.
+        if (!opts.staff && qWouldSplit (arr, j, key, leftKey))
             return { ok: false, text: qSplitText (qKey (arr[j]), '**' + (was.title || 'трек') + '**') };
         idx = j;
     }
@@ -13060,10 +13117,95 @@ function queuePush (guildId, targetId, who)
         text: '⬆️ Поднял наверх ' + mine.length + ' ' + plural (mine.length, 'трек', 'трека', 'треков') +
             ' (' + whoTxt + '):' + (titles ? ' ' + titles + (mine.length > 3 ? ' и ещё ' + (mine.length - 3) : '') : '') +
             (curSame ? '\n_Играющий трек остался на месте -- он №0, а эти встали сразу за ним._' : '') +
-            (at ? '\n_Выше не ставлю: играет трек ' + qWhoText (curKey) +
-                ' -- встал бы посреди его пачки._' : '') +
+            (at ? '\n_Выше без номера не ставлю: играет трек ' + qWhoText (curKey) +
+                ' -- встал бы посреди его пачки. Место выбирается номером пачки: `/push number:N` (только админы и модеры)._' : '') +
             (glued ? '\n_Заодно склеил пачку ' + qWhoText (curKey) + ': её треки были вразброс._' : '') +
-            '\n' + queuePreview (m),
+            '\n' + queuePacksText (m) + '\n' + queuePreview (m),
+    };
+}
+
+// ============================================================================
+// [v2.90] /push С НОМЕРОМ ПАЧКИ -- ПОСТАВИТЬ ПАЧКУ ПЕРЕД ВЫБРАННОЙ (только staff).
+// Без номера /push делает одно понятное дело -- «вверх», сразу за пачкой играющего.
+// А когда пачек много и нужно другое место ("я хочу свою перед Фантазёром"), выбирать
+// его по номерам пачек: их видно в ответе и в /queue (`queuePacksText`), а номер трека
+// для этого не годится -- в пачке бывает 50 треков, и позиция «между треками» ничего
+// не значит (пачка -- одно целое; вставить внутрь неё -- это и есть разрыв).
+// ОСОБЫЙ СЛУЧАЙ -- МЕСТО №1: там стоит играющий трек (№0 плейлиста). Поставить туда
+// чужую пачку -- значит перебить эфир, и тогда работает уже знакомая по «▶ Играющим»
+// и «срочному переходу» механика: играть начинает ПЕРВЫЙ трек новой пачки, а прерванный
+// трек возвращается в СВОЮ пачку вместе со своей секундой.
+// ============================================================================
+function queuePlacePack (guildId, targetId, packNo, who, opts = {})
+{
+    const m = musicOf (guildId);
+    const key = String (targetId === undefined || targetId === null ? '' : targetId);
+    const whoTxt = key ? u (key) : 'треки без автора';
+    const same = t => t && String (t.byId || '') === key;
+    const mine = m.tracks.filter (same);
+    if (!m.tracks.length)
+        return { ok: false, text: '🈳 В очереди нет треков -- ставить нечего.' };
+    if (!mine.length)
+        return { ok: false, text: '🤔 В очереди нет треков от ' + whoTxt + '.' };
+    const packs = queuePacks (m);
+    if (packs.length < 2)
+        return { ok: false, text: '📚 В очереди всего одна пачка -- переставлять нечего (' +
+            (m.current ? 'играет ' + qWhoText (qKey (m.current)) + ', ' : '') + 'все треки одного автора).' };
+    if (!Number.isInteger (packNo) || packNo < 1 || packNo > packs.length)
+        return { ok: false, text: '🤔 Пачек в очереди ' + packs.length + ' -- номер от 1 до ' + packs.length + '.\n' +
+            queuePacksText (m) };
+    // Ключ трека и ключ пачки приводим к строке: у треков старых баз автора нет, и там
+    // и тут это пустая строка -- иначе «без автора» не совпало бы само с собой (в пачках
+    // ключ null/undef, а targetId уже пришёл как '').
+    const norm = k => String (k === undefined || k === null ? '' : k);
+    const target = packs[packNo - 1];
+    // Цель -- моя же пачка. И здесь сверяем КЛЮЧИ, а не ссылки на объект: у staff свои
+    // треки теперь могут лежать ДВУМЯ отрезками (разрыв разрешён), и «перед своей же
+    // пачкой» по ссылке сдвинуло бы мой первый отрезок вниз, к моему второму.
+    if (norm (target.key) === key)
+        return { ok: true, text: '✅ Пачка ' + whoTxt + ' и так на месте №' + packNo + '.\n' + queuePacksText (m) };
+    // Место №1 -- то, что звучит сейчас, -- НО ТОЛЬКО когда первая пачка и есть пачка
+    // играющего трека (он №0 плейлиста). Если играет автор, чьих треков в очереди нет,
+    // первая пачка чужая, и «перед №1» -- это просто верх очереди: перебивать эфир ради
+    // этого не за чем. Права на «в эфир» -- как у срочного перехода (их даёт jumpGuard).
+    const curKey = m.current ? qKey (m.current) : null;
+    if (packNo === 1 && m.current && norm (curKey) !== key && norm (packs[0].key) === norm (curKey))
+    {
+        const firstNo = m.tracks.indexOf (mine[0]) + 1;
+        const denied = jumpGuard (m, firstNo, false, opts);
+        if (denied) return { ok: false, text: denied };
+        const res = queuePromote (guildId, firstNo, who, opts);
+        if (res.ok)
+            res.text += '\n_Место №1 -- это эфир: теперь играет первый трек пачки ' + whoTxt +
+                ', а прерванный трек вернулся в свою пачку со своим местом._';
+        return res;
+    }
+    // Обычный случай: пачка встаёт ПЕРЕД пачкой №packNo -- и целиком, одним блоком.
+    // Точку вставки считаем по ИСХОДНОЙ очереди (сколько ЧУЖИХ треков стоит до начала
+    // выбранной пачки), а не суммой размеров пачек: у staff один автор может лежать двумя
+    // отрезками, и сумма тогда сдвинула бы вставку на размер моего же второго отрезка.
+    const rest = m.tracks.filter (t => !same (t));
+    let at = 0;
+    for (let i = 0; i < target.from; i++)
+        if (!same (m.tracks[i])) at++;
+    const next = rest.slice (0, at).concat (mine, rest.slice (at));
+    if (next.length === m.tracks.length && next.every ((t, i) => t === m.tracks[i]))
+        return { ok: true, text: '✅ Пачка ' + whoTxt + ' и так стоит перед пачкой №' + packNo + '.\n' + queuePacksText (m) };
+    m.tracks = next;
+    dropPreload (m);
+    startPreload (guildId);
+    saveMusicState (guildId);
+    scheduleVoiceStatus (guildId, true);
+    schedulePresence (true);
+    console.log ('[' + (d()) + '] [music] ' + whoText (who) + 'поставил пачку ' + whoTxt + ' (' + mine.length +
+        ' шт.) перед пачкой №' + packNo + ' (' + qWhoText (packs[packNo - 1].key) + ')' +
+        (m.current ? ' (играет ' + qWhoText (qKey (m.current)) + ' -- эфир не трогал)' : ''));
+    return {
+        ok: true,
+        text: '📚 **Пачка ' + whoTxt + ' (' + mine.length + ' ' + plural (mine.length, 'трек', 'трека', 'треков') +
+            ') встала перед пачкой №' + packNo + '** (' + qWhoText (packs[packNo - 1].key) + ')' +
+            (m.current ? '\n_Играющий трек не трогал -- он остаётся на месте._' : '') +
+            '\n' + queuePacksText (m) + '\n' + queuePreview (m),
     };
 }
 
@@ -13376,6 +13518,9 @@ function queueView (m, start, moveSel = 0, opts = {})
           ' -- двигай его кнопками ниже; «✖ Вернуться» вернёт обычные кнопки очереди.'
         : '';
     const authors = queueAuthorsText (m);
+    // [v2.90] Пачки с номерами: по этим номерам /push (staff) ставит пачку перед выбранной.
+    // Строка короткая и есть только там, где пачек больше одной.
+    const packList = queuePacksText (m);
     // [v2.54] Строки «Последние добавления» здесь больше нет: кто и когда ставил --
     // в /history (см. historyText), а очередь остаётся только очередью.
     const check = queueCheckText (m); // [v2.43] итог проверки очереди заранее
@@ -13389,7 +13534,7 @@ function queueView (m, start, moveSel = 0, opts = {})
     const net = [netWaitText (m), netRouteText (m.guildId, opts.actorId)].filter (Boolean).join ('\n');
     const build = hint => queueHeadText (m) +
         '\n' + QSEP + '\n' +
-        [net, check, authors, queueWaitText (m), move, hint].filter (Boolean).join ('\n') +
+        [net, check, authors, packList, queueWaitText (m), move, hint].filter (Boolean).join ('\n') +
         '\n' + QSEP +
         '\n**Очередь (' + total + ')**' + (page.start > 1 ? ' · с №' + page.start : '') + ':\n' + page.list +
         (restNow () > 0 ? '\n*...и ещё ' + restNow () + ': `/queue from:' + (page.start + page.count) + '`*' : '');
@@ -14929,7 +15074,15 @@ const musicCommands =
         .setDescription ('Поднять треки автора наверх очереди (DJ -- свои, админы/модеры -- любые)')
         .addUserOption (o =>
             o.setName ('author')
-             .setDescription ('Чьи треки поднять (без него -- твои; чужого -- только админы/модеры)')),
+             .setDescription ('Чьи треки поднять (без него -- твои; чужого -- только админы/модеры)'))
+        // [v2.90] Второй способ: не «наверх», а ПЕРЕД выбранной ПАЧКОЙ. Пачки видны
+        // и пронумерованы в /queue («📚 Пачки: 1) 2) 3)...»), поэтому место выбирается
+        // одним числом даже в очереди из сотни треков. Место №1 -- это эфир (там играющий
+        // трек): постановка туда меняет то, что звучит, поэтому только staff.
+        .addIntegerOption (o =>
+            o.setName ('number')
+             .setDescription ('Перед какой ПАЧКОЙ поставить (номер из /queue; только админы/модеры)')
+             .setMinValue (1)),
     new SlashCommandBuilder ()
         .setName ('jump')
         .setDescription ('Перейти сразу к треку (DJ -- по своим, админы/модеры -- любым)')
@@ -16501,8 +16654,19 @@ client.on ('interactionCreate', async (interaction) =>
                         '_Свои -- можно: `/push` без аргумента, или кнопка меню автора под `/queue`._',
                     flags: MessageFlags.Ephemeral,
                 });
-            const res = queuePush (guildId, targetId,
-                interaction.member ? uuu (interaction.member) : interaction.user.username);
+            const who = interaction.member ? uuu (interaction.member) : interaction.user.username;
+            // [v2.90] С номером пачки -- поставить ПЕРЕД ней (это уже про весь плейлист,
+            // а не про свои треки, поэтому только админы и модеры).
+            const packNo = interaction.options.getInteger ('number');
+            if (packNo)
+            {
+                if (!staff)
+                    return interaction.reply ({ content: qPackStaffText (), flags: MessageFlags.Ephemeral });
+                const res = queuePlacePack (guildId, targetId, packNo, who, { staff: true, actorId: interaction.user.id });
+                if (res.ok) qRedraw ();
+                return interaction.reply (res.ok ? res.text : { content: res.text, flags: MessageFlags.Ephemeral });
+            }
+            const res = queuePush (guildId, targetId, who);
             if (res.ok) qRedraw ();
             return interaction.reply (res.ok ? res.text : { content: res.text, flags: MessageFlags.Ephemeral });
         }
