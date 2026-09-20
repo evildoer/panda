@@ -12003,6 +12003,35 @@ function proxyForAgent (proxyUrl)
     return s;
 }
 
+// [v2.72] СВОЙ ЗАПРОС УМЕЕТ И HTTP(S)-ПРОКСИ. До этого здесь знали только SOCKS: если в
+// MUSIC.proxy стоит http://127.0.0.1:10809 (у владельца рядом с socks-портом поднят и
+// HTTP), проверка очереди по oEmbed молча ломалась («не могу достучаться до YouTube»),
+// хотя yt-dlp с таким прокси работает -- он-то понимает http-прокси сам. Владелец именно
+// на это и указал: порт есть, а музыка всё равно ругалась. Агента берём по схеме адреса;
+// модуля рядом нет -- честно null (тогда идём напрямую, как и раньше).
+function proxyAgentFor (addr)
+{
+    const s = String (addr || '').trim ();
+    if (!s) return null;
+    try
+    {
+        if (/^socks/i.test (s))
+        {
+            const M = require ('socks-proxy-agent'); // рядом с discord.js -- берём, если есть
+            const A = M.SocksProxyAgent || M;
+            return new A (proxyForAgent (s));
+        }
+        if (/^https?:\/\//i.test (s))
+        {
+            const M = require ('https-proxy-agent'); // тоже лежит рядом (зависимость discord.js)
+            const A = M.HttpsProxyAgent || M;
+            return new A (s);
+        }
+    }
+    catch { return null; }
+    return null;   // схему не поняли -- как раньше, напрямую
+}
+
 // oEmbed: маленький публичный запрос. 'ok' -- видео есть, 'gone' -- удалено/закрыто,
 // 'unknown' -- не смогли узнать (403/429/5xx), 'neterr' -- до YouTube вообще не дошли
 // (DNS, сокет): это не про видео, и по такому ответу ничего не убираем.
@@ -12023,15 +12052,10 @@ async function oembedProbe (url)
     {
         let httpsMod;
         try { httpsMod = require ('https'); } catch { return resolve ('neterr'); }
-        let agent = null;
-        if (proxyAddr)
-            try
-            {
-                const M = require ('socks-proxy-agent'); // рядом с discord.js -- берём, если есть
-                const A = M.SocksProxyAgent || M;
-                agent = new A (proxyForAgent (proxyAddr));
-            }
-            catch { agent = null; } // модуля рядом нет -- идём напрямую, проверить это не мешает
+        // [v2.60/v2.72] агент по схеме адреса (SOCKS или HTTP): SOCKS поднимаем до socks5h,
+        // чтобы имя резолвил прокси, а не машина. Модуля рядом нет -- agent остаётся null,
+        // и запрос идёт напрямую: проверить это не мешает.
+        const agent = proxyAddr ? proxyAgentFor (proxyAddr) : null;
         let done = false;
         const fin = v => { if (done) return; done = true; resolve (v); };
         let req;
@@ -12067,7 +12091,8 @@ function oembedNote (verdict)
     oembedHintTold = true;
     console.error ('[' + (d()) + '] [music] проверка очереди: не могу достучаться до YouTube (DNS/сеть) -- ' +
         'мёртвые видео, как и раньше, узнаются только при подходе к эфиру. ' +
-        'Проверь MUSIC.proxy (запрос идёт через socks5h) или выключи MUSIC.queue_check вовсе');
+        'Проверь MUSIC.proxy (запрос идёт по адресу из конфига: socks5 -- с резолвом имени на стороне прокси, http -- как есть) ' +
+        'или выключи MUSIC.queue_check вовсе');
 }
 
 // Приговор выносит yt-dlp -- тот же инструмент, что играет музыку. Значит «мёртвый» трек --
