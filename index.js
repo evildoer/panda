@@ -5,6 +5,13 @@
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
+// CHANGELOG v2.65 (место в начатых треках и понятная стрелка у перепрыгивания):
+//   * У ТРЕКОВ, КОТОРЫЕ НАЧИНАЛИ ИГРАТЬ, НО НЕ ДОИГРАНЫ, в /queue видно `02:44/03:14`
+//     (просьба владельца). Позиция берётся из track.seek (её кладут /leave и срочный
+//     переход) либо из m.seekSec у ждущего продолжения трека. У обычных треков -- как
+//     раньше, просто длина.
+//   * ИКОНКА ПЕРЕПРЫГИВАНИЯ -- АРКА-СТРЕЛКА «⤴» вместо «⏭»: тем же «⏭» помечено
+//     «Пропустить», и две одинаковые стрелки в соседних рядах путали.
 // CHANGELOG v2.64 (живое сообщение /queue -- раз в полминуты по умолчанию):
 //   * MUSIC.queue_live_ms по умолчанию 30000 (было 60000) -- просьба владельца: чаще
 //     видеть живые счётчики. Это ~120 правок в час против допустимых Discord ~3600.
@@ -9632,9 +9639,19 @@ function queueListBudget (m)
 // Строки одной страницы при заданной обрезке названия (titleClip).
 // [v2.18] Автор у идущих ПОДРЯД треков одного человека пишется один раз (обычное
 // дело -- DJ залил плейлист), смена автора всегда видна.
-function queueLines (slice, start, titleClip)
+function queueLines (slice, start, titleClip, m)
 {
     const lines = [];
+    // [v2.65] У НАЧАТЫХ, НО НЕ ДОИГРАННЫХ ТРЕКОВ ВИДНО МЕСТО: `02:44/03:14`.
+    // Позиция берётся из `track.seek` (её кладёт /leave и срочный переход вместе
+    // с треком) либо из `m.seekSec`, если это трек, ждущий продолжения (обрыв/пауза).
+    // У обычных треков ничего не меняется -- там просто длина.
+    const seekOf = t =>
+    {
+        let at = Number (t && t.seek) || 0;
+        if (m && m.seekTrack === t && (Number (m.seekSec) || 0) > at) at = Number (m.seekSec) || 0;
+        return Math.max (0, Math.round (at));
+    };
     for (let i = 0; i < slice.length; i++)
     {
         const t = slice[i];
@@ -9657,9 +9674,12 @@ function queueLines (slice, start, titleClip)
         // и рендер его не трогает; нумерацию это не меняет (/remove ждёт те же числа).
         // [v2.43] ⚠ -- трек, который проверка заранее сочла недоступным. Он остаётся
         // в очереди (удаляем только по факту), но человеку видно, что с ним может быть беда.
+        const at = seekOf (t);
+        const timeTxt = (at >= 1 && t.duration > 0)
+            ? fmtDur (Math.min (at, t.duration)) + '/' + fmtDur (t.duration)
+            : fmtDur (t.duration, t.isLive);
         lines.push ('`' + (start + i) + '` · ' + (t.warn ? '⚠ ' : '') + '**' +
-            clipText (t.title || 'трек', titleClip) + '** `' +
-            fmtDur (t.duration, t.isLive) + '`' + label);
+            clipText (t.title || 'трек', titleClip) + '** `' + timeTxt + '`' + label);
     }
     return lines;
 }
@@ -9677,7 +9697,7 @@ function queuePage (m, start)
     let lines = null;
     for (const clip of [120, 80, 60, 45, 30, 25, 20])
     {
-        lines = queueLines (slice, start, clip);
+        lines = queueLines (slice, start, clip, m);
         if (lines.join ('\n').length <= budget) break;
     }
     // Крайняя страховка. Срабатывает только если ОДНОВРЕМЕННО: queue_page выставлен
@@ -9842,7 +9862,8 @@ function queueComponents (page, m, moveSel = 0, opts = {})
                 .setDisabled (!m.current)
         )
     );
-    // [v2.62] «⏭ Перепрыгнуть» -- /jump прямо из очереди (окно ввода номера -> подтверждение
+    // [v2.62] «⤴ Перепрыгнуть» (v2.65 -- стрелка вместо ⏭, чтобы не путать с «⏭ Пропустить»)
+    // -- /jump прямо из очереди (окно ввода номера -> подтверждение
     // варианта). Доступно и обычному DJ (по своим трекам -- см. jumpGuard). Встало в этот
     // ряд (перед «▶ Войти») -- пятая кнопка в ряду, лимит Discord ровно пять.
     // «▶ Войти» сменил зелёный на нейтральный: зелёный в боте значит «подтверждаю/ок», а
@@ -9852,7 +9873,7 @@ function queueComponents (page, m, moveSel = 0, opts = {})
         new ActionRowBuilder ().addComponents
         (
             new ButtonBuilder ()
-                .setCustomId ('q:jmp').setLabel ('⏭ Перепрыгнуть').setStyle (ButtonStyle.Secondary)
+                .setCustomId ('q:jmp').setLabel ('⤴ Перепрыгнуть').setStyle (ButtonStyle.Secondary)
                 .setDisabled (!total),
             new ButtonBuilder ()
                 .setCustomId ('q:join').setLabel ('▶ Войти').setStyle (ButtonStyle.Secondary),
@@ -10284,7 +10305,7 @@ function jumpMusic (guildId, n, cut, opts = {})
     else playNext (guildId);
     return {
         ok: true,
-        text: '⏭ Перехожу к №' + n + ': **' + (target.title || 'трек') + '**' +
+        text: '⤴ Перехожу к №' + n + ': **' + (target.title || 'трек') + '**' +
             (was ? '\n_Прерванный трек заиграет следующим, с ' + fmtDur (wasAt) + '._' : '') +
             (m.tracks.length > (was ? 2 : 1)
                 ? '\n_Тронул только эти два трека -- остальная очередь стоит как стояла._' : '') +
@@ -10299,12 +10320,12 @@ function jumpConfirm (n)
     const cancel = new ButtonBuilder ()
         .setCustomId ('q:jp:x').setLabel ('✖ Отмена').setStyle (ButtonStyle.Secondary);
     return {
-        text: '⏭ **Перейти к №' + n + '?** Что сделать с тем, что стоит до него:\n' +
+        text: '⤴ **Перейти к №' + n + '?** Что сделать с тем, что стоит до него:\n' +
             '• **Срочный переход** -- цель играет сразу, а прерванный трек встанет **следующим** (с того же места). Тронем только эти два трека: остальная очередь останется как стояла.\n' +
             '• **Обрезать до трека** -- всё до цели (и прерванный) уйдёт **насовсем**.',
         rows: [new ActionRowBuilder ().addComponents
         (
-            new ButtonBuilder ().setCustomId ('q:jp:u:' + n).setLabel ('⏭ Срочный переход').setStyle (ButtonStyle.Primary),
+            new ButtonBuilder ().setCustomId ('q:jp:u:' + n).setLabel ('⤴ Срочный переход').setStyle (ButtonStyle.Primary),
             new ButtonBuilder ().setCustomId ('q:jp:c:' + n).setLabel ('✂ Обрезать до трека').setStyle (ButtonStyle.Danger),
             cancel
         )],
@@ -12490,7 +12511,7 @@ client.on ('interactionCreate', async (interaction) =>
             );
         }
         const who = interaction.member ? uuu (interaction.member) : interaction.user.username;
-        // [v2.62] «⏭ Перепрыгнуть» -- окно ввода номера, дальше спрашиваем вариант
+        // [v2.62] «⤴ Перепрыгнуть» -- окно ввода номера, дальше спрашиваем вариант
         // (срочный переход / обрезка) теми же кнопками, что и у /jump.
         if (cid === 'q:jmp')
         {
