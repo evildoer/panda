@@ -5,6 +5,31 @@
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
+// CHANGELOG v2.54 (история добавлений -- своя команда /history, а не строка в /queue):
+//   * СТРОКИ «Последние добавления» В /queue БОЛЬШЕ НЕТ (просьба владельца). И дело не
+//     только в месте: та строка строилась ИЗ ОЧЕРЕДИ, поэтому и показывала всего четыре
+//     пачки, и теряла всё доигранное и убранное, и не говорила, что именно поставили --
+//     «33 трека (№1, 2, 3 и ещё 30)» без единого названия.
+//   * ЗАМЕНА -- КОМАНДА /history (для всех, как /queue): кто, когда и что поставил.
+//     Один заход /play = одна запись, и в ней видно вид добавленного: трек, ПРЯМОЙ ЭФИР
+//     или целый ПЛЕЙЛИСТ со составом (первые три названия и «и ещё N»), плюс счётчик
+//     эфиров внутри пачки. Смотреть может каждый; команда есть и в /help.
+//   * ИСТОРИЯ ЖИВЁТ ОТДЕЛЬНО ОТ ОЧЕРЕДИ (запись musicState/history), поэтому:
+//       - её НЕ стирают /clear и /stop (очередь -- своё, история добавлений -- своё);
+//       - доигранное, пропущенное и убранное из очереди в ней остаётся;
+//       - она переживает перезапуск, а при старте в лог уходит строка, сколько пачек
+//         поднято из базы;
+//       - ПЕРВЫЙ ЗАПУСК НЕ ОТКРЫВАЕТСЯ ПУСТЫМ: если записи ещё нет, а в очереди есть
+//         треки с метками добавления (addAt), бот ОДИН РАЗ переносит эти пачки в
+//         историю и пишет об этом в лог -- очередь при этом не меняется.
+//   * СКОЛЬКО ПОМНИТЬ -- КЛЮЧ MUSIC.history_len (по умолчанию 25, максимум 200;
+//     0 -- выключить, /history так и скажет). Мусор в ключе не проходит молча: в
+//     [config]-аудите строка с объяснением (иначе вышло бы 0 и история молча пропала).
+//   * ОЧЕРЕДЬ СТАЛА КОРОЧЕ и от этого не пострадала: из бюджета страницы убрана длина
+//     ушедшей строки, поэтому на страницу по-прежнему влезают все треки (проверяется
+//     стендом на 200 длинных треках с эфирами и ⚠). Функция queueAddsText удалена -- её
+//     текст есть в истории git (v2.35–v2.53), а поле addAt у треков осталось (по нему
+//     переносятся старые пачки и его же видно в `node . dump`).
 // CHANGELOG v2.53 (чужой трек нельзя ни перемотать, ни пропустить; подсказка /queue спрятана):
 //   * ПРОПУСК ПОПАЛ ПОД ТО ЖЕ ПРАВИЛО, ЧТО ПЕРЕМОТКА (v2.50): свой трек пропускает
 //     его автор, любой -- админы и модеры. Пропустить чужую песню -- не «перемотать»,
@@ -1533,6 +1558,7 @@ const STARTUP_DM_TEXT =
     '`/play` ссылка или запрос -- поставить трек, плейлист или прямой эфир\n' +
     '`/queue` -- что играет сейчас и что дальше: кто что поставил и сколько ещё ждать\n' +
     '`/nowplaying` -- коротко про текущий трек: позиция, кто поставил, что дальше\n' +
+    '`/history` -- кто и когда ставил музыку: последние добавления (треки, эфиры, плейлисты)\n' +
     'Если в канале никого, музыка встаёт на паузу и продолжается, когда кто-то зашёл: бот помнит и трек, и место в нём -- перезапуск и обрыв связи их не сбрасывают.\n' +
     '\n' +
     '🔑 **Свой голосовой канал**\n' +
@@ -6009,6 +6035,13 @@ function configSanityIssues ()
     if (MUSIC_QUEUE_CHECK && MUSIC_CFG.queue_check_gap_ms !== undefined &&
         Number (MUSIC_CFG.queue_check_gap_ms) < 1000)
         out.push ('MUSIC.queue_check_gap_ms меньше 1000 -- поднимаю до 1000 (чаще не надо: это защита от лимитов YouTube)');
+    // [v2.54] История добавлений: мусор в ключе молча выключал бы /history (0)
+    if (MUSIC_CFG.history_len !== undefined &&
+        !(Number.isFinite (Number (MUSIC_CFG.history_len)) && String (MUSIC_CFG.history_len).trim () !== ''))
+        out.push ('MUSIC.history_len = "' + MUSIC_CFG.history_len + '": ожидается число -- ' +
+            'иначе выходит 0, и /history будет отвечать, что история выключена (ставь 25 или не пиши ключ вовсе)');
+    else if (Number (MUSIC_CFG.history_len) > 200)
+        out.push ('MUSIC.history_len: ' + MUSIC_CFG.history_len + ' -- держу 200 (это запись в базе и текст сообщения, а не архив)');
     for (let server in SERVERS)
     {
         // Значение не объект (в конфиг случайно попала строка/число) -- не падаем:
@@ -6522,6 +6555,13 @@ const QUEUE_CHECK_GAP_MS = Math.max (1000, Math.min (60000,
 // региональные блокировки не знает (отвечает «есть», хотя бот её не сыграет). 0 -- только
 // oEmbed; больше 5 -- уже заметная доля от обычной работы бота, смысла нет.
 const QUEUE_CHECK_STRICT = 3;
+// [v2.54] ИСТОРИЯ ДОБАВЛЕНИЙ (/history) -- отдельный ключ MUSIC.history_len (по умолчанию
+// 25): сколько последних ПАЧЕК /play помнить. 0 -- не помнить вовсе (команда так и
+// скажет). Это НЕ очередь: очередь живёт своей жизнью и стирается /stop, а история --
+// это след добавлений (кто, когда и что поставил), и она переживает и доигранное, и
+// /stop, и перезапуск. Верхняя граница -- чтобы запись в базу не распухала.
+const MUSIC_HISTORY_LEN = Math.max (0, Math.min (200,
+    Math.round (Number (MUSIC_CFG.history_len === undefined ? 25 : MUSIC_CFG.history_len) || 0)));
 if (MUSIC_QUEUE_CHECK && QUEUE_CHECK_DEPTH)
     console.log ('[' + (d()) + '] [music] проверка очереди заранее: ВКЛЮЧЕНА -- до ' + QUEUE_CHECK_DEPTH +
         ' треков за проход, пауза ' + Math.round (QUEUE_CHECK_GAP_MS / 1000) + ' с (первые ' + QUEUE_CHECK_STRICT +
@@ -6841,6 +6881,10 @@ function musicOf (guildId)
             // (например queue_page -- сколько треков показывать на странице /queue),
             // потому что queuePage получает только m, а не guildId.
             guildId: guildId,
+            // [v2.54] история добавлений (/history): null -- ещё не читали из базы
+            // (читается один раз при старте или перед первой записью, см. historyLoad).
+            history: null,
+            historyFromDb: false,   // была ли уже НАСТОЯЩАЯ запись (иначе перенесём из очереди)
         };
     if (!$music[guildId].guildId) $music[guildId].guildId = guildId;
     return $music[guildId];
@@ -8571,6 +8615,153 @@ async function clearMusicState (guildId)
 }
 
 // ============================================================================
+// [v2.54] ИСТОРИЯ ДОБАВЛЕНИЙ -- ЗАПИСЬ musicState/history, ОТДЕЛЬНО от очереди.
+// Раньше «кто и когда поставил» жило прямо в очереди (строка «Последние добавления»
+// в /queue строилась из неё же), поэтому доигранное и убранное пропадало вместе со
+// своими треками, а длинные пачки показывались одним куцым огрызком. Теперь пачка
+// записывается НАВСЕГДА (до MUSIC.history_len пачек) и видна командой /history:
+// кто, когда и что добавил -- трек, эфир или плейлист (со составом). Очередь -- своё,
+// история -- своё: /stop и /clear очередь стирают, а историю не трогают.
+// ============================================================================
+const HISTORY_MSG_LIMIT = 1800; // сколько символов отдаём под список -- с запасом до лимита Discord
+async function historyLoad (guildId)
+{
+    const m = musicOf (guildId);
+    if (Array.isArray (m.history)) return m.history;   // уже читали -- в базу не ходим
+    m.history = [];
+    m.historyFromDb = false;
+    if (!MUSIC_HISTORY_LEN) return m.history;
+    try
+    {
+        const rec = await db (guildId, 'musicState', 'history');
+        const list = rec && Array.isArray (rec.list) ? rec.list : [];
+        m.history = list.filter (e => e && typeof e === 'object' && Number (e.at))
+            .slice (0, MUSIC_HISTORY_LEN);
+        m.historyFromDb = !!rec;
+    }
+    catch (e) { console.error ('[music] не смог прочитать историю добавлений: ' + oneLine ((e && e.message) || e)); }
+    return m.history;
+}
+
+// [v2.54] ПЕРВЫЙ ЗАПУСК ПОСЛЕ ОБНОВЛЕНИЯ: история ещё ни разу не писалась (ключа в базе
+// нет), а в очереди лежат треки с метками добавления (addAt) -- ровно то, что показывала
+// старая строка «Последние добавления» в /queue. Чтобы /history не открывался пустым,
+// переносим эти пачки ОДИН раз -- дальше история пишется сама и стирается только
+// полностью (удалить ключ musicState/history в базе). Очередь при этом не меняется.
+async function historySeedFromQueue (guildId)
+{
+    if (!MUSIC_HISTORY_LEN) return 0;
+    const m = $music[guildId];
+    if (!m) return 0;
+    // Сами читаем базу (в память история попадает только по historyLoad): если запись
+    // там УЖЕ есть, переносить нечего -- она и есть настоящая история.
+    await historyLoad (guildId);
+    if (m.historyFromDb || m.history.length) return 0;
+    const byKey = new Map ();
+    // ПО ОБЪЕКТУ, а не по списку: ждущий продолжения трек лежит И в m.current, И в
+    // m.tracks (так его ждёт playNext) -- без этой проверки он посчитался бы дважды
+    // и пачка получилась бы на трек больше, чем на самом деле.
+    const seen = new Set ();
+    for (const t of [...m.tracks, m.current, m.seekTrack])
+    {
+        if (!t || seen.has (t)) continue;
+        seen.add (t);
+        const at = Number (t.addAt) || 0;
+        if (!at) continue; // трек из старой базы -- времени добавления у него нет
+        const key = byIdOf (t) + '@' + at;
+        let b = byKey.get (key);
+        if (!b) { b = { at: at, byId: byIdOf (t), byName: byNameOf (t), inCh: t.addIn ? String (t.addIn) : '',
+                         n: 0, live: 0, titles: [] }; byKey.set (key, b); }
+        b.n++;
+        if (t.isLive) b.live++;
+        if (b.titles.length < 3) b.titles.push (t.title || t.url || '');
+    }
+    const list = [...byKey.values ()].sort ((a, b) => b.at - a.at).slice (0, MUSIC_HISTORY_LEN);
+    if (!list.length) return 0;
+    m.history = list;
+    await historySave (guildId);
+    console.log ('[' + (d()) + '] [music] история добавлений: перенёс в неё ' + list.length + ' ' +
+        plural (list.length, 'пачку', 'пачки', 'пачек') + ' из очереди (строка «Последние добавления» переехала в /history)');
+    return list.length;
+}
+
+async function historySave (guildId)
+{
+    const m = $music[guildId];
+    if (!m || !Array.isArray (m.history)) return;
+    try { await db (guildId, 'musicState', 'history', { at: Date.now (), list: m.history.slice (0, MUSIC_HISTORY_LEN) }); }
+    catch (e) { console.error ('[music] не смог сохранить историю добавлений: ' + oneLine ((e && e.message) || e)); }
+}
+
+// Одна пачка /play -- одна запись. Зовётся из /play ПОСЛЕ того, как треки уже встали
+// в очередь (иначе в историю попало бы то, чего в очереди не оказалось).
+async function historyAdd (guildId, entry)
+{
+    if (!MUSIC_HISTORY_LEN) return;
+    const m = musicOf (guildId);
+    await historyLoad (guildId);
+    m.history.unshift
+    ({
+        at: Number (entry.at) || Date.now (),
+        byId: entry.byId ? String (entry.byId) : '',
+        byName: String (entry.byName || '').slice (0, 80),
+        inCh: entry.inCh ? String (entry.inCh) : '',
+        n: Math.max (1, Number (entry.n) || 1),
+        live: Math.max (0, Number (entry.live) || 0),
+        titles: (entry.titles || []).slice (0, 3).map (t => String (t || '').slice (0, 90)),
+    });
+    if (m.history.length > MUSIC_HISTORY_LEN) m.history.length = MUSIC_HISTORY_LEN;
+    await historySave (guildId);
+}
+
+// Текст /history. Ограничен и по числу пачек (history_len), и по длине сообщения:
+// Discord в 2000 символов не влезет двадцатью пятью пачками плейлистов, поэтому
+// строки идут от свежих к старым, а остаток честно называется.
+function historyText (guildId)
+{
+    const m = musicOf (guildId);
+    const list = Array.isArray (m.history) ? m.history : [];
+    const two = n => String (n).padStart (2, '0');
+    const stamp = t => { const x = new Date (t); return two (x.getDate ()) + '.' + two (x.getMonth () + 1) +
+        ' ' + two (x.getHours ()) + ':' + two (x.getMinutes ()); };
+    if (!MUSIC_HISTORY_LEN)
+        return '🕘 История добавлений выключена (`MUSIC.history_len`: 0).\n_' +
+            'Поставь число (например 25) -- и снова буду помнить, кто что ставил._';
+    if (!list.length)
+        return '🕘 Истории добавлений пока нет -- её начнут писать новые `/play`.\n_' +
+            'Помню последние ' + MUSIC_HISTORY_LEN + ' ' + plural (MUSIC_HISTORY_LEN, 'пачку', 'пачки', 'пачек') +
+            ' (`MUSIC.history_len`); очередь -- отдельно: `/queue`._';
+    const head = '🕘 **История добавлений** -- ' + plural (list.length, 'последняя', 'последние', 'последние') +
+        ' ' + list.length + ' ' + plural (list.length, 'пачка', 'пачки', 'пачек') + (list.length >= MUSIC_HISTORY_LEN
+            ? ' (_MUSIC.history_len_: ' + MUSIC_HISTORY_LEN + ')' : '') + ':\n' + QSEP;
+    const shown = [];
+    let len = head.length, hidden = 0;
+    for (const e of list)
+    {
+        const what = (e.n > 1)
+            ? 'плейлист: ' + e.n + ' ' + plural (e.n, 'трек', 'трека', 'треков') +
+              (e.live ? ' (' + e.live + ' 🔴 ' + plural (e.live, 'эфир', 'эфира', 'эфиров') + ')' : '') +
+              ((e.titles || []).length ? ': ' + e.titles.join (', ') +
+                  (e.n > e.titles.length ? ' и ещё ' + (e.n - e.titles.length) : '') : '')
+            : (e.live ? 'эфир: ' : 'трек: ') + ((e.titles || [])[0] || 'без названия');
+        const line = '`' + stamp (e.at) + '` **' + (e.byName || 'без автора') + '** -- ' + what;
+        if (len + line.length + 2 > HISTORY_MSG_LIMIT)
+        {
+            hidden = list.length - shown.length;
+            break;
+        }
+        shown.push (line);
+        len += line.length + 1;
+    }
+    const tail = '\n' + QSEP + '\n_Один `/play` = одна пачка: кто, когда и что поставил.\n' +
+        'Очередь -- отдельно (`/queue`); тут остаётся и то, что уже доиграно или убрано.\n' +
+        (hidden ? 'Раньше -- ещё ' + hidden + ' ' + plural (hidden, 'пачка', 'пачки', 'пачек') +
+            ' (всего помню ' + MUSIC_HISTORY_LEN + ' -- ключ `MUSIC.history_len`).\n' : '') +
+        'Старое уходит само: помню последние ' + MUSIC_HISTORY_LEN + ' ' + plural (MUSIC_HISTORY_LEN, 'пачку', 'пачки', 'пачек') + '._';
+    return head + '\n' + shown.join ('\n') + tail;
+}
+
+// ============================================================================
 // [v2.24] ПРИСУТСТВИЕ бота -- ОТДЕЛЬНО от очереди.
 // Бот может сидеть в канале и без единого трека (/join «посидеть с ботом», /stop,
 // доигравшая очередь), и это состояние тоже должно переживать перезапуск: «сам он
@@ -8743,44 +8934,14 @@ function queueAuthorsText (m)
         (noAuthor ? (top.length ? ', ' : '') + 'без автора: ' + noAuthor : '');
 }
 
-// [v2.35] «КТО И КОГДА ЭТО ПОСТАВИЛ» -- история добавлений для /queue.
-// Зачем: в длинном плейлисте обычно несколько DJ, и надо видеть СВЕЖИЕ ВСТАВКИ --
-// кто, когда и сколько поставил, и на каких местах это лежит сейчас (номера -- те же,
-// что в /remove). Метка времени пишется каждому треку при добавлении (/play), один
-// заход = одна пачка (общая метка), поэтому читается как «20:02 Фантазёр -- 2 трека».
-// Показываем последние 4 пачки (свежие сверху): больше в сообщение просто не влезет,
-// а старое и так видно по «По авторам» и по самой очереди.
-function queueAddsText (m)
-{
-    const batches = new Map ();
-    let noStamp = 0;
-    m.tracks.forEach ((t, i) =>
-    {
-        const at = Number (t.addAt) || 0;
-        if (!at) { noStamp++; return; } // трек из старой версии -- метки у него нет
-        const key = byIdOf (t) + '@' + at;
-        let b = batches.get (key);
-        if (!b) { b = { name: byNameOf (t) || 'без автора', at: at, nums: [] }; batches.set (key, b); }
-        b.nums.push (i + 1);
-    });
-    if (!batches.size) return '';
-    const list = [...batches.values ()].sort ((a, b) => b.at - a.at).slice (0, 4);
-    const parts = list.map (b =>
-    {
-        const nums = b.nums.length > 3
-            ? b.nums.slice (0, 3).join (', ') + ' и ещё ' + (b.nums.length - 3)
-            : b.nums.join (', ');
-        return hhmm (b.at) + ' ' + b.name + ' -- ' + b.nums.length + ' ' +
-            plural (b.nums.length, 'трек', 'трека', 'треков') + ' (№' + nums + ')';
-    });
-    const older = batches.size - list.length;
-    return QSMALL + '🕘 Последние добавления: ' + parts.join ('; ') +
-        (older ? '; и ещё ' + older + ' ' + plural (older, 'пачка', 'пачки', 'пачек') + ' раньше' : '') +
-        (noStamp ? '; без отметки: ' + noStamp + ' (поставлены раньше, чем бот их начал писать)' : '');
-}
+// [v2.54] СТРОКА «Последние добавления» ИЗ /queue УБРАНА (просьба владельца). Её
+// работу забрала команда /history: там те же пачки, но полностью -- и треки, и эфиры,
+// и целые плейлисты со составом, и не только из текущей очереди (доигранное и убранное
+// тоже), и не 4 огрызка, а MUSIC.history_len пачек. Функция queueAddsText удалена
+// вместе со строкой -- её текст есть в истории git (v2.35–v2.53).
 
 // Сколько символов остаётся на СПИСОК: лимит минус шапка, «до конца очереди»,
-// история добавлений, подсказка и служебные строки. Считается по живым строкам, поэтому
+// подсказка и служебные строки. Считается по живым строкам, поэтому
 // бюджет один и тот же при отрисовке страницы и в queuePageOf (один и тот же m).
 function queueListBudget (m)
 {
@@ -8788,8 +8949,10 @@ function queueListBudget (m)
     // ВСЕГДА (раньше выбиралась по длине, и владелец видел «примечания то есть, то нет»).
     // Не влезает -- укорачивается САМ СПИСОК, а не справка (см. queueView).
     const chrome = queueHeadText (m).length + queueWaitText (m).length +
-        queueAuthorsText (m).length + queueAddsText (m).length + queueCheckText (m).length +
+        queueAuthorsText (m).length + queueCheckText (m).length +
         QUEUE_GLUE + queueHintText ().length;
+    // [v2.54] Истории добавлений в /queue больше нет -- её место в бюджете тоже убрано
+    // (проверяется стендом: на странице по-прежнему 15 треков).
     return Math.max (200, QUEUE_MSG_LIMIT - chrome);
 }
 
@@ -9759,14 +9922,15 @@ function queueView (m, start, moveSel = 0, opts = {})
           ' -- двигай его кнопками ниже; «✖ Вернуться» вернёт обычные кнопки очереди.'
         : '';
     const authors = queueAuthorsText (m);
-    const adds = queueAddsText (m); // [v2.35] кто и когда поставил (свежие вставки)
+    // [v2.54] Строки «Последние добавления» здесь больше нет: кто и когда ставил --
+    // в /history (см. historyText), а очередь остаётся только очередью.
     const check = queueCheckText (m); // [v2.43] итог проверки очереди заранее
     // [v2.32] Блоки разделены линией (QSEP): «Сейчас» / справка / «Очередь».
     // [v2.44] ПОРЯДОК: шапка -> справка (мелким) -> подсказка -> СПИСОК (он теперь
     // последний, вплотную к кнопкам: треки и управление видны на одном экране).
     const build = hint => queueHeadText (m) +
         '\n' + QSEP + '\n' +
-        [check, authors, adds, queueWaitText (m), move, hint].filter (Boolean).join ('\n') +
+        [check, authors, queueWaitText (m), move, hint].filter (Boolean).join ('\n') +
         '\n' + QSEP +
         '\n**Очередь (' + total + ')**' + (page.start > 1 ? ' · с №' + page.start : '') + ':\n' + page.list +
         (restNow () > 0 ? '\n*...и ещё ' + restNow () + ': `/queue from:' + (page.start + page.count) + '`*' : '');
@@ -9837,6 +10001,13 @@ async function resumeMusic (server)
                     '» -- бот сидел там до перезапуска' +
                     (_h ? '' : ' (живых слушателей нет)'));
         }
+        // --- 2а) ИСТОРИЯ ДОБАВЛЕНИЙ [v2.54] ---
+        // Читаем ДО очереди и не выходим раньше времени: история живёт своей жизнью
+        // (очередь могла доиграть или быть стёрта /stop, а добавления помним).
+        await historyLoad (server);
+        if (Array.isArray (m.history) && m.history.length)
+            console.log ('[' + (d()) + '] [music] история добавлений: ' + m.history.length + ' ' +
+                plural (m.history.length, 'пачка', 'пачки', 'пачек') + ' с прошлого запуска -- /history');
         // --- 2) ОЧЕРЕДЬ с прошлого запуска ---
         let saved = await db (server, 'musicState', 'queue');
         if (!saved) return;
@@ -9849,6 +10020,9 @@ async function resumeMusic (server)
         // всегда в начало: если DJ переставил его через /move, порядок сохраняется
         const at = Math.min (Math.max (0, Math.round (saved.curIdx || 0)), tracks.length);
         m.tracks = current ? [...tracks.slice (0, at), current, ...tracks.slice (at)] : tracks;
+        // [v2.54] очередь на месте -- самое время один раз перенести её пачки в историю
+        // (если настоящей истории ещё нет: первое обновление на этой версии)
+        await historySeedFromQueue (server);
         m.seekTrack = current;   // этому треку playNext попробует сдвиг на elapsed
         m.seekSec = Math.max (0, Math.round (saved.elapsed || 0));
         // уже вернулись в канал (присутствие выше) -- значит точно не «выходили по /leave»
@@ -11163,6 +11337,12 @@ const musicCommands =
     new SlashCommandBuilder ()
         .setName ('nowplaying')
         .setDescription ('Что играет сейчас: трек, позиция, кто поставил и что дальше'),
+    // [v2.54] /history -- кто, когда и что ставил (треки, эфиры и целые плейлисты).
+    // Смотреть может каждый, как /queue: это информация, а не действие.
+    // Сколько пачек помнить -- ключ MUSIC.history_len (по умолчанию 25).
+    new SlashCommandBuilder ()
+        .setName ('history')
+        .setDescription ('История добавлений: кто, когда и что поставил (треки, эфиры, плейлисты)'),
     new SlashCommandBuilder ()
         .setName ('leave')
         .setDescription ('Отложить свои треки и играть чужое; из канала выхожу, если играть нечего'),
@@ -12062,14 +12242,14 @@ client.on ('interactionCreate', async (interaction) =>
             '\nСохрани его отдельно от config.json -- без него записи базы не читаются. Перезапуск не нужен.');
     }
     // [v2.32] seek -- в том же списке, что музыка (проверка прав ниже общая)
-    if (!['play','join','stop','skip','pause','resume','seek','queue','nowplaying','leave','remove','clear','jump','move','push'].includes (name)) return;
+    if (!['play','join','stop','skip','pause','resume','seek','queue','nowplaying','history','leave','remove','clear','jump','move','push'].includes (name)) return;
     const guildId = interaction.guildId;
     const m = musicOf (guildId);
 
     try
     {
-        // DJ-проверка (смотреть /queue и /nowplaying может каждый):
-        if (name !== 'queue' && name !== 'nowplaying' && !isDJ (interaction))
+        // DJ-проверка (смотреть /queue, /nowplaying и /history может каждый):
+        if (name !== 'queue' && name !== 'nowplaying' && name !== 'history' && !isDJ (interaction))
         {
             let role_dj = SERVERS[guildId].role_dj || '';
             return interaction.reply ({ content: '🚫 Музыка только для ' + (role_dj ? '<@&' + role_dj + '>' : 'DJ'), flags: MessageFlags.Ephemeral });
@@ -12163,6 +12343,19 @@ client.on ('interactionCreate', async (interaction) =>
             scheduleDeadScan (guildId);    // [v2.41] свежая пачка -- сразу проверим, что в ней играется
             if (!shouldStart) startPreload (guildId); // [v2.9] уже играет что-то -- готовим следующий
             saveMusicState (guildId);             // [v2.10] очередь -- на диск
+            // [v2.54] ...и НАВСЕГДА в историю добавлений (одна запись на один /play):
+            // кто, когда и что поставил -- трек, эфир или плейлист. В /queue этой строки
+            // больше нет (просьба владельца), и историю не трогают /stop и /clear.
+            historyAdd (guildId,
+            {
+                at: addedAt,
+                byId: interaction.user.id,
+                byName: interaction.user.username,
+                inCh: interaction.channelId,
+                n: tracks.length,
+                live: tracks.filter (t => t.isLive).length,
+                titles: tracks.map (t => t.title || t.url || ''),
+            }).catch (e => console.error ('[music] история добавлений: ' + oneLine ((e && e.message) || e)));
             await interaction.editReply
             (
                 '🎶 Добавлено: **' + (tracks[0].title || query) + '**' +
@@ -12377,6 +12570,14 @@ client.on ('interactionCreate', async (interaction) =>
             // [v2.44] Короткая карточка вместо целой очереди: что звучит, откуда,
             // сколько слушает и что будет дальше. Доступна всем (без DJ).
             return interaction.reply (nowPlayingText (m, guildId));
+        }
+        else if (name === 'history')
+        {
+            // [v2.54] Кто, когда и что ставил -- треки, эфиры и целые плейлисты.
+            // История живёт ОТДЕЛЬНО от очереди (musicState/history) и переживает и
+            // доигранное, и /stop, и перезапуск (см. historyLoad/historyAdd).
+            await historyLoad (guildId);   // с прошлого запуска могло остаться в базе
+            return interaction.reply (historyText (guildId));
         }
         else if (name === 'queue')
         {
