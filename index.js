@@ -5,6 +5,22 @@
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
+// CHANGELOG v2.61 (/jump: прерванный трек -- следующим; автор ссылкой; видно самообновление):
+//   * /JUMP: ПРЕРВАННЫЙ ТРЕК ИДЁТ СЛЕДУЮЩИМ (просьба владельца: «старый перекидывает В
+//     КОНЕЦ, хотя я говорил НАОБОРОТ в начало очереди»). Срочный переход: цель играет
+//     сразу, а прерванный встаёт сразу за ней -- заиграет следующим, с того же места;
+//     то, что стояло до цели, уходит в конец (ничего не теряется).
+//   * ВТОРОЙ ВАРИАНТ ТЕПЕРЬ СПРАШИВАЕТСЯ: не указал `mode` в команде -- бот отвечает
+//     двумя кнопками («⏭ Срочный переход» / «✂ Обрезать до трека»), а не молча прыгает.
+//     Логика одна -- jumpMusic, поэтому слэш-команда и кнопки не разъедутся.
+//   * АВТОР В ОЧЕРЕДИ -- ССЫЛКОЙ НА ПРОФИЛЬ (упоминание), а не голым ником: по нику
+//     нельзя ни написать, ни открыть профиль. Пингов нет: сообщение /queue и все его
+//     правки идут с allowedMentions: { parse: [] }. У треков старой базы id нет -- там
+//     остаётся ник.
+//   * САМООБНОВЛЕНИЕ /queue СТАЛО ВИДИМЫМ. У прямого эфира не менялось НИЧЕГО (у него
+//     нет позиции), и сообщение казалось мёртвым -- теперь у эфира есть `🔴 в эфире
+//     MM:SS`. При старте -- строка, включено ли самообновление и как часто; первая
+//     самоправка пишется в лог одной строкой (дальше молча -- 60 строк в час это спам).
 // CHANGELOG v2.60 (прокси может быть несколько -- обрыв одного не тушит музыку):
 //   * ВОПРОС ВЛАДЕЛЬЦА: «нет разве публичных прокси, которые бы всегда работали, не
 //     скрывая IP, а только выступая как DNS?» Короткий ответ -- НЕТ: SOCKS/HTTP прокси
@@ -6971,6 +6987,11 @@ if (MUSIC_QUEUE_CHECK && QUEUE_CHECK_DEPTH)
         ' трека -- сразу через yt-dlp, остальные -- дешёвым oEmbed)');
 else
     console.log ('[' + (d()) + '] [music] проверка очереди заранее: выключена (MUSIC.queue_check) -- мёртвые видео узнаём, когда трек подходит к эфиру');
+// [v2.61] Одна строка при старте: обновляется ли сообщение /queue само и как часто.
+// Раньше про это молчали, и «не обновляется» ничем не отличалось от «выключено».
+console.log ('[' + (d()) + '] [music] живое сообщение /queue: ' + (QUEUE_LIVE_MS
+    ? 'обновляю сам каждые ' + Math.round (QUEUE_LIVE_MS / 1000) + ' с, пока его видят (MUSIC.queue_live_ms)'
+    : 'самообновление выключено (MUSIC.queue_live_ms: 0) -- освежается листанием или кнопкой «🔄 Обновить»'));
 // [v2.23] Одна строка при старте о том, как бот ходит на YouTube: видно, что ключ
 // MUSIC.proxy действительно подхватился (промах в этом месте раньше не был заметен).
 console.log ('[' + (d()) + '] [music] YouTube: ' + (MUSIC_PROXY
@@ -9007,7 +9028,8 @@ function authorBlockInsertAt (tracks, byId)
 // читалось как «автор неизвестен», и непонятно было, почему трек нельзя тронуть.
 function byLabel (t)
 {
-    return ' · 👤 ' + byNameOf (t);
+    // [v2.61] Тот же переход на ссылку-упоминание, что и в списке очереди (queueLines).
+    return byIdOf (t) ? ' · ' + u (byIdOf (t)) : ' · 👤 ' + byNameOf (t);
 }
 
 // сколько миллисекунд играет текущий трек (пауза не считается):
@@ -9468,8 +9490,8 @@ const QUEUE_HINT_FULL =
     ' свой трек (у админов и модеров -- любой).' + '\n' +
     QSMALL + 'Подвинуть -- выбери трек в меню ниже (выше/ниже, в начало, в конец' +
     ' или «На позицию…»), либо командой /move номер to номер.' + '\n' +
-    QSMALL + 'Прыгнуть по очереди -- /jump (админы и модеры): по умолчанию срочный' +
-    ' переход (прерванный трек -- в конец очереди), либо «Обрезать до трека» (всё до него убрать).' + '\n' +
+    QSMALL + 'Прыгнуть по очереди -- /jump (админы и модеры): срочный переход (прерванный' +
+    ' трек заиграет следующим, с того же места) либо «Обрезать до трека» (всё до него убрать).' + '\n' +
     QSMALL + 'Чистить -- /clear (остаться) или /stop (уйти): спросят подтверждение.' + '\n' +
     QSMALL + 'DJ распоряжается только своими треками (и ставит их только на свои же' +
     ' места), админы и модеры -- любыми.';
@@ -9549,8 +9571,14 @@ function queueLines (slice, start, titleClip)
         // читалось как «трек ничей»: видно одно «👤 Фантазёр», а рядом пять строк без
         // хозяина. Теперь имя есть всегда (для бюджета сжимаем длинный ник, названия
         // треков при нехватке места всё равно укорачиваются -- треки не выбрасываем).
+        // [v2.61] АВТОР -- ССЫЛКОЙ НА ПРОФИЛЬ (упоминание), а не голым ником: по нику
+        // нельзя ни написать человеку, ни открыть профиль (просьба владельца). У треков
+        // старой базы id нет -- у них остаётся ник. Пингов это не вызывает: сообщение
+        // очереди отправляется и правится с allowedMentions: { parse: [] }.
+        const byId = byIdOf (t);
         const by = byNameOf (t);
-        const label = by ? ' · 👤 ' + clipText (by, 24) : '';
+        const label = byId ? ' · ' + u (byId)
+            : (by ? ' · 👤 ' + clipText (by, 24) : '');
         // [v2.32] Номер -- в косых кавычках (`12`), а не «12.»: Discord принимает «12.»
         // за начало markdown-СПИСКА и сам переформатирует строки (первый пункт «уезжал»
         // от остальных и в логе, и на экране). В кавычках номер ровный, моноширинный,
@@ -10085,6 +10113,93 @@ function queueClearConfirm (m, actorId, staff, opts = {})
     };
 }
 
+// ============================================================================
+// [v2.61] /jump -- ДВА ВАРИАНТА ПЕРЕХОДА, и логика одна на слэш-команду и на кнопки
+// подтверждения (чтобы поведение не разъезжалось, как уже бывало с подсказками).
+//   * urgent (по умолчанию) -- СРОЧНЫЙ ПЕРЕХОД: цель играет сразу, а прерванный трек
+//     встаёт В НАЧАЛО оставшейся очереди -- то есть заиграет СЛЕДУЮЩИМ, с того же
+//     места. Раньше он уезжал в КОНЕЦ, хотя владелец просил именно «следующим».
+//     То, что стояло до цели, отправляется в конец (ничего не выбрасывается).
+//   * cut -- ОБРЕЗАТЬ ДО ТРЕКА: всё до цели и прерванный убираются насовсем (это
+//     и есть чистка одним движением -- поэтому только staff).
+// ============================================================================
+function jumpMusic (guildId, n, cut)
+{
+    const m = $music[guildId];
+    if (!m || !m.tracks.length || !Number.isInteger (n) || n < 1 || n > m.tracks.length)
+        return {
+            ok: false,
+            text: (m && m.tracks.length)
+                ? '🤔 В очереди ' + m.tracks.length + ' треков -- номер от 1 до ' + m.tracks.length + '.'
+                : '🈳 В очереди нет треков (играет только текущий).',
+        };
+    if (cut)
+    {
+        const gone = m.tracks.splice (0, n - 1);
+        const wasCut = m.current;
+        dropPreload (m);
+        const targetCut = m.tracks[0];
+        const cutTxt = (gone.length ? gone.length + ' ' + plural (gone.length, 'трек', 'трека', 'треков') + ' до него' : '') +
+            (gone.length && wasCut ? ' и ' : '') + (wasCut ? 'прерванный **' + (wasCut.title || 'трек') + '**' : '');
+        console.log ('[' + (d()) + '] [music] обрезал очередь до №' + n + ': ' + (targetCut.title || 'трек') +
+            (cutTxt ? ' (убрано насовсем: ' + cutTxt + ')' : ''));
+        if (wasCut) { m.skipRequested = true; m.player.stop (true); }
+        else playNext (guildId);
+        return {
+            ok: true,
+            text: '✂ Обрезал до №' + n + ': **' + (targetCut.title || 'трек') + '**' +
+                (cutTxt ? '\n_Убрано насовсем: ' + cutTxt + '._' : ''),
+        };
+    }
+    const before = m.tracks.splice (0, n - 1);   // всё, что стояло до цели
+    const was = m.current;                       // что играло -- его не выбрасываем
+    const wasAt = was ? Math.max (0, Math.round (playedMsOf (m) / 1000)) : 0;
+    if (was)
+    {
+        // [v2.61] Прерванный трек -- В НАЧАЛО оставшейся очереди (сразу за целью),
+        // чтобы заиграть СЛЕДУЮЩИМ и с того же места. Раньше уезжал в конец.
+        was.seek = wasAt;
+        m.tracks.splice (1, 0, was);
+    }
+    if (before.length) m.tracks.push (...before);
+    dropPreload (m);
+    const target = m.tracks[0];
+    const movedTxt = (before.length ? before.length + ' ' + plural (before.length, 'трек', 'трека', 'треков') + ' до него' : '') +
+        (before.length && was ? ' и ' : '') + (was ? 'прерванный **' + (was.title || 'трек') + '** (с ' + fmtDur (wasAt) + ')' : '');
+    console.log ('[' + (d()) + '] [music] срочный переход к №' + n + ': ' + (target.title || 'трек') +
+        (was ? ' (прерванный ' + (was.title || 'трек') + ' -- следующим, с ' + fmtDur (wasAt) + ')' : '') +
+        (before.length ? ' (в конец очереди: ' + before.length + ' до него)' : ''));
+    if (was) { m.skipRequested = true; m.player.stop (true); } // Idle-хэндлер запустит то, к чему прыгнули
+    else playNext (guildId);
+    return {
+        ok: true,
+        text: '⏭ Перехожу к №' + n + ': **' + (target.title || 'трек') + '**' +
+            (was ? '\n_Прерванный трек заиграет следующим, с ' + fmtDur (wasAt) + '._' : '') +
+            (before.length ? '\n_То, что стояло до него (' + before.length + ' ' + plural (before.length, 'трек', 'трека', 'треков') + '), перенёс в конец очереди._' : '') +
+            (!was && !before.length ? '' : '') +
+            '\n_Убрать всё до него насовсем -- вариант «Обрезать до трека»._',
+    };
+}
+
+// Подтверждение выбора, когда вариант в команде не указан: «срочно» и «обрезать»
+// -- это разные последствия (одно ничего не теряет, второе чистит), поэтому спрашиваем.
+function jumpConfirm (n)
+{
+    const cancel = new ButtonBuilder ()
+        .setCustomId ('q:jp:x').setLabel ('✖ Отмена').setStyle (ButtonStyle.Secondary);
+    return {
+        text: '⏭ **Перейти к №' + n + '?** Что сделать с тем, что стоит до него:\n' +
+            '• **Срочный переход** -- цель играет сразу, а прерванный трек встанет **следующим** (с того же места); остальное -- в конец очереди, ничего не теряется.\n' +
+            '• **Обрезать до трека** -- всё до цели (и прерванный) уйдёт **насовсем**.',
+        rows: [new ActionRowBuilder ().addComponents
+        (
+            new ButtonBuilder ().setCustomId ('q:jp:u:' + n).setLabel ('⏭ Срочный переход').setStyle (ButtonStyle.Primary),
+            new ButtonBuilder ().setCustomId ('q:jp:c:' + n).setLabel ('✂ Обрезать до трека').setStyle (ButtonStyle.Danger),
+            cancel
+        )],
+    };
+}
+
 function queueClear (guildId, who, opts = {})
 {
     const leave = !!opts.leave;
@@ -10405,8 +10520,12 @@ function queueHeadText (m)
 {
     if (m.current)
     {
-        const pos = m.current.isLive ? '' :
-            (m.current.duration > 0
+        // [v2.61] У ПРЯМОГО ЭФИРА ПОЗИЦИИ НЕТ, но есть «сколько уже слушаем» -- и это
+        // ещё и делает самообновление /queue заметным: у эфира раньше не менялось НИЧЕГО,
+        // и сообщение казалось «неживым» (владелец: «что-то не особо сам обновляется»).
+        const pos = m.current.isLive
+            ? ' `🔴 в эфире ' + fmtDur (Math.floor (playedMsOf (m) / 1000)) + '`'
+            : (m.current.duration > 0
                 ? ' `' + fmtDur (Math.min (Math.floor (playedMsOf (m) / 1000), m.current.duration)) + ' / ' + fmtDur (m.current.duration) + '`'
                 : '');
         return '🎵 **Сейчас:** ' + (m.current.isLive ? '🔴 ' : '') + '**' + (m.current.title || 'трек') + '**' + pos +
@@ -10582,8 +10701,9 @@ function queueView (m, start, moveSel = 0, opts = {})
 //     обычный вид очереди (w.move);
 //   * когда очередь доиграла совсем, делается ОДНА финальная правка и бот забывает
 //     сообщение (m.qMsg = null) -- дальше в этом канале нет ни правок, ни запросов;
-//   * сообщение удалили/нет прав (10008 и прочее) -- молча перестаём его вести;
-//   * 0 в конфиге выключает самообновление целиком (таймер даже не заводится).
+//   * сообщение удалили/нет прав (10008 и прочее) -- молча перестаём его вести;//     * 0 в конфиге выключает самообновление целиком (таймер даже не заводится).
+// Первая самоправка пишется в лог одной строкой -- по ней видно, что оно действительно
+// работает (дальше молча: 60 строк в час -- это уже спам, а не лог событий).
 // ============================================================================
 const QUEUE_LIVE_STEP = 5000;   // как часто проверяем, кому пора обновиться (5 с)
 
@@ -10593,7 +10713,8 @@ function queueWatch (m, msg, ctx, page, text, move)
 {
     if (!QUEUE_LIVE_MS || !m || !msg || !msg.id) return;
     m.qMsg = { ch: msg.channelId, id: msg.id, ctx: ctx, page: Math.max (1, Number (page) || 1),
-               text: String (text || ''), move: Math.max (0, Number (move) || 0), at: Date.now () };
+               text: String (text || ''), move: Math.max (0, Number (move) || 0), at: Date.now (),
+               first: true };   // [v2.61] первая самоправка пишется в лог -- видно, что оно работает
 }
 
 // Восстановить живое сообщение из записи в базе (переживает перезапуск). Текст не
@@ -10629,9 +10750,11 @@ async function queueLiveTick (guildId)
         const ch = client.channels.cache.get (w.ch) || await client.channels.fetch (w.ch).catch (() => null);
         if (!ch) { m.qMsg = null; return; }
         const msg = await ch.messages.fetch (w.id);
-        await msg.edit (view.components.length
-            ? { content: content, components: view.components }
-            : { content: content });
+        await msg.edit (Object.assign (
+            view.components.length ? { content: content, components: view.components } : { content: content },
+            { allowedMentions: { parse: [] } }));   // [v2.61] авторы -- ссылками, без пингов
+        // [v2.61] Первую самоправку видно в логе (дальше -- молча, иначе было бы 60 строк в час).
+        if (w.first) { w.first = false; console.log ('[' + (d()) + '] [music] сообщение /queue обновил сам (стр. ' + w.page + ')'); }
         w.text = content;
         if (empty) m.qMsg = null;         // финальный вид показали -- больше не правим
     }
@@ -11915,10 +12038,10 @@ const musicCommands =
         // насовсем (это и есть «чистка», только одним движением).
         .addStringOption (o =>
             o.setName ('mode')
-             .setDescription ('Что делать с тем, что стояло до него (без ответа -- срочный переход)')
-             .addChoices (
-                 { name: 'Срочный переход -- прерванный трек в конец очереди', value: 'urgent' },
-                 { name: 'Обрезать до трека -- всё до него убрать насовсем', value: 'cut' })),
+            .setDescription ('Что делать с тем, что стояло до него (без ответа -- спрошу кнопками)')
+            .addChoices (
+                { name: 'Срочный переход -- прерванный трек заиграет следующим', value: 'urgent' },
+                { name: 'Обрезать до трека -- всё до него убрать насовсем', value: 'cut' })),
     // [v2.32] /seek -- перейти к другому месту ВНУТРИ текущего трека (у DJ были
     // только «следующий» и «прыжок по очереди», а перемотать было нечем).
     new SlashCommandBuilder ()
@@ -12134,7 +12257,7 @@ client.on ('interactionCreate', async (interaction) =>
             {
                 const view0 = queueView (m0, page0, 0, ctx0);
                 if (interaction.message && typeof interaction.message.edit === 'function')
-                    interaction.message.edit ({ content: view0.content, components: view0.components }).catch (() => {});
+                    interaction.message.edit ({ content: view0.content, components: view0.components, allowedMentions: { parse: [] } }).catch (() => {});
             }, 1500);
             return interaction.reply ({ content: res0.text, flags: MessageFlags.Ephemeral });
         }
@@ -12158,7 +12281,7 @@ client.on ('interactionCreate', async (interaction) =>
         const view2 = queueView (m, queuePageOf (m, res.to), res.to,
             { actorId: interaction.user.id, actorName: who, staff: staff2 });
         if (interaction.message && typeof interaction.message.edit === 'function')
-            await interaction.message.edit ({ content: view2.content, components: view2.components }).catch (() => {});
+            await interaction.message.edit ({ content: view2.content, components: view2.components, allowedMentions: { parse: [] } }).catch (() => {});
         return interaction.reply ({ content: res.text, flags: MessageFlags.Ephemeral });
     }
     if (interaction.isButton () || interaction.isStringSelectMenu ())
@@ -12183,7 +12306,7 @@ client.on ('interactionCreate', async (interaction) =>
         const replyView = async (at = page, moveSel = 0) =>
         {
             const view = queueView (m, at, moveSel, ctx);
-            await interaction.update ({ content: view.content, components: view.components });
+            await interaction.update ({ content: view.content, components: view.components, allowedMentions: { parse: [] } });
             // [v2.57] ...и запоминаем, ЧТО именно сейчас показано и на какой странице:
             // иначе самообновление вернуло бы сообщение на первую страницу, а в режиме
             // переноса -- перерисовало бы меню прямо под руками (moveSel != 0 -- стоп).
@@ -12207,6 +12330,24 @@ client.on ('interactionCreate', async (interaction) =>
                     { content: '📜 Эту очередь открыл другой человек -- вызови `/queue` сам.', flags: MessageFlags.Ephemeral }
                 );
             return replyView (parseInt (mPage[2], 10) || 1);
+        }
+        // [v2.61] ПОДТВЕРЖДЕНИЕ /jump: вариант не указали в команде -- спрашиваем кнопками.
+        // Права те же, что у самой команды (прыжок перебивает чужую музыку -- только staff),
+        // поэтому ветка стоит ДО общего гейта «только DJ»: staff без роли DJ тоже должен смочь.
+        const mJp = /^q:jp:(x|u|c)(?::(\d+))?$/.exec (cid);
+        if (mJp)
+        {
+            if (mJp[1] === 'x')
+                return interaction.update ({ content: '✖ Прыжок отменён -- очередь на месте.', components: [] });
+            if (!staff)
+                return interaction.reply
+                ({
+                    content: '🚫 Прыжок доступен админам и модерам -- он перебивает то, что играет.\n' +
+                        '_Свой трек можно поднять -- `/push` или «⬆ Поднять» в меню автора под `/queue`._',
+                    flags: MessageFlags.Ephemeral,
+                });
+            const res = jumpMusic (guildId, parseInt (mJp[2], 10) || 0, mJp[1] === 'c');
+            return interaction.update ({ content: (res.ok ? '' : '⚠️ ') + res.text, components: [] });
         }
         // --- действия: как и слэш-команды, только для админов/модеров и роли DJ ---
         // [v2.44] mt/mb/mp -- «⏫ В начало», «⏬ В конец», «#️⃣ На позицию…». Их в списке
@@ -12347,7 +12488,7 @@ client.on ('interactionCreate', async (interaction) =>
                     staff: isStaffInteraction ({ guildId: interaction.guildId, member: opener }),
                 };
                 const view = queueView (m, 1, 0, oCtx);
-                await src.edit ({ content: view.content, components: view.components }).catch (() => {});
+                await src.edit ({ content: view.content, components: view.components, allowedMentions: { parse: [] } }).catch (() => {});
             }
         };
         // [v2.31] Подтверждение чистки -- общее для кнопок «🧹 Очистить» и «⏹ Стоп»:
@@ -13209,47 +13350,17 @@ client.on ('interactionCreate', async (interaction) =>
                         '_Свой трек можно поднять -- `/push` или «⬆ Поднять» в меню автора под `/queue`; один трек пропускается кнопкой «⏭ Пропустить»._',
                     flags: MessageFlags.Ephemeral,
                 });
-            // [v2.56] ОБРЕЗАТЬ (второй вариант, mode: «Обрезать до трека») = прежнее
-            // поведение /jump: всё до цели уходит НАСОВСЕМ (вместе с прерванным).
-            // Срочный переход (по умолчанию) ничего не теряет -- см. ниже.
-            const cut = interaction.options.getString ('mode') === 'cut';
-            if (cut)
+            // [v2.61] ВАРИАНТ МОЖНО ВЫБРАТЬ В САМОЙ КОМАНДЕ, а если не выбрал -- СПРАШИВАЕМ
+            // кнопками (владелец: «а второй вариант вообще не спросило»). Логика одна --
+            // jumpMusic, поэтому слэш-команда и кнопки не разъедутся.
+            const mode = interaction.options.getString ('mode');
+            if (!mode)
             {
-                const gone = m.tracks.splice (0, n - 1);
-                const wasCut = m.current;
-                dropPreload (m);
-                const targetCut = m.tracks[0];
-                const cutTxt = (gone.length ? gone.length + ' ' + plural (gone.length, 'трек', 'трека', 'треков') + ' до него' : '') +
-                    (gone.length && wasCut ? ' и ' : '') + (wasCut ? 'прерванный **' + (wasCut.title || 'трек') + '**' : '');
-                console.log ('[' + (d()) + '] [music] обрезал очередь до №' + n + ': ' + (targetCut.title || 'трек') +
-                    (cutTxt ? ' (убрано насовсем: ' + cutTxt + ')' : ''));
-                if (wasCut) { m.skipRequested = true; m.player.stop (true); }
-                else playNext (guildId);
-                return interaction.reply ('✂ Обрезал до №' + n + ': **' + (targetCut.title || 'трек') + '**' +
-                    (cutTxt ? '\n_Убрано насовсем: ' + cutTxt + '._' : ''));
+                const c = jumpConfirm (n);
+                return interaction.reply ({ content: c.text, components: c.rows, flags: MessageFlags.Ephemeral });
             }
-            const before = m.tracks.splice (0, n - 1); // всё, что стояло до цели
-            const was = m.current;                     // что играло (его не выбрасываем)
-            const wasAt = was ? Math.max (0, Math.round (playedMsOf (m) / 1000)) : 0;
-            if (was)
-            {
-                // [v2.36] Прерванный трек не выбрасываем и место в нём не теряем:
-                // он уезжает в конец очереди с той же секундой (как у /leave).
-                was.seek = wasAt;
-                m.tracks.push (...before, was);
-            }
-            else if (before.length) m.tracks.push (...before);
-            dropPreload (m);
-            const target = m.tracks[0];
-            const movedTxt = (before.length ? before.length + ' ' + plural (before.length, 'трек', 'трека', 'треков') + ' до него' : '') +
-                (before.length && was ? ' и ' : '') + (was ? 'прерванный **' + (was.title || 'трек') + '** (с ' + fmtDur (wasAt) + ')' : '');
-            console.log ('[' + (d()) + '] [music] прыжок к №' + n + ': ' + (target.title || 'трек') +
-                (movedTxt ? ' (перенёс в конец очереди: ' + movedTxt + ')' : ''));
-            if (was) { m.skipRequested = true; m.player.stop (true); } // [v2.30] прыжок -- не обрыв; Idle-хэндлер запустит то, к чему прыгнули
-            else playNext (guildId);
-            return interaction.reply ('⏭ Перехожу к №' + n + ': **' + (target.title || 'трек') + '**' +
-                (movedTxt ? '\n_Ничего не выброшено: ' + movedTxt + ' -- в конце очереди (вернуть -- `/move`)._' : '') +
-                '\n_Убрать всё до него насовсем -- тот же `/jump` с вариантом «Обрезать до трека»._');
+            const res = jumpMusic (guildId, n, mode === 'cut');
+            return interaction.reply (res.ok ? res.text : { content: res.text, flags: MessageFlags.Ephemeral });
         }
         else if (name === 'skip')
         {
@@ -13348,7 +13459,7 @@ client.on ('interactionCreate', async (interaction) =>
                     view.components.length
                         ? { content: view.content, components: view.components }
                         : { content: view.content },
-                    { withResponse: true }
+                    { withResponse: true, allowedMentions: { parse: [] } }
                 )
             );
             const sentMsg = (sent && sent.resource && sent.resource.message) || null;
