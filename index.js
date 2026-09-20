@@ -9568,7 +9568,8 @@ const QUEUE_HINT_FULL =
     ' свой трек (у админов и модеров -- любой).' + '\n' +
     QSMALL + 'Подвинуть -- выбери трек в меню ниже (выше/ниже, в начало, в конец' +
     ' или «На позицию…»), либо командой /move номер to номер.' + '\n' +
-    QSMALL + 'Прыгнуть по очереди -- /jump: DJ -- по своим трекам, админы и модеры -- любым.' +
+    QSMALL + 'Прыгнуть по очереди -- /jump или кнопка «⤴ Перепрыгнуть» (список треков):' +
+    ' DJ -- по своим, админы и модеры -- любым.' +
     ' Срочный переход (прерванный трек заиграет следующим, с того же места) либо «Обрезать до трека»' +
     ' (всё до него убрать -- DJ только если всё убираемое его).' + '\n' +
     QSMALL + 'Чистить -- /clear (остаться) или /stop (уйти): спросят подтверждение.' + '\n' +
@@ -10330,6 +10331,28 @@ function jumpConfirm (n)
             cancel
         )],
     };
+}
+
+// [v2.66] СПИСОК ТРЕКОВ ДЛЯ «ПЕРЕПРЫГНУТЬ» -- вместо окна с номером (просьба владельца:
+// «в перепрыгнуть вместо номера выводится список треков, и нашим и вашим»). Номера --
+// те же, что в /queue. Обычному DJ показываем только его треки (jumpGuard всё равно
+// откажет по чужому), staff -- любые; не больше 25 -- лимит меню Discord.
+function jumpPickerRows (m, actorId, staff)
+{
+    const opts = [];
+    for (let i = 0; i < m.tracks.length && opts.length < 25; i++)
+    {
+        const t = m.tracks[i];
+        if (!t) continue;
+        if (!staff && !isBy (t, actorId)) continue;
+        opts.push ({ label: ('№' + (i + 1) + ' · ' + (t.title || 'трек')).slice (0, 100), value: String (i + 1) });
+    }
+    if (!opts.length) return null;
+    const sel = new StringSelectMenuBuilder ()
+        .setCustomId ('q:jsel')
+        .setPlaceholder (staff ? '⤴ Перепрыгнуть к треку…' : '⤴ Перепрыгнуть к своему треку…');
+    sel.addOptions (opts);
+    return [new ActionRowBuilder ().addComponents (sel)];
 }
 
 function queueClear (guildId, who, opts = {})
@@ -12165,9 +12188,9 @@ const musicCommands =
              .setMinValue (1)
              .setRequired (true))
         // [v2.56] ДВА ВАРИАНТА ПЕРЕХОДА. По умолчанию -- «срочный»: ничего не теряется,
-        // прерванный трек уезжает в конец очереди вместе с местом в нём. Второй --
-        // «обрезать до трека»: прежнее поведение /jump, когда всё до цели убирается
-        // насовсем (это и есть «чистка», только одним движением).
+        // прерванный трек [v2.63] встаёт СРАЗУ ЗА целью (заиграет следующим, с того же
+        // места), а остальная очередь не двигается. Второй -- «обрезать до трека»:
+        // всё до цели убирается насовсем (это и есть «чистка», только одним движением).
         .addStringOption (o =>
             o.setName ('mode')
             .setDescription ('Что делать с тем, что стояло до него (без ответа -- спрошу кнопками)')
@@ -12393,24 +12416,9 @@ client.on ('interactionCreate', async (interaction) =>
             }, 1500);
             return interaction.reply ({ content: res0.text, flags: MessageFlags.Ephemeral });
         }
-        // [v2.62] ОКНО ВВОДА НОМЕРА ДЛЯ «⏭ Перепрыгнуть»: число проверили -- дальше тот же
-        // jumpConfirm, что и у /jump (срочный переход или обрезка), и те же требования к
-        // правам (jumpGuard).
-        if (interaction.customId === 'q:jumpm')
-        {
-            const mJ = musicOf (guildId);
-            const to = parseInt (String (interaction.fields.getTextInputValue ('pos') || '').replace (/\D+/g, ''), 10);
-            if (!Number.isInteger (to) || to < 1 || to > mJ.tracks.length)
-                return interaction.reply
-                ({
-                    content: mJ.tracks.length
-                        ? '🤔 В очереди ' + mJ.tracks.length + ' треков -- номер от 1 до ' + mJ.tracks.length + '.'
-                        : '🈳 В очереди нет треков.',
-                    flags: MessageFlags.Ephemeral,
-                });
-            const c = jumpConfirm (to);
-            return interaction.reply ({ content: c.text, components: c.rows, flags: MessageFlags.Ephemeral });
-        }
+        // [v2.66] Окно ввода номера для «⤴ Перепрыгнуть» (q:jumpm) убрано: теперь у кнопки
+        // СПИСОК треков (jumpPickerRows -> q:jsel), номер набирать не нужно. Ветка удалена
+        // целиком, чтобы не осталось недостижимого кода.
         const mMpos = /^q:mpos:(\d+)$/.exec (interaction.customId || '');
         if (!mMpos) return;
         const m = musicOf (guildId);
@@ -12498,7 +12506,7 @@ client.on ('interactionCreate', async (interaction) =>
         // не было, и нажатие молча уходило в return: Discord показывал «взаимодействие
         // не удалось», а перенос кнопками не работал (при этом /move работал -- это и
         // сбивало с толку). Теперь все три пути перестановки разрешены одинаково.
-        if (!/^q:(skip|join|leave|clear|stop|da|dau|dax|dx|cq|rm|mv|mt|mb|mp|mu|md|mx|s|sk|tr|rx|jmp)(:|$)/.test (cid)) return;
+        if (!/^q:(skip|join|leave|clear|stop|da|dau|dax|dx|cq|rm|mv|mt|mb|mp|mu|md|mx|s|sk|tr|rx|jmp|jsel)(:|$)/.test (cid)) return;
         if (!isDJ (interaction))
         {
             const role_dj = SERVERS[guildId].role_dj || '';
@@ -12511,28 +12519,36 @@ client.on ('interactionCreate', async (interaction) =>
             );
         }
         const who = interaction.member ? uuu (interaction.member) : interaction.user.username;
-        // [v2.62] «⤴ Перепрыгнуть» -- окно ввода номера, дальше спрашиваем вариант
-        // (срочный переход / обрезка) теми же кнопками, что и у /jump.
+        // [v2.62] «⤴ Перепрыгнуть» -- [v2.66] не окно с номером, а СПИСОК ТРЕКОВ:
+        // выбрал -- спрашиваем вариант (срочный переход / обрезка) теми же кнопками,
+        // что и у /jump. Список личный: DJ видит только свои треки, staff -- все.
         if (cid === 'q:jmp')
         {
             if (!m.tracks.length)
                 return interaction.reply ({ content: '🈳 В очереди нет треков -- перепрыгивать некуда.', flags: MessageFlags.Ephemeral });
-            return interaction.showModal
-            (
-                new ModalBuilder ().setCustomId ('q:jumpm')
-                    .setTitle ('Перепрыгнуть к треку')
-                    .addComponents
-                    (
-                        new ActionRowBuilder ().addComponents
-                        (
-                            new TextInputBuilder ()
-                                .setCustomId ('pos')
-                                .setLabel ('Номер трека в очереди (1-' + m.tracks.length + ')')
-                                .setStyle (TextInputStyle.Short)
-                                .setRequired (true).setMaxLength (4)
-                        )
-                    )
-            );
+            const rows = jumpPickerRows (m, ctx.actorId, staff);
+            if (!rows)
+                return interaction.reply
+                ({
+                    content: '🈳 Своих треков в очереди нет -- перепрыгивать некуда.\n' +
+                        '_Чужой трек они могут пропустить только админы и модеры._',
+                    flags: MessageFlags.Ephemeral,
+                });
+            return interaction.reply
+            ({
+                content: '⤴ **Перепрыгнуть к треку** -- выбери из списка (номера как в `/queue`):',
+                components: rows,
+                flags: MessageFlags.Ephemeral,
+            });
+        }
+        // [v2.66] Выбор трека из списка «Перепрыгнуть» -- показываем подтверждение варианта.
+        if (cid === 'q:jsel')
+        {
+            const nSel = parseInt (String ((interaction.values || [])[0] || ''), 10) || 0;
+            if (!(nSel >= 1 && nSel <= m.tracks.length))
+                return interaction.update ({ content: '🤔 Такого трека в очереди уже нет -- вызови `/queue` заново.', components: [] });
+            const c = jumpConfirm (nSel);
+            return interaction.update ({ content: c.text, components: c.rows });
         }
         // [v2.17] «⬆ Выше» / «⬇ Ниже» -- перестановка того трека, что выбран в меню
         // [v2.36] «⏫ В начало» / «⏬ В конец» и «#️⃣ На позицию…» (окно ввода):
