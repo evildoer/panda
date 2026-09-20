@@ -5,6 +5,22 @@
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
+// CHANGELOG v2.50 (перемотать чужой трек нельзя -- ни командой, ни кнопками):
+//   * ЖИВОЙ СЛУЧАЙ ОТ ВЛАДЕЛЬЦА: «Почему я могу другим человеком (хоть и DJ) прыгать
+//     по таймкодам МОЕГО трека?» Действительно мог: роль DJ проверялась, а АВТОРСТВО
+//     самого трека -- нет. Правило «своё/чужое» (v2.31, v2.32) жило только в очереди
+//     и в удалении, а внутренняя навигация -- перемотка ±30 с, окно «⏱ На таймкод…» и
+//     /seek -- оставалась открыта всем DJ: чужой трек можно было утащить к концу или в
+//     начало прямо посреди чужого сета (и преспокойно слушать его заново).
+//   * ТЕПЕРЬ СВОЙ ТРЕК ПЕРЕМАТЫВАЕТ ЕГО АВТОР, А ЛЮБОЙ -- АДМИНЫ И МОДЕРЫ (staff).
+//     Проверка стоит ВНУТРИ seekMusic, у самого общего места: через неё проходят все
+//     три пути, поэтому разъехаться (как разъезжались подсказка и список) они не могут.
+//     Трек БЕЗ АВТОРА -- из старой базы, он ничей: его перематывает тот, кому он
+//     сейчас играет (как и раньше), иначе модернизация базы молча сломала бы кнопки.
+//   * ОТКАЗ -- тот же понятный текст, что у перестановки и удаления («только свои
+//     записи: этот трек добавил ...»), поэтому ничего нового объяснять не надо.
+//     Кнопки перемотки остаются видны всем DJ (в общем сообщении ещё нельзя показать
+//     разное разным людям): правило объявляется в ответе на нажатие, как и у меню автора.
 // CHANGELOG v2.43 (проверка очереди только ПРЕДУПРЕЖДАЕТ, её итог виден в /queue):
 //   * ЗАРАНЕЕ НИЧЕГО НЕ УДАЛЯЕТСЯ. Приговор «видео недоступно» зависит от НАШЕГО IP и
 //     прокси: владелец меняет прокси, видео закрыто по региону СЕЙЧАС -- а когда до
@@ -8568,7 +8584,8 @@ const QSEP = '────────────';
 const QSMALL = '-# ';
 const QUEUE_HINT_SHORT = QSMALL + 'Действия -- кнопками ниже.';
 const QUEUE_HINT_FULL =
-    QSMALL + 'Перемотать внутри трека -- кнопки «◀ 30 с» / «30 с ▶» / «⏱ На таймкод…» или /seek.' + '\n' +
+    QSMALL + 'Перемотать внутри трека -- «◀ 30 с» / «30 с ▶» / «⏱ На таймкод…» или /seek;' +
+    ' свой трек (у админов и модеров -- любой).' + '\n' +
     QSMALL + 'Подвинуть -- выбери трек в меню ниже (выше/ниже, в начало, в конец' +
     ' или «На позицию…»), либо командой /move номер to номер.' + '\n' +
     QSMALL + 'Прыгнуть по очереди -- /jump (админы и модеры).' + '\n' +
@@ -9412,12 +9429,23 @@ function parseSeekTime (raw)
     return sec > SEEK_MAX_INPUT ? null : sec;
 }
 
-function seekMusic (guildId, sec, who)
+function seekMusic (guildId, sec, who, opts = {})
 {
     const m = musicOf (guildId);
     if (!m.current) return { ok: false, text: '🤷 Сейчас ничего не играет -- перематывать нечего.' };
     const t = m.current;
     const title = '**' + (t.title || 'трек') + '**';
+    // [v2.50] ПЕРЕМОТКА -- ТОЛЬКО ПО СВОЕМУ ТРЕКУ. «Своё/чужое» (v2.31) относилось к
+    // очереди и к удалению, а ВНУТРЕННЯЯ навигация оставалась открыта всем DJ: любой
+    // DJ мог утащить чужой трек к концу или в начало прямо посреди сета (живой
+    // случай: твинк с ролью DJ и «⏱ На таймкод…» в чужом треке). Просьба владельца:
+    // «бот для слушателей, и распоряжается каждый своим» -- как у перестановки и
+    // удаления. Проверка стоит ЗДЕСЬ, у самой функции, потому что к ней ведут три
+    // пути (/seek, «◀ 30 с / 30 с ▶» и окно «⏱ На таймкод…») -- и все три получают
+    // правило одинаково, разъехаться не могут. staff -- любой трек; трек без автора
+    // (из старой базы) -- ничей, его перематывает тот, кому он сейчас играет.
+    if (!opts.staff && byIdOf (t) && !isBy (t, opts.actorId))
+        return { ok: false, text: ownOnlyText ('Перематывать', t) };
     if (t.isLive)
     {
         m.skipRequested = true; // это осознанный переход, а не обрыв потока
@@ -9465,15 +9493,19 @@ function seekMusic (guildId, sec, who)
 // (никакого второго пути: иначе кнопки и команда со временем разъехались бы).
 // У прямого эфира позиции нет и быть не может -- честно говорим об этом, а не делаем
 // вид, что перемотали.
-function queueSeekBy (guildId, delta, who)
+function queueSeekBy (guildId, delta, who, opts = {})
 {
     const m = musicOf (guildId);
     if (!m.current)
         return { ok: false, text: '🤷 Сейчас ничего не играет -- перематывать нечего.' };
+    // [v2.50] Чужой трек отбиваем ДО подсказки про эфир: правило одно, и человек должен
+    // получить причину, а не рассуждение про прямой эфир.
+    if (!opts.staff && byIdOf (m.current) && !isBy (m.current, opts.actorId))
+        return { ok: false, text: ownOnlyText ('Перематывать', m.current) };
     if (m.current.isLive)
         return { ok: false, text: '🔴 Это прямой эфир -- позиции у него нет (`/seek 0` -- перейти к живому краю).' };
     const at = Math.max (0, Math.round (playedMsOf (m) / 1000));
-    const res = seekMusic (guildId, at + delta, who);
+    const res = seekMusic (guildId, at + delta, who, opts);
     if (!res.ok) return res;
     return { ok: true, text: res.text + '\n_Место, где играло: `' + fmtDur (at) + '`._' };
 }
@@ -10880,7 +10912,7 @@ const musicCommands =
     // только «следующий» и «прыжок по очереди», а перемотать было нечем).
     new SlashCommandBuilder ()
         .setName ('seek')
-        .setDescription ('Перейти к другому месту в текущем треке (время: 1:30, 83 или 0:05)')
+        .setDescription ('Перейти к другому месту в текущем треке -- своего (время: 1:30, 83 или 0:05)')
         .addStringOption (o =>
             o.setName ('time')
              .setDescription ('Куда перейти: 90, 1:30 или 1:02:03 (0 -- с начала)')
@@ -11044,9 +11076,9 @@ client.on ('interactionCreate', async (interaction) =>
         const guildId = interaction.guildId;
         if (!(guildId in SERVERS)) return;
         // [v2.44] «⏱ На таймкод…» -- перемотка ВНУТРИ текущего трека тем же путём, что
-        // /seek (никакой второй логики). Права те же, что у остальной музыки (DJ),
-        // и проверяются здесь сами, потому что seekMusic их не смотрит (из слэша
-        // команда приходит уже после общей DJ-проверки).
+        // /seek (никакой второй логики). Здесь -- роль DJ (окно приходит не через гейт
+        // кнопок, так что проверяем сами), а [v2.50] на ЧУЖОЙ трек откажет уже
+        // seekMusic -- там же, где это делают кнопки ±30 с и слэш-команда.
         if (/^q:skt:(\d+)$/.test (interaction.customId || ''))
         {
             const page0 = parseInt (/^q:skt:(\d+)$/.exec (interaction.customId)[1], 10) || 1;
@@ -11074,7 +11106,8 @@ client.on ('interactionCreate', async (interaction) =>
                         flags: MessageFlags.Ephemeral,
                     }
                 );
-            const res0 = seekMusic (guildId, to0, who0);
+            const res0 = seekMusic (guildId, to0, who0,
+                { actorId: interaction.user.id, actorName: who0, staff: isStaffInteraction (interaction) });
             if (!res0.ok)
                 return interaction.reply ({ content: res0.text, flags: MessageFlags.Ephemeral });
             // [v2.35] Сообщение очереди перерисовываем ЧУТЬ ПОЗЖЕ: сразу после перемотки
@@ -11304,7 +11337,7 @@ client.on ('interactionCreate', async (interaction) =>
         const mSeek = /^q:s:([mp])$/.exec (cid);
         if (mSeek)
         {
-            const res = queueSeekBy (guildId, mSeek[1] === 'm' ? -30 : 30, who);
+            const res = queueSeekBy (guildId, mSeek[1] === 'm' ? -30 : 30, who, ctx);
             // Сообщение очереди обновляем ЧУТЬ ПОЗЖЕ: плеер перезапускается тем же
             // событием, и сразу после перемотки в строке «Сейчас» был бы прочерк.
             if (res.ok) setTimeout (() => { refreshQueueMsg (msgId).catch (() => {}); }, 1500);
@@ -12166,6 +12199,9 @@ client.on ('interactionCreate', async (interaction) =>
         {
             // [v2.32] Права -- те же, что у музыки (DJ/админ/модер): это управление
             // воспроизведением, а не очередь. Кто угодно со стороны команду не видит.
+            // [v2.50] И сам трек должен быть СВОЙ: чужой перематывает только его автор
+            // и staff -- правило то же, что у перестановки и удаления (проверяет
+            // seekMusic, чтобы слэш, кнопки ±30 с и окно таймкода не разъехались).
             const raw = interaction.options.getString ('time');
             const sec = parseSeekTime (raw);
             if (sec === null)
@@ -12176,7 +12212,8 @@ client.on ('interactionCreate', async (interaction) =>
                     flags: MessageFlags.Ephemeral,
                 });
             const res = seekMusic (guildId, sec,
-                interaction.member ? uuu (interaction.member) : interaction.user.username);
+                interaction.member ? uuu (interaction.member) : interaction.user.username,
+                { actorId: interaction.user.id, staff: isStaffInteraction (interaction) });
             return interaction.reply (res.ok ? res.text : { content: res.text, flags: MessageFlags.Ephemeral });
         }
         else if (name === 'pause')
