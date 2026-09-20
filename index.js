@@ -7111,6 +7111,23 @@ const proxyBadUntil = new Map ();
 function proxyMarkBad (addr) { if (addr) proxyBadUntil.set (String (addr), Date.now () + PROXY_BAD_TTL); }
 function proxyMarkGood (addr) { if (addr) proxyBadUntil.delete (String (addr)); }
 function proxyBrieflyBad (addr) { const t = proxyBadUntil.get (String (addr === undefined || addr === null ? '' : addr)); return !!t && t > Date.now (); }
+// [v2.78] КАКИМ МАРШРУТОМ ИДЁТ МУЗЫКА -- для /queue и /nowplaying (владелец: «показывай,
+// каким маршрутом идёт и какие адреса помечены икнувшими»): раньше это было видно только
+// в консоли. Храним ТОЛЬКО факт: адрес, которым реально открыт играющий поток ('' = DIRECT),
+// либо отметку «с диска» -- тогда маршрут вообще не нужен. Никаких попыток его «угадать».
+const routeInUse = new Map ();   // guildId -> { proxy, kind, at }
+function routeUseSet (guildId, proxy, kind)
+{
+    if (!guildId) return;
+    // Только строка -- адрес. openFromCache отдаёт `viaProxy: false` («маршрут не
+    // нужен»): приведение через String() превратило бы это в адрес «false».
+    routeInUse.set (String (guildId),
+        { proxy: (typeof proxy === 'string' ? proxy : ''), kind: String (kind || 'stream'), at: Date.now () });
+}
+function routeUseOf (guildId) { return routeInUse.get (String (guildId)) || null; }
+// Очередь стёрта / бот вышел -- записи о маршруте больше не к чему относиться
+// (иначе /queue показывал бы маршрут трека, которого уже нет).
+function routeUseClear (guildId) { if (guildId !== undefined && guildId !== null) routeInUse.delete (String (guildId)); }
 // [v2.14] ВЫРАВНИВАНИЕ ГРОМКОСТИ: yt-dlp -> ffmpeg(-af loudnorm) -> Discord.
 // Записи бывают сведены с разной громкостью (одна тише, другая громче) -- фильтр
 // loudnorm приводит их к среднему уровню, поэтому между песнями нет «качелей»
@@ -8835,7 +8852,17 @@ async function playNext (guildId)
             // [v2.9] этот трек уже готовился пока играл предыдущий -- берём готовое
             m.preload = null; // вынули: теперь это обычный играющий ресурс, не предзагрузка
             const r = await p.promise; // в бою уже готова (песня играла минуты)
-            if (r) { resource = r.resource; viaProxy = r.viaProxy; handle = { resource: r.resource, source: p.source, proc: p.proc, ff: p.ff, tee: p.tee }; }
+            if (r)
+            {
+                resource = r.resource; viaProxy = r.viaProxy;
+                handle = { resource: r.resource, source: p.source, proc: p.proc, ff: p.ff, tee: p.tee };
+                // [v2.78] МАРШРУТ ЭТОГО трека, а не прошлого: у заготовки поток уже открыт,
+                // и без этой строки /queue показывал бы адрес предыдущего трека (реальный
+                // ресурс и его прокси одинаково ценны -- берём оба из заготовки).
+                // Ресурса нет (заготовка -- только скачанный файл) -- маршрут выставит
+                // ветка ниже, там трек откроется с диска.
+                if (resource) routeUseSet (guildId, r.viaProxy, (r.fromCache || r.fromPart) ? 'disk' : 'stream');
+            }
         }
         else
         {
@@ -8937,6 +8964,10 @@ async function playNext (guildId)
             }
             m.seekReturnSec = 0;
             resource = opened.resource;
+            // [v2.78] Запоминаем, КАКИМ маршрутом открыт звук: с диска -- так и говорим
+            // (маршрут не нужен), иначе адрес прокси, а '' означает DIRECT. Это видно
+            // в /queue и /nowplaying (см. netRouteText).
+            routeUseSet (guildId, opened.viaProxy, (opened.fromCache || opened.fromPart) ? 'disk' : 'stream');
             viaProxy = opened.viaProxy;
             handle = { resource: opened.resource, source: opened.source, proc: opened.proc, ff: opened.ff };
             startedAt = seekSec;
@@ -10733,8 +10764,11 @@ function queueListBudget (m)
     // [v2.44] В бюджете -- ПОЛНАЯ подсказка, а не короткая: она теперь стоит в письме
     // ВСЕГДА (раньше выбиралась по длине, и владелец видел «примечания то есть, то нет»).
     // Не влезает -- укорачивается САМ СПИСОК, а не справка (см. queueView).
+    // [v2.78] Состояние сети тоже входит в бюджет: строк стало до двух (ждём ли + чем идём),
+    // и без этого длинная очередь могла упереться в лимит Discord.
     const chrome = queueHeadText (m).length + queueWaitText (m).length +
         queueAuthorsText (m).length + queueCheckText (m).length +
+        netWaitText (m).length + netRouteText (m.guildId).length +
         QUEUE_GLUE + queueHintText ().length;
     // [v2.54] Истории добавлений в /queue больше нет -- её место в бюджете тоже убрано
     // (проверяется стендом: на странице по-прежнему 15 треков).
@@ -11162,6 +11196,7 @@ function queueWipe (guildId)
     dropPreload (m);
     m.player.stop (true);     // тишина: играть больше нечего (Idle-хэндлер запустит нечего)
     clearMusicState (guildId); // и из базы -- чтобы убранное не воскресло после перезапуска
+    routeUseClear (guildId); // [v2.78] играть больше нечего -- и маршрут помнить незачем
     cacheDropUnused (); // [v2.39] очередь стёрта -- и кэш тоже: играть больше нечего
     return w;
 }
@@ -11193,6 +11228,7 @@ function queuePurge (guildId, keep)
     {
         m.pending = false;
         clearMusicState (guildId);
+        routeUseClear (guildId); // [v2.78] играть нечего -- и маршрут забываем
         cacheDropUnused (); // [v2.39] убирать больше нечего -- чистим и кэш
     }
     else saveMusicState (guildId);
@@ -12124,6 +12160,41 @@ function netWaitText (m)
         '; очередь и место в треке держатся';
 }
 
+// [v2.78] ЧЕМ ИМЕННО ИДЁТ МУЗЫКА И КТО ОТДЫХАЕТ. Владелец: «показывай в /queue, каким
+// маршрутом идёт музыка и какие адреса помечены икнувшими» -- и раньше это было видно
+// только в консоли. Пишем только то, что знаем точно:
+//   * маршрут -- тот, которым РЕАЛЬНО открыт играющий поток (routeUseSet зовётся в playNext),
+//     либо «не нужен: играю с диска»;
+//   * запасной -- первый живой из оставшихся, чтобы было видно, куда бот уйдёт при обрыве;
+//   * «икнувшие» -- адреса из proxyBadUntil, с остатком их минуты отдыха (v2.60: состояние
+//     у каждого адреса своё).
+// Ничего не знаем и ничего не отдыхает -- строка не показывается вовсе (справка не должна
+// занимать место впустую).
+function netRouteText (guildId)
+{
+    const bits = [];
+    const u = routeUseOf (guildId);
+    // Маршрут записан -- но мог успеть «икнуть» (обрыв потока помечает адрес минутой
+    // отдыха, а новый маршрут выберется только на следующей попытке): так и пишем, иначе
+    // строка врала бы -- «иду через X, а сам X в списке икнувших ниже».
+    const inUseBad = !!(u && u.proxy && proxyBrieflyBad (u.proxy));
+    if (u)
+    {
+        bits.push (u.kind === 'disk'
+            ? '🌐 Маршрут: не нужен -- этот трек играю с диска'
+            : '🌐 Маршрут: ' + (u.proxy ? 'прокси ' + u.proxy : 'DIRECT (напрямую)') +
+              (inUseBad ? ' (сейчас икнул)' : ''));
+        const spare = MUSIC_PROXIES.filter (p => p !== u.proxy && !proxyBrieflyBad (p));
+        if (spare.length) bits.push ('запасной: ' + spare[0]);
+    }
+    // Икнувшие -- БЕЗ того, кого только что назвали в маршруте (дважды об одном и том же).
+    const bad = MUSIC_PROXIES.filter (p => proxyBrieflyBad (p) && !(u && String (u.proxy) === String (p)));
+    if (bad.length)
+        bits.push ('икнувшие: ' + bad.map (p => p + ' (ещё ' +
+            fmtAgo (Math.max (0, (proxyBadUntil.get (String (p)) || 0) - Date.now ())) + ')').join (', '));
+    return bits.length ? QSMALL + bits.join (' · ') : '';
+}
+
 // [v2.44] /nowplaying -- ОДНА КАРТОЧКА «ЧТО ИГРАЕТ ПРЯМО СЕЙЧАС», не открывая /queue
 // целиком: трек, позиция и остаток, кто его поставил и в каком канале, сколько людей
 // слушает, сколько всего в очереди и когда она закончится, что будет дальше. Доступна
@@ -12162,6 +12233,8 @@ function nowPlayingText (m, guildId)
         ' · в очереди: ' + m.tracks.length);
     const net = netWaitText (m);   // [v2.71] почему тишина: прокси/сеть (видно без консоли)
     if (net) lines.push (net);
+    const route = netRouteText (guildId);   // [v2.78] чем идёт звук и кто «икнул»
+    if (route) lines.push (route);
     lines.push (queueWaitText (m));
     // Дальше: сперва то, что уже готово (предзагрузка), иначе первый в очереди.
     const next = (m.preload && m.preload.track) || m.tracks[0] || null;
@@ -12193,7 +12266,9 @@ function queueView (m, start, moveSel = 0, opts = {})
     // последний, вплотную к кнопкам: треки и управление видны на одном экране).
     // [v2.71] Состояние сети -- первым в справке: когда прокси молчит, это самое важное,
     // что нужно знать человеку (пустой строки здесь не появляется, если всё в порядке).
-    const net = netWaitText (m);
+    // [v2.78] Сеть -- двумя строками: ждём ли (netWaitText) и чем идём/кто «икнул»
+    // (netRouteText). Пустые не подставляются -- справка не должна пухнуть.
+    const net = [netWaitText (m), netRouteText (m.guildId)].filter (Boolean).join ('\n');
     const build = hint => queueHeadText (m) +
         '\n' + QSEP + '\n' +
         [net, check, authors, queueWaitText (m), move, hint].filter (Boolean).join ('\n') +
@@ -13591,6 +13666,7 @@ function destroyMusic (guildId, opts = {})
     // [v2.70] Вышли из канала -- ждать сеть больше не для кого: ожидание снимаем (если
     // связь всё ещё лежит, следующая же попытка заведёт его заново).
     m.netWait = null;
+    routeUseClear (guildId); // [v2.78] вышли из канала -- маршрут относился к тому, что играло
     if (opts.forget) // /stop -- очередь больше не нужна
     {
         m.tracks = [];
