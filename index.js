@@ -7774,12 +7774,18 @@ const MUSIC_CACHE_MAX_MB = MUSIC_CFG.cache_max_mb === undefined || MUSIC_CFG.cac
 // КОРОЧЕ этого предела качаются на диск ЦЕЛИКОМ ещё до старта, всё, что длиннее, и любой
 // прямой эфир играют потоком. СТАРОЕ ИМЯ ПОНИМАЕМ ДО СИХ ПОР (оно уже стоит у кого-то в
 // боевом конфиге, и ломать его нельзя); если оно там есть -- [config] подскажет новое.
-const _cacheShortMin = (MUSIC_CFG.cache_short_max_min === undefined || MUSIC_CFG.cache_short_max_min === null)
+// [v2.75] ВНУТРЕННИЕ КОНСТАНТЫ НАЗВАНЫ ТАК ЖЕ, КАК КЛЮЧИ, и с единицей в имени: код не
+// должен спорить с конфигом, а читающий -- гадать, «max_min» это минуты или минимум.
+//   MUSIC_CACHE_SHORT_MAX_MIN  -- значение из конфига: МИНУТЫ, максимум минут;
+//   MUSIC_CACHE_SHORT_MAX_SEC  -- те же минуты в СЕКУНДАХ (с ними сравнивается длина трека);
+//   MUSIC_CACHE_LONG_SETS / MUSIC_CACHE_KEEP_PLAYED / MUSIC_CACHE_MAX_MB / MUSIC_CACHE_DIR
+//   -- читаются из ключей cache_long_sets / cache_keep_played / cache_max_mb / cache_dir.
+const MUSIC_CACHE_SHORT_MAX_MIN = (MUSIC_CFG.cache_short_max_min === undefined || MUSIC_CFG.cache_short_max_min === null)
     ? MUSIC_CFG.cache_full_max_min
     : MUSIC_CFG.cache_short_max_min;
-const MUSIC_CACHE_FULL_MAX = (_cacheShortMin === undefined || _cacheShortMin === null
+const MUSIC_CACHE_SHORT_MAX_SEC = (MUSIC_CACHE_SHORT_MAX_MIN === undefined || MUSIC_CACHE_SHORT_MAX_MIN === null
     ? 15
-    : Math.max (0, Math.round (Number (_cacheShortMin) || 0))) * 60;
+    : Math.max (0, Math.round (Number (MUSIC_CACHE_SHORT_MAX_MIN) || 0))) * 60;
 // [v2.39] ХРАНИТЬ ЛИ УЖЕ ПРОИГРАННОЕ. По умолчанию нет: файл отыгравшего трека
 // удаляется сразу, на диске живут только играющий трек и предзагрузка. Иначе
 // скачанное копилось бы до лимита гигабайтами, хотя заново оно уже не понадобится
@@ -7794,10 +7800,10 @@ const MUSIC_CACHE_KEEP_PLAYED = MUSIC_CFG.cache_keep_played === true;
 // место), поэтому по умолчанию выключено: обычный кэш и так пишет сет потоком, но его файл
 // не обгоняет проигрывание.
 const MUSIC_CACHE_LONG_SETS = MUSIC_CACHE && MUSIC_CFG.cache_long_sets === true;
-const CACHE_PART_MIN_BYTES = 65536;     // мельче -- огрызок, продолжать с него нечего
-const CACHE_PART_BYTES_PER_SEC = 16384; // 128 кбит/с = 16 КБ за секунду звука
-const CACHE_PART_SAFE = 0.9;            // запас оценки: ошибка допустима только в меньшую
-const CACHE_PART_MIN_AHEAD = 20;        // сек: столько звука должно быть ПОСЛЕ нужной секунды
+const CACHE_PART_USEFUL_BYTES  = 65536;  // мельче -- огрызок, продолжать с него нечего
+const CACHE_PART_BYTES_PER_SEC = 16384;  // 128 кбит/с = 16 КБ за секунду звука
+const CACHE_PART_SAFE_FACTOR   = 0.9;    // запас оценки: ошибка допустима только в меньшую
+const CACHE_PART_AHEAD_SEC     = 20;     // сек: столько звука должно быть ПОСЛЕ нужной секунды
 const cachePartSpent = new Set ();      // файлы, с которых уже отыграли -- второй раз не берём
 const cacheLongBusy = new Set ();       // ключи, которые прямо сейчас качает фоновое скачивание сета
 // Одна строка при старте (как остальные отчёты): видно, включён ли кэш и куда он пишет.
@@ -7807,14 +7813,14 @@ if (MUSIC_CACHE)
         (MUSIC_CACHE_KEEP_PLAYED
             ? '; проигранное остаётся на диске (cache_keep_played: true)'
             : '; проигранные файлы удаляются сразу -- на диске только играющий и предзагрузка') +
-        (MUSIC_CACHE_FULL_MAX ? '; треки до ' + Math.round (MUSIC_CACHE_FULL_MAX / 60) +
+        (MUSIC_CACHE_SHORT_MAX_SEC ? '; треки до ' + Math.round (MUSIC_CACHE_SHORT_MAX_SEC / 60) +
             ' мин качаю на диск до старта, ' + (MUSIC_CACHE_LONG_SETS ? 'длинные сеты -- целиком в фоне'
                 : 'длинные сеты пишу во время игры') : ''));
 else
     console.log ('[' + (d()) + '] [music] кэш аудио: выключен (MUSIC.cache: false) -- звук идёт потоком, как раньше');
 if (MUSIC_CACHE_LONG_SETS)
     console.log ('[' + (d()) + '] [music] длинные сеты: качаю на диск ЦЕЛИКОМ в фоне (' +
-        (MUSIC_CACHE_FULL_MAX ? 'всё, что длиннее ' + Math.round (MUSIC_CACHE_FULL_MAX / 60) + ' мин' : 'вообще все') +
+        (MUSIC_CACHE_SHORT_MAX_SEC ? 'всё, что длиннее ' + Math.round (MUSIC_CACHE_SHORT_MAX_SEC / 60) + ' мин' : 'вообще все') +
         ') -- файл уходит вперёд музыки, поэтому перезапуск и перемотка обходятся без YouTube' +
         '; это второй запрос на такой трек и примерно 57 МБ на час звука');
 let cacheDirOk = false;
@@ -7833,7 +7839,7 @@ function cacheDirReady ()
 }
 // [v2.72] НЕДОКАЧАННЫЕ ФАЙЛЫ ПРОШЛОГО ЗАПУСКА. Раньше они безусловно удалялись («тот
 // поток уже мёртв») -- и вместе с ними уходило всё, что успело лечь на диск. Теперь
-// осмысленные (больше CACHE_PART_MIN_BYTES) остаются: если позиция трека внутри
+// осмысленные (больше CACHE_PART_USEFUL_BYTES) остаются: если позиция трека внутри
 // записанного куска, продолжение идёт С ДИСКА, без обращения к YouTube (cachePartFind).
 // Совсем мелкие огрызки ничего не стоят -- их по-прежнему в корзину.
 function cacheCleanStale ()
@@ -7847,7 +7853,7 @@ function cacheCleanStale ()
         const p = pathMod.join (MUSIC_CACHE_DIR, f);
         let st = null;
         try { st = fsMod.statSync (p); } catch { continue; }
-        if (!st.isFile () || st.size < CACHE_PART_MIN_BYTES)
+        if (!st.isFile () || st.size < CACHE_PART_USEFUL_BYTES)
         {
             try { fsMod.unlinkSync (p); junk++; } catch {}
             continue;
@@ -7863,7 +7869,7 @@ function cacheCleanStale ()
     else if (junk)
         console.log ('[' + (d()) + '] [music] кэш: убрал ' + junk + ' ' +
             plural (junk, 'огрызок', 'огрызка', 'огрызков') + ' прошлого запуска (мельче ' +
-            Math.round (CACHE_PART_MIN_BYTES / 1024) + ' КБ -- продолжать с них нечего)');
+            Math.round (CACHE_PART_USEFUL_BYTES / 1024) + ' КБ -- продолжать с них нечего)');
     return kept;
 }
 function fmtMb (bytes) { return Math.max (1, Math.round (Number (bytes || 0) / 1048576)) + ' МБ'; }
@@ -7904,7 +7910,7 @@ function cacheDropParts (key)
 }
 // [v2.72] НЕДОКАЧАННЫЙ ФАЙЛ ЭТОГО ТРЕКА, КОТОРЫЙ УЖЕ ЗАКРЫВАЕТ НУЖНУЮ СЕКУНДУ. Именно
 // так перезапуск продолжается МГНОВЕННО: играем с диска, а не тянем поток сначала. Запас
-// CACHE_PART_MIN_AHEAD нужен, чтобы «с диска» не обернулось тишиной через секунду: файл
+// CACHE_PART_AHEAD_SEC нужен, чтобы «с диска» не обернулось тишиной через секунду: файл
 // отдаёт ровно то, что в нём записано, а дальше трек продолжается обычным потоком (см.
 // Idle-обработчик и earlyEndResumeFrom). Готовый файл (без '.dl.') сюда не попадает -- у
 // него своя дорога (cacheFind), но он всегда лучше недокачанного, и его проверяют раньше.
@@ -7930,9 +7936,9 @@ function cachePartFind (track, posSec)
         const p = pathMod.join (MUSIC_CACHE_DIR, n);
         let st = null;
         try { st = fsMod.statSync (p); } catch { continue; }
-        if (!st.isFile () || st.size < CACHE_PART_MIN_BYTES) continue;
-        const sec = cachePartSeconds (st.size) * CACHE_PART_SAFE;
-        if (want + CACHE_PART_MIN_AHEAD > sec) continue; // в файле просто нет этой секунды
+        if (!st.isFile () || st.size < CACHE_PART_USEFUL_BYTES) continue;
+        const sec = cachePartSeconds (st.size) * CACHE_PART_SAFE_FACTOR;
+        if (want + CACHE_PART_AHEAD_SEC > sec) continue; // в файле просто нет этой секунды
         if (!best || sec > best.sec) best = { file: p, name: n, sec: Math.round (sec) };
     }
     return best;
@@ -8030,7 +8036,7 @@ async function cacheDownload (track, holder = {})
 function longSetCached (track)
 {
     return !!(MUSIC_CACHE_LONG_SETS && track && !track.isLive &&
-        Number (track.duration) > MUSIC_CACHE_FULL_MAX);
+        Number (track.duration) > MUSIC_CACHE_SHORT_MAX_SEC);
 }
 // [v2.73] Закачка сета нужна, пока ЕЁ ТРЕК В ОЧЕРЕДИ (или играет): очередь почистили --
 // тянуть десятки мегабайт впустую незачем. Зовётся там, где очередь меняется без старта
@@ -8308,7 +8314,7 @@ function cacheCli (args = [])
     {
         console.log ('[cache] папки ещё нет -- она появится, когда бот скачает первый трек');
         console.log ('[cache] пределы: лимит ' + (MUSIC_CACHE_MAX_MB ? MUSIC_CACHE_MAX_MB + ' МБ' : 'без лимита') +
-            ', на диск до старта качаются треки до ' + (MUSIC_CACHE_FULL_MAX ? Math.round (MUSIC_CACHE_FULL_MAX / 60) + ' мин' : '0 мин'));
+            ', на диск до старта качаются треки до ' + (MUSIC_CACHE_SHORT_MAX_SEC ? Math.round (MUSIC_CACHE_SHORT_MAX_SEC / 60) + ' мин' : '0 мин'));
         return 0;
     }
     let names = [];
@@ -8341,7 +8347,7 @@ function cacheCli (args = [])
     if (parts.length)
     {
         console.log ('[cache] недокачанное НЕ выбрасывается (v2.72): если позиция трека внутри записанного куска, ' +
-            'продолжение идёт С ДИСКА сразу, без YouTube; мельче ' + Math.round (CACHE_PART_MIN_BYTES / 1024) +
+            'продолжение идёт С ДИСКА сразу, без YouTube; мельче ' + Math.round (CACHE_PART_USEFUL_BYTES / 1024) +
             ' КБ бот убирает сам -- продолжать с них нечего');
         console.log ('[cache] с чего можно продолжить (в имени -- <sha1 адреса>, не название):');
         for (const f of parts.slice (0, 8))
@@ -8851,7 +8857,7 @@ async function playNext (guildId)
             // видно: трек уже качается предзагрузкой, пока играет предыдущий. Не получилось --
             // играем потоком, как раньше (музыка из-за кэша встать не должна).
             if (MUSIC_CACHE && !track.isLive && Number (track.duration) > 0 &&
-                Number (track.duration) <= MUSIC_CACHE_FULL_MAX && !cacheFind (track))
+                Number (track.duration) <= MUSIC_CACHE_SHORT_MAX_SEC && !cacheFind (track))
             {
                 try
                 {
@@ -9130,7 +9136,7 @@ function startPreload (guildId)
     // [v2.37] КОРОТКИЙ ТРЕК ГОТОВИМ СКАЧИВАНИЕМ НА ДИСК: пока играет текущий, следующий
     // уже лежит файлом -- между песнями нет не только паузы, но и ни одного запроса к
     // YouTube (а перемотка и восстановление потом вообще мгновенные).
-    if (MUSIC_CACHE && !next.isLive && next.duration > 0 && next.duration <= MUSIC_CACHE_FULL_MAX && !cacheFind (next))
+    if (MUSIC_CACHE && !next.isLive && next.duration > 0 && next.duration <= MUSIC_CACHE_SHORT_MAX_SEC && !cacheFind (next))
     {
         const cp = { track: next, resource: null, viaProxy: false, cancelled: false, cacheOnly: true };
         const holder = {};
@@ -11585,6 +11591,10 @@ function queueClear (guildId, who, opts = {})
 // ============================================================================
 const FILTER_TEXT_MAX = 60;             // подстрока: длиннее -- только палец устанет
 const FILTER_ASK_MS = 5 * 60 * 1000;    // сколько живёт подтверждение (как прочие окна)
+// [v2.75] СКОЛЬКО НАЗВАНИЙ ПОКАЗЫВАТЬ В ПОДТВЕРЖДЕНИИ. Числа мало: «уйдёт 7 треков»
+// не даёт понять, те ли это треки (владелец: «показывай первые несколько, а не только
+// их число»). Пять строк -- примерно то, что видно в одном экране сообщения.
+const FILTER_PREVIEW_N = 5;
 let $filterToken = 0;
 
 function filterTextOf (s)
@@ -11607,16 +11617,53 @@ function filterPlan (m, mode, text, scope, actorId)
     const hit = t => inScope (t) && filterMatch (t, text);
     // keep-предикат для queuePurge: трек ОСТАЁТСЯ, если он истинен.
     const keep = keepMode ? (t => !inScope (t) || filterMatch (t, text)) : (t => !hit (t));
-    const gone = m.tracks.filter (t => !keep (t)).length;
+    // [v2.75] ЧТО ИМЕННО УЙДЁТ -- не только число: названия нужны и в подтверждении, и в
+    // ответе после действия. Берём их ЗДЕСЬ, до чистки: после неё этих треков в очереди
+    // уже нет. В памяти держим только первые FILTER_PREVIEW_N (остальные -- счётом).
+    const dropped = m.tracks.filter (t => !keep (t));
+    const gone = dropped.length;
     const playing = (m.current && !keep (m.current)) ? m.current : null;
     const waiting = (!playing && m.seekTrack && !keep (m.seekTrack)) ? m.seekTrack : null;
     return {
         keep: keep, mode: keepMode ? 'keep' : 'remove', scope: (scope === 'all') ? 'all' : 'mine',
         gone: gone, playing: playing, waiting: waiting,
         matchN: m.tracks.filter (hit).length,
+        goneTitles: dropped.slice (0, FILTER_PREVIEW_N).map (t => t.title || 'трек'),
         left: m.tracks.length - gone, total: m.tracks.length,
         any: !!(gone || playing || waiting),
     };
+}
+
+// Строки «что уйдёт» -- СПИСКОМ названий (см. FILTER_PREVIEW_N), с честным «…и ещё N»:
+// сколько треков осталось за списком, видно из числа выше, но без этой строки кажется,
+// что уйдёт ровно показанное.
+function filterGoneLines (plan)
+{
+    const out = [];
+    plan.goneTitles.forEach ((t, i) => out.push ('  ' + (i + 1) + '. ' + clipped (t, 70)));
+    if (plan.gone > plan.goneTitles.length)
+        out.push ('  …и ещё ' + (plan.gone - plan.goneTitles.length));
+    return out;
+}
+
+// До трёх названий в ОТВЕТЕ после действия (полный список был в подтверждении, а тут
+// важно просто напомнить, что именно ушло; названия берутся из плана -- см. goneTitles).
+function filterTitlesText (plan)
+{
+    const shown = plan.goneTitles.slice (0, 3).map (t => clipped (t, 40));
+    return shown.join (' · ') + ((plan.gone > shown.length) ? ' · …' : '');
+}
+
+// Почему убирать нечего -- по режиму и области, чтобы фраза не врала: при «оставить
+// только найденное» пустой список означает НЕ «ничего не нашлось», а «и так ничего лишнего».
+function filterNothingText (plan, text)
+{
+    if (plan.mode === 'keep')
+        return (plan.scope === 'all')
+            ? '_Убирать нечего: в очереди и так нет ничего, кроме треков с «' + text + '»._'
+            : '_Убирать нечего: твоих треков в очереди нет (чужие не трогаю)._';
+    return '_Убирать нечего: треков с «' + text + '» ' +
+        (plan.scope === 'all' ? 'в очереди нет' : 'среди твоих нет') + ' -- очередь как есть._';
 }
 
 // Подтверждение фильтра. Кнопки несут только метку (см. m.filterAsk) -- всё остальное
@@ -11624,17 +11671,15 @@ function filterPlan (m, mode, text, scope, actorId)
 function queueFilterConfirm (m, mode, text, scope, actorId, msgId)
 {
     const plan = filterPlan (m, mode, text, scope, actorId);
-    const modeName = (plan.mode === 'keep') ? 'оставить ТОЛЬКО треки с «' : 'убрать треки с «';
-    const head = '🧽 **Фильтр очереди:** ' + modeName + text + '»' +
-        (plan.scope === 'all' ? ' (во всех треках)' : ' (только твои)');
-    const found = '• найдено по названию: ' + plan.matchN + ' ' +
-        plural (plan.matchN, 'трек', 'трека', 'треков');
+    const keepMode = (plan.mode === 'keep');
+    const head = '🧽 **Фильтр очереди:** ' + (keepMode ? 'оставить ТОЛЬКО треки с «' : 'убрать треки с «') +
+        text + '»' + (plan.scope === 'all' ? ' (во всех треках)' : ' (только твои)');
     // [v2.75] Здесь нечего подтверждать -- и кнопка НЕ «Отмена» (иначе получалось бы,
     // что человек что-то отменил, хотя действие и не собиралось происходить): у неё свой
     // ответ («очередь не менялась»), см. ветку q:fl:k ниже.
     if (!plan.any)
         return {
-            text: head + '\n' + found + '\n_Убирать нечего -- всё, что нашлось, и так осталось бы в очереди._',
+            text: head + '\n' + filterNothingText (plan, text),
             rows: [new ActionRowBuilder ().addComponents
             (
                 new ButtonBuilder ().setCustomId ('q:fl:k').setLabel ('✖ Понятно').setStyle (ButtonStyle.Secondary)
@@ -11647,15 +11692,22 @@ function queueFilterConfirm (m, mode, text, scope, actorId, msgId)
                     // уходит раньше, чем действие делается (иначе оно осталось бы старым).
                     msgId: String (msgId || '0') };
     const total = plan.gone + (plan.playing ? 1 : 0) + (plan.waiting ? 1 : 0);
-    const goneTxt = [];
-    if (plan.gone) goneTxt.push (plan.gone + ' ' + plural (plan.gone, 'трек', 'трека', 'треков') + ' из очереди');
-    if (plan.playing) goneTxt.push ('играющий **' + (plan.playing.title || 'трек') + '**');
-    else if (plan.waiting) goneTxt.push ('ждущий **' + (plan.waiting.title || 'трек') + '**');
+    // ТЕКСТ ПОДТВЕРЖДЕНИЯ: сперва -- что уйдёт (списком, см. filterGoneLines), и только
+    // в режиме «оставить только» -- ещё и сколько нашлось (там это разные числа).
+    const lines = [];
+    if (keepMode)
+        lines.push ('• найдено: ' + plan.matchN + ' ' + plural (plan.matchN, 'трек', 'трека', 'треков') +
+            ' -- они и останутся');
+    if (plan.gone)
+        lines.push ('• уйдёт: ' + plan.gone + ' ' + plural (plan.gone, 'трек', 'трека', 'треков'));
+    for (const l of filterGoneLines (plan)) lines.push (l);
+    if (plan.playing)
+        lines.push ('• играющий прервётся: **' + (plan.playing.title || 'трек') + '** -- сразу пойдёт следующий');
+    else if (plan.waiting)
+        lines.push ('• ждущий уйдёт: **' + (plan.waiting.title || 'трек') + '**');
+    lines.push ('• останется в очереди: ' + plan.left);
     return {
-        text: head + '\n' + found + '\n' +
-            '• уйдёт: ' + goneTxt.join (' + ') + '\n' +
-            (plan.playing ? '• играющий прервётся -- сразу пойдёт следующий\n' : '') +
-            '• останется в очереди: ' + plan.left +
+        text: head + '\n' + lines.join ('\n') +
             '\n_Действие необратимое. Вернуть трек можно только заново ( `/play` или «📜 Все треки» в `/history` )._',
         rows: [new ActionRowBuilder ().addComponents
         (
@@ -11674,9 +11726,10 @@ function queueFilter (guildId, opts)
     const text = filterTextOf (opts.text);
     if (!text) return { ok: false, text: '🤔 Пустая подстрока -- искать нечего.' };
     const plan = filterPlan (m, opts.mode, text, opts.scope, opts.actorId);
+    // Та же фраза, что в подтверждении (см. filterNothingText): она знает и режим, и область,
+    // и не говорит «треков с «X» нет», когда на самом деле «и так нет ничего лишнего».
     if (!plan.any)
-        return { ok: false, text: '🈳 Убирать нечего: треков с «' + text + '» в очереди ' +
-            (plan.scope === 'all' ? 'нет' : 'среди твоих нет') + '.' };
+        return { ok: false, text: '🈳 ' + filterNothingText (plan, text) };
     const w = queuePurge (guildId, plan.keep);
     if (!w) return { ok: false, text: '🈳 Убирать нечего -- очередь уже другая (может, её убрали с тех пор).' };
     console.log ('[' + (d()) + '] [music] ' + whoText (opts.who) +
@@ -11685,7 +11738,9 @@ function queueFilter (guildId, opts)
         (w.playing ? ' и снял играющий трек' : (w.waiting ? ' и снял ждущий трек' : '')) +
         ', осталось ' + w.left);
     const bits = [];
-    if (w.goneQ) bits.push (w.goneQ + ' ' + plural (w.goneQ, 'трек', 'трека', 'треков'));
+    if (w.goneQ)
+        bits.push (w.goneQ + ' ' + plural (w.goneQ, 'трек', 'трека', 'треков') +
+            (plan.goneTitles.length ? ' (' + filterTitlesText (plan) + ')' : ''));
     if (w.playing) bits.push ('играющий **' + w.playing + '**' + (w.left ? ' -- играю следующий' : ' -- тишина'));
     else if (w.waiting) bits.push ('ждущий **' + w.waiting + '**');
     return {
