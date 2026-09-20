@@ -5,6 +5,27 @@
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
+// CHANGELOG v2.74 (к слушателю, а не в канал; ссылки в /history; понятный ключ кэша):
+//   * СТАРТ: БОТ ИДЁТ К СЛУШАТЕЛЮ, А НЕ В КАНАЛ (владелец: «Если нет канала, где сидел
+//     раньше от разрыва связи, -- то идёт к автору! Если он в войсе»). Раньше при старте
+//     без сохранённого канала бот просто ждал /join, хотя автор очереди мог уже сидеть
+//     в голосовом, -- а в СВОЁМ пустом канале молчал, пока автор слушал в другом.
+//     Теперь и то и другое значат одно: слушателем считается АВТОР ближайшего нужного
+//     трека (pickAuthorChannel), и бот едет туда. Канал помним только как «где стояли»:
+//     туда возвращаемся (и молчим) лишь когда автора нет в голосовом нигде.
+//   * /HISTORY: В РАСКРЫТОМ СОСТАВЕ ПАЧКИ ВИДНЫ И ССЫЛКИ (вопрос владельца: «а там только
+//     названия, без URL»). Строка стала «12. Название -- https://youtu.be/ID»; ссылки
+//     строятся из тех самых ключей треков, что и раньше хранились для «судьбы пачки», а
+//     не из трёх ссылок в тексте /history. Со ссылками страница листается по 15 названий
+//     (было 20): иначе состав упёрся бы в лимит сообщения Discord и «Позже» перепрыгнуло
+//     бы то, что не влезло. У пачек старой записи (ключей нет) всё как было -- только
+//     названия, по 20 на страницу.
+//   * КЛЮЧ cache_full_max_min ПЕРЕИМЕНОВАН В cache_short_max_min (владелец: «какое-то
+//     странное название»). Смысл тот же -- треки КОРОЧЕ этого предела качаются на диск
+//     целиком до старта, -- а старое имя по-прежнему понимается (на случай, если оно уже
+//     стоит в чьём-то config.json): [config] подскажет новое, бот не сломается. Этот ключ и
+//     cache_long_sets -- про разное: первый решает, какие треки качать ЦЕЛИКОМ ДО старта,
+//     второй -- качать ли длинные сеты в ФОНЕ, пока играет текущий.
 // CHANGELOG v2.73 (режим повтора /repeat; начатый трек не теряет свой файл):
 //   * /REPEAT -- РЕЖИМ АВТОРА, А НЕ ОТДЕЛЬНОГО ТРЕКА (только админы и модеры; в списке
 //     команд видна всем, у остальных -- отказ). Пока режим включён, треки этого автора
@@ -29,7 +50,7 @@
 //   * ДЛИННЫЙ СЕТ КАЧАЕТСЯ ЗАРАНЕЕ (вопрос владельца: «почему ты заранее не качал длинные
 //     треки, как и все остальные маленькие?»). Причина была -- тишина на минуты, пока
 //     скачается файл сета; теперь её нет: как только длинный сет встал СЛЕДУЮЩИМ (startPreload),
-//     его закачка уже идёт (память: cache_long_sets + cache_full_max_min). Пока играет
+//     его закачка уже идёт (память: cache_long_sets + cache_short_max_min). Пока играет
 //     текущий трек, файл успевает лечь целиком, и сет начинается С ДИСКА. Заодно: закачка
 //     стала одной за раз (нужный следующим запоминается в m.longWant и берётся в работу
 //     после текущей), готовый файл повторно не качается (раньше после игры с диска тот же
@@ -331,7 +352,7 @@
 //     YouTube участвовал в проигрывании каждую секунду: его сбои (403, Broken pipe,
 //     оборванный сет) слышали слушатели, а перемотка и продолжение после перезапуска
 //     каждый раз заново просили звук у YouTube.
-//   * ГИБРИД (так выбрал владелец): короткий трек (до MUSIC.cache_full_max_min минут)
+//   * ГИБРИД (так выбрал владелец): короткий трек (до MUSIC.cache_short_max_min минут)
 //     скачивается ЦЕЛИКОМ и играет файлом -- перемотка мгновенная и точная, YouTube не
 //     нужен; предзагрузка следующего трека -- это его скачивание, то есть паузы между
 //     песнями нет. Длинный сет и прямой эфир играют сразу потоком, но тот же звук
@@ -6568,6 +6589,11 @@ function configSanityIssues ()
     if (MUSIC_CFG.cache_long_sets === true && MUSIC_CFG.cache === false)
         out.push ('MUSIC.cache_long_sets: true, но MUSIC.cache: false -- кэш выключен целиком, качать сеты некуда: ' +
             'настройка не работает (или включи cache, или убери cache_long_sets)');
+    // [v2.74] Старое имя ключа «короткие треки качаем целиком»: понимаем по-прежнему, но
+    // молчать не будем -- иначе владелец искал бы в примере ключ, которого там уже нет.
+    if (MUSIC_CFG.cache_full_max_min !== undefined && MUSIC_CFG.cache_short_max_min === undefined)
+        out.push ('MUSIC.cache_full_max_min: ключ переименован в cache_short_max_min (смысл и значение ' +
+            'по умолчанию те же) -- старое имя ещё понимаю, но лучше переименуй в конфиге');
     // [v2.55] Живой лог в файл: мусор в ключе не должен молча менять поведение --
     // строка "шесть" превратилась бы в 0 (не удалять ничего) или "no" в NaN.
     if (log_keep_months !== undefined &&
@@ -7708,7 +7734,7 @@ function probeNormalize ()
 // слышали слушатели, а перемотка и продолжение после перезапуска каждый раз заново
 // просили звук у YouTube. Теперь трек живёт на диске.
 // КАК (гибрид -- так выбрал владелец):
-//   * короткий трек (до MUSIC.cache_full_max_min минут) скачивается ЦЕЛИКОМ и играет
+//   * короткий трек (до MUSIC.cache_short_max_min минут) скачивается ЦЕЛИКОМ и играет
 //     уже файл: перемотка мгновенная и точная, YouTube во время игры не нужен. Обычно
 //     этого даже не замечаешь: пока играет текущий трек, следующий уже скачивается
 //     (предзагрузка), то есть паузы между песнями нет;
@@ -7742,9 +7768,17 @@ const MUSIC_CACHE_DIR = pathMod.isAbsolute (String (MUSIC_CFG.cache_dir || 'musi
 const MUSIC_CACHE_MAX_MB = MUSIC_CFG.cache_max_mb === undefined || MUSIC_CFG.cache_max_mb === null
     ? 4096
     : Math.max (0, Math.round (Number (MUSIC_CFG.cache_max_mb) || 0));
-const MUSIC_CACHE_FULL_MAX = (MUSIC_CFG.cache_full_max_min === undefined || MUSIC_CFG.cache_full_max_min === null
+// [v2.74] КЛЮЧ ПЕРЕИМЕНОВАН: cache_full_max_min -> cache_short_max_min (владелец: «какое-то
+// странное название» -- «full» + «max_min» читались как заклинание). Смысл прежний: треки
+// КОРОЧЕ этого предела качаются на диск ЦЕЛИКОМ ещё до старта, всё, что длиннее, и любой
+// прямой эфир играют потоком. СТАРОЕ ИМЯ ПОНИМАЕМ ДО СИХ ПОР (оно уже стоит у кого-то в
+// боевом конфиге, и ломать его нельзя); если оно там есть -- [config] подскажет новое.
+const _cacheShortMin = (MUSIC_CFG.cache_short_max_min === undefined || MUSIC_CFG.cache_short_max_min === null)
+    ? MUSIC_CFG.cache_full_max_min
+    : MUSIC_CFG.cache_short_max_min;
+const MUSIC_CACHE_FULL_MAX = (_cacheShortMin === undefined || _cacheShortMin === null
     ? 15
-    : Math.max (0, Math.round (Number (MUSIC_CFG.cache_full_max_min) || 0))) * 60;
+    : Math.max (0, Math.round (Number (_cacheShortMin) || 0))) * 60;
 // [v2.39] ХРАНИТЬ ЛИ УЖЕ ПРОИГРАННОЕ. По умолчанию нет: файл отыгравшего трека
 // удаляется сразу, на диске живут только играющий трек и предзагрузка. Иначе
 // скачанное копилось бы до лимита гигабайтами, хотя заново оно уже не понадобится
@@ -10197,9 +10231,42 @@ function historyText (guildId)
 // на месте и не раздувается (владелец: «вижу список треков, а выводится только
 // начало пары из них»).
 // ============================================================================
+// [v2.73] НАЗВАНИЯ И ИХ АДРЕСА ВМЕСТЕ. Раньше тут был просто список названий, а ключи
+// треков (ids) лежали рядом и в том же порядке -- при показе состава их не использовали,
+// и получалось «в /history -- только названия, без URL». Теперь пары идут вместе:
+// в раскрытом составе у каждого трека видна короткая ссылка (владелец: «чтобы потом
+// можно было их оттуда брать для повторного добавления»). Пустое название по-прежнему
+// выбрасывается, но НОМЕР ключа при этом не сьезжает -- пары строятся по одному индексу.
+function historyPairsOf (e)
+{
+    const t = Array.isArray (e && e.titles) ? e.titles : [];
+    const ids = Array.isArray (e && e.ids) ? e.ids : [];
+    const out = [];
+    for (let i = 0; i < t.length; i++)
+    {
+        const title = String (t[i] || '').trim ();
+        if (!title) continue;
+        out.push ({ title: title, id: String (ids[i] || '').trim () });
+    }
+    return out;
+}
 function historyTitlesOf (e)
 {
-    return (Array.isArray (e && e.titles) ? e.titles : []).map (t => String (t || '').trim ()).filter (Boolean);
+    return historyPairsOf (e).map (p => p.title);
+}
+// Достаточно ли ключ похож на видео-id, чтобы из него вышла ссылка (в базе бывают
+// ключи из очень старых записей и пустые строки -- выдумывать ссылки нельзя).
+function historyLinkOf (id)
+{
+    return /^[\w-]{6,20}$/.test (String (id || '')) ? 'https://youtu.be/' + id : '';
+}
+// [v2.73] Со ссылками строка длиннее (название + адрес), поэтому на страницу их влезает
+// меньше, чем без них: иначе состав упёрся бы в лимит сообщения Discord, и «Позже»
+// перепрыгнуло бы то, что не влезло (та же арифметика, что у страницы /queue).
+const HISTORY_LINK_PAGE = 15;
+function historyPageSize (e)
+{
+    return (Array.isArray (e && e.ids) && e.ids.some (historyLinkOf)) ? HISTORY_LINK_PAGE : HISTORY_TITLES_PAGE;
 }
 function historyStamp (t)
 {
@@ -10250,21 +10317,23 @@ function clipped (s, n = 90)
     return t.length > n ? t.slice (0, n - 1) + '…' : t;
 }
 
-// Кнопки листания состава: шаг -- ровно страница (HISTORY_TITLES_PAGE), потому что
-// столько строк в неё гарантированно влезает (см. константы выше).
+// Кнопки листания состава: шаг -- ровно страница, потому что столько строк в неё
+// гарантированно влезает. Размер страницы -- historyPageSize(e): пачка СО ССЫЛКАМИ
+// листается по 15 (строка длиннее), без ключей -- по 20, как раньше (v2.73).
 function historyExpandRows (e, off, n)
 {
-    const pages = Math.max (1, Math.ceil (n / HISTORY_TITLES_PAGE));
-    const p = Math.min (Math.max (0, Math.floor ((Number (off) || 0) / HISTORY_TITLES_PAGE) || 0), pages - 1);
-    const first = p * HISTORY_TITLES_PAGE;
+    const size = historyPageSize (e);
+    const pages = Math.max (1, Math.ceil (n / size));
+    const p = Math.min (Math.max (0, Math.floor ((Number (off) || 0) / size) || 0), pages - 1);
+    const first = p * size;
     const btns = [];
     if (pages > 1)
     {
         btns.push (new ButtonBuilder ()
-            .setCustomId ('q:hp:' + (Number (e.at) || 0) + ':' + (first - HISTORY_TITLES_PAGE))
+            .setCustomId ('q:hp:' + (Number (e.at) || 0) + ':' + (first - size))
             .setLabel ('◀ Раньше').setStyle (ButtonStyle.Secondary).setDisabled (p <= 0));
         btns.push (new ButtonBuilder ()
-            .setCustomId ('q:hp:' + (Number (e.at) || 0) + ':' + (first + HISTORY_TITLES_PAGE))
+            .setCustomId ('q:hp:' + (Number (e.at) || 0) + ':' + (first + size))
             .setLabel ('Позже ▶').setStyle (ButtonStyle.Secondary).setDisabled (p >= pages - 1));
     }
     // [v2.71] «▶ Поставить заново» -- ВСЯ пачка обратно в очередь одним нажатием: это
@@ -10281,7 +10350,8 @@ function historyExpandRows (e, off, n)
 // Текст одной страницы состава (+ метаданные для кнопок).
 function historyExpandView (e, off)
 {
-    const titles = historyTitlesOf (e);
+    const pairs = historyPairsOf (e);
+    const titles = pairs.map (p => p.title);
     const total = historySizeOf (e);
     const head = '📜 **Состав пачки** -- `' + historyStamp (e.at) + '` ' + (e.byName || 'без автора') + ': ' +
         total + ' ' + plural (total, 'трек', 'трека', 'треков') +
@@ -10291,12 +10361,20 @@ function historyExpandView (e, off)
             + ' оставались только первые три названия (в /history они видны).' +
             (e.q ? ' Зато я помню, что вводили в /play -- кнопка ниже вернёт пачку в очередь.' : '') + '_',
             rows: e.q ? historyExpandRows (e, 0, 0) : [] };
-    const pages = Math.max (1, Math.ceil (titles.length / HISTORY_TITLES_PAGE));
-    const p = Math.min (Math.max (0, Math.floor ((Number (off) || 0) / HISTORY_TITLES_PAGE) || 0), pages - 1);
-    const first = p * HISTORY_TITLES_PAGE;
+    const size = historyPageSize (e);
+    const pages = Math.max (1, Math.ceil (titles.length / size));
+    const p = Math.min (Math.max (0, Math.floor ((Number (off) || 0) / size) || 0), pages - 1);
+    const first = p * size;
+    // [v2.73] Каждый трек -- со своей короткой ссылкой (см. historyPairsOf/historyLinkOf):
+    // из состава пачки её можно скопировать и вставить в /play. Строки -- всё ещё код-блок:
+    // он держит ровный столбик номеров и копируется одним куском целиком.
     const lines = [];
-    for (let i = first; i < titles.length && lines.length < HISTORY_TITLES_PAGE; i++)
-        lines.push (String (i + 1).padStart (2, ' ') + '. ' + clipped (titles[i], HISTORY_EXPAND_CLIP));
+    for (let i = first; i < titles.length && lines.length < size; i++)
+    {
+        const link = historyLinkOf (pairs[i] && pairs[i].id);
+        lines.push (String (i + 1).padStart (2, ' ') + '. ' + clipped (titles[i], HISTORY_EXPAND_CLIP) +
+            (link ? ' — ' + link : ''));
+    }
     const notes = [];
     if (titles.length < total)
         notes.push ('В базе сохранено ' + titles.length + ' названий из ' + total +
@@ -12081,18 +12159,36 @@ async function resumeMusic (server)
             console.log ('[' + (d()) + '] [music] очередь с прошлого раза на месте (выходили по /leave) -- ' + where + '; продолжу по /join');
             return;
         }
-        if (!ch)
+        // [v2.74] К СЛУШАТЕЛЮ, А НЕ К КАНАЛУ. Владелец: «Если нет канала, где сидел раньше
+        // от разрыва связи, -- то идёт к автору! Если он в войсе» и «если канала нет или он
+        // пустой, одинаково -- слушателя там нет». Слушателем считается АВТОР ближайшего
+        // нужного трека (pickAuthorChannel): именно ему и играет очередь, а канал -- просто
+        // место. Поэтому отсутствие канала и пустой канал значат одно: идём к автору, если он
+        // в голосовом. Канал помним как «где стояли» -- туда возвращаемся, когда слушателя
+        // нет нигде (тогда молчим и ждём захода человека или /join).
+        // [v2.34] НЕ ИГРАТЬ В ПУСТУЮ КОМНАТУ. Слушателей считаем по факту
+        // (humansInChannelChecked): у чужого бота без member раньше выходил «живой
+        // слушатель», и yt-dlp запускался в тишину. Не ответил Discord -- считаем, что
+        // человек есть (лучше заиграть, чем промолчать).
+        if (!ch || !await humansInChannelChecked (server, ch.id))
         {
-            console.log ('[' + (d()) + '] [music] канала из прошлого запуска нет -- очередь ждёт /join: ' + where);
-            return;
-        }
-        // [v2.34] НЕ ИГРАТЬ В ПУСТУЮ КОМНАТУ. Раньше здесь стояла быстрая проверка по
-        // кэшу (humansInChannel), и на старте она могла ошибиться в обе стороны: чужой
-        // бот без member считался слушателем (и yt-dlp запускался в тишину), а
-        // недогруженные состояния -- людьми. Теперь спрашиваем по-настоящему; не
-        // ответил Discord -- считаем, что человек есть (лучше заиграть, чем промолчать).
-        if (!await humansInChannelChecked (server, ch.id))
-        {
+            const found = pickAuthorChannel (server, ch ? ch.id : null);
+            if (found)
+            {
+                console.log ('[' + (d()) + '] [music] ' +
+                    (ch ? 'в «' + ch.name + '» слушателей нет' : 'канала из прошлого запуска нет') +
+                    ' -- иду туда, где слушает автор трека (' +
+                    (found.track.byName || u (found.track.byId)) + '): «' + found.ch.name + '» (' + where + ')');
+                m.savedChannelId = found.ch.id;
+                startRestored (server, found.ch, guild);
+                return;
+            }
+            if (!ch)
+            {
+                console.log ('[' + (d()) + '] [music] канала из прошлого запуска нет и автора трека нет ' +
+                    'в голосовом -- жду захода человека или /join: ' + where);
+                return;
+            }
             // В канал мы уже зашли (присутствие выше) -- сидим и молчим, пока кто-то не
             // войдёт: очередь и МЕСТО В ТРЕКЕ остаются как были (m.seekTrack/m.seekSec).
             console.log ('[' + (d()) + '] [music] зашёл в «' + ch.name + '» и МОЛЧУ: живых слушателей нет, ' +
