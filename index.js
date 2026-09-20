@@ -5,6 +5,19 @@
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
+// CHANGELOG v2.70 (сбой сети/прокси не тратит очередь):
+//   * СБОЙ МАРШРУТА -- НЕ «БИТЫЙ ТРЕК». Живой случай владельца: отвалился прокси,
+//     очередь посыпалась (каждый трек считался «не запустившимся»), после десяти подряд
+//     бот умолкал совсем и сам больше не пытался -- а переключённый сервер прокси
+//     оживлял музыку неизвестно когда. Теперь текущий трек возвращается в начало
+//     очереди ВМЕСТЕ с секундой обрыва, очередь стоит как стояла, а watchdog
+//     (musicNetTick) пробует снова: 10 с -> 20 с -> 30 с, дальше каждые полминуты,
+//     пока в канале есть живой слушатель. Сеть вернулась -- музыка идёт сама, без команд.
+//     Слушателей нет -- сеть впустую не будим (ждём захода человека). Пауза --
+//     MUSIC.net_wait_ms (10000). В журнале: «сеть/прокси не отвечает (...) -- держу
+//     "трек" на 01:06 и очередь не трогаю: пробую снова...» и потом «сеть вернулась
+//     (попыток: 4) -- музыка снова идёт (с 01:06)». Пропуск трека -- только для
+//     настоящих ошибок видео (Video unavailable и подобное).
 // CHANGELOG v2.65 (место в начатых треках и понятная стрелка у перепрыгивания):
 //   * У ТРЕКОВ, КОТОРЫЕ НАЧИНАЛИ ИГРАТЬ, НО НЕ ДОИГРАНЫ, в /queue видно `02:44/03:14`
 //     (просьба владельца). Позиция берётся из track.seek (её кладут /leave и срочный
@@ -6440,6 +6453,15 @@ function configSanityIssues ()
         out.push ('MUSIC.queue_live_ms: ' + MUSIC_CFG.queue_live_ms + ' -- это МИЛЛИСЕКУНДЫ, и меньше 10 секунд не беру: ' +
             'поднимаю до 10000. Похоже, ты указал секунды -- тогда пиши 30000 для полминуты или 60000 для минуты (правки сообщений в Discord ' +
             'ограничены примерно 5 за 5 секунд на канал)');
+    // [v2.70] Ожидание сети при сбое прокси: мусор в ключе сделал бы паузу мгновенной
+    // (0) и бот молотил бы мёртвый прокси без остановки -- это лишние запросы и шум в журнале.
+    if (MUSIC_CFG.net_wait_ms !== undefined &&
+        !(Number.isFinite (Number (MUSIC_CFG.net_wait_ms)) && String (MUSIC_CFG.net_wait_ms).trim () !== ''))
+        out.push ('MUSIC.net_wait_ms = "' + MUSIC_CFG.net_wait_ms + '": ожидается число МИЛЛИСЕКУНД -- ' +
+            'иначе беру 10000 (10 секунд); ключ можно вообще не писать');
+    else if (Number (MUSIC_CFG.net_wait_ms) > 0 && Number (MUSIC_CFG.net_wait_ms) < 2000)
+        out.push ('MUSIC.net_wait_ms: ' + MUSIC_CFG.net_wait_ms + ' -- это МИЛЛИСЕКУНДЫ, и чаще двух секунд не пробую: ' +
+            'поднимаю до 2000. Пожалуй, ты указал секунды -- для десяти секунд пиши 10000');
     // [v2.55] Живой лог в файл: мусор в ключе не должен молча менять поведение --
     // строка "шесть" превратилась бы в 0 (не удалять ничего) или "no" в NaN.
     if (log_keep_months !== undefined &&
@@ -7033,6 +7055,15 @@ console.log ('[' + (d()) + '] [music] YouTube: ' + (MUSIC_PROXY
     (MUSIC_PROXIES_ALL.length > MUSIC_PROXIES.length
         ? ' | в конфиге ' + MUSIC_PROXIES_ALL.length + ' адресов прокси -- беру первые ' + MUSIC_PROXIES.length
         : ''));
+// [v2.70] Сколько ждать до повторной попытки, когда отвалилась сеть/прокси (см. musicNetStall).
+// Живёт рядом с прокси, потому что весь смысл -- именно в порядке восстановления маршрута.
+const NET_WAIT_MS = Math.max (2000, Math.min (120000,
+    Math.round (Number (MUSIC_CFG.net_wait_ms === undefined ? 10000 : MUSIC_CFG.net_wait_ms) || 10000)));
+const NET_WAIT_MAX_MS = Math.max (NET_WAIT_MS, 30000);   // дальше -- не реже раза в полминуты
+const NET_WATCH_STEP_MS = Math.max (2000, Math.min (15000, Math.round (NET_WAIT_MS / 2)));
+console.log ('[' + (d()) + '] [music] если сеть/прокси отвалится: очередь НЕ тратится -- держу место в треке и пробую снова каждые ' +
+    Math.round (NET_WAIT_MS / 1000) + ' с (до ' + Math.round (NET_WAIT_MAX_MS / 1000) + ' с, MUSIC.net_wait_ms); ' +
+    (MUSIC_PROXY ? 'как только прокси оживёт -- музыка пойдёт сама' : 'как только сеть вернётся -- музыка пойдёт сама'));
 // [v2.26] Одна строка при старте: трогаем ли мы шапку голосового канала (см. выше).
 console.log ('[' + (d()) + '] [music] статус голосового канала (шапка): ' + (MUSIC_CHANNEL_STATUS
     ? 'пишу свой (что играет, очередь, люди) -- прежний текст автора канала вернуть нельзя, он затирается'
@@ -8218,6 +8249,68 @@ function streamEndedEarly (track, at, startedAt = 0)
     return at < from + 20;
 }
 
+// ============================================================================
+// [v2.70] СЕТЬ/ПРОКСИ ОТВАЛИЛИСЬ -- ЭТО НЕ «БИТЫЙ ТРЕК».
+// Живой случай владельца: прокси икнул -- бот честно пробовал дальше, очередь
+// посыпалась (каждый трек считался «не запустившимся»), после десяти подряд он умолкал
+// совсем, и сам больше не пытался: ни один таймер не звал playNext. Переключённый
+// сервер прокси оживлял музыку не сразу -- ждать было некому.
+// Теперь сбой маршрута НЕ тратит треки: место в текущем треке держится, очередь стоит
+// как стояла, а watchdog (см. musicNetTick) пробует снова с нарастающей паузой -- музыка
+// пойдёт сама, как только связь вернётся. Пропуск трека остаётся только для настоящих
+// ошибок видео (удалили, закрыли доступ).
+// ============================================================================
+// Поставить очередь на «ожидание сети»: трек возвращается на своё место вместе с секундой,
+// на которой оборвался, и НЕ пропускается. Возвращает false, если трека нет (тогда
+// вызывающий обработает ошибку обычным путём -- «пропускаю трек»).
+function musicNetStall (guildId, track, at, e)
+{
+    const m = $music[guildId];
+    if (!m) return false;
+    const why = ytDlpErr (e, 140);
+    const pos = Math.max (0, Math.round (Number (at) || 0));
+    if (track)
+    {
+        track.seek = pos;                 // позиция едет вместе с треком (переживёт перезапуск)
+        m.current = null;
+        m.tracks.unshift (track);
+        m.seekTrack = track;
+        m.seekSec = pos;
+        m.playedMs = pos * 1000;
+        m.playingSince = null;
+        m.startedAtSec = pos;
+    }
+    m.streamRetries = 0;
+    m.playFailStreak = 0;                 // это не «битая пачка треков» -- цепочку не копим
+    const w = m.netWait || (m.netWait = { tries: 0, at: 0, lastWhy: '' });
+    w.tries++;
+    w.at = Date.now ();
+    w.lastWhy = why;
+    w.nextAt = Date.now () + Math.min (NET_WAIT_MAX_MS,
+        NET_WAIT_MS * Math.pow (2, Math.min (3, Math.max (0, w.tries - 1))));
+    const chId = m.connection ? m.connection.joinConfig.channelId : m.savedChannelId;
+    const heard = !!(chId && humansInChannel (guildId, chId) > 0);
+    // В журнал -- по-человечески: первые три попытки, дальше каждая пятая (иначе при
+    // долгом сбое событие превратилось бы в «пробую ещё раз» каждые полминуты).
+    if (w.tries === 1)
+        console.error ('[' + (d()) + '] [music] сеть/прокси не отвечает (' + why + ') -- ' +
+            (track ? 'держу «' + (track.title || 'трек') + '»' + (pos ? ' на ' + fmtDur (pos) : '') + ' и ' : '') +
+            'очередь не трогаю: пробую снова, как только связь вернётся' +
+            (heard ? '' : ' (слушателей нет -- молчу, пока кто-нибудь не зайдёт)') +
+            // Сразу видно, почему не пробуем DIRECT: если имя локально не резолвится,
+            // обходной путь и не мог бы помочь (см. directUsable/ytRoutes).
+            (dnsCache.ok === false ? ' [DIRECT не пробую: youtube.com локально не резолвится]' : ''));
+    else if (w.tries <= 3 || (w.tries % 5) === 0)
+        console.error ('[' + (d()) + '] [music] сеть всё ещё не отвечает (попытка ' + w.tries + '): ' + why +
+            ' -- музыка пойдёт сама, как только маршрут оживёт');
+    if (!heard || !m.connection)
+        m.pending = true;                 // ждём слушателя/подключения: очередь поднимет заход человека (checkListeners)
+    scheduleVoiceStatus (guildId, true);
+    schedulePresence (true);
+    saveMusicState (guildId);
+    return true;
+}
+
 async function playNext (guildId)
 {
     const m = musicOf (guildId);
@@ -8428,6 +8521,14 @@ async function playNext (guildId)
         m.streamHandle = handle; // [v2.14] чем глушить этот трек (см. killStream)
         m.player.play (resource);
         m.playFailStreak = 0; // трек заиграл -- цепочка неудач сброшена (см. catch ниже)
+        // [v2.70] Была пауза «сеть/прокси не отвечает» -- она кончилась: очередь поехала.
+        if (m.netWait)
+        {
+            const _w = m.netWait;
+            m.netWait = null;
+            console.log ('[' + (d()) + '] [music] сеть вернулась (попыток: ' + _w.tries +
+                ') -- музыка снова идёт' + (startedAt ? ' (с ' + fmtDur (startedAt) + ')' : ''));
+        }
         // [v2.43] ПРОВЕРКА ЗАРАНЕЕ ОШИБЛАСЬ -- И ЭТО НОРМАЛЬНО. Трек доехал до эфира и
         // заиграл (прокси поменяли, регион отпустил): снимаем пометку «под вопросом»,
         // чтобы ⚠ в /queue не пугала зря.
@@ -8449,6 +8550,11 @@ async function playNext (guildId)
     }
     catch (e)
     {
+        // [v2.70] СБОЙ СЕТИ/ПРОКСИ -- НЕ ПОВОД ТЕРЯТЬ ТРЕК (см. musicNetStall). Позиция, с
+        // которой пытались продолжить, ещё не сброшена -- берём её как есть.
+        const _at = (m.seekTrack === track) ? (m.seekSec || 0) : (track.seek || 0);
+        if (isNetworkError (e) && !isGoneError (e) && musicNetStall (guildId, track, _at, e))
+            return;
         // [v2.30] Сказать и ЧТО не заиграло, и что дальше: раньше строка молчала об
         // обоих, и в логе были только «непонятные» ошибки от yt-dlp/ffmpeg.
         console.error ('[' + (d()) + '] [music] трек не заиграл: ' + (track.title || track.url || 'трек') +
@@ -8743,6 +8849,13 @@ function wireStreamErrors (m, track, resource, viaProxy, guildId)
             m.player.stop (true); // Idle -> playNext (с места обрыва)
             return;
         }
+        // [v2.70] Исчерпали повторы, но причина -- сеть/прокси? Трек НЕ пропускаем: держим
+        // его место и ждём, пока маршрут оживёт (музыка пойдёт сама, см. musicNetStall).
+        if (isNetworkError (e) && !isGoneError (e) && musicNetStall (guildId, track, at, e))
+        {
+            m.player.stop (true); // Idle: следующий запуск -- уже по возвращении сети
+            return;
+        }
         console.error ('[music] поток обрывается снова (' + attempt + ' раз) -- пропускаю: ' + (track.title || 'трек'));
         m.streamRetries = 0;
         m.current = null;
@@ -9018,6 +9131,32 @@ const musicSaveTick = setInterval
     5 * 1000
 );
 if (musicSaveTick.unref) musicSaveTick.unref ();
+
+// [v2.70] WATCHDOG ОЖИДАНИЯ СЕТИ. Пока маршрут (прокси) молчит, очередь стоит на месте --
+// и здесь мы пробуем снова, НЕ дожидаясь ни события в голосовых, ни команды человека:
+// владелец переключил сервер прокси -- музыка должна пойти сама и как можно раньше.
+// Слушателей нет -- сеть впустую не будим: очередь поднимет заход человека (checkListeners).
+const musicNetTick = setInterval
+(
+    () =>
+    {
+        const now = Date.now ();
+        for (const g of Object.keys ($music))
+        {
+            const m = $music[g];
+            if (!m || m.leaving || !m.netWait || m.current) continue;
+            if (!m.tracks.length && !m.seekTrack) { m.netWait = null; continue; }
+            if (now < (m.netWait.nextAt || 0)) continue;
+            const chId = m.connection ? m.connection.joinConfig.channelId : m.savedChannelId;
+            if (!m.connection || !chId || humansInChannel (g, chId) <= 0) continue;
+            // на время попытки отодвигаем срок: playNext сам пересчитает его заново
+            m.netWait.nextAt = now + NET_WAIT_MAX_MS;
+            Promise.resolve (playNext (g)).catch (() => {}); // playNext свои ошибки ловит сам
+        }
+    },
+    NET_WATCH_STEP_MS
+);
+if (musicNetTick.unref) musicNetTick.unref ();
 
 // [v2.12] Ctrl+C -- сохраняем музыку В МОМЕНТ выхода, а не «как успел по таймеру»:
 // позиция восстанавливается точнее. [v2.12.2] Уточнение: это именно Ctrl+C/SIGTERM.
@@ -12021,6 +12160,11 @@ function joinVoiceNow (guildId, voiceChannel, guild, reason = '')
                         playNext (guildId); // плеер уже Idle -- сразу к тому же треку
                         return;
                     }
+                    // [v2.70] Причина обрыва -- сеть/прокси? Не пропускаем трек: держим место
+                    // и ждём (см. musicNetStall) -- очередь пойдёт сама, когда связь вернётся.
+                    if ((_deadErr && isNetworkError (_deadErr) && !isGoneError (_deadErr)) &&
+                        musicNetStall (guildId, playing, at, _deadErr))
+                        return;
                     console.error ('[' + (d()) + '] [music] поток обрывается снова (' + attempt +
                         ' раз) -- пропускаю: ' + (playing.title || 'трек'));
                 }
@@ -12263,6 +12407,9 @@ function destroyMusic (guildId, opts = {})
     try { m.player.stop (true); } catch {}
     try { m.connection.destroy (); } catch {}
     m.connection = null;
+    // [v2.70] Вышли из канала -- ждать сеть больше не для кого: ожидание снимаем (если
+    // связь всё ещё лежит, следующая же попытка заведёт его заново).
+    m.netWait = null;
     if (opts.forget) // /stop -- очередь больше не нужна
     {
         m.tracks = [];
