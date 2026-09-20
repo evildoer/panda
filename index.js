@@ -5,6 +5,25 @@
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
+// CHANGELOG v2.60 (прокси может быть несколько -- обрыв одного не тушит музыку):
+//   * ВОПРОС ВЛАДЕЛЬЦА: «нет разве публичных прокси, которые бы всегда работали, не
+//     скрывая IP, а только выступая как DNS?» Короткий ответ -- НЕТ: SOCKS/HTTP прокси
+//     ВСЕГДА несёт твой трафик через чужую машину (даже если не прячет адрес), то есть
+//     чужой открытый прокси -- это чужие логи, общая перегрузка и быстрые лимиты от
+//     YouTube. Роль «только DNS» умеет играть socks5h (имя резолвит ПРОКСИ) -- но это
+//     уже свой прокси, и он может икнуть. Честный ответ -- иметь ВТОРОЙ СВОЙ.
+//   * ПОЭТОМУ MUSIC.proxy ТЕПЕРЬ ПРИНИМАЕТ СПИСОК: адреса через запятую (или массив).
+//     Бот пробует их ПО ПОРЯДКУ, а «икнувший» пропускает минуту -- работу подхватывает
+//     следующий. Больше трёх адресов не берём (это уже путаница); сколько взято -- видно
+//     в стартовой строке.
+//   * «ИКНУВШИЙ» ПРОКСИ -- НЕ «МЁРТВЫЙ НАСМЕРТЬ»: раньше был один общий флаг
+//     proxyStreamDead, и один обрыв глушил сразу ВСЕ прокси. Теперь состояние своё у
+//     КАЖДОГО адреса (proxyBadUntil на 60 с): обрыв потока или сетевой сбой в yt-dlp
+//     помечает ИМЕННО тот адрес, а остальные продолжают работать.
+//   * ТО ЖЕ И У OEmbed-ПРОВЕРКИ ОЧЕРЕДИ и у DIRECT: маршруты (ytRoutes) теперь не
+//     строки 'proxy'/'DIRECT', а { proxy: <адрес> }, поэтому и скачивание на диск, и
+//     поток, и проверка берут адрес ИЗ МАРШРУТА, а не из «главного» прокси.
+//   * Настройка необязательна: одна строка в MUSIC.proxy работает ровно как раньше.
 // CHANGELOG v2.55 («🔄 Обновить» в очереди и живой лог ещё и в файле):
 //   * КНОПКА «🔄 Обновить» -- в РЯДУ ЛИСТАНИЯ, МЕЖДУ «◀ Влево» и «Вправо ▶» (просьба
 //     владельца: «список обновляется только когда я по нему перемещаюсь»). Discord
@@ -73,8 +92,8 @@
 //   * ТЕПЕРЬ БОТ ЗНАЕТ, ЕСТЬ ЛИ ЗАПАСНОЙ ПУТЬ: при старте одна строка ('запасной путь
 //     DIRECT: НЕ работает -- youtube.com локально не резолвится...'), а решения о
 //     маршруте принимает один ytRoutes (): если имя локально не резолвится, DIRECT даже
-//     не рассматривается и прокси остаётся рабочим маршрутом -- включая случай
-//     proxyStreamDead. Если имя резолвится, DIRECT остаётся запасным путём, как раньше.
+//     не рассматривается и прокси остаётся рабочим маршрутом -- включая случай, когда
+//     прокси «икнул» (v2.60). Если имя резолвится, DIRECT остаётся запасным путём, как раньше.
 //   * 3-СЕКУНДНАЯ ПРОВЕРКА ПРОКСИ КЭШИРУЕТСЯ (30 с для живой / 60 с для молчащей).
 //     Раньше она выполнялась перед КАЖДЫМ запуском yt-dlp -- метаданные, скачивание
 //     на диск и поток, то есть до трёх раз на трек: при молчащем прокси это лишние
@@ -6851,11 +6870,37 @@ const MUSIC_CFG = MUSIC || {};
 // равно лез в несуществующий прокси и терял 3 секунды на каждой песне. Теперь смысл
 // ключа честный: ключ есть -- берём его как есть (пустой = DIRECT); ключа нет --
 // переменная окружения MUSIC_PROXY, иначе DIRECT. Зашитого адреса в коде больше нет.
-const MUSIC_PROXY = ('proxy' in MUSIC_CFG)
-    ? String (MUSIC_CFG.proxy === undefined || MUSIC_CFG.proxy === null ? '' : MUSIC_CFG.proxy).trim ()
-    : String (process.env.MUSIC_PROXY || '').trim ();
-const MUSIC_PROXY_TIMEOUT = 3000; // мс -- «не получилось за 3 сек» -> DIRECT
-let proxyStreamDead = false;      // прокси отвечает по TCP, но стрим умер -> временно DIRECT
+// [v2.60] ПРОКСИ МОЖЕТ БЫТЬ НЕСКОЛЬКО -- чтобы обрыв одного не останавливал музыку.
+// Владелец спросил: «есть же публичные прокси, которые только DNS?» -- таких нет:
+// SOCKS/HTTP прокси всегда несёт твой трафик через чужую машину (даже если не скрывает
+// адрес), а чужой открытый прокси -- это чужие логи, перегрузка и быстрые лимиты от
+// YouTube. Честный ответ на «локальный прокси икнул» -- иметь ВТОРОЙ СВОЙ (другой
+// профиль VPN, другой сервер). Поэтому в ключе proxy можно перечислить адреса через
+// запятую (или массивом) -- бот пробует их по порядку, а «икнувший» пропускает минуту.
+function musicProxyList (raw)
+{
+    const arr = Array.isArray (raw) ? raw : String (raw === undefined || raw === null ? '' : raw).split (',');
+    const out = [];
+    for (const s of arr)
+    {
+        const v = String (s === undefined || s === null ? '' : s).trim ();
+        if (v && !/^(direct|none|off|no)$/i.test (v) && !out.includes (v)) out.push (v);
+    }
+    return out;
+}
+const MUSIC_PROXY_RAW = ('proxy' in MUSIC_CFG) ? MUSIC_CFG.proxy : process.env.MUSIC_PROXY;
+const MUSIC_PROXIES_ALL = musicProxyList (MUSIC_PROXY_RAW);
+const MUSIC_PROXIES = MUSIC_PROXIES_ALL.slice (0, 3);   // больше трёх -- уже путаница, а не подспорье
+const MUSIC_PROXY = MUSIC_PROXIES[0] || '';   // где нужен «главный»: строка при старте
+const MUSIC_PROXY_TIMEOUT = 3000; // мс -- «не получилось за 3 сек» -> следующий маршрут
+// [v2.60] «Икнувший» прокси -- не «мёртвый насмерть», а «пропускаем его минуту». Раньше
+// на один обрыв был общий флаг proxyStreamDead, и он же глушил сразу ВСЕ прокси; теперь
+// состояние своё у каждого адреса -- если адресов два, работу подхватывает второй.
+const PROXY_BAD_TTL = 60000;
+const proxyBadUntil = new Map ();
+function proxyMarkBad (addr) { if (addr) proxyBadUntil.set (String (addr), Date.now () + PROXY_BAD_TTL); }
+function proxyMarkGood (addr) { if (addr) proxyBadUntil.delete (String (addr)); }
+function proxyBrieflyBad (addr) { const t = proxyBadUntil.get (String (addr === undefined || addr === null ? '' : addr)); return !!t && t > Date.now (); }
 // [v2.14] ВЫРАВНИВАНИЕ ГРОМКОСТИ: yt-dlp -> ffmpeg(-af loudnorm) -> Discord.
 // Записи бывают сведены с разной громкостью (одна тише, другая громче) -- фильтр
 // loudnorm приводит их к среднему уровню, поэтому между песнями нет «качелей»
@@ -6929,8 +6974,13 @@ else
 // [v2.23] Одна строка при старте о том, как бот ходит на YouTube: видно, что ключ
 // MUSIC.proxy действительно подхватился (промах в этом месте раньше не был заметен).
 console.log ('[' + (d()) + '] [music] YouTube: ' + (MUSIC_PROXY
-    ? 'через прокси ' + MUSIC_PROXY + ' (не ответит за 3 сек -- иду напрямую)'
-    : 'напрямую (DIRECT) -- прокси не задан'));
+    ? 'через прокси ' + MUSIC_PROXY +
+      (MUSIC_PROXIES.length > 1 ? ' (запасные: ' + MUSIC_PROXIES.slice (1).join (', ') + ')' : '') +
+      ' (не ответит за 3 сек -- пробую следующий маршрут)'
+    : 'напрямую (DIRECT) -- прокси не задан') +
+    (MUSIC_PROXIES_ALL.length > MUSIC_PROXIES.length
+        ? ' | в конфиге ' + MUSIC_PROXIES_ALL.length + ' адресов прокси -- беру первые ' + MUSIC_PROXIES.length
+        : ''));
 // [v2.26] Одна строка при старте: трогаем ли мы шапку голосового канала (см. выше).
 console.log ('[' + (d()) + '] [music] статус голосового канала (шапка): ' + (MUSIC_CHANNEL_STATUS
     ? 'пишу свой (что играет, очередь, люди) -- прежний текст автора канала вернуть нельзя, он затирается'
@@ -6938,14 +6988,14 @@ console.log ('[' + (d()) + '] [music] статус голосового кана
 // Роль DJ -- задаётся в config.json сервера как role_dj.
 
 // [v2.2.2] Быстрая TCP-проверка прокси (коннект за timeoutMs, иначе -- мёртв):
-function pingProxy (timeoutMs = MUSIC_PROXY_TIMEOUT)
+function pingProxy (addr, timeoutMs = MUSIC_PROXY_TIMEOUT)
 {
     return new Promise (resolve =>
     {
         let host, port;
         try
         {
-            let u = new URL (MUSIC_PROXY);
+            let u = new URL (String (addr || ''));
             host = u.hostname;
             port = Number (u.port) || 1080;
         }
@@ -6973,18 +7023,39 @@ function pingProxy (timeoutMs = MUSIC_PROXY_TIMEOUT)
 const PING_OK_TTL = 30000;   // мс: живой прокси не переспрашиваем
 const PING_BAD_TTL = 60000;  // мс: молчащий -- тем более (успеет очнуться)
 const DNS_TTL = 60000;       // мс: состояние локального DNS
-let pingCache = { ok: false, at: 0 };
+const pingCache = new Map ();   // [v2.60] адрес -> { ok, at }: проверяем КАЖДЫЙ прокси отдельно
 let dnsCache = { ok: null, at: 0 };
 
-async function proxyAlive ()
+async function proxyAlive (addr)
 {
-    if (!MUSIC_PROXY || proxyStreamDead) return false;
+    const a = String (addr || '');
+    if (!a) return false;
+    if (proxyBrieflyBad (a)) return false;   // «икнул» на стриме -- минуту не трогаем
     const now = Date.now ();
-    const ttl = pingCache.ok ? PING_OK_TTL : PING_BAD_TTL;
-    if (pingCache.at && (now - pingCache.at) < ttl) return pingCache.ok;
-    const ok = await pingProxy ();
-    pingCache = { ok: ok, at: now };
+    const c = pingCache.get (a);
+    if (c && c.at && (now - c.at) < (c.ok ? PING_OK_TTL : PING_BAD_TTL)) return c.ok;
+    const ok = await pingProxy (a);
+    pingCache.set (a, { ok: ok, at: now });
     return ok;
+}
+
+// Живые прокси из списка, в порядке конфига (сначала те, что отвечают на TCP). Если
+// локальный DNS мёртв, DIRECT не запасной путь, поэтому в список возвращаем ВСЁ (даже
+// «икнувшее»): альтернативы просто нет.
+async function liveProxyList ()
+{
+    const alive = [], rest = [];
+    for (const p of MUSIC_PROXIES)
+        ((proxyBrieflyBad (p) || !(await proxyAlive (p))) ? rest : alive).push (p);
+    return { alive: alive, rest: rest };
+}
+
+// Какой прокси брать для своих запросов (oEmbed-проверка): первый не «икнувший»,
+// иначе (если DIRECT невозможен) хоть какой-то, иначе '' = напрямую.
+async function proxyForFetch ()
+{
+    for (const p of MUSIC_PROXIES) if (!proxyBrieflyBad (p)) return p;
+    return (await directUsable ()) ? '' : (MUSIC_PROXIES[0] || '');
 }
 
 // Резолвится ли youtube.com ЛОКАЛЬНО. null не бывает: не смогли проверить -- считаем,
@@ -7009,21 +7080,25 @@ async function directUsable ()
 // (ошибка маршрута -- не ошибка видео, см. isNetworkError). Если локальный DNS мёртв,
 // DIRECT из списка выкидывается совсем: иначе на выходе была бы невнятная DNS-ошибка
 // вместо внятной причины. Именно от прокси тянется всё, а значит выкинуть его при
-// 3-секундной заминке нельзя -- поэтому в этом случае прокси остаётся даже когда
-// proxyStreamDead (альтернативы просто нет).
+// 3-секундной заминке нельзя -- поэтому в этом случае прокси остаётся даже «икнувшим»
+// (v2.60: альтернативы просто нет).
 let directWarnedAt = 0;
+// Возвращаем МАРШРУТЫ по порядку: у прокси в поле proxy адрес, у DIRECT -- пустая строка
+// (адрес важен стал в v2.60: прокси может быть несколько, и обрыв одного не тушит музыку).
 async function ytRoutes ()
 {
-    if (!MUSIC_PROXY) return ['DIRECT'];
+    if (!MUSIC_PROXIES.length) return [{ proxy: '' }];
     const dnsOk = await directUsable ();
     if (!dnsOk && (Date.now () - directWarnedAt) > 600000)
     {
         directWarnedAt = Date.now ();
         console.log ('[' + (d()) + '] [music] youtube.com не резолвится локально -- иду через прокси (DIRECT на этой машине невозможен)');
     }
-    if (!dnsOk) return ['proxy'];                 // DIRECT бесполезен -- даже если прокси молчит
-    if (await proxyAlive ()) return ['proxy', 'DIRECT'];
-    return ['DIRECT', 'proxy'];                   // прокси молчит, но имя резолвится -- начнём с DIRECT
+    const { alive, rest } = await liveProxyList ();
+    const pRoutes = [...alive, ...rest].map (p => ({ proxy: p }));
+    if (!dnsOk) return pRoutes;               // DIRECT бесполезен -- даже если все прокси молчат
+    // Имя резолвится: живые прокси, потом DIRECT, потом «икнувшие» -- они могли очнуться
+    return [...alive.map (p => ({ proxy: p })), { proxy: '' }, ...rest.map (p => ({ proxy: p }))];
 }
 
 // Строка при старте: честно видно, ЕСТЬ ли запасной путь DIRECT (владелец: «у меня
@@ -7177,7 +7252,10 @@ async function ytDlpRun (query, optsBase)
     let lastErr;
     for (let route of routes)
     {
-        const tries = (route === 'proxy' && routes.length === 1) ? 2 : 1;
+        const addr = route && route.proxy ? String (route.proxy) : '';
+        // Маршрут остался ОДИН (остальные недоступны)? Даём ему вторую попытку через
+        // паузу -- одиночная заминка прокси ещё не повод терять трек.
+        const tries = (addr && routes.length === 1) ? 2 : 1;
         for (let attempt = 1; attempt <= tries; attempt++)
         {
             if (attempt > 1)
@@ -7188,19 +7266,21 @@ async function ytDlpRun (query, optsBase)
             }
             try
             {
-                let opts = Object.assign ({}, optsBase, route === 'proxy'
-                    ? { proxy: MUSIC_PROXY, socketTimeout: 10 } // не висим вечно в мёртвом прокси
+                let opts = Object.assign ({}, optsBase, addr
+                    ? { proxy: addr, socketTimeout: 10 } // не висим вечно в мёртвом прокси
                     : {});
                 let r = await ytdlp (query, opts);
-                if (route === 'proxy') proxyStreamDead = false; // прокси ожил
+                if (addr) proxyMarkGood (addr);   // этот прокси работает
                 return r;
             }
             catch (e)
             {
                 lastErr = e;
                 if (!ytDlpQuiet)
-                    console.error ('[music] ' + route + ' не сработал: ' + ytDlpErr (e, 150));
+                    console.error ('[music] ' + (addr ? 'прокси ' + addr : 'DIRECT') + ' не сработал: ' + ytDlpErr (e, 150));
                 if (!isNetworkError (e)) throw e; // реальная ошибка YouTube -- повторять бессмысленно
+                // [v2.60] сеть подвела на прокси -- помечаем ИМЕННО ЕГО (а не все сразу)
+                if (addr) proxyMarkBad (addr);
             }
         }
     }
@@ -7538,7 +7618,7 @@ async function cacheDownload (track, holder = {})
     cacheDirReady ();
     // [v2.52] маршрут -- как везде (см. ytRoutes): при мёртвом локальном DNS DIRECT
     // даже не рассматривается, иначе вместо музыки была бы DNS-ошибка
-    const viaProxy = (await ytRoutes ())[0] === 'proxy';
+    const viaProxy = ((await ytRoutes ())[0] || {}).proxy || '';   // [v2.60] адрес прокси или '' = DIRECT
     const key = cacheKeyOf (track);
     cacheDropParts (key); // не докачиваем старое -- качаем заново
     const proc = ytdlp.exec
@@ -7550,7 +7630,7 @@ async function cacheDownload (track, holder = {})
             quiet: true,
             noWarnings: true,
             noPlaylist: true,
-            ...(viaProxy ? { proxy: MUSIC_PROXY, socketTimeout: 10 } : {}),
+            ...(viaProxy ? { proxy: viaProxy, socketTimeout: 10 } : {}),
             f: 'bestaudio[acodec!=none][ext=m4a]/bestaudio[acodec!=none]/bestaudio/best',
             retries: 3,
         }
@@ -7841,7 +7921,7 @@ async function createTrackStream (track, seekSec = 0, seekMode = 'sections')
         const r = openCachedTrack (track, _cached, seekSec);
         if (r) return r; // не вышло -- играем как раньше, потоком
     }
-    let viaProxy = (await ytRoutes ())[0] === 'proxy';   // [v2.52] см. ytRoutes
+    let viaProxy = ((await ytRoutes ())[0] || {}).proxy || '';   // [v2.52, v2.60] см. ytRoutes
     // [v2.10] продолжение с места после перезапуска: yt-dlp отдаёт поток с N-й секунды
     // (--download-sections, нужен ffmpeg). Если так не умеет -- процесс падает сразу,
     // и playNext пробует резервный путь (ffseek), а потом берёт трек с начала.
@@ -7857,8 +7937,9 @@ async function createTrackStream (track, seekSec = 0, seekMode = 'sections')
             quiet: true,
             noWarnings: true,
             noPlaylist: true,
-            // [v2.2.2] через прокси, если жив; иначе DIRECT:
-            ...(viaProxy ? { proxy: MUSIC_PROXY, socketTimeout: 10 } : {}),
+            // [v2.2.2] через прокси, если жив; иначе DIRECT (v2.60: адрес -- из маршрута,
+            // а не из «главного» прокси: их может быть несколько):
+            ...(viaProxy ? { proxy: viaProxy, socketTimeout: 10 } : {}),
             f: 'bestaudio[acodec!=none][ext=m4a]/bestaudio[acodec!=none]/bestaudio/best',
             // буфер под riff-сети:
             bufferSize: '4M',
@@ -8518,8 +8599,10 @@ function wireStreamErrors (m, track, resource, viaProxy, guildId)
     resource.playStream.once ('error', e =>
     {
         const playing = m.current === track;
-        // [v2.2.2] сеть упала при стриме через прокси -- следующие треки временно DIRECT:
-        if (viaProxy && isNetworkError (e)) proxyStreamDead = true;
+        // [v2.2.2] сеть упала при стриме через прокси -- следующие треки временно DIRECT.
+        // [v2.60] помечаем ИМЕННО ЭТОТ адрес (viaProxy -- теперь строка с адресом), а не
+        // все прокси сразу: если в конфиге есть второй, музыка продолжится через него.
+        if (viaProxy && isNetworkError (e)) proxyMarkBad (viaProxy);
         if (!playing)
         {
             console.error ('[music] обрыв потока (предзагрузка): ' + oneLine (e.message));
@@ -10829,18 +10912,20 @@ async function oembedProbe (url)
     // не видит: на такой машине DIRECT не работает вообще, а oEmbed-проверка без
     // маршрута отвечает 'neterr' -- то есть очередь просто перестаёт проверяться.
     // (Считаем ЗАРАНЕЕ: внутри new Promise уже нельзя ждать.)
-    const useProxy = !!MUSIC_PROXY && (!proxyStreamDead || !(await directUsable ()));
+    // [v2.60] Берём первый НЕ «икнувший» прокси (а если локальный DNS мёртв -- хоть
+    // какой-то): раньше тут был один общий флаг, и один обрыв глушил проверку целиком.
+    const proxyAddr = await proxyForFetch ();
     return new Promise (resolve =>
     {
         let httpsMod;
         try { httpsMod = require ('https'); } catch { return resolve ('neterr'); }
         let agent = null;
-        if (useProxy)
+        if (proxyAddr)
             try
             {
                 const M = require ('socks-proxy-agent'); // рядом с discord.js -- берём, если есть
                 const A = M.SocksProxyAgent || M;
-                agent = new A (proxyForAgent (MUSIC_PROXY));
+                agent = new A (proxyForAgent (proxyAddr));
             }
             catch { agent = null; } // модуля рядом нет -- идём напрямую, проверить это не мешает
         let done = false;
