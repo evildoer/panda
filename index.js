@@ -5,6 +5,20 @@
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
+// CHANGELOG v2.62 (/jump доступен DJ, кнопка «Перепрыгнуть», предзагрузка с повторами):
+//   * /JUMP РАЗРЕШЁН ОБЫЧНОМУ DJ (просьба владельца: «полезная очень»), но по правилу
+//     «своё/чужое», как /skip, /move и перемотка: цель должна быть его; «обрезать» --
+//     только если всё убираемое тоже его; срочно перебить ЧУЖОЙ играющий трек нельзя
+//     (иначе прыжок обошёл бы запрет на пропуск чужого). Проверка внутри jumpGuard,
+//     поэтому слэш и кнопки не разъедутся.
+//   * КНОПКА «⏭ Перепрыгнуть» В РЯДУ ДЕЙСТВИЙ (перед «▶ Войти»): окно ввода номера ->
+//     подтверждение варианта. Пятая кнопка в ряду -- ровно лимит Discord.
+//   * «▶ Войти» СТАЛ НЕЙТРАЛЬНЫМ: зелёный в боте -- «подтверждаю/ок», а вход в канал --
+//     обычное перемещение (владелец: «почему ещё войти зелёным?»).
+//   * ПРЕДЗАГРУЗКА ПРОБУЕТ НЕСКОЛЬКО РАЗ (PRELOAD_TRIES = 3 с паузой 5 с). Живой случай:
+//     YouTube ответил '403 Forbidden' на скачивание следующего трека -- одна попытка, и
+//     заготовки нет; когда очередь дошла, тот же трек открылся сразу. Одна сетевая заминка
+//     не повод играть без заготовки; ошибку самого видео по-прежнему не повторяем.
 // CHANGELOG v2.61 (/jump: прерванный трек -- следующим; автор ссылкой; видно самообновление):
 //   * /JUMP: ПРЕРВАННЫЙ ТРЕК ИДЁТ СЛЕДУЮЩИМ (просьба владельца: «старый перекидывает В
 //     КОНЕЦ, хотя я говорил НАОБОРОТ в начало очереди»). Срочный переход: цель играет
@@ -8493,6 +8507,39 @@ function killStream (r)
 }
 
 // Начать готовить первый трек очереди (повторные вызовы безопасны).
+// [v2.62] ПРЕДЗАГРУЗКА ПРОБУЕТ НЕСКОЛЬКО РАЗ. Живой случай владельца: YouTube ответил
+// 'HTTP Error 403: Forbidden' на скачивание следующего трека -- одна попытка, и заготовки
+// нет; когда очередь дошла, тот же трек открылся сразу. Одна сетевая заминка (или 403 от
+// лимита) ещё не значит, что трек мёртв, поэтому теперь до PRELOAD_TRIES попыток с паузой.
+// Если видео реально удалено ('Video unavailable') -- попытки не тратим: помечаем сразу.
+const PRELOAD_TRIES = 3;
+const PRELOAD_RETRY_MS = 5000;
+const sleep = ms => new Promise (r => setTimeout (r, ms));
+
+// Общая попытка с повторами для предзагрузки: зовём fn до PRELOAD_TRIES раз с паузой.
+// Отдаём результат fn, а если всё не вышло -- бросаем последнюю ошибку (по ней вызывает
+// обычный обработчик: «видео больше нет» / «предзагрузка не удалась»).
+async function preloadRetry (fn, p, next)
+{
+    let lastErr = null;
+    for (let i = 1; i <= PRELOAD_TRIES; i++)
+    {
+        if (p.cancelled) return null;
+        try { return await fn (); }
+        catch (e) { lastErr = e; }
+        if (p.cancelled) return null;
+        if (isGoneError (lastErr)) throw lastErr;   // видео нет -- повторять бессмысленно
+        if (i < PRELOAD_TRIES)
+        {
+            console.log ('[' + (d()) + '] [music] предзагрузка не вышла (попытка ' + i + '/' + PRELOAD_TRIES + ', ' +
+                (next.title || 'трек') + '): ' + ytDlpErr (lastErr, 120) + ' -- пробую ещё раз через ' +
+                Math.round (PRELOAD_RETRY_MS / 1000) + ' с');
+            await sleep (PRELOAD_RETRY_MS);
+        }
+    }
+    throw lastErr;
+}
+
 function startPreload (guildId)
 {
     const m = musicOf (guildId);
@@ -8509,46 +8556,60 @@ function startPreload (guildId)
         const holder = {};
         cp.dlStop = () => holder.stop && holder.stop ();
         m.preload = cp;
-        cp.promise = cacheDownload (next, holder).then
-        (
-            file =>
+        // [v2.62] Скачивание пробуем несколько раз с паузой (см. PRELOAD_TRIES).
+        cp.promise = (async () =>
+        {
+            let lastErr = null;
+            for (let i = 1; i <= PRELOAD_TRIES; i++)
             {
                 if (cp.cancelled) return null;
-                if (!file)
+                try
                 {
-                    console.error ('[music] предзагрузка не удалась (' + (next.title || 'трек') + '): файл на диск не лёг');
-                    return null;
+                    const file = await cacheDownload (next, holder);
+                    if (file)
+                    {
+                        console.log ('[' + (d()) + '] [music] предзагрузка готова (уже на диске): ' + (next.title || 'трек') +
+                            (i > 1 ? ' -- со попытки ' + i : ''));
+                        return { resource: null, viaProxy: false, fromCache: true };
+                    }
+                    lastErr = new Error ('файл на диск не лёг');
                 }
-                console.log ('[' + (d()) + '] [music] предзагрузка готова (уже на диске): ' + (next.title || 'трек'));
-                return { resource: null, viaProxy: false, fromCache: true };
-            },
-            e =>
-            {
-                cp.cancelled = true;
+                catch (e) { lastErr = e; }
+                if (cp.cancelled) return null;
                 // [v2.35] видео больше нет (удалено/закрыто) -- помним это на треке, чтобы
-                // очередь не тратила на него четыре попытки, а убрала сразу
-                if (isGoneError (e))
+                // очередь не тратила на него четыре попытки, а убрала сразу. Повторять
+                // такую ошибку бессмысленно -- сразу выходим.
+                if (isGoneError (lastErr))
                 {
                     next.gone = true;
                     console.error ('[' + (d()) + '] [music] видео больше нет на YouTube (' + (next.title || 'трек') +
-                        ') -- уберу его из очереди, когда дойдёт; очередь не трогаю: ' + ytDlpErr (e, 120));
+                        ') -- уберу его из очереди, когда дойдёт; очередь не трогаю: ' + ytDlpErr (lastErr, 120));
                     return null;
                 }
-                console.error ('[music] предзагрузка не удалась (' + (next.title || 'трек') + '): ' + ytDlpErr (e));
-                return null;
+                if (i < PRELOAD_TRIES)
+                {
+                    console.log ('[' + (d()) + '] [music] предзагрузка не вышла (попытка ' + i + '/' + PRELOAD_TRIES + ', ' +
+                        (next.title || 'трек') + '): ' + ytDlpErr (lastErr, 120) + ' -- пробую ещё раз через ' +
+                        Math.round (PRELOAD_RETRY_MS / 1000) + ' с');
+                    await sleep (PRELOAD_RETRY_MS);
+                }
             }
-        );
+            console.error ('[music] предзагрузка не удалась (' + (next.title || 'трек') + '): ' + ytDlpErr (lastErr));
+            return null;
+        })();
         return;
     }
     const p = { track: next, resource: null, viaProxy: false, cancelled: false };
     m.preload = p;
-    p.promise = createTrackStream (next).then
+    // [v2.62] И поток пробуем несколько раз с паузой (preloadRetry): одна сетевая заминка
+    // не повод играть без заготовки; ошибку самого видео не повторяем.
+    p.promise = preloadRetry (() => createTrackStream (next), p, next).then
     (
         r =>
         {
-            if (p.cancelled)
+            if (p.cancelled || !r)
             {
-                killStream (r); // предзагрузку уже выбросили -- глушим всё, что успело открыться
+                if (r) killStream (r); // предзагрузку уже выбросили -- глушим всё, что успело открыться
                 return null;
             }
             p.resource = r.resource;
@@ -9490,8 +9551,9 @@ const QUEUE_HINT_FULL =
     ' свой трек (у админов и модеров -- любой).' + '\n' +
     QSMALL + 'Подвинуть -- выбери трек в меню ниже (выше/ниже, в начало, в конец' +
     ' или «На позицию…»), либо командой /move номер to номер.' + '\n' +
-    QSMALL + 'Прыгнуть по очереди -- /jump (админы и модеры): срочный переход (прерванный' +
-    ' трек заиграет следующим, с того же места) либо «Обрезать до трека» (всё до него убрать).' + '\n' +
+    QSMALL + 'Прыгнуть по очереди -- /jump: DJ -- по своим трекам, админы и модеры -- любым.' +
+    ' Срочный переход (прерванный трек заиграет следующим, с того же места) либо «Обрезать до трека»' +
+    ' (всё до него убрать -- DJ только если всё убираемое его).' + '\n' +
     QSMALL + 'Чистить -- /clear (остаться) или /stop (уйти): спросят подтверждение.' + '\n' +
     QSMALL + 'DJ распоряжается только своими треками (и ставит их только на свои же' +
     ' места), админы и модеры -- любыми.';
@@ -9770,12 +9832,20 @@ function queueComponents (page, m, moveSel = 0, opts = {})
                 .setDisabled (!m.current)
         )
     );
+    // [v2.62] «⏭ Перепрыгнуть» -- /jump прямо из очереди (окно ввода номера -> подтверждение
+    // варианта). Доступно и обычному DJ (по своим трекам -- см. jumpGuard). Встало в этот
+    // ряд (перед «▶ Войти») -- пятая кнопка в ряду, лимит Discord ровно пять.
+    // «▶ Войти» сменил зелёный на нейтральный: зелёный в боте значит «подтверждаю/ок», а
+    // вход/выход -- обычное перемещение, и в ряду он смотрелся чужеродно.
     rows.push
     (
         new ActionRowBuilder ().addComponents
         (
             new ButtonBuilder ()
-                .setCustomId ('q:join').setLabel ('▶ Войти').setStyle (ButtonStyle.Success),
+                .setCustomId ('q:jmp').setLabel ('⏭ Перепрыгнуть').setStyle (ButtonStyle.Secondary)
+                .setDisabled (!total),
+            new ButtonBuilder ()
+                .setCustomId ('q:join').setLabel ('▶ Войти').setStyle (ButtonStyle.Secondary),
             new ButtonBuilder ()
                 .setCustomId ('q:leave').setLabel ('⏏ Выйти').setStyle (ButtonStyle.Secondary),
             new ButtonBuilder ()
@@ -10123,7 +10193,36 @@ function queueClearConfirm (m, actorId, staff, opts = {})
 //   * cut -- ОБРЕЗАТЬ ДО ТРЕКА: всё до цели и прерванный убираются насовсем (это
 //     и есть чистка одним движением -- поэтому только staff).
 // ============================================================================
-function jumpMusic (guildId, n, cut)
+// [v2.62] ПРАВА НА ПРЫЖОК: staff -- любой трек и любой режим; обычный DJ -- только по
+// СВОИМ правилам (то же «своё/чужое», что у /skip, /move и перемотки): цель должна быть
+// его, «обрезать» можно только если всё убираемое тоже его, а срочно перебить ЧУЖОЙ
+// играющий трек нельзя (иначе прыжок стал бы обходом правила «чужое не пропускать»).
+function jumpGuard (m, n, cut, opts)
+{
+    const staff = !!(opts && opts.staff);
+    const actorId = (opts && opts.actorId) ? String (opts.actorId) : '';
+    if (staff) return null;
+    const target = m.tracks[n - 1];
+    if (!target || !isBy (target, actorId))
+        return '🚫 **Прыгнуть можно только к своему треку** -- этот добавил ' +
+            (byIdOf (target) ? u (byIdOf (target)) : 'не ты') + '.\n' +
+            '_Свой трек поднять -- «⬆ Поднять» в меню автора; чужой пропускают только админы и модеры._';
+    if (cut)
+    {
+        const gone = m.tracks.slice (0, n - 1).concat (m.current ? [m.current] : []);
+        const foe = gone.find (t => !isBy (t, actorId));
+        if (foe)
+            return '🚫 **Обрезать очередь может только админ/модер** -- перед №' + n +
+                ' есть чужие треки (' + (byIdOf (foe) ? u (byIdOf (foe)) : 'без автора') + ').\n' +
+                '_Обычному DJ остаётся «Срочный переход»: он ничего не теряет._';
+    }
+    if (!cut && m.current && !isBy (m.current, actorId))
+        return '🚫 **Сейчас играет чужой трек** -- срочный переход его перебьёт, а это могут только админы и модеры.\n' +
+            '_Дождись конца или попроси «⬆ Поднять» свой трек._';
+    return null;
+}
+
+function jumpMusic (guildId, n, cut, opts = {})
 {
     const m = $music[guildId];
     if (!m || !m.tracks.length || !Number.isInteger (n) || n < 1 || n > m.tracks.length)
@@ -10133,6 +10232,8 @@ function jumpMusic (guildId, n, cut)
                 ? '🤔 В очереди ' + m.tracks.length + ' треков -- номер от 1 до ' + m.tracks.length + '.'
                 : '🈳 В очереди нет треков (играет только текущий).',
         };
+    const denied = jumpGuard (m, n, cut, opts);
+    if (denied) return { ok: false, text: denied };
     if (cut)
     {
         const gone = m.tracks.splice (0, n - 1);
@@ -12026,7 +12127,7 @@ const musicCommands =
              .setDescription ('Чьи треки поднять (без него -- твои; чужого -- только админы/модеры)')),
     new SlashCommandBuilder ()
         .setName ('jump')
-        .setDescription ('Перейти сразу к треку под этим номером (только админы и модеры)')
+        .setDescription ('Перейти сразу к треку (DJ -- по своим, админы/модеры -- любым)')
         .addIntegerOption (o =>
             o.setName ('number')
              .setDescription ('Номер трека в очереди (см. /queue)')
@@ -12261,6 +12362,24 @@ client.on ('interactionCreate', async (interaction) =>
             }, 1500);
             return interaction.reply ({ content: res0.text, flags: MessageFlags.Ephemeral });
         }
+        // [v2.62] ОКНО ВВОДА НОМЕРА ДЛЯ «⏭ Перепрыгнуть»: число проверили -- дальше тот же
+        // jumpConfirm, что и у /jump (срочный переход или обрезка), и те же требования к
+        // правам (jumpGuard).
+        if (interaction.customId === 'q:jumpm')
+        {
+            const mJ = musicOf (guildId);
+            const to = parseInt (String (interaction.fields.getTextInputValue ('pos') || '').replace (/\D+/g, ''), 10);
+            if (!Number.isInteger (to) || to < 1 || to > mJ.tracks.length)
+                return interaction.reply
+                ({
+                    content: mJ.tracks.length
+                        ? '🤔 В очереди ' + mJ.tracks.length + ' треков -- номер от 1 до ' + mJ.tracks.length + '.'
+                        : '🈳 В очереди нет треков.',
+                    flags: MessageFlags.Ephemeral,
+                });
+            const c = jumpConfirm (to);
+            return interaction.reply ({ content: c.text, components: c.rows, flags: MessageFlags.Ephemeral });
+        }
         const mMpos = /^q:mpos:(\d+)$/.exec (interaction.customId || '');
         if (!mMpos) return;
         const m = musicOf (guildId);
@@ -12332,21 +12451,15 @@ client.on ('interactionCreate', async (interaction) =>
             return replyView (parseInt (mPage[2], 10) || 1);
         }
         // [v2.61] ПОДТВЕРЖДЕНИЕ /jump: вариант не указали в команде -- спрашиваем кнопками.
-        // Права те же, что у самой команды (прыжок перебивает чужую музыку -- только staff),
-        // поэтому ветка стоит ДО общего гейта «только DJ»: staff без роли DJ тоже должен смочь.
+        // Ветка стоит ДО общего гейта «только DJ»: staff без роли DJ тоже должен смочь,
+        // а права проверяет jumpGuard (staff -- любые, DJ -- только свои).
         const mJp = /^q:jp:(x|u|c)(?::(\d+))?$/.exec (cid);
         if (mJp)
         {
             if (mJp[1] === 'x')
                 return interaction.update ({ content: '✖ Прыжок отменён -- очередь на месте.', components: [] });
-            if (!staff)
-                return interaction.reply
-                ({
-                    content: '🚫 Прыжок доступен админам и модерам -- он перебивает то, что играет.\n' +
-                        '_Свой трек можно поднять -- `/push` или «⬆ Поднять» в меню автора под `/queue`._',
-                    flags: MessageFlags.Ephemeral,
-                });
-            const res = jumpMusic (guildId, parseInt (mJp[2], 10) || 0, mJp[1] === 'c');
+            const res = jumpMusic (guildId, parseInt (mJp[2], 10) || 0, mJp[1] === 'c',
+                { actorId: interaction.user.id, staff: staff });
             return interaction.update ({ content: (res.ok ? '' : '⚠️ ') + res.text, components: [] });
         }
         // --- действия: как и слэш-команды, только для админов/модеров и роли DJ ---
@@ -12354,7 +12467,7 @@ client.on ('interactionCreate', async (interaction) =>
         // не было, и нажатие молча уходило в return: Discord показывал «взаимодействие
         // не удалось», а перенос кнопками не работал (при этом /move работал -- это и
         // сбивало с толку). Теперь все три пути перестановки разрешены одинаково.
-        if (!/^q:(skip|join|leave|clear|stop|da|dau|dax|dx|cq|rm|mv|mt|mb|mp|mu|md|mx|s|sk|tr|rx)(:|$)/.test (cid)) return;
+        if (!/^q:(skip|join|leave|clear|stop|da|dau|dax|dx|cq|rm|mv|mt|mb|mp|mu|md|mx|s|sk|tr|rx|jmp)(:|$)/.test (cid)) return;
         if (!isDJ (interaction))
         {
             const role_dj = SERVERS[guildId].role_dj || '';
@@ -12367,6 +12480,29 @@ client.on ('interactionCreate', async (interaction) =>
             );
         }
         const who = interaction.member ? uuu (interaction.member) : interaction.user.username;
+        // [v2.62] «⏭ Перепрыгнуть» -- окно ввода номера, дальше спрашиваем вариант
+        // (срочный переход / обрезка) теми же кнопками, что и у /jump.
+        if (cid === 'q:jmp')
+        {
+            if (!m.tracks.length)
+                return interaction.reply ({ content: '🈳 В очереди нет треков -- перепрыгивать некуда.', flags: MessageFlags.Ephemeral });
+            return interaction.showModal
+            (
+                new ModalBuilder ().setCustomId ('q:jumpm')
+                    .setTitle ('Перепрыгнуть к треку')
+                    .addComponents
+                    (
+                        new ActionRowBuilder ().addComponents
+                        (
+                            new TextInputBuilder ()
+                                .setCustomId ('pos')
+                                .setLabel ('Номер трека в очереди (1-' + m.tracks.length + ')')
+                                .setStyle (TextInputStyle.Short)
+                                .setRequired (true).setMaxLength (4)
+                        )
+                    )
+            );
+        }
         // [v2.17] «⬆ Выше» / «⬇ Ниже» -- перестановка того трека, что выбран в меню
         // [v2.36] «⏫ В начало» / «⏬ В конец» и «#️⃣ На позицию…» (окно ввода):
         // та же queueMove -- права и ответы те же, что у «⬆ Выше/⬇ Ниже» и /move.
@@ -13342,14 +13478,9 @@ client.on ('interactionCreate', async (interaction) =>
             // выбранный трек играет сразу, а то, что было до него (вместе с прерванным
             // играющим и ЕГО МЕСТОМ В ТРЕКЕ), уезжает в конец очереди -- ничего не
             // теряется: убрать лишнее можно /remove, /clear, /clear author.
-            // Права -- админы/модеры: прыжок перебивает чужую музыку.
-            if (!isStaffInteraction (interaction))
-                return interaction.reply
-                ({
-                    content: '🚫 Прыжок доступен админам и модерам -- он перебивает то, что играет.\n' +
-                        '_Свой трек можно поднять -- `/push` или «⬆ Поднять» в меню автора под `/queue`; один трек пропускается кнопкой «⏭ Пропустить»._',
-                    flags: MessageFlags.Ephemeral,
-                });
+            // [v2.62] ПРАВА: staff -- любые треки; обычный DJ -- только по своим (за этим
+            // следит jumpGuard внутри jumpMusic, поэтому слэш и кнопки не разъедутся).
+            const ctxJ = { actorId: interaction.user.id, staff: isStaffInteraction (interaction) };
             // [v2.61] ВАРИАНТ МОЖНО ВЫБРАТЬ В САМОЙ КОМАНДЕ, а если не выбрал -- СПРАШИВАЕМ
             // кнопками (владелец: «а второй вариант вообще не спросило»). Логика одна --
             // jumpMusic, поэтому слэш-команда и кнопки не разъедутся.
@@ -13359,7 +13490,7 @@ client.on ('interactionCreate', async (interaction) =>
                 const c = jumpConfirm (n);
                 return interaction.reply ({ content: c.text, components: c.rows, flags: MessageFlags.Ephemeral });
             }
-            const res = jumpMusic (guildId, n, mode === 'cut');
+            const res = jumpMusic (guildId, n, mode === 'cut', ctxJ);
             return interaction.reply (res.ok ? res.text : { content: res.text, flags: MessageFlags.Ephemeral });
         }
         else if (name === 'skip')
