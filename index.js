@@ -9187,6 +9187,25 @@ async function clearMusicState (guildId)
 // история -- своё: /stop и /clear очередь стирают, а историю не трогают.
 // ============================================================================
 const HISTORY_MSG_LIMIT = 1800; // сколько символов отдаём под список -- с запасом до лимита Discord
+// [v2.69] СКОЛЬКО НАЗВАНИЙ ПАЧКИ ХРАНИМ. В самом сообщении /history видно первые три
+// (иначе один плейлист съел бы весь текст) -- а остальное лежит в базе, и состав пачки
+// целиком можно ПОСМОТРЕТЬ ПО КНОПКЕ «📜 Все треки» (просьба владельца: «вижу список
+// треков, но выводится только начало пары из них»). 100 -- компромисс: 33-трековые сеты
+// влезают целиком, а пачка на 1000 треков не превращает запись истории в архив
+// (100 названий по 90 символов -- это ~9 КБ на пачку). Ключа в конфиге нет намеренно:
+// это технический предел хранения, а не настройка вкуса.
+const HISTORY_TITLES_STORE = 100;
+// Сколько названий на одной странице просмотра и по сколько символов режем название.
+// Размеры подобраны так, чтобы страница ВСЕГДА влезала в лимит сообщения Discord даже
+// с заголовком и пояснениями: 20 × (60 + 5) = 1300 символов строк + ~400 на всё
+// остальное. Иначе «Позже» перепрыгивало бы то, что не влезло в сообщение.
+const HISTORY_TITLES_PAGE = 20;
+const HISTORY_EXPAND_CLIP = 60;
+// Сколько названий печатаем В САМОМ /history: три, как и было (v2.69 -- только это число
+// теперь про ВЫВОД, а не про хранение). Если печатать все 100, строка пачки вырастает
+// до 6 КБ и перестаёт помещаться в сообщение -- /history показал бы «Раньше -- ещё N»
+// вместо самого списка (это и поймал стенд).
+const HISTORY_INLINE_TITLES = 3;
 
 // [v2.56] ЛИМИТОВ У ИСТОРИИ ДВА, И РЕЖЕМ МЫ ЦЕЛЫМИ ПАЧКАМИ.
 //   history_len    -- сколько ПАЧЕК помнить (как было);
@@ -9267,12 +9286,13 @@ async function historySeedFromQueue (guildId)
                          n: 0, live: 0, titles: [], urls: [], ids: [], q: '' }; byKey.set (key, b); }
         b.n++;
         if (t.isLive) b.live++;
-        if (b.titles.length < 3) b.titles.push (t.title || t.url || '');
+        if (b.titles.length < HISTORY_TITLES_STORE) b.titles.push (t.title || t.url || '');
         // [v2.56] Ключи треков -- чтобы у перенесённых из очереди пачек тоже работала
         // «судьба» (см. historyFate). Метка добавления у пачки общая, треки -- свои.
         if (b.ids.length < 500) b.ids.push (ytKey (t.url));
         // [v2.56] ссылки переносим вместе с названиями -- чтобы из /history можно было
         // добавить пачку заново, не разыскивая её в YouTube (то же, что у новых пачек).
+        // Ссылок по-прежнему не больше трёх: больше в сообщении не показать.
         if (b.urls.length < 3 && /^https?:/i.test (String (t.url || ''))) b.urls.push (String (t.url).slice (0, 200));
     }
     const list = historyTrim ([...byKey.values ()].sort ((a, b) => b.at - a.at));
@@ -9312,7 +9332,9 @@ async function historyAdd (guildId, entry)
         // разыскивая трек заново. У плейлистов тут адрес плейлиста, а сами треки -- в
         // titles/urls (их первые три, иначе одна пачка съела бы всё сообщение).
         q: String (entry.q || '').replace (/\s+/g, ' ').trim ().slice (0, 120),
-        titles: (entry.titles || []).slice (0, 3).map (t => String (t || '').slice (0, 90)),
+        // [v2.69] Названий храним МНОГО (см. HISTORY_TITLES_STORE), а показываем в тексте
+        // /history -- первые три: остальные смотрит кнопка «📜 Все треки».
+        titles: (entry.titles || []).slice (0, HISTORY_TITLES_STORE).map (t => String (t || '').slice (0, 90)),
         urls: (entry.urls || []).filter (u => /^https?:/i.test (String (u || '')))
             .slice (0, 3).map (u => String (u).slice (0, 200)),
         // [v2.56] КЛЮЧИ ТРЕКОВ ПАЧКИ -- по ним /history и отвечает на «а что с ней
@@ -9405,12 +9427,16 @@ function historyText (guildId)
     let len = head.length, hidden = 0;
     for (const e of list)
     {
+        // [v2.69] В самом сообщении -- первые HISTORY_INLINE_TITLES названий, сколько бы
+        // их ни лежало в базе: иначе строка одной пачки вырастает в килобайты и пачка
+        // вообще выпадает из сообщения. Остальное -- кнопкой «📜 Все треки».
+        const t3 = historyTitlesOf (e).slice (0, HISTORY_INLINE_TITLES);
         const what = (e.n > 1)
             ? 'плейлист: ' + e.n + ' ' + plural (e.n, 'трек', 'трека', 'треков') +
               (e.live ? ' (' + e.live + ' 🔴 ' + plural (e.live, 'эфир', 'эфира', 'эфиров') + ')' : '') +
-              ((e.titles || []).length ? ': ' + e.titles.join (', ') +
-                  (e.n > e.titles.length ? ' и ещё ' + (e.n - e.titles.length) : '') : '')
-            : (e.live ? 'эфир: ' : 'трек: ') + ((e.titles || [])[0] || 'без названия');
+              (t3.length ? ': ' + t3.join (', ') +
+                  (e.n > t3.length ? ' и ещё ' + (e.n - t3.length) : '') : '')
+            : (e.live ? 'эфир: ' : 'трек: ') + (t3[0] || 'без названия');
         const line = '`' + stamp (e.at) + '` **' + (e.byName || 'без автора') + '** -- ' + what;
         // [v2.56] Вторая строка -- что стало с пачкой, что человек написал в /play и
         // адреса для повторного добавления. Собирается только из того, что есть.
@@ -9432,11 +9458,133 @@ function historyText (guildId)
     const tail = '\n' + QSEP + '\n_Один `/play` = одна пачка: кто, когда и что поставил.\n' +
         'Строка «↳» -- судьба пачки (что ждёт в очереди, что доиграно и убрано),\n' +
         'что ты написал в `/play` -- это можно вставить заново, ссылки на сами треки.\n' +
+        'Состав пачки целиком -- кнопкой «📜 Все треки» ниже.\n' +
         (hidden ? 'Раньше -- ещё ' + hidden + ' ' + plural (hidden, 'пачка', 'пачки', 'пачек') + '.\n' : '') +
         'Старое уходит само: помню ' + MUSIC_HISTORY_LEN + ' ' + plural (MUSIC_HISTORY_LEN, 'пачку', 'пачки', 'пачек') +
         (MUSIC_HISTORY_TRACKS ? ' и до ' + MUSIC_HISTORY_TRACKS + ' треков суммарно (пачка уходит целиком)' : '') +
         ' -- ключи `MUSIC.history_len`' + (MUSIC_HISTORY_TRACKS ? ' и `MUSIC.history_tracks`' : '') + '._';
     return head + '\n' + shown.join ('\n') + tail;
+}
+
+// ============================================================================
+// [v2.69] «📜 ВСЕ ТРЕКИ» -- СОСТАВ ПАЧКИ ЦЕЛИКОМ.
+// В самом сообщении /history у пачки видно только первые три названия (иначе один
+// плейлист съел бы весь текст), а храним мы до HISTORY_TITLES_STORE. Поэтому под
+// /history есть кнопка: она даёт ВЫБРАТЬ пачку, а потом листает её состав страницами.
+// Всё это эфемерно -- видит только нажавший: публичное сообщение истории остаётся
+// на месте и не раздувается (владелец: «вижу список треков, а выводится только
+// начало пары из них»).
+// ============================================================================
+function historyTitlesOf (e)
+{
+    return (Array.isArray (e && e.titles) ? e.titles : []).map (t => String (t || '').trim ()).filter (Boolean);
+}
+function historyStamp (t)
+{
+    const two = n => String (n).padStart (2, '0');
+    const x = new Date (Number (t) || 0);
+    return two (x.getDate ()) + '.' + two (x.getMonth () + 1) + ' ' + two (x.getHours ()) + ':' + two (x.getMinutes ());
+}
+function historySizeOf (e)
+{
+    return Math.max (Number (e && e.n) || 0, historyTitlesOf (e).length);
+}
+
+// Меню выбора пачки: последние HISTORY_PICK_COUNT (лимит меню Discord). Значение -- метка
+// времени пачки: две пачки в одну миллисекунду не бывает, а если бывает -- вторую
+// пропускаем (Discord не принимает меню с одинаковыми значениями).
+const HISTORY_PICK_COUNT = 25;
+function historyPickRows (list)
+{
+    const opts = [], used = new Set ();
+    for (const e of (Array.isArray (list) ? list : []))
+    {
+        if (opts.length >= HISTORY_PICK_COUNT) break;
+        const at = String (Number (e && e.at) || 0);
+        if (at === '0' || used.has (at)) continue;
+        used.add (at);
+        const n = historySizeOf (e);
+        const opt =
+        {
+            label: (historyStamp (e.at) + ' · ' + (e.byName || 'без автора') + ' · ' + n + ' ' +
+                plural (n, 'трек', 'трека', 'треков')).slice (0, 100),
+            value: at,
+        };
+        // описание добавляем только когда оно есть: Discord не любит пустые строки
+        if (e.q) opt.description = clipped ('запуск: ' + String (e.q), 90);
+        opts.push (opt);
+    }
+    if (!opts.length) return null;
+    const sel = new StringSelectMenuBuilder ()
+        .setCustomId ('q:hsel').setPlaceholder ('📜 Какую пачку раскрыть?');
+    sel.addOptions (opts);
+    return [new ActionRowBuilder ().addComponents (sel),
+            new ActionRowBuilder ().addComponents
+            (new ButtonBuilder ().setCustomId ('q:hclose').setLabel ('✖ Закрыть').setStyle (ButtonStyle.Secondary))];
+}
+function clipped (s, n = 90)
+{
+    const t = String (s || '');
+    return t.length > n ? t.slice (0, n - 1) + '…' : t;
+}
+
+// Кнопки листания состава: шаг -- ровно страница (HISTORY_TITLES_PAGE), потому что
+// столько строк в неё гарантированно влезает (см. константы выше).
+function historyExpandRows (e, off, n)
+{
+    const pages = Math.max (1, Math.ceil (n / HISTORY_TITLES_PAGE));
+    const p = Math.min (Math.max (0, Math.floor ((Number (off) || 0) / HISTORY_TITLES_PAGE) || 0), pages - 1);
+    const first = p * HISTORY_TITLES_PAGE;
+    const btns = [];
+    if (pages > 1)
+    {
+        btns.push (new ButtonBuilder ()
+            .setCustomId ('q:hp:' + (Number (e.at) || 0) + ':' + (first - HISTORY_TITLES_PAGE))
+            .setLabel ('◀ Раньше').setStyle (ButtonStyle.Secondary).setDisabled (p <= 0));
+        btns.push (new ButtonBuilder ()
+            .setCustomId ('q:hp:' + (Number (e.at) || 0) + ':' + (first + HISTORY_TITLES_PAGE))
+            .setLabel ('Позже ▶').setStyle (ButtonStyle.Secondary).setDisabled (p >= pages - 1));
+    }
+    btns.push (new ButtonBuilder ().setCustomId ('q:hclose').setLabel ('✖ Закрыть').setStyle (ButtonStyle.Secondary));
+    return [new ActionRowBuilder ().addComponents (...btns)];
+}
+
+// Текст одной страницы состава (+ метаданные для кнопок).
+function historyExpandView (e, off)
+{
+    const titles = historyTitlesOf (e);
+    const total = historySizeOf (e);
+    const head = '📜 **Состав пачки** -- `' + historyStamp (e.at) + '` ' + (e.byName || 'без автора') + ': ' +
+        total + ' ' + plural (total, 'трек', 'трека', 'треков') +
+        ((e.live && e.n > 1) ? ' (' + e.live + ' 🔴 ' + plural (e.live, 'эфир', 'эфира', 'эфиров') + ')' : '');
+    if (!titles.length)
+        return { text: head + '\n_' + 'Состав не сохранён -- пачка записана до v2.69: тогда в базе'
+            + ' оставались только первые три названия (в /history они видны)._', rows: [] };
+    const pages = Math.max (1, Math.ceil (titles.length / HISTORY_TITLES_PAGE));
+    const p = Math.min (Math.max (0, Math.floor ((Number (off) || 0) / HISTORY_TITLES_PAGE) || 0), pages - 1);
+    const first = p * HISTORY_TITLES_PAGE;
+    const lines = [];
+    for (let i = first; i < titles.length && lines.length < HISTORY_TITLES_PAGE; i++)
+        lines.push (String (i + 1).padStart (2, ' ') + '. ' + clipped (titles[i], HISTORY_EXPAND_CLIP));
+    const notes = [];
+    if (titles.length < total)
+        notes.push ('В базе сохранено ' + titles.length + ' названий из ' + total +
+            ' -- пачка из ' + (titles.length <= 3 ? 'старой записи (до v2.69)' : 'более чем ' +
+            HISTORY_TITLES_STORE + ' треков'));
+    if (e.q) notes.push ('запуск: `' + clipped (e.q, 60) + '`');
+    const text = head + (pages > 1 ? ' · стр. ' + (p + 1) + '/' + pages + ' (всего показано ' +
+            titles.length + ')' : '') + '\n' + QSEP + '\n' +
+        '```\n' + lines.join ('\n') + '\n```' +
+        (notes.length ? '\n' + notes.map (s => '_' + s + '_').join ('\n') : '');
+    return { text: text, rows: historyExpandRows (e, off, titles.length), titles: titles.length };
+}
+
+// Найти пачку по метке времени (из value меню или из customId кнопок листания).
+function historyFind (list, at)
+{
+    const want = String (Number (at) || 0);
+    for (const e of (Array.isArray (list) ? list : [])) if (String (Number (e && e.at) || 0) === want) return e;
+    return null;
 }
 
 // ============================================================================
@@ -12579,6 +12727,40 @@ client.on ('interactionCreate', async (interaction) =>
             if (res.ok) queueMsgRedraw (guildId, 1500).catch (() => {});
             return interaction.update ({ content: (res.ok ? '' : '⚠️ ') + res.text, components: [] });
         }
+        // [v2.69] «📜 ВСЕ ТРЕКИ» ПОД /history -- состав пачки целиком. Ветки стоят ДО гейта
+        // «только DJ»: смотреть историю может каждый (как /queue и /nowplaying), а всё
+        // это эфемерно -- чужой человек увидит только свой выбор, публичное сообщение
+        // истории останется на месте.
+        if (cid === 'q:hi')
+        {
+            await historyLoad (guildId);   // с прошлого запуска могла остаться в базе
+            const rows = historyPickRows (m.history);
+            if (!rows)
+                return interaction.reply
+                ({ content: '🕘 Раскрывать нечего -- истории добавлений пока нет.', flags: MessageFlags.Ephemeral });
+            return interaction.reply
+            ({
+                content: '📜 **Состав пачки** -- выбери, какую раскрыть (последние ' + m.history.length + '):',
+                components: rows,
+                flags: MessageFlags.Ephemeral,
+            });
+        }
+        if (cid === 'q:hclose')
+            return interaction.update ({ content: '✖ Закрыто.', components: [] });
+        const mHsel = (cid === 'q:hsel') ? String ((interaction.values || [])[0] || '') : null;
+        const mHp = mHsel === null ? /^q:hp:(\d+):(-?\d+)$/.exec (cid) : null;
+        if (mHsel !== null || mHp)
+        {
+            await historyLoad (guildId);
+            const at = mHsel !== null ? mHsel : mHp[1];
+            const off = mHp ? (parseInt (mHp[2], 10) || 0) : 0;
+            const e = historyFind (m.history, at);
+            if (!e)
+                return interaction.update
+                ({ content: '🕘 Этой пачки в истории уже нет -- она ушла по лимиту. Вызови `/history` заново.', components: [] });
+            const v = historyExpandView (e, off);
+            return interaction.update ({ content: v.text, components: v.rows });
+        }
         // --- действия: как и слэш-команды, только для админов/модеров и роли DJ ---
         // [v2.44] mt/mb/mp -- «⏫ В начало», «⏬ В конец», «#️⃣ На позицию…». Их в списке
         // не было, и нажатие молча уходило в return: Discord показывал «взаимодействие
@@ -13745,7 +13927,18 @@ client.on ('interactionCreate', async (interaction) =>
             // История живёт ОТДЕЛЬНО от очереди (musicState/history) и переживает и
             // доигранное, и /stop, и перезапуск (см. historyLoad/historyAdd).
             await historyLoad (guildId);   // с прошлого запуска могло остаться в базе
-            return interaction.reply (historyText (guildId));
+            // [v2.69] В САМОМ тексте у пачки видно только первые три названия (иначе один
+            // плейлист съел бы весь текст). Всё остальное (до HISTORY_TITLES_STORE) -- по
+            // кнопке «📜 Все треки»: она даёт выбрать пачку и листает её состав.
+            const hiRows = m.history.some (e => historyTitlesOf (e).length > 3)
+                ? [new ActionRowBuilder ().addComponents (
+                    new ButtonBuilder ().setCustomId ('q:hi').setLabel ('📜 Все треки')
+                        .setStyle (ButtonStyle.Secondary))]
+                : [];
+            const hText = historyText (guildId);
+            return interaction.reply (hiRows.length
+                ? { content: hText, components: hiRows }
+                : hText);
         }
         else if (name === 'queue')
         {
