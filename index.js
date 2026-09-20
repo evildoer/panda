@@ -1181,6 +1181,23 @@ function dbDumpFmt (_ns, _key, _value)
     }
     if (_ns === 'musicState')
     {
+        // [v2.57] ИСТОРИЯ ДОБАВЛЕНИЙ -- это тоже musicState, но в другой записи (history),
+        // и раньше дамп читал её как ЗАПИСЬ ПРИСУТСТВИЯ («сижу в канале -- ...») -- по
+        // такой строке казалось, что истории нет вовсе. Показываем то, что в ней есть:
+        // сколько пачек, сколько в них треков, кто поставил последнюю и когда.
+        if (Array.isArray (_value.list))
+        {
+            const _list = _value.list;
+            const _tr = _list.reduce ((s, _e) => s + Math.max (1, Number (_e && _e.n) || 1), 0);
+            const _new = _list[0] || null;
+            return _head + ' -- пачек ' + _list.length + ', треков ' + _tr +
+                ' | последняя: ' + (_new
+                    ? dbDumpDate (_new.at) + ' -- ' + clipText (String (_new.byName || 'без автора'), 40) +
+                      ' (' + Math.max (1, Number (_new.n) || 1) + ' ' +
+                      plural (Math.max (1, Number (_new.n) || 1), 'трек', 'трека', 'треков') + ')'
+                    : '--') +
+                ' | показывается в /history, переживает перезапуск';
+        }
         // [v2.25] У присутствия (musicState/voice) очереди нет по устройству -- очередь
         // лежит в отдельной записи (musicState/queue). Раньше дамп писал и про неё
         // «в очереди 0, играющего нет», и это читалось как «бот ничего не помнит».
@@ -1197,7 +1214,9 @@ function dbDumpFmt (_ns, _key, _value)
             // показывалась как «0 сек» вместо настоящей. Это то же тело бага, что был
             // в /mydata: отчёт показывал меньше, чем бот реально помнит.
             (Number (_value.elapsed) ? ', позиция ' + Math.floor (Number (_value.elapsed)) + ' сек' : '') +
-            (_value.left ? ' | вышел по /leave' : '');
+            (_value.left ? ' | вышел по /leave' : '') +
+            // [v2.57] ...и видно, что сообщение /queue у бота на примете (оно обновляется само)
+            ((_value.qMsg && _value.qMsg.id) ? ' | живое сообщение /queue помню' : '');
     }
     return _head + ' -- ' + clipText (JSON.stringify (_value), 300);
 }
