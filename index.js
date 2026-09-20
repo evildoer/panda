@@ -1215,8 +1215,15 @@ function dbDumpFmt (_ns, _key, _value)
             // в /mydata: отчёт показывал меньше, чем бот реально помнит.
             (Number (_value.elapsed) ? ', позиция ' + Math.floor (Number (_value.elapsed)) + ' сек' : '') +
             (_value.left ? ' | вышел по /leave' : '') +
-            // [v2.57] ...и видно, что сообщение /queue у бота на примете (оно обновляется само)
-            ((_value.qMsg && _value.qMsg.id) ? ' | живое сообщение /queue помню' : '');
+            // [v2.57] ...и видно, ЧТО именно бот ведёт (сообщение /queue обновляется само):
+            // канал, id сообщения, страница и кто его открыл -- чтобы это не было тайной
+            // ни для владельца в дампе, ни при разборе («почему в канале что-то меняется»).
+            ((_value.qMsg && _value.qMsg.id)
+                ? ' | живое сообщение /queue: <#' + (_value.qMsg.ch || '?') + '>, id ' + _value.qMsg.id +
+                  ', стр. ' + (Number (_value.qMsg.page) || 1) +
+                  (_value.qMsg.actorName ? ', открыл ' + clipText (String (_value.qMsg.actorName), 30) : '') +
+                  (_value.qMsg.actorId ? ' (' + String (_value.qMsg.actorId) + ')' : '')
+                : '');
     }
     return _head + ' -- ' + clipText (JSON.stringify (_value), 300);
 }
@@ -6361,11 +6368,12 @@ function configSanityIssues ()
     // частое -- упирало бы в лимиты Discord на правки сообщений (5 за 5 секунд на канал).
     if (MUSIC_CFG.queue_live_ms !== undefined &&
         !(Number.isFinite (Number (MUSIC_CFG.queue_live_ms)) && String (MUSIC_CFG.queue_live_ms).trim () !== ''))
-        out.push ('MUSIC.queue_live_ms = "' + MUSIC_CFG.queue_live_ms + '": ожидается число миллисекунд -- ' +
+        out.push ('MUSIC.queue_live_ms = "' + MUSIC_CFG.queue_live_ms + '": ожидается число МИЛЛИСЕКУНД -- ' +
             'иначе выходит 0 и /queue перестанет обновляться сам (ставь 60000 или не пиши ключ вовсе)');
     else if (Number (MUSIC_CFG.queue_live_ms) > 0 && Number (MUSIC_CFG.queue_live_ms) < 10000)
-        out.push ('MUSIC.queue_live_ms: ' + MUSIC_CFG.queue_live_ms + ' -- поднимаю до 10000 (правки сообщений ' +
-            'в Discord ограничены примерно 5 за 5 секунд на канал; минута -- безопасный шаг)');
+        out.push ('MUSIC.queue_live_ms: ' + MUSIC_CFG.queue_live_ms + ' -- это МИЛЛИСЕКУНДЫ, и меньше 10 секунд не беру: ' +
+            'поднимаю до 10000. Похоже, ты указал секунды -- тогда пиши 60000 для минуты (правки сообщений в Discord ' +
+            'ограничены примерно 5 за 5 секунд на канал)');
     // [v2.55] Живой лог в файл: мусор в ключе не должен молча менять поведение --
     // строка "шесть" превратилась бы в 0 (не удалять ничего) или "no" в NaN.
     if (log_keep_months !== undefined &&
