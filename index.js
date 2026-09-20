@@ -26,6 +26,15 @@
 //     был убран (уборка кэша знала только «играющий и предзагрузка») -- и бот тянул его
 //     заново. Владелец: «надо сохранять, если скачал, до полного прослушивания или удаления
 //     из очереди». Теперь файл защищён, пока у трека стоит метка места (track.seek).
+//   * ДЛИННЫЙ СЕТ КАЧАЕТСЯ ЗАРАНЕЕ (вопрос владельца: «почему ты заранее не качал длинные
+//     треки, как и все остальные маленькие?»). Причина была -- тишина на минуты, пока
+//     скачается файл сета; теперь её нет: как только длинный сет встал СЛЕДУЮЩИМ (startPreload),
+//     его закачка уже идёт (память: cache_long_sets + cache_full_max_min). Пока играет
+//     текущий трек, файл успевает лечь целиком, и сет начинается С ДИСКА. Заодно: закачка
+//     стала одной за раз (нужный следующим запоминается в m.longWant и берётся в работу
+//     после текущей), готовый файл повторно не качается (раньше после игры с диска тот же
+//     сет уходил на второй круг), уборка кэша не сносит файл, который в этот момент пишется,
+//     а после /clear и /clear author закачка убранного трека прекращается.
 //   * МУЗЫКАЛЬНЫЙ (ЛИЧНЫЙ) КАНАЛ -- ОБЫЧНАЯ ВРЕМЕННАЯ КОМНАТА: пустой -- уходит, как любая
 //     другая, и никакого исключения для него больше нет (оно было в v2.71). Владелец:
 //     «Бот должен возвращаться К СЛУШАТЕЛЮ, а не тупо в канал». И это не только слова:
@@ -7988,24 +7997,49 @@ function longSetCached (track)
     return !!(MUSIC_CACHE_LONG_SETS && track && !track.isLive &&
         Number (track.duration) > MUSIC_CACHE_FULL_MAX);
 }
+// [v2.73] Закачка сета нужна, пока ЕЁ ТРЕК В ОЧЕРЕДИ (или играет): очередь почистили --
+// тянуть десятки мегабайт впустую незачем. Зовётся там, где очередь меняется без старта
+// нового трека (а при смене трека закачка сама переключается -- см. playNext).
+function longDownloadPrune (m)
+{
+    if (!m) return;
+    const alive = t => !!t && (t === m.current || (m.tracks || []).includes (t));
+    if (m.longDl && !alive (m.longDl.track)) cancelLongDownload (m);
+    if (m.longWant && !alive (m.longWant)) m.longWant = null;
+}
 function cancelLongDownload (m)
 {
     const h = m && m.longDl;
+    if (m) m.longWant = null;   // [v2.73] и «что качать следующим» тоже забываем
     if (!h) return;
     m.longDl = null;
     try { if (typeof h.stop === 'function') h.stop (); } catch {}
     cacheLongBusy.delete (h.key);
 }
-function startLongDownload (guildId, track)
+// [v2.73] ЗАКАЧКА СЕТА ИДЁТ ЗАРАНЕЕ, А НЕ ТОЛЬКО ПО ХОДУ ИГРЫ. Владелец спросил, почему
+// длинные треки не качаются до старта, как короткие: ответ -- потому что это была бы
+// тишина на минуты (сет весит десятки мегабайт). Теперь качаем БЕЗ тишины, но на шаг
+// раньше: как только длинный сет встал следующим (startPreload), его закачка уже идёт --
+// к моменту старта файл обычно лежит, и сет начинается с диска, а не с потока.
+// Одновременно -- ровно одна закачка; нужный следующим трек запоминается в m.longWant и
+// берётся в работу, как только текущая закончится (иначе «заранее» для второго сета
+// подряд так и не наступало бы).
+function startLongDownload (guildId, track, why = '')
 {
     const m = $music[guildId];
-    if (!m || !longSetCached (track) || m.longDl) return;
+    if (!m || !longSetCached (track) || cacheFind (track)) return;
+    if (m.longDl)
+    {
+        if (m.longDl.track !== track) m.longWant = track; // качается другой -- встанем в очередь
+        return;
+    }
     const key = cacheKeyOf (track);
     const holder = { key: key, track: track };
     m.longDl = holder;
     cacheLongBusy.add (key);
-    console.log ('[' + (d()) + '] [music] качаю сет на диск целиком в фоне (файл идёт вперёд музыки -- ' +
-        'перезапуск потом продолжит с диска): ' + (track.title || 'трек'));
+    console.log ('[' + (d()) + '] [music] качаю сет на диск целиком в фоне (' +
+        (why || 'файл идёт вперёд музыки -- перезапуск потом продолжит с диска') +
+        '): ' + (track.title || 'трек'));
     cacheDownload (track, holder).then
     (
         file =>
@@ -8015,11 +8049,22 @@ function startLongDownload (guildId, track)
             if (file)
                 console.log ('[' + (d()) + '] [music] сет целиком на диске: ' + (track.title || 'трек') +
                     ' -- теперь он продолжается и перематывается без YouTube');
+            // [v2.73] взяли в работу то, что ждало очереди (следующий длинный сет)
+            const want = m.longWant;
+            m.longWant = null;
+            if (want && longSetCached (want))
+                startLongDownload (guildId, want, 'заранее: предыдущий сет уже на диске');
         },
         e =>
         {
             if (m.longDl === holder) m.longDl = null;
             cacheLongBusy.delete (key);
+            // [v2.73] неудачная закачка не должна запирать следующую: то, что ждало
+            // очереди, всё равно пробуем (своей ошибкой оно в лог попадёт само).
+            const want = m.longWant;
+            m.longWant = null;
+            if (want && longSetCached (want))
+                startLongDownload (guildId, want, 'заранее: предыдущая закачка закончилась');
             if (holder.cancelled) return; // выбросили сами (трек сменился) -- это не событие
             console.error ('[music] сет на диск не лёг (' + (track.title || 'трек') + '): ' + ytDlpErr (e, 150) +
                 ' -- музыку это не ломает, играю потоком');
@@ -8131,6 +8176,10 @@ function cacheKeysInUse ()
         for (const t of m.tracks)
             if (t && !t.isLive && Number (t.seek) >= 1) set.add (cacheKeyOf (t));
     }
+    // [v2.73] и файл, который прямо сейчас тянет фоновая закачка сета (она может идти
+    // заранее -- тогда этот трек ещё не играет и не предзагружен, и уборка снесла бы
+    // файл из-под пишущего процесса).
+    for (const k of cacheLongBusy) set.add (k);
     return set;
 }
 function cacheDropUnused (retries = 5)
@@ -9032,6 +9081,17 @@ function startPreload (guildId)
     if (!next) { dropPreload (m); return; }
     if (m.preload && m.preload.track === next) return; // этот уже готовим
     dropPreload (m);                                   // готовили не то -- выкидываем
+    // [v2.73] ДЛИННЫЙ СЕТ КАЧАЕМ ЗАРАНЕЕ -- УЖЕ ЗДЕСЬ. Владелец: «правда не понял, почему ты
+    // заранее не качал длинные треки, как и все остальные маленькие». Причина была -- тишина
+    // на минуты, пока файл сета скачается. А вот заранее её нет: пока играет текущий трек
+    // (минуты и часы), следующий длинный сет успевает лечь на диск целиком, и начинается он
+    // уже с файла, а не с потока. Закачка одна за раз (см. startLongDownload/m.longWant).
+    if (longSetCached (next))
+    {
+        // длинная закачка идёт не за тем треком, который теперь нужен, и он не играет -- меняем
+        if (m.longDl && m.longDl.track !== next && m.longDl.track !== m.current) cancelLongDownload (m);
+        startLongDownload (guildId, next, 'заранее: пока играет текущий трек -- к началу сета файл уже на диске');
+    }
     // [v2.37] КОРОТКИЙ ТРЕК ГОТОВИМ СКАЧИВАНИЕМ НА ДИСК: пока играет текущий, следующий
     // уже лежит файлом -- между песнями нет не только паузы, но и ни одного запроса к
     // YouTube (а перемотка и восстановление потом вообще мгновенные).
@@ -10929,6 +10989,7 @@ function queueWipe (guildId)
     m.playedToSomeone = false; // очередь стёрта осознанно -- не пишем «доиграна до конца»
     m.playedMs = 0;
     m.playingSince = null;
+    longDownloadPrune (m);  // [v2.73] очередь убрали -- закачки сета тоже прекращаем
     dropPreload (m);
     m.player.stop (true);     // тишина: играть больше нечего (Idle-хэндлер запустит нечего)
     clearMusicState (guildId); // и из базы -- чтобы убранное не воскресло после перезапуска
@@ -10966,6 +11027,7 @@ function queuePurge (guildId, keep)
         cacheDropUnused (); // [v2.39] убирать больше нечего -- чистим и кэш
     }
     else saveMusicState (guildId);
+    longDownloadPrune (m);   // [v2.73] закачка убранного трека больше не нужна (см. longDownloadPrune)
     dropPreload (m);
     startPreload (guildId);
     scheduleVoiceStatus (guildId, true);
