@@ -31,6 +31,27 @@
 //     стоит в чьём-то config.json): [config] подскажет новое, бот не сломается. Этот ключ и
 //     cache_long_sets -- про разное: первый решает, какие треки качать ЦЕЛИКОМ ДО старта,
 //     второй -- качать ли длинные сеты в ФОНЕ, пока играет текущий.
+// CHANGELOG v2.86 (булевы ключи: «а если ключа нет?»; имя файла лога -- из префикса):
+//   * МУСОР В БУЛЕВОМ КЛЮЧЕ = «КЛЮЧА НЕТ». Вопрос владельца: «что будет, если ключа нет?» --
+//     ответ теперь один и безопасный, а значение не true/false (строка "false", единица) --
+//     это ТО ЖЕ САМОЕ, что ключа нет. Раньше было не везде: у флагов наказаний стояло
+//     `|| false`, и строка "false" считалась ВКЛЮЧЁННОЙ -- опечатка в конфиге оборачивалась
+//     баном человеку. Теперь флаги читает flagOn (только явный true), а про мусор в ЛЮБОМ
+//     булевом ключе (верхний уровень, MUSIC, сервер) говорит строка [config].
+//   * ЧТО ЗНАЧИТ «КЛЮЧА НЕТ» -- НАПИСАНО В ПРИМЕРЕ у каждого булева ключа (19 ключей).
+//     Ключи, которые трогают людей или тратят ресурсы (наказания, шапка канала, ники,
+//     файлы на диске), без ключа ВЫКЛЮЧЕНЫ; те, что берегут данные или показывают контакт, --
+//     ВКЛЮЧЕНЫ (save_roles, кэш, выравнивание, проверка очереди, приветствие, контакты).
+//     Само правило -- в _ПРО_КОММЕНТАРИИ примера.
+//   * ИМЯ ФАЙЛА ЛОГА -- ИЗ ПРЕФИКСА (владелец: «пускай для имени файла берёт префикс… связать
+//     явно эти два использования одной переменной»): 'panda ' -> logs/panda-ГГГГ-ММ.log,
+//     отдельного ключа для имени нет. Префикс нормализуется (пробелы и знаки -> '-', пусто ->
+//     'bot'), а старые месячные файлы подчищаются под ЛЮБЫМ именем -- раньше только 'panda-',
+//     и после смены префикса они оставались бы навсегда. Живой стенд поймал тут вторую ошибку:
+//     без незахватывающей группы в образце номер месяца съезжал, и файлы НЕ удалялись.
+//   * КОММЕНТАРИИ БОЕВОГО CONFIG.JSON = КОММЕНТАРИЯМ ПРИМЕРА (просьба владельца), и в примере
+//     больше нет чужого слова 'panda' -- в подсказках 'prefix', а сообщение [config] про
+//     PREFIX показывает ПРЕФИКС ВЛАДЕЛЬЦА, а не чужие примеры.
 // CHANGELOG v2.85 (`allow: true` -- единственный способ включить экземпляр):
 //   * ОДНО ПРАВИЛО ВКЛЮЧЁННОСТИ ВМЕСТО ДВУХ. Нашлось на чистке боевого конфига по
 //     просьбе владельца («только обязательное и отклонения от умолчаний»): убрав
@@ -1007,7 +1028,8 @@ const space = ' ';
 // Владелец смотрит лог в окне консоли, но окно прокручивается, а по логу же нужно
 // разбирать случаи из боя: «что там было в 03:43?». Поэтому те же строки (с той же
 // меткой времени) уходят и в файл:
-//   * ФАЙЛ НА МЕСЯЦ -- logs/panda-2026-09.log. Это и есть ротация: новый месяц --
+//   * ФАЙЛ НА МЕСЯЦ -- logs/<PREFIX>-2026-09.log (с v2.86 имя берётся из PREFIX команд:
+//     'panda ' -> logs/panda-2026-09.log, отдельного ключа для имени нет). Это и есть ротация: новый месяц --
 //     новый файл, а не одна растущая простыня, которую не открыть;
 //   * сколько месячных файлов держать -- ключ log_keep_months (по умолчанию 0 -- не
 //     удалять ничего; задано число, например 6, -- старые месяцы убираются при смене);
@@ -1030,6 +1052,22 @@ const BOT_RUN = process.argv.slice (2).length === 0;
 const utilMod = require ('util');
 const fsLog = require ('fs');
 const LOG_DIR = __dirname + '/' + (String (log_dir === undefined || log_dir === null ? '' : log_dir).trim () || 'logs');
+// [v2.86] ИМЯ ФАЙЛА ЛОГА -- ИЗ ПРЕФИКСА КОМАНД (владелец: «пускай для имени файла берёт
+// префикс… связать явно эти два использования одной переменной»). Так имя файла не надо
+// помнить отдельно: вписал свой префикс -- и лог называется так же (`panda ` ->
+// logs/panda-2026-09.log). Но PREFIX -- это ключ конфига, там бывает и пробел на конце,
+// и слэш, и двоеточие, поэтому НОРМАЛИЗУЕМ: пробелы и недопустимые символы -> '-',
+// повторные '-' схлопываются, пустое (префикс из одних знаков) -> 'bot'.
+function logBaseName (p)
+{
+    const _s = String (p === undefined || p === null ? '' : p).trim ()
+        .replace (/\s+/g, '-')
+        .replace (/[^0-9A-Za-zА-Яа-яЁё_-]/g, '-')
+        .replace (/-+/g, '-')
+        .replace (/^[-_]+|[-_]+$/g, '');
+    return _s || 'bot';
+}
+const LOG_BASE = logBaseName (PREFIX);
 const LOG_KEEP_MONTHS = Math.max (0, Math.round (Number (log_keep_months) || 0));
 const logMonthKey = t => t.getFullYear () + '-' + String (t.getMonth () + 1).padStart (2, '0');
 let $logMonthPath = '', $logKey = '', $logWarned = false;
@@ -1043,7 +1081,12 @@ function logPruneMonths (keep, now)
     {
         for (const name of fsLog.readdirSync (LOG_DIR))
         {
-            const mm = /^panda-(\d{4})-(\d{2})\.log$/.exec (name);
+            // [v2.86] Ловим ЛЮБОЕ имя с месячной меткой, а не только текущее: после смены
+            // префикса старые файлы остались с прежним именем -- иначе они не убирались бы.
+            // ВАЖНО: группа без имени НЕ захватывающая (?:.+): номер месяца ниже берётся как
+            // mm[2], и «жадная» группа сдвинула бы нумерацию -- тогда age стал бы NaN и старые
+            // файлы просто НЕ удалялись бы (живой стенд это и поймал: файл августа остался).
+            const mm = /^(?:.+)-(\d{4})-(\d{2})\.log$/.exec (name);
             if (!mm) continue;
             const age = (now.getFullYear () - Number (mm[1])) * 12 + (now.getMonth () + 1 - Number (mm[2]));
             if (age >= keep) { try { fsLog.unlinkSync (LOG_DIR + '/' + name); gone++; } catch (e) {} }
@@ -1063,7 +1106,7 @@ function logFileWrite (line)
         {
             fsLog.mkdirSync (LOG_DIR, {recursive: true});
             const gone = logPruneMonths (LOG_KEEP_MONTHS, now);
-            $logMonthPath = LOG_DIR + '/panda-' + key + '.log';
+            $logMonthPath = LOG_DIR + '/' + LOG_BASE + '-' + key + '.log';
             $logKey = key;
             if (gone)
                 fsLog.appendFileSync ($logMonthPath, '[' + d () + '] [log] убрал старых файлов лога: ' + gone +
@@ -1112,7 +1155,7 @@ function logTailLines (n)
 {
     try
     {
-        const p = logFilePath () || (LOG_DIR + '/panda-' + logMonthKey (new Date ()) + '.log');
+        const p = logFilePath () || (LOG_DIR + '/' + LOG_BASE + '-' + logMonthKey (new Date ()) + '.log');
         const arr = fsLog.readFileSync (p, 'utf8').split ('\n').filter (l => l !== '');
         return arr.slice (Math.max (0, arr.length - n));
     }
@@ -1710,7 +1753,7 @@ function filesCli ()
         const _info = _e.name === 'node_modules' ? ['скачанные зависимости npm', 'МОЖНО -- npm i вернёт, и в git они не попадают']
             : _e.name === 'images' ? ['старые картинки из истории бота (код их не использует)', 'можно (оставлены как память)']
             : _e.name === '.git' ? ['история git (коммиты): отсюда можно откатиться', 'НЕТ']
-            : _e.name === 'logs' ? ['ЖИВОЙ ЛОГ бота (panda-ГГГГ-ММ.log -- файл на месяц; рядом crash-*.txt -- отчёты о сбоях, если они были)',
+            : _e.name === 'logs' ? ['ЖИВОЙ ЛОГ бота (' + LOG_BASE + '-ГГГГ-ММ.log -- файл на месяц, имя из PREFIX; рядом crash-*.txt -- отчёты о сбоях, если они были)',
                 'можно -- файлы создадутся заново; старые месяцы уходят по log_keep_months']
             : (_e.isDirectory () ? _what (_e.name) : _what (_e.name));
         _lines.push ('  ' + _e.name.padEnd (34).slice (0, 34) + ' ' + _sizeTxt.padStart (14) + '  ' +
@@ -2348,6 +2391,13 @@ function dbServerList ()   { return Object.keys (SERVERS).filter (_k => /^\d{17,
 // выглядел в отчётах живым, хотя бот его не трогал (а [config] просил поставить allow).
 // Теперь отчёты, проверки и правда на диске говорят одно и то же.
 function serverOn (_srv) { return !!(SERVERS[_srv] && SERVERS[_srv].allow === true); }
+// [v2.86] БУЛЕВ ФЛАГ СЕРВЕРА -- ТОЛЬКО ЯВНЫЙ true. Вопрос владельца («что будет, если ключа
+// нет?») у наказаний решается так: нет ключа или значение не boolean (в том числе СТРОКА
+// "false"!) -- наказания НЕТ. Раньше стояло `|| false`, и такая строка считалась ВКЛЮЧЁННОЙ:
+// опечатка в конфиге оборачивалась баном человеку. У остальных серверных флагов безопасное
+// состояние -- наоборот «включено» (save_roles, welcome_prefix, show_owner_*): они либо
+// берегут данные, либо показывают контакт владельца, и там действует `!== false`.
+function flagOn (_srv, _key) { return !!(SERVERS[_srv] && SERVERS[_srv][_key] === true); }
 // [v2.26] Включённые серверы (allow: false -- сознательно выключен, базы у него нет):
 // проверки целостности, копии и `node . backup`/`restore` его не касаются.
 function dbServerListOn ()  { return dbServerList ().filter (_k => serverOn (_k)); }
@@ -5515,7 +5565,8 @@ async function bansOverview (server)
     // бана НЕ прошёл: чаще всего нет права «Банить участников» или роль бота ниже роли
     // человека. Это не «бог знает что» и не навсегда: при перезаходе бот попробует снова,
     // а в конце срока запись уйдёт сама (и ложного «разбанил» не будет).
-    const leaveBan = (SERVERS[server].onLeaveBanRealy || false) && (SERVERS[server].onLeaveBanTimeout || 0) > 0;
+    // [v2.86] флаг читаем строго (см. flagOn): мусор в ключе -- это «ключа нет», а не «бань»
+    const leaveBan = flagOn (server, 'onLeaveBanRealy') && (SERVERS[server].onLeaveBanTimeout || 0) > 0;
     const rows = active.map (a =>
     ({
         id: a.id,
@@ -5941,7 +5992,7 @@ async function handleMemberJoin (server, uid, raw)
     const guild = client.guilds.cache.get (server);
     const serverName = SERVERS[server].name;
     let onLeaveBanTimeout = SERVERS[server].onLeaveBanTimeout || 0;
-    let onEnterBanRealy = SERVERS[server].onEnterBanRealy || false;
+    let onEnterBanRealy = flagOn (server, 'onEnterBanRealy');   // [v2.86] только явный true
     let until = await db (server, 'membersBanTimeout', uid); // конец таймаута (Date.now-мс)
     const left = until ? until - Date.now () : 0;
     const username = (raw && raw.user && raw.user.username) || uid;
@@ -6039,10 +6090,10 @@ async function handleMemberLeave (server, uid, raw, since = 0)
     const guild = client.guilds.cache.get (server);
     let log_channel = SERVERS[server].log_channel || '';
     let onLeaveBanTimeout = SERVERS[server].onLeaveBanTimeout || 0;
-    let onLeaveBanRealy = SERVERS[server].onLeaveBanRealy || false;
+    let onLeaveBanRealy = flagOn (server, 'onLeaveBanRealy');    // [v2.86] только явный true
     // [v2.26] Нужен только для честной подсказки в логе: что будет с человеком дальше
     // (попробует ли бот забанить его при перезаходе).
-    const onEnterBanRealy = SERVERS[server].onEnterBanRealy || false;
+    const onEnterBanRealy = flagOn (server, 'onEnterBanRealy');   // [v2.86] только явный true
     // [v2.14] Сначала запоминаем роли выходящего -- ДО таймаута и до любых банов.
     // Это делает сама PANDAMIA (раньше это умел только сторонний бот), см. saveMemberRoles.
     // [v2.15] since -- время снимка поллера: роль, снятая за секунды до выхода, в базу
@@ -6402,7 +6453,7 @@ async function rolecheckReport (server, target)
     const isBan = bans.has (target.id);
     const why = isBan && bans.get (target.id) ? ' (причина: ' + oneLine (bans.get (target.id), 200) + ')' : '';
     const unconfirmed = !isBan && !!until && until > Date.now () &&
-        (s.onLeaveBanRealy || false) && (s.onLeaveBanTimeout || 0) > 0;
+        flagOn (server, 'onLeaveBanRealy') && (s.onLeaveBanTimeout || 0) > 0;   // [v2.86]
     if (until && until > Date.now ())
         out.push ('\n**Сейчас в наказании:** ' + (isBan ? '🚫 бан' : '⏳ таймаут (бана в Discord нет)') +
             ' до `' + d (until, true) + '` -- осталось `' + dd (until) + '`' + why +
@@ -6725,10 +6776,12 @@ function configSanityIssues ()
     const out = [];
     const idOk = v => /^\d{17,20}$/.test (String (v === undefined || v === null ? '' : v).trim ());
     const has = v => String (v === undefined || v === null ? '' : v).trim () !== '';
-    // PREFIX без пробела на конце: 'panda ping' не соберётся ни в одну команду.
+    // PREFIX без пробела на конце: '<prefix>ping' не соберётся ни в одну команду.
+    // [v2.86] В подсказке -- ПРЕФИКС ВЛАДЕЛЬЦА, а не чужое слово: раньше тут были зашиты
+    // примеры с 'panda', и в чужом конфиге они сбивали с толку (то же слово даёт имя файла лога).
     if (has (PREFIX) && !/\s$/.test (String (PREFIX)))
         out.push ('PREFIX = "' + PREFIX + '": нет пробела на конце -- текстовые команды (' +
-            'panda ping, panda help, panda dm) работать не будут');
+            String (PREFIX).trim () + ' ping, ' + String (PREFIX).trim () + ' help) работать не будут');
     if (has (privacy_url) && !PRIVACY_URL)
         out.push ('privacy_url: не похоже на ссылку http(s) -- /mydata и /help её не покажут');
     // [v2.42] Ссылка на политику задаётся только верхним ключом, а показывать её или нет
@@ -6818,6 +6871,27 @@ function configSanityIssues ()
     if (log_dir !== undefined && typeof log_dir !== 'string')
         out.push ('log_dir = ' + JSON.stringify (log_dir) + ': ожидается папка строкой -- ' +
             'беру значение по умолчанию (logs)');
+    // [v2.86] БУЛЕВЫ КЛЮЧИ И ИХ БЕЗОПАСНОЕ СОСТОЯНИЕ. Вопрос владельца: «что будет, если
+    // ключа нет?» -- ответ должен быть один и безопасный, а МУСОР в ключе (строка "false",
+    // единица) -- это ТО ЖЕ САМОЕ, что ключа нет: иначе опечатка молча включает поведение.
+    // Проверяем одним списком, а в config.example.json у каждого из этих ключей есть
+    // строка «ключа нет -- …», поэтому владельцу есть куда посмотреть.
+    const boolKeys = (obj, where, keys) =>
+    {
+        if (!obj || typeof obj !== 'object') return;
+        for (const k of keys)
+        {
+            if (!Object.prototype.hasOwnProperty.call (obj, k)) continue;
+            if (typeof obj[k] === 'boolean') continue;
+            out.push (where + '.' + k + ' = ' + JSON.stringify (obj[k]) + ': ожидается true или false -- ' +
+                'беру состояние «ключа нет» (в config.example.json написано, что это значит для этого ключа)');
+        }
+    };
+    // Верхний уровень: интенты (DEBUG -- только подробный лог).
+    boolKeys (CONFIG_RAW, 'config.json', ['DEBUG', 'MESSAGE_CONTENT', 'GUILD_MEMBERS']);
+    // MUSIC: безопасное состояние у них -- ВКЛЮЧЕНО (кэш, выравнивание, проверка очереди
+    // и пропуск отсутствующего автора); выключить можно явным false.
+    boolKeys (MUSIC_CFG, 'MUSIC', ['normalize', 'skip_absent_author', 'cache', 'cache_keep_played', 'queue_check']);
     for (let server in SERVERS)
     {
         // Значение не объект (в конфиг случайно попала строка/число) -- не падаем:
@@ -6831,6 +6905,16 @@ function configSanityIssues ()
             continue; // остальные настройки выключенного сервера не разбираем
         }
         if (s.allow === false) continue; // выключен осознанно -- придираться не к чему
+        // [v2.86] allow со строкой "true" -- самая обидная опечатка: она ВЫКЛЮЧАЕТ сервер,
+        // хотя внешне выглядит как включённый. Говорим прямо, что именно случилось.
+        if (typeof s.allow !== 'boolean')
+            out.push ('сервер ' + nm + ': allow = ' + JSON.stringify (s.allow) + ': ожидается true или false (без кавычек) -- ' +
+                'такое значение считаю ВЫКЛЮЧЕННЫМ: экземпляр не обслуживается');
+        // [v2.86] Остальные серверные флаги: безопасное состояние -- ВКЛЮЧЕНО (они берегут
+        // роли, добавляют описание к приветствию, показывают контакт владельца), а флаги
+        // наказаний -- только явный true (см. flagOn); мусор = «ключа нет».
+        boolKeys (s, 'сервер ' + nm, ['welcome_prefix', 'save_roles', 'show_owner_hoster', 'show_owner_server',
+                                      'onLeaveBanRealy', 'onEnterBanRealy']);
         if (idOk (s.welcome_message) && !idOk (s.welcome_channel))
             out.push ('сервер ' + nm + ': welcome_message задан, а welcome_channel пуст/неверен -- ' +
                 'сообщение с правилами найти негде, приветствие новичкам ВЫКЛЮЧЕНО');
@@ -6847,7 +6931,7 @@ function configSanityIssues ()
         if (idOk (s.pipe_channel_source) && !idOk (s.pipe_channel_target))
             out.push ('сервер ' + nm + ': pipe_channel_source задан, а pipe_channel_target пуст -- ' +
                 'пересылать некуда, мост ничего не делает');
-        if ((Number (s.onLeaveBanTimeout) > 0) && s.onLeaveBanRealy === false && s.onEnterBanRealy === false)
+        if ((Number (s.onLeaveBanTimeout) > 0) && !flagOn (server, 'onLeaveBanRealy') && !flagOn (server, 'onEnterBanRealy'))
             out.push ('сервер ' + nm + ': onLeaveBanTimeout = ' + s.onLeaveBanTimeout + ', но onLeaveBanRealy ' +
                 'и onEnterBanRealy выключены -- таймаут только записывается, никто не ограничивается');
         for (let key of ['role_admin', 'role_moder', 'role_dj', 'role_for_manage',
@@ -8831,8 +8915,10 @@ function configCli ()
         row ('welcome_prefix', s.welcome_prefix === false ? 'нет (без описания бота)' : 'да', has ('welcome_prefix') ? 'config.json' : 'по умолчанию (да)');
         row ('queue_page', (Number (s.queue_page) || 15) + ' треков (в коде максимум 25)', has ('queue_page') ? 'config.json' : 'по умолчанию (15)');
         row ('onLeaveBanTimeout', (Number (s.onLeaveBanTimeout) || 0) + (Number (s.onLeaveBanTimeout) ? ' мин' : ' (механизм выкл)'), has ('onLeaveBanTimeout') ? 'config.json' : 'в коде 0 -- без ключа не работает');
-        row ('onLeaveBanRealy', YN (s.onLeaveBanRealy), has ('onLeaveBanRealy') ? 'config.json' : 'в коде нет');
-        row ('onEnterBanRealy', YN (s.onEnterBanRealy), has ('onEnterBanRealy') ? 'config.json' : 'в коде нет');
+        // [v2.86] читаем флаги так же, как бот (только явный true): в колонке «откуда взято»
+        // видно, что мусор в ключе -- это «ключа нет», а не «включено».
+        row ('onLeaveBanRealy', YN (flagOn (id, 'onLeaveBanRealy')), has ('onLeaveBanRealy') ? 'config.json' : 'по умолчанию (нет -- не наказываю)');
+        row ('onEnterBanRealy', YN (flagOn (id, 'onEnterBanRealy')), has ('onEnterBanRealy') ? 'config.json' : 'по умолчанию (нет -- не наказываю)');
         row ('save_roles', YN (s.save_roles !== false), has ('save_roles') ? 'config.json' : 'по умолчанию (вкл)');
         row ('save_roles_days', (Number (s.save_roles_days) || 0) + ' (0 -- всегда)', has ('save_roles_days') ? 'config.json' : 'по умолчанию (0)');
         row ('save_roles_exclude', Array.isArray (s.save_roles_exclude) ? s.save_roles_exclude.length + ' шт' : '0', has ('save_roles_exclude') ? 'config.json' : 'по умолчанию (пусто)');
