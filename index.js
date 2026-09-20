@@ -164,12 +164,12 @@
 //     ВСЕГДА несёт твой трафик через чужую машину (даже если не прячет адрес), то есть
 //     чужой открытый прокси -- это чужие логи, общая перегрузка и быстрые лимиты от
 //     YouTube. Роль «только DNS» умеет играть socks5h (имя резолвит ПРОКСИ) -- но это
-//     уже свой прокси, и он может икнуть. Честный ответ -- иметь ВТОРОЙ СВОЙ.
+//     уже свой прокси, и он может подвести. Честный ответ -- иметь ВТОРОЙ СВОЙ.
 //   * ПОЭТОМУ MUSIC.proxy ТЕПЕРЬ ПРИНИМАЕТ СПИСОК: адреса через запятую (или массив).
-//     Бот пробует их ПО ПОРЯДКУ, а «икнувший» пропускает минуту -- работу подхватывает
+//     Бот пробует их ПО ПОРЯДКУ, а давший сбой пропускает минуту -- работу подхватывает
 //     следующий. Больше трёх адресов не берём (это уже путаница); сколько взято -- видно
 //     в стартовой строке.
-//   * «ИКНУВШИЙ» ПРОКСИ -- НЕ «МЁРТВЫЙ НАСМЕРТЬ»: раньше был один общий флаг
+//   * ПРОКСИ «СО СБОЕМ» -- НЕ «МЁРТВЫЙ НАСМЕРТЬ»: раньше был один общий флаг
 //     proxyStreamDead, и один обрыв глушил сразу ВСЕ прокси. Теперь состояние своё у
 //     КАЖДОГО адреса (proxyBadUntil на 60 с): обрыв потока или сетевой сбой в yt-dlp
 //     помечает ИМЕННО тот адрес, а остальные продолжают работать.
@@ -246,7 +246,7 @@
 //     DIRECT: НЕ работает -- youtube.com локально не резолвится...'), а решения о
 //     маршруте принимает один ytRoutes (): если имя локально не резолвится, DIRECT даже
 //     не рассматривается и прокси остаётся рабочим маршрутом -- включая случай, когда
-//     прокси «икнул» (v2.60). Если имя резолвится, DIRECT остаётся запасным путём, как раньше.
+//     прокси дал сбой (v2.60). Если имя резолвится, DIRECT остаётся запасным путём, как раньше.
 //   * 3-СЕКУНДНАЯ ПРОВЕРКА ПРОКСИ КЭШИРУЕТСЯ (30 с для живой / 60 с для молчащей).
 //     Раньше она выполнялась перед КАЖДЫМ запуском yt-dlp -- метаданные, скачивание
 //     на диск и поток, то есть до трёх раз на трек: при молчащем прокси это лишние
@@ -1122,7 +1122,7 @@ const DB_ENC_HEX = /^[0-9a-fA-F]{64}$/;
 // игнорировался -- `node . unkey` или опечатка в `node . dum` запускали БОТА, а не
 // давали ошибку: одна случайная строка в консоли = лишний процесс. Список -- ровно то,
 // что обрабатывается ниже; всё остальное считается опечаткой.
-const CONSOLE_CMDS = ['help', 'keygen', 'dump', 'files', 'cache', 'privacy', 'backup', 'checkpoint', 'backups', 'restore', 'clearstatus', 'unkey', 'fixauthors'];
+const CONSOLE_CMDS = ['help', 'config', 'keygen', 'dump', 'files', 'cache', 'privacy', 'backup', 'checkpoint', 'backups', 'restore', 'clearstatus', 'unkey', 'fixauthors'];
 // [v2.32] СПИСОК КОМАНД -- ОДИН НА ВСЕ СЛУЧАИ: его печатает `node . help`, его же
 // показывает ошибка про опечатку. Раньше про этот список знала только ошибка, и
 // `node . help` отвечал «Неизвестная команда: help» -- то есть спросить было не у кого.
@@ -1136,6 +1136,7 @@ const CONSOLE_HELP =
     ['node . help',               'этот список'],
     ['node . keygen',             'напечатать новый ключ шифрования базы (для строки db_key)'],
     ['node . dump [id]',          'посмотреть базу глазами (только чтение, бот не запускается)'],
+    ['node . config',             'чем бот РЕАЛЬНО работает: все ключи, их значения и откуда взяты (бот не запускается)'],
     ['node . files',              'что за каждый файл в папке и что можно удалять'],
     ['node . cache [--clear]',    'кэш музыки: что скачано, сколько занимает, что удалять (--clear -- стереть всё)'],
     ['node . privacy [--check]',  'пересобрать PRIVACY.md из шаблона (--check -- только проверить)'],
@@ -6710,10 +6711,18 @@ function configDriftIssues ()
             ' -- бот их не читает: это опечатка или ключ старой версии');
     // Блоки (MUSIC, SERVERS) в верхний счёт не входят -- они названы отдельно.
     const _isBlock = _v => _v && typeof _v === 'object' && !Array.isArray (_v);
-    const _topKeys = Object.keys (_cfg).filter (_k => _isKey (_k) && !_isBlock (_cfg[_k])).length;
-    out.push ('config.json -- чистый: ключей верхнего уровня ' + _topKeys + ', в MUSIC ' + _count (_cfg.MUSIC) +
-        (_srvBits.length ? ', у серверов ' + _srvBits.join (' и ') : '') +
-        '; остальное бот берёт из значений по умолчанию, а полный список ключей с пояснениями лежит в config.example.json');
+    // Считаем одинаково у обоих файлов (без блоков MUSIC/SERVERS): иначе сравнивались бы
+    // «ключи без блоков» с "ключами вместе с блоками".
+    const _topKeysOf = _o => Object.keys (_o || {}).filter (_k => _isKey (_k) && !_isBlock (_o[_k])).length;
+    const _topKeys = _topKeysOf (_cfg);
+    // [v2.80] СВОДКА БЕЗ ОЦЕНОК: раньше эта строка всегда говорила «config.json -- чистый»,
+    // даже если в файле стояли ВСЕ ключи, -- а `node . config` печатает её владельцу как
+    // факт. Теперь это просто счёт: сколько ключей в файле и сколько их в примере (сколько
+    // ключей НЕ в файле -- работают значения по умолчанию, об этом и написано прямо).
+    out.push ('config.json: ключей верхнего уровня ' + _topKeys + ' (в примере ' + _topKeysOf (_ex) + '), в MUSIC ' +
+        _count (_cfg.MUSIC) + ' (в примере ' + _count (_ex.MUSIC) + ')' +
+        (_srvBits.length ? ', у серверов ' + _srvBits.join (' и ') + ' (в примере ' + _count (_srvEx) + ')' : '') +
+        '; чего в файле нет -- бот берёт из значений по умолчанию, а полный список ключей с пояснениями лежит в config.example.json');
     return out;
 }
 
@@ -7098,9 +7107,9 @@ const MUSIC_CFG = MUSIC || {};
 // Владелец спросил: «есть же публичные прокси, которые только DNS?» -- таких нет:
 // SOCKS/HTTP прокси всегда несёт твой трафик через чужую машину (даже если не скрывает
 // адрес), а чужой открытый прокси -- это чужие логи, перегрузка и быстрые лимиты от
-// YouTube. Честный ответ на «локальный прокси икнул» -- иметь ВТОРОЙ СВОЙ (другой
+// YouTube. Честный ответ на «локальный прокси подвёл» -- иметь ВТОРОЙ СВОЙ (другой
 // профиль VPN, другой сервер). Поэтому в ключе proxy можно перечислить адреса через
-// запятую (или массивом) -- бот пробует их по порядку, а «икнувший» пропускает минуту.
+// запятую (или массивом) -- бот пробует их по порядку, а давший сбой пропускает минуту.
 function musicProxyList (raw)
 {
     const arr = Array.isArray (raw) ? raw : String (raw === undefined || raw === null ? '' : raw).split (',');
@@ -7117,7 +7126,7 @@ const MUSIC_PROXIES_ALL = musicProxyList (MUSIC_PROXY_RAW);
 const MUSIC_PROXIES = MUSIC_PROXIES_ALL.slice (0, 3);   // больше трёх -- уже путаница, а не подспорье
 const MUSIC_PROXY = MUSIC_PROXIES[0] || '';   // где нужен «главный»: строка при старте
 const MUSIC_PROXY_TIMEOUT = 3000; // мс -- «не получилось за 3 сек» -> следующий маршрут
-// [v2.60] «Икнувший» прокси -- не «мёртвый насмерть», а «пропускаем его минуту». Раньше
+// [v2.60] Прокси «со сбоем» -- не «мёртвый насмерть», а «пропускаем его минуту». Раньше
 // на один обрыв был общий флаг proxyStreamDead, и он же глушил сразу ВСЕ прокси; теперь
 // состояние своё у каждого адреса -- если адресов два, работу подхватывает второй.
 const PROXY_BAD_TTL = 60000;
@@ -7126,7 +7135,7 @@ function proxyMarkBad (addr) { if (addr) proxyBadUntil.set (String (addr), Date.
 function proxyMarkGood (addr) { if (addr) proxyBadUntil.delete (String (addr)); }
 function proxyBrieflyBad (addr) { const t = proxyBadUntil.get (String (addr === undefined || addr === null ? '' : addr)); return !!t && t > Date.now (); }
 // [v2.78] КАКИМ МАРШРУТОМ ИДЁТ МУЗЫКА -- для /queue и /nowplaying (владелец: «показывай,
-// каким маршрутом идёт и какие адреса помечены икнувшими»): раньше это было видно только
+// каким маршрутом идёт и какие адреса помечены сбоем»): раньше это было видно только
 // в консоли. Храним ТОЛЬКО факт: адрес, которым реально открыт играющий поток ('' = DIRECT),
 // либо отметку «с диска» -- тогда маршрут вообще не нужен. Никаких попыток его «угадать».
 const routeInUse = new Map ();   // guildId -> { proxy, kind, at }
@@ -7287,7 +7296,7 @@ async function proxyAlive (addr)
 {
     const a = String (addr || '');
     if (!a) return false;
-    if (proxyBrieflyBad (a)) return false;   // «икнул» на стриме -- минуту не трогаем
+    if (proxyBrieflyBad (a)) return false;   // сбой на стриме -- минуту не трогаем
     const now = Date.now ();
     const c = pingCache.get (a);
     if (c && c.at && (now - c.at) < (c.ok ? PING_OK_TTL : PING_BAD_TTL)) return c.ok;
@@ -7298,7 +7307,7 @@ async function proxyAlive (addr)
 
 // Живые прокси из списка, в порядке конфига (сначала те, что отвечают на TCP). Если
 // локальный DNS мёртв, DIRECT не запасной путь, поэтому в список возвращаем ВСЁ (даже
-// «икнувшее»): альтернативы просто нет.
+// «сбойное»): альтернативы просто нет.
 async function liveProxyList ()
 {
     const alive = [], rest = [];
@@ -7307,7 +7316,7 @@ async function liveProxyList ()
     return { alive: alive, rest: rest };
 }
 
-// Какой прокси брать для своих запросов (oEmbed-проверка): первый не «икнувший»,
+// Какой прокси брать для своих запросов (oEmbed-проверка): первый не «сбойный»,
 // иначе (если DIRECT невозможен) хоть какой-то, иначе '' = напрямую.
 async function proxyForFetch ()
 {
@@ -7337,7 +7346,7 @@ async function directUsable ()
 // (ошибка маршрута -- не ошибка видео, см. isNetworkError). Если локальный DNS мёртв,
 // DIRECT из списка выкидывается совсем: иначе на выходе была бы невнятная DNS-ошибка
 // вместо внятной причины. Именно от прокси тянется всё, а значит выкинуть его при
-// 3-секундной заминке нельзя -- поэтому в этом случае прокси остаётся даже «икнувшим»
+// 3-секундной заминке нельзя -- поэтому в этом случае прокси остаётся даже со сбоем
 // (v2.60: альтернативы просто нет).
 let directWarnedAt = 0;
 // Возвращаем МАРШРУТЫ по порядку: у прокси в поле proxy адрес, у DIRECT -- пустая строка
@@ -7354,7 +7363,7 @@ async function ytRoutes ()
     const { alive, rest } = await liveProxyList ();
     const pRoutes = [...alive, ...rest].map (p => ({ proxy: p }));
     if (!dnsOk) return pRoutes;               // DIRECT бесполезен -- даже если все прокси молчат
-    // Имя резолвится: живые прокси, потом DIRECT, потом «икнувшие» -- они могли очнуться
+    // Имя резолвится: живые прокси, потом DIRECT, потом «сбойные» -- они могли очнуться
     return [...alive.map (p => ({ proxy: p })), { proxy: '' }, ...rest.map (p => ({ proxy: p }))];
 }
 
@@ -7380,7 +7389,7 @@ function sectionProxyFor (viaProxy)
     if (self && !proxyBrieflyBad (self)) return self;   // свой живой HTTP -- самый точный
     for (const p of MUSIC_PROXIES)
         if (/^https?:\/\//i.test (p) && p !== self && !proxyBrieflyBad (p)) return p;
-    // Свой HTTP «икнул», а других нет -- всё равно отдаём его: идти напрямую ещё хуже
+    // У своего HTTP сбой, а других нет -- всё равно отдаём его: идти напрямую ещё хуже
     // (ffmpeg SOCKS не понимает), а не сработает -- сработает резервный путь.
     return self;
 }
@@ -7390,7 +7399,7 @@ function sectionProxyWhy (sectionProxy)
 {
     if (sectionProxy) return ' (секция шла через ' + sectionProxy + ')';
     return MUSIC_PROXIES.some (p => /^https?:\/\//i.test (p))
-        ? ' (HTTP-прокси икнул -- секция шла напрямую)'
+        ? ' (у HTTP-прокси сбой -- секция шла напрямую)'
         : ' (в конфиге только SOCKS, а ffmpeg его не понимает -- секция шла напрямую)';
 }
 
@@ -7407,7 +7416,7 @@ if (MUSIC_PROXY)
 // нет). Смысл -- в скорости возврата музыки: настоящая попытка стоит 10-30 секунд (таймаут
 // сокета на каждом шаге), а пинг -- один коннект, поэтому владелец, переключивший сервер
 // прокси, слышит музыку через те же секунды, а не после выросшей паузы.
-// Кэш «икнувших» тут УМЫШЛЕННО игнорируется: мы как раз и проверяем, очнулся ли он.
+// Кэш «сбойных» тут УМЫШЛЕННО игнорируется: мы как раз и проверяем, очнулся ли он.
 async function netRouteAnswers ()
 {
     if (!MUSIC_PROXIES.length) return await directUsable ();
@@ -8462,6 +8471,147 @@ function cacheCli (args = [])
     return 0;
 }
 
+// ============================================================================
+// `node . config` -- ЧЕМ БОТ РЕАЛЬНО РАБОТАЕТ, НЕ ЗАПУСКАЯ БОТА.
+// Владелец чистит config.json до «только обязательное и отклонения от умолчаний», и
+// после этой чистки глазами уже не видно, что именно получилось: бот берёт десятки
+// значений из кода. Здесь всё это печатается ОДНИМ отчётом: каждый ключ, его значение
+// и ОТКУДА оно -- из config.json или по умолчанию. Плюс те же замечания, что бот
+// говорит строкой [config] при старте (пары ключей и «ключ не читается»).
+// В Discord бот при этом НЕ заходит (токен не используется, в лог-файл ничего не пишется),
+// а строки [db]/[music] ВЫШЕ отчёта -- обычная стартовая проверка, как у `node . cache`:
+// она же освежает штатную копию базы. Сам отчёт только читает и ничего не меняет.
+// ============================================================================
+function configCli ()
+{
+    const hasTop = _k => Object.prototype.hasOwnProperty.call (CONFIG_RAW || {}, _k);
+    // hasM -- «есть ли ключ в блоке MUSIC файла» (значения бот берёт из кода: ключа нет -- работает
+    // значение по умолчанию, и в отчёте это должно быть видно именно так).
+    const _mus = (CONFIG_RAW && CONFIG_RAW.MUSIC && typeof CONFIG_RAW.MUSIC === 'object') ? CONFIG_RAW.MUSIC : {};
+    const hasM = _k => Object.prototype.hasOwnProperty.call (_mus, _k);
+    const YN = v => (v ? 'да' : 'нет');
+    const orDash = v => (v === undefined || v === null || String (v) === '' ? '--' : String (v));
+    const lines = [];
+    // Строки таблицы собираем ЗАРАНЕЕ, а печатаем только в конце: ширину колонок считаем
+    // по самому длинному значению (при жёстких 24/26 длинное значение вида
+    // «15 треков (в коде максимум 25)» налезало на колонку «откуда взято»).
+    const rows = [];
+    const sec = t => rows.push ({ sec: t });
+    const row = (k, v, src) => rows.push ({ k: String (k), v: String (v), src: String (src) });
+
+    // Префикс '[config] ' печатается один раз -- в цикле вывода ниже (без него строки
+    // получались вида «[config][config] чем бот РЕАЛЬНО работает»).
+    lines.push ('чем бот РЕАЛЬНО работает (только чтение; бот не запускается)');
+    lines.push ('колонки: ключ | значение | откуда взято (config.json или значение по умолчанию)');
+    lines.push ('секреты не печатаю: TOKEN и db_key видно только как «задан/пусто»');
+
+    sec ('верхний уровень');
+    row ('ID', orDash (ID), hasTop ('ID') ? 'config.json' : '-- (в файле нет)');
+    row ('TOKEN', TOKEN ? 'задан (секрет)' : 'ПУСТО -- бот не запустится', hasTop ('TOKEN') ? 'config.json' : '-- (в файле нет)');
+    row ('PREFIX', orDash (PREFIX), hasTop ('PREFIX') ? 'config.json' : 'в файле нет: текстовые команды молчат');
+    row ('DEBUG', YN (DEBUG), hasTop ('DEBUG') ? 'config.json' : 'по умолчанию (выкл)');
+    row ('MESSAGE_CONTENT', YN (USE_MESSAGE_CONTENT), hasTop ('MESSAGE_CONTENT') ? 'config.json' : 'по умолчанию (запрашиваю)');
+    row ('GUILD_MEMBERS', YN (USE_GUILD_MEMBERS), hasTop ('GUILD_MEMBERS') ? 'config.json' : 'по умолчанию (запрашиваю)');
+    row ('STARTUP_DM', Array.isArray (STARTUP_DM) ? STARTUP_DM.length + ' адрес(ов)' : '--', hasTop ('STARTUP_DM') ? 'config.json' : 'по умолчанию (никому)');
+    row ('OWNER (хостинг)', OWNER_HOSTER || 'НЕ ЗАДАН (нет /rekey и контакта)', hasTop ('OWNER') ? 'config.json' : '-- (в файле нет)');
+    row ('db_key', DB_KEYS.length ? 'задан (шифрование ВКЛ)' : 'пусто (база открыта)', hasTop ('db_key') ? 'config.json' : '-- (в файле нет)');
+    row ('db_key_prev', Array.isArray (db_key_prev) ? db_key_prev.length + ' шт' : '0', hasTop ('db_key_prev') ? 'config.json' : 'по умолчанию (0)');
+    row ('privacy_url', PRIVACY_URL ? 'задан' : 'пусто (ссылки не будет)', hasTop ('privacy_url') ? 'config.json' : '-- (в файле нет)');
+    row ('show_privacy_url', YN (SHOW_PRIVACY_URL), hasTop ('show_privacy_url') ? 'config.json' : 'по умолчанию (показывать)');
+    row ('backup_minutes', BACKUP_EVERY_MIN + (BACKUP_EVERY_MIN ? ' мин' : ' (только при старте)'), hasTop ('backup_minutes') ? 'config.json' : 'по умолчанию (60)');
+    row ('backup_keep', BACKUP_KEEP, hasTop ('backup_keep') ? 'config.json' : 'по умолчанию (10)');
+    row ('log_dir', LOG_DIR, hasTop ('log_dir') ? 'config.json' : 'по умолчанию (logs)');
+    row ('log_keep_months', LOG_KEEP_MONTHS || '0 (не удалять)', hasTop ('log_keep_months') ? 'config.json' : 'по умолчанию (0)');
+
+    sec ('музыка (MUSIC)');
+    row ('proxy', MUSIC_PROXIES.length ? MUSIC_PROXIES.join (', ') : 'нет -- напрямую (DIRECT)', hasM ('proxy') ? 'config.json' : (process.env.MUSIC_PROXY ? 'переменная окружения MUSIC_PROXY' : '-- (в файле нет)'));
+    row ('normalize (громкость)', YN (MUSIC_NORMALIZE), hasM ('normalize') ? 'config.json' : 'по умолчанию (вкл)');
+    row ('filter', MUSIC_NORMALIZE_FILTER, hasM ('filter') ? 'config.json' : 'по умолчанию');
+    row ('channel_status (шапка)', YN (MUSIC_CHANNEL_STATUS), hasM ('channel_status') ? 'config.json' : 'по умолчанию (пишу)');
+    row ('skip_absent_author', YN (MUSIC_SKIP_ABSENT), hasM ('skip_absent_author') ? 'config.json' : 'по умолчанию (да)');
+    row ('cache (диск)', YN (MUSIC_CACHE), hasM ('cache') ? 'config.json' : 'по умолчанию (вкл)');
+    row ('cache_dir', MUSIC_CACHE_DIR, hasM ('cache_dir') ? 'config.json' : 'по умолчанию (music_cache)');
+    row ('cache_short_max_min', Math.round (MUSIC_CACHE_SHORT_MAX_SEC / 60) + ' мин', hasM ('cache_short_max_min') || hasM ('cache_full_max_min') ? 'config.json' : 'по умолчанию (15)');
+    row ('cache_long_sets', YN (MUSIC_CACHE_LONG_SETS), hasM ('cache_long_sets') ? 'config.json' : 'по умолчанию (выкл)');
+    row ('cache_max_mb', MUSIC_CACHE_MAX_MB || '0 (без лимита)', hasM ('cache_max_mb') ? 'config.json' : 'по умолчанию (4096)');
+    row ('cache_keep_played', YN (MUSIC_CACHE_KEEP_PLAYED), hasM ('cache_keep_played') ? 'config.json' : 'по умолчанию (выкл)');
+    row ('queue_check (заранее)', YN (MUSIC_QUEUE_CHECK), hasM ('queue_check') ? 'config.json' : 'по умолчанию (вкл)');
+    row ('queue_check_depth', QUEUE_CHECK_DEPTH + ' треков (первые ' + QUEUE_CHECK_STRICT + ' -- yt-dlp)', hasM ('queue_check_depth') ? 'config.json' : 'по умолчанию (20)');
+    row ('queue_check_gap_ms', QUEUE_CHECK_GAP_MS + ' мс', hasM ('queue_check_gap_ms') ? 'config.json' : 'по умолчанию (5000)');
+    row ('history_len', MUSIC_HISTORY_LEN + ' пачек', hasM ('history_len') ? 'config.json' : 'по умолчанию (25)');
+    row ('history_tracks', MUSIC_HISTORY_TRACKS + ' треков', hasM ('history_tracks') ? 'config.json' : 'по умолчанию (500)');
+    row ('queue_live_ms', QUEUE_LIVE_MS ? QUEUE_LIVE_MS + ' мс (миллисекунды)' : '0 (сам не обновляю)', hasM ('queue_live_ms') ? 'config.json' : 'по умолчанию (30000)');
+    row ('net_wait_ms', NET_WAIT_MS + ' мс (до ' + NET_WAIT_MAX_MS + ' мс)', hasM ('net_wait_ms') ? 'config.json' : 'по умолчанию (10000)');
+
+    // Сервера: те же ключи, что в шаблоне config.example.json. Значение по умолчанию
+    // здесь не всегда равно значению из шаблона (ONLY эти три: у остальных иное поведение
+    // без ключа) -- поэтому у ключей с кодом «|| 0 / || false» в подсказке стоит «в коде».
+    for (const id of Object.keys (SERVERS))
+    {
+        if (!/^\d{17,20}$/.test (id)) continue;
+        const s = SERVERS[id], has = _k => Object.prototype.hasOwnProperty.call (s, _k);
+        const nm = s.name ? ' («' + s.name + '»)' : '';
+        sec ('сервер ' + id + nm + (s.allow === false ? ' -- ВЫКЛЮЧЕН (allow: false): бот его не обслуживает' : ' -- обслуживается'));
+        row ('allow', s.allow === false ? 'false' : 'true', has ('allow') ? 'config.json' : 'по умолчанию (вкл)');
+        row ('name', orDash (s.name), has ('name') ? 'config.json' : '-- (в файле нет)');
+        for (const k of ['log_channel', 'pipe_channel_source', 'pipe_channel_target', 'channel_common',
+                         'role_admin', 'role_moder', 'role_dj', 'role_for_manage', 'role_for_no_speak',
+                         'role_for_no_stream', 'role_for_no_media', 'role_for_no_chat',
+                         'temp_category', 'temp_lobby', 'welcome_channel', 'welcome_message',
+                         'welcome_public_channel', 'welcome_public_message', 'owner_server'])
+            row (k, orDash (s[k]), has (k) ? 'config.json' : '-- (в файле нет)');
+        row ('addTag', YN (s.addTag), has ('addTag') ? 'config.json' : 'в коде выкл (тег не ставится)');
+        row ('welcome_prefix', s.welcome_prefix === false ? 'нет (без описания бота)' : 'да', has ('welcome_prefix') ? 'config.json' : 'по умолчанию (да)');
+        row ('queue_page', (Number (s.queue_page) || 15) + ' треков (в коде максимум 25)', has ('queue_page') ? 'config.json' : 'по умолчанию (15)');
+        row ('onLeaveBanTimeout', (Number (s.onLeaveBanTimeout) || 0) + (Number (s.onLeaveBanTimeout) ? ' мин' : ' (механизм выкл)'), has ('onLeaveBanTimeout') ? 'config.json' : 'в коде 0 -- без ключа не работает');
+        row ('onLeaveBanRealy', YN (s.onLeaveBanRealy), has ('onLeaveBanRealy') ? 'config.json' : 'в коде нет');
+        row ('onEnterBanRealy', YN (s.onEnterBanRealy), has ('onEnterBanRealy') ? 'config.json' : 'в коде нет');
+        row ('save_roles', YN (s.save_roles !== false), has ('save_roles') ? 'config.json' : 'по умолчанию (вкл)');
+        row ('save_roles_days', (Number (s.save_roles_days) || 0) + ' (0 -- всегда)', has ('save_roles_days') ? 'config.json' : 'по умолчанию (0)');
+        row ('save_roles_exclude', Array.isArray (s.save_roles_exclude) ? s.save_roles_exclude.length + ' шт' : '0', has ('save_roles_exclude') ? 'config.json' : 'по умолчанию (пусто)');
+        row ('bans_history_days', (Number (s.bans_history_days) || 0) + ' (0 -- всегда)', has ('bans_history_days') ? 'config.json' : 'по умолчанию (0)');
+        row ('show_owner_hoster', YN (s.show_owner_hoster !== false), has ('show_owner_hoster') ? 'config.json' : 'по умолчанию (да)');
+        row ('show_owner_server', YN (s.show_owner_server !== false), has ('show_owner_server') ? 'config.json' : 'по умолчанию (да)');
+        row ('show_privacy_url (сервер)', YN (showPrivacyUrl (id)) + (PRIVACY_URL ? '' : ' (ссылки нет)'), has ('show_privacy_url') ? 'config.json' : 'по верхнему show_privacy_url');
+    }
+
+    for (const l of lines) console.log ('[config] ' + l);
+    const body = rows.filter (r => r.k);
+    const kw = Math.max (24, ...body.map (r => r.k.length)) + 2;
+    const vw = Math.max (20, ...body.map (r => r.v.length)) + 2;
+    for (const r of rows)
+    {
+        if (r.sec) { console.log ('[config]'); console.log ('[config]  ' + r.sec); continue; }
+        console.log ('[config]    ' + r.k.padEnd (kw) + r.v.padEnd (vw) + r.src);
+    }
+    // Замечания и сведения -- РАЗНОЕ: configSanityIssues -- это настоящие проблемы (пары
+    // ключей, «ключ не читается»), а configDriftIssues() всегда возвращает строку-сводку
+    // «сколько ключей в файле». Сваленные в один список, они печатались как
+    // «замечания [config] (1):», хотя замечанием была сама сводка.
+    const issues = configSanityIssues ();
+    const drift = configDriftIssues ();
+    console.log ('[config]');
+    if (!issues.length)
+        console.log ('[config] замечаний [config] нет -- так и должно быть');
+    else
+    {
+        console.log ('[config] замечания [config] (' + issues.length + '):');
+        for (const i of issues) console.log ('[config]   ' + i);
+    }
+    for (const i of drift) console.log ('[config] ' + i);
+    console.log ('[config] все ключи и пояснения к ним -- config.example.json; здесь только то, что бот взял сейчас');
+    return 0;
+}
+
+// `node . config` -- печатаем и ВЫХОДИМ (дальше запустился бы бот).
+if (process.argv.slice (2).some (_a => /^config$/i.test (_a)))
+{
+    let _code = 0;
+    try { _code = configCli (); }
+    catch (e) { console.log ('[config] ошибка: ' + ((e && e.message) || e)); _code = 1; }
+    process.exit (_code);
+}
+
 if (process.argv.slice (2).some (_a => /^cache$/i.test (_a)))
 {
     let _code = 0;
@@ -8777,7 +8927,7 @@ function earlyEndResumeFrom (at, startedFromSeek, fromPart, startedAtSec)
 
 // ============================================================================
 // [v2.70] СЕТЬ/ПРОКСИ ОТВАЛИЛИСЬ -- ЭТО НЕ «БИТЫЙ ТРЕК».
-// Живой случай владельца: прокси икнул -- бот честно пробовал дальше, очередь
+// Живой случай владельца: прокси подвёл -- бот честно пробовал дальше, очередь
 // посыпалась (каждый трек считался «не запустившимся»), после десяти подряд он умолкал
 // совсем, и сам больше не пытался: ни один таймер не звал playNext. Переключённый
 // сервер прокси оживлял музыку не сразу -- ждать было некому.
@@ -10845,7 +10995,9 @@ function queueListBudget (m)
     // и без этого длинная очередь могла упереться в лимит Discord.
     const chrome = queueHeadText (m).length + queueWaitText (m).length +
         queueAuthorsText (m).length + queueCheckText (m).length +
-        netWaitText (m).length + netRouteText (m.guildId).length +
+        // [v2.80] Маршрут видят только владельцы -- считаем его длину ДЛЯ НИХ (как самый
+        // длинный вариант): иначе у владельца страница могла бы вылезти за лимит.
+        netWaitText (m).length + netRouteText (m.guildId, OWNER_HOSTER).length +
         QUEUE_GLUE + queueHintText ().length;
     // [v2.54] Истории добавлений в /queue больше нет -- её место в бюджете тоже убрано
     // (проверяется стендом: на странице по-прежнему 15 треков).
@@ -12238,36 +12390,44 @@ function netWaitText (m)
 }
 
 // [v2.78] ЧЕМ ИМЕННО ИДЁТ МУЗЫКА И КТО ОТДЫХАЕТ. Владелец: «показывай в /queue, каким
-// маршрутом идёт музыка и какие адреса помечены икнувшими» -- и раньше это было видно
-// только в консоли. Пишем только то, что знаем точно:
+// маршрутом идёт музыка и какие адреса помечены сбоем» -- и раньше это было видно
+// только в консоли.
+// [v2.80] ВИДНО ТОЛЬКО ВЛАДЕЛЬЦУ ХОСТИНГА (id в ключе OWNER): адреса прокси и состояние
+// маршрутов -- это кухня хостинга, а не информация для слушателя (владелец: «эта
+// информация выводится ТОЛЬКО для OWNER!! Остальным не надо знать»). Поэтому функция
+// сама себя выключает, если зритель не владелец, -- и ни один вызов не может «забыть»
+// про проверку. Зритель неизвестен (старое сообщение без ctx, вызов из бюджета страницы)
+// -- тоже молчим.
+// Пишем только то, что знаем точно:
 //   * маршрут -- тот, которым РЕАЛЬНО открыт играющий поток (routeUseSet зовётся в playNext),
 //     либо «не нужен: играю с диска»;
 //   * запасной -- первый живой из оставшихся, чтобы было видно, куда бот уйдёт при обрыве;
-//   * «икнувшие» -- адреса из proxyBadUntil, с остатком их минуты отдыха (v2.60: состояние
+//   * «со сбоем» -- адреса из proxyBadUntil, с остатком их минуты отдыха (v2.60: состояние
 //     у каждого адреса своё).
 // Ничего не знаем и ничего не отдыхает -- строка не показывается вовсе (справка не должна
 // занимать место впустую).
-function netRouteText (guildId)
+function netRouteText (guildId, viewerId)
 {
+    if (!isBotOwner (viewerId)) return '';   // [v2.80] не владелец -- строки нет вообще
     const bits = [];
     const u = routeUseOf (guildId);
-    // Маршрут записан -- но мог успеть «икнуть» (обрыв потока помечает адрес минутой
+    // Маршрут записан -- но мог успеть дать сбой (обрыв потока помечает адрес минутой
     // отдыха, а новый маршрут выберется только на следующей попытке): так и пишем, иначе
-    // строка врала бы -- «иду через X, а сам X в списке икнувших ниже».
+    // строка врала бы -- «иду через X, а сам X в списке сбойных ниже».
     const inUseBad = !!(u && u.proxy && proxyBrieflyBad (u.proxy));
     if (u)
     {
         bits.push (u.kind === 'disk'
             ? '🌐 Маршрут: не нужен -- этот трек играю с диска'
             : '🌐 Маршрут: ' + (u.proxy ? 'прокси ' + u.proxy : 'DIRECT (напрямую)') +
-              (inUseBad ? ' (сейчас икнул)' : ''));
+              (inUseBad ? ' (сейчас со сбоем)' : ''));
         const spare = MUSIC_PROXIES.filter (p => p !== u.proxy && !proxyBrieflyBad (p));
         if (spare.length) bits.push ('запасной: ' + spare[0]);
     }
-    // Икнувшие -- БЕЗ того, кого только что назвали в маршруте (дважды об одном и том же).
+    // Маршруты со сбоем -- БЕЗ того, кого только что назвали в маршруте (дважды об одном и том же).
     const bad = MUSIC_PROXIES.filter (p => proxyBrieflyBad (p) && !(u && String (u.proxy) === String (p)));
     if (bad.length)
-        bits.push ('икнувшие: ' + bad.map (p => p + ' (ещё ' +
+        bits.push ('со сбоем: ' + bad.map (p => p + ' (ещё ' +
             fmtAgo (Math.max (0, (proxyBadUntil.get (String (p)) || 0) - Date.now ())) + ')').join (', '));
     return bits.length ? QSMALL + bits.join (' · ') : '';
 }
@@ -12277,7 +12437,7 @@ function netRouteText (guildId)
 // слушает, сколько всего в очереди и когда она закончится, что будет дальше. Доступна
 // всем (как /queue) -- это просто информация. Внимание: позиция берётся тем же счётом,
 // что и в /queue (playedMsOf), поэтому цифры в двух ответах совпадают.
-function nowPlayingText (m, guildId)
+function nowPlayingText (m, guildId, viewerId)
 {
     const t = m.current || m.seekTrack || null;
     const paused = !!(m.player && m.player.state && m.player.state.status === AudioPlayerStatus.Paused);
@@ -12310,7 +12470,8 @@ function nowPlayingText (m, guildId)
         ' · в очереди: ' + m.tracks.length);
     const net = netWaitText (m);   // [v2.71] почему тишина: прокси/сеть (видно без консоли)
     if (net) lines.push (net);
-    const route = netRouteText (guildId);   // [v2.78] чем идёт звук и кто «икнул»
+    // [v2.80] Строка маршрута -- только владельцу хостинга (сама функция это проверяет).
+    const route = netRouteText (guildId, viewerId);   // [v2.78] чем идёт звук и у кого сбой
     if (route) lines.push (route);
     lines.push (queueWaitText (m));
     // Дальше: сперва то, что уже готово (предзагрузка), иначе первый в очереди.
@@ -12343,9 +12504,9 @@ function queueView (m, start, moveSel = 0, opts = {})
     // последний, вплотную к кнопкам: треки и управление видны на одном экране).
     // [v2.71] Состояние сети -- первым в справке: когда прокси молчит, это самое важное,
     // что нужно знать человеку (пустой строки здесь не появляется, если всё в порядке).
-    // [v2.78] Сеть -- двумя строками: ждём ли (netWaitText) и чем идём/кто «икнул»
+    // [v2.78] Сеть -- двумя строками: ждём ли (netWaitText) и чем идём/у кого сбой
     // (netRouteText). Пустые не подставляются -- справка не должна пухнуть.
-    const net = [netWaitText (m), netRouteText (m.guildId)].filter (Boolean).join ('\n');
+    const net = [netWaitText (m), netRouteText (m.guildId, opts.actorId)].filter (Boolean).join ('\n');
     const build = hint => queueHeadText (m) +
         '\n' + QSEP + '\n' +
         [net, check, authors, queueWaitText (m), move, hint].filter (Boolean).join ('\n') +
@@ -12825,7 +12986,7 @@ async function oembedProbe (url)
     // не видит: на такой машине DIRECT не работает вообще, а oEmbed-проверка без
     // маршрута отвечает 'neterr' -- то есть очередь просто перестаёт проверяться.
     // (Считаем ЗАРАНЕЕ: внутри new Promise уже нельзя ждать.)
-    // [v2.60] Берём первый НЕ «икнувший» прокси (а если локальный DNS мёртв -- хоть
+    // [v2.60] Берём первый НЕ «сбойный» прокси (а если локальный DNS мёртв -- хоть
     // какой-то): раньше тут был один общий флаг, и один обрыв глушил проверку целиком.
     const proxyAddr = await proxyForFetch ();
     return new Promise (resolve =>
@@ -12918,12 +13079,15 @@ function deadWarnSend (told)
     {
         const ch = client.channels.cache.get (id);
         if (!ch || typeof ch.send !== 'function') continue;
+        // [v2.80] ОДНА НЕПРЕРЫВНАЯ ФРАЗА: раньше текст был разрезан переносами прямо в
+        // строке ("...видео просто не" / "отдаётся сейчас..."), и в чате это выглядело
+        // как три обрывка вместо предложения -- переносы делает сам Discord по ширине окна.
         ch.send ('⚠️ **Возможно, это видео недоступно:** ' +
             titles.slice (0, 8).map (t => '**' + oneLine (t, 60) + '**').join (', ') +
             (titles.length > 8 ? ' и ещё ' + (titles.length - 8) : '') +
-            '. Проверка идёт заранее и через мой прокси -- бывает, что видео просто не\n' +
-            'отдаётся сейчас (регион, VPN). **Из очереди не убираю:** проверю, когда дойдёт\n' +
-            'очередь, и если не сыграет -- скажу причину и уберу. Ставлять заново не надо.').catch (() => {});
+            '. Проверка идёт заранее и через мой прокси -- бывает, что видео просто не ' +
+            'отдаётся сейчас (регион, VPN). **Из очереди не убираю:** проверю, когда дойдёт ' +
+            'очередь, и если не сыграет -- скажу причину и уберу. Ставить заново не надо.').catch (() => {});
     }
 }
 
@@ -15583,7 +15747,7 @@ client.on ('interactionCreate', async (interaction) =>
         {
             // [v2.44] Короткая карточка вместо целой очереди: что звучит, откуда,
             // сколько слушает и что будет дальше. Доступна всем (без DJ).
-            return interaction.reply (nowPlayingText (m, guildId));
+            return interaction.reply (nowPlayingText (m, guildId, interaction.user.id));
         }
         else if (name === 'history')
         {
