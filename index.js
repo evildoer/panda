@@ -5,6 +5,24 @@
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
+// CHANGELOG v2.72 (недокачанный файл переживает перезапуск; длинный сет можно качать в фоне):
+//   * НЕДОКАЧАННОЕ БОЛЬШЕ НЕ ВЫБРАСЫВАЕТСЯ. Раньше при старте любые '.dl.' удалялись
+//     ("тот поток мёртв"), и продолжить длинный сет можно было только заново попросив
+//     звук у YouTube -- секунды тишины на каждом перезапуске. Теперь файл остаётся, и
+//     если позиция трека ВНУТРИ записанного куска, игра идёт С ДИСКА сразу (cachePartFind,
+//     openCachedTrack со сдвигом по файлу); когда кусок кончится, трек продолжается
+//     потоком С ТОЙ ЖЕ секунды, а не с начала (earlyEndResumeFrom), и сам файл уходит
+//     (он своё отдал). Оценка длины -- по размеру (128 кбит/с) с запасом 20 секунд и в
+//     меньшую сторону: ошибка допустима только так, иначе обернулась бы тишиной.
+//   * MUSIC.cache_long_sets (ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНО): длинные сеты качаются на диск
+//     ЦЕЛИКОМ отдельным запросом, не оглядываясь на проигрывание, -- файл обгоняет музыку,
+//     и потому перезапуск, обрыв и перемотка обходятся без YouTube. Владелец подтвердил
+//     главный сценарий: очередь на много часов, перезапуск посреди сета. Цена -- второй
+//     запрос на такой трек и место (128 кбит/с = ~57 МБ на час звука); оценка места видна
+//     в `node . dump` (строка очереди), а недокачанные файлы -- в `node . cache`.
+//   * Заодно: тег записи потока больше не пишется зря при cache_long_sets (тот же звук уже
+//     качается целиком -- второй раз не тратим трафик), а уборка кэша не трогает файл,
+//     который прямо сейчас пишет фоновое скачивание.
 // CHANGELOG v2.71 (музыка возвращается быстрее; /history ставит пачку заново):
 //   * БЫСТРЫЙ ВОЗВРАТ МУЗЫКИ. Пока прокси молчит, маршрут проверяется ДЁШЕВО: раз в 3 с
 //     -- только TCP-пинг (yt-dlp при молчащем прокси не запускаем вообще), и как только
@@ -1242,6 +1260,15 @@ if (!_srvReal)
 // Свои мелкие помощники: d()/dd() из основного кода опираются на `var pad`, который
 // на момент этой команды ещё не определён (она выполняется до остального файла).
 function dbDumpDate (_t) { return new Date (_t).toLocaleString (); }
+// [v2.72] Длительность очереди в дампе: «1 ч 12 мин». Свой счётчик, а не fmtDur: тот
+// читает `pad`, который ставится НИЖЕ по файлу, а режим `node . dump` работает до этого.
+function dbDumpDur (_sec)
+{
+    let _s = Math.max (0, Math.round (Number (_sec) || 0));
+    const _h = Math.floor (_s / 3600); _s -= _h * 3600;
+    const _m = Math.floor (_s / 60);
+    return (_h ? _h + ' ч ' : '') + (_h || _m ? _m + ' мин' : _s + ' сек');
+}
 function dbDumpLeft (_until)
 {
     let _s = Math.max (0, Math.round ((_until - Date.now ()) / 1000));
@@ -1303,6 +1330,11 @@ function dbDumpFmt (_ns, _key, _value)
                 ' (присутствие; очередь и позиция -- в отдельной записи queue)';
         const _tr = Array.isArray (_value.tracks) ? _value.tracks : [];
         const _cur = _value.current && _value.current.title ? _value.current.title : '';
+        // [v2.72] Сколько всего звучания (вместе с играющим) и сколько это займёт на диске,
+        // если качать целиком (≈128 кбит/с = 57 МБ на час) -- вопрос владельца об оценке
+        // места: ответ прямо в дампе, без калькулятора.
+        const _dur = [_value.current].concat (_tr).reduce
+            ((s, t) => s + ((t && !t.isLive) ? Math.max (0, Number (t.duration) || 0) : 0), 0);
         return _head + ' -- в очереди ' + _tr.length +
             (_cur ? ', играет «' + clipText (String (_cur), 60) + '»' : ', играющего нет') +
             ' | канал ' + (_value.channelId || '--') +
@@ -1312,6 +1344,8 @@ function dbDumpFmt (_ns, _key, _value)
             // в /mydata: отчёт показывал меньше, чем бот реально помнит.
             (Number (_value.elapsed) ? ', позиция ' + Math.floor (Number (_value.elapsed)) + ' сек' : '') +
             (_value.left ? ' | вышел по /leave' : '') +
+            (_dur ? ' | всего звучания ~' + dbDumpDur (_dur) + ' (на диск целиком -- ~' +
+                Math.max (1, Math.round (_dur / 64)) + ' МБ)' : '') +
             // [v2.57] ...и видно, ЧТО именно бот ведёт (сообщение /queue обновляется само):
             // канал, id сообщения, страница и кто его открыл -- чтобы это не было тайной
             // ни для владельца в дампе, ни при разборе («почему в канале что-то меняется»).
@@ -1475,7 +1509,8 @@ function filesCli ()
         if (/\.check-.*\.sqlite$/i.test (_name)) return ['контрольная точка базы (`node . checkpoint`)', 'можно (самые старые уходят сами по backup_keep)'];
         if (/\.sqlite-(journal|wal|shm)$/i.test (_name)) return ['хвост незакрытой транзакции SQLite', 'можно, когда бот выключен'];
         if (_name === 'music_cache') return ['кэш музыки (MUSIC.cache): скачанные треки. Это НЕ данные бота -- просто музыка',
-            'можно ВСЁ -- бот скачает заново (отчёт и очистка: `node . cache`)'];
+            'можно ВСЁ -- бот скачает заново (отчёт и очистка: `node . cache`); но недокачанное ему полезно: ' +
+            'если позиция трека внутри записанного куска, продолжение идёт с диска сразу'];
         if (/^intents-.*\.md$/i.test (_name)) return ['заявка/шпаргалка по интентам (данные реального сервера -- в git не попадает)', 'можно (но заявка ещё может пригодиться)'];
         if (/\.log$/i.test (_name)) return ['старый лог', 'можно'];
         if (/^crash-.*\.txt$/i.test (_name)) return ['отчёт о сбое (бот сам кладёт его рядом с логом при падении: причина, стек, последние строки лога)',
@@ -6488,6 +6523,16 @@ function configSanityIssues ()
     else if (Number (MUSIC_CFG.net_wait_ms) > 0 && Number (MUSIC_CFG.net_wait_ms) < 2000)
         out.push ('MUSIC.net_wait_ms: ' + MUSIC_CFG.net_wait_ms + ' -- это МИЛЛИСЕКУНДЫ, и чаще двух секунд не пробую: ' +
             'поднимаю до 2000. Пожалуй, ты указал секунды -- для десяти секунд пиши 10000');
+    // [v2.72] Скачивание длинных сетов целиком: это ДОБРОВОЛЬНАЯ плата (второй запрос к
+    // YouTube и место на диске), поэтому мусор в ключе не должен её молча включать, а связка
+    // с выключенным кэшем -- молча не работать: иначе владелец ждал бы мгновенного
+    // продолжения и не понял, почему его нет.
+    if (MUSIC_CFG.cache_long_sets !== undefined && typeof MUSIC_CFG.cache_long_sets !== 'boolean')
+        out.push ('MUSIC.cache_long_sets = ' + JSON.stringify (MUSIC_CFG.cache_long_sets) +
+            ': ожидается true или false -- считаю выключенным (это лишний запрос к YouTube и место на диске, так что без ошибок)');
+    if (MUSIC_CFG.cache_long_sets === true && MUSIC_CFG.cache === false)
+        out.push ('MUSIC.cache_long_sets: true, но MUSIC.cache: false -- кэш выключен целиком, качать сеты некуда: ' +
+            'настройка не работает (или включи cache, или убери cache_long_sets)');
     // [v2.55] Живой лог в файл: мусор в ключе не должен молча менять поведение --
     // строка "шесть" превратилась бы в 0 (не удалять ничего) или "no" в NaN.
     if (log_keep_months !== undefined &&
@@ -7635,8 +7680,19 @@ function probeNormalize ()
 //   * место ограничено MUSIC.cache_max_mb: старые файлы удаляются сами (текущий и
 //     предзагруженный не трогаются). Папку кэша можно удалить целиком в любой момент --
 //     бот скачает заново; в базе про кэш ничего нет.
-// Файлы: music_cache/<sha1 адреса>.m4a; незавершённое лежит рядом с пометкой '.dl.' и
-// готовым никогда не считается.
+//   * [v2.72] НЕДОКАЧАННОЕ ПЕРЕЖИВАЕТ ПЕРЕЗАПУСК. Раньше при старте любые '.dl.' убирались
+//     («тот поток уже мёртв»), и продолжить длинный сет можно было только заново попросив
+//     звук у YouTube (--download-sections на таких источниках отдаёт ноль, дальше сдвиг
+//     своим ffmpeg -- секунды тишины). Теперь файл ОСТАЁТСЯ, и если позиция трека внутри
+//     уже записанного куска, бот играет с диска сразу: ни YouTube, ни прокси не нужны
+//     (см. cachePartFind и earlyEndResumeFrom).
+//   * [v2.72] ДЛИННЫЙ СЕТ МОЖНО КАЧАТЬ НА ДИСК ЦЕЛИКОМ В ФОНЕ (MUSIC.cache_long_sets, по
+//     умолчанию выключено): отдельный запрос тянет сет на полной скорости, не оглядываясь
+//     на проигрывание, поэтому файл уходит ВПЕРЁД музыки -- перезапуск продолжается с
+//     диска мгновенно. Цена: второй запрос к YouTube на такой трек и место (примерно
+//     57 МБ на час звука).
+// Файлы: music_cache/<sha1 адреса>.m4a (готовый), <sha1>.dl.stream (запись живого потока)
+// и <sha1>.dl.<ext> (скачивание в фоне) -- всё с пометкой '.dl.' готовым не считается.
 // ============================================================================
 const pathMod = require ('path');
 const MUSIC_CACHE = MUSIC_CFG.cache !== false;
@@ -7657,6 +7713,20 @@ const MUSIC_CACHE_FULL_MAX = (MUSIC_CFG.cache_full_max_min === undefined || MUSI
 // (интернет безлимитный -- перекачать не грех). false -- удалять, true -- старое
 // поведение (файлы живут до лимита cache_max_mb, удобно слушать плейлист по кругу).
 const MUSIC_CACHE_KEEP_PLAYED = MUSIC_CFG.cache_keep_played === true;
+// [v2.72] КАЧАТЬ ДЛИННЫЕ СЕТЫ ЦЕЛИКОМ, В ФОНЕ (MUSIC.cache_long_sets, по умолчанию false).
+// Живой случай владельца: перезапуск на середине часового сета -- и музыка ждала, пока
+// yt-dlp отдаст звук с нужной секунды (а секции этот источник не умеет вовсе). Если файл
+// качается отдельным запросом на полной скорости, он обгоняет музыку, и продолжать всегда
+// есть с чего: позиция внутри записанного куска. Это ДОБРОВОЛЬНАЯ плата (второй запрос и
+// место), поэтому по умолчанию выключено: обычный кэш и так пишет сет потоком, но его файл
+// не обгоняет проигрывание.
+const MUSIC_CACHE_LONG_SETS = MUSIC_CACHE && MUSIC_CFG.cache_long_sets === true;
+const CACHE_PART_MIN_BYTES = 65536;     // мельче -- огрызок, продолжать с него нечего
+const CACHE_PART_BYTES_PER_SEC = 16384; // 128 кбит/с = 16 КБ за секунду звука
+const CACHE_PART_SAFE = 0.9;            // запас оценки: ошибка допустима только в меньшую
+const CACHE_PART_MIN_AHEAD = 20;        // сек: столько звука должно быть ПОСЛЕ нужной секунды
+const cachePartSpent = new Set ();      // файлы, с которых уже отыграли -- второй раз не берём
+const cacheLongBusy = new Set ();       // ключи, которые прямо сейчас качает фоновое скачивание сета
 // Одна строка при старте (как остальные отчёты): видно, включён ли кэш и куда он пишет.
 if (MUSIC_CACHE)
     console.log ('[' + (d()) + '] [music] кэш аудио: ВКЛЮЧЁН -- ' + MUSIC_CACHE_DIR + ' (' +
@@ -7668,6 +7738,11 @@ if (MUSIC_CACHE)
             ' мин качаю на диск до старта, длинные сеты пишу во время игры' : ''));
 else
     console.log ('[' + (d()) + '] [music] кэш аудио: выключен (MUSIC.cache: false) -- звук идёт потоком, как раньше');
+if (MUSIC_CACHE_LONG_SETS)
+    console.log ('[' + (d()) + '] [music] длинные сеты: качаю на диск ЦЕЛИКОМ в фоне (' +
+        (MUSIC_CACHE_FULL_MAX ? 'всё, что длиннее ' + Math.round (MUSIC_CACHE_FULL_MAX / 60) + ' мин' : 'вообще все') +
+        ') -- файл уходит вперёд музыки, поэтому перезапуск и перемотка обходятся без YouTube' +
+        '; это второй запрос на такой трек и примерно 57 МБ на час звука');
 let cacheDirOk = false;
 function cacheDirReady ()
 {
@@ -7676,26 +7751,53 @@ function cacheDirReady ()
     {
         fsMod.mkdirSync (MUSIC_CACHE_DIR, { recursive: true });
         cacheDirOk = true;
-        cacheCleanStale (); // хвосты прошлого запуска уже никто не докачает
+        cacheCleanStale (); // [v2.72] недокачанное ПЕРЕЖИВАЕТ перезапуск: с него можно продолжить
     }
     catch (e) { console.error ('[' + (d()) + '] [music] папка кэша недоступна (' + MUSIC_CACHE_DIR + '): ' +
         oneLine (e.message) + ' -- играю потоком, как раньше'); }
     return cacheDirOk;
 }
-// Недокачанные файлы ('.dl.') после перезапуска бессмысленны: тот поток уже мёртв.
+// [v2.72] НЕДОКАЧАННЫЕ ФАЙЛЫ ПРОШЛОГО ЗАПУСКА. Раньше они безусловно удалялись («тот
+// поток уже мёртв») -- и вместе с ними уходило всё, что успело лечь на диск. Теперь
+// осмысленные (больше CACHE_PART_MIN_BYTES) остаются: если позиция трека внутри
+// записанного куска, продолжение идёт С ДИСКА, без обращения к YouTube (cachePartFind).
+// Совсем мелкие огрызки ничего не стоят -- их по-прежнему в корзину.
 function cacheCleanStale ()
 {
     let names = [];
-    let n = 0;
     try { names = fsMod.readdirSync (MUSIC_CACHE_DIR); } catch { return 0; }
+    let kept = 0, junk = 0, bestSec = 0;
     for (const f of names)
-        if (f.includes ('.dl.'))
-            try { fsMod.unlinkSync (pathMod.join (MUSIC_CACHE_DIR, f)); n++; } catch {}
-    if (n) console.log ('[' + (d()) + '] [music] кэш: убрал ' + n + ' ' +
-        plural (n, 'недокачанный файл', 'недокачанных файла', 'недокачанных файлов') + ' прошлого запуска');
-    return n;
+    {
+        if (!f.includes ('.dl.')) continue;
+        const p = pathMod.join (MUSIC_CACHE_DIR, f);
+        let st = null;
+        try { st = fsMod.statSync (p); } catch { continue; }
+        if (!st.isFile () || st.size < CACHE_PART_MIN_BYTES)
+        {
+            try { fsMod.unlinkSync (p); junk++; } catch {}
+            continue;
+        }
+        kept++;
+        bestSec = Math.max (bestSec, cachePartSeconds (st.size));
+    }
+    if (kept)
+        console.log ('[' + (d()) + '] [music] кэш: оставил ' + kept + ' ' +
+            plural (kept, 'недокачанный файл', 'недокачанных файла', 'недокачанных файлов') +
+            ' прошлого запуска (записи примерно на ' + fmtDur (Math.round (bestSec)) +
+            ') -- если позиция трека внутри, продолжу с диска сразу, без YouTube');
+    else if (junk)
+        console.log ('[' + (d()) + '] [music] кэш: убрал ' + junk + ' ' +
+            plural (junk, 'огрызок', 'огрызка', 'огрызков') + ' прошлого запуска (мельче ' +
+            Math.round (CACHE_PART_MIN_BYTES / 1024) + ' КБ -- продолжать с них нечего)');
+    return kept;
 }
 function fmtMb (bytes) { return Math.max (1, Math.round (Number (bytes || 0) / 1048576)) + ' МБ'; }
+// [v2.72] СКОЛЬКО ЗВУКА В НЕДОКАЧАННОМ ФАЙЛЕ. 128 кбит/с -- обычный звук YouTube в m4a,
+// то есть 16 КБ за секунду. Считаем по размеру и с запасом В МЕНЬШУЮ сторону: если у
+// видео битрейт выше (бывает), оценка завысила бы длину, а «продолжить с диска» тогда
+// обернулось бы тишиной -- в файле просто нет этой секунды.
+function cachePartSeconds (bytes) { return Math.max (0, Number (bytes || 0) / CACHE_PART_BYTES_PER_SEC); }
 // Ключ файла -- от АДРЕСА (не от названия): тот же трек, добавленный заново, найдёт
 // свою готовую запись; а переименованное видео не создаст вторую копию.
 function cacheKeyOf (track)
@@ -7725,6 +7827,58 @@ function cacheDropParts (key)
     for (const n of names)
         if (n.startsWith (key + '.dl.'))
             try { fsMod.unlinkSync (pathMod.join (MUSIC_CACHE_DIR, n)); } catch {}
+}
+// [v2.72] НЕДОКАЧАННЫЙ ФАЙЛ ЭТОГО ТРЕКА, КОТОРЫЙ УЖЕ ЗАКРЫВАЕТ НУЖНУЮ СЕКУНДУ. Именно
+// так перезапуск продолжается МГНОВЕННО: играем с диска, а не тянем поток сначала. Запас
+// CACHE_PART_MIN_AHEAD нужен, чтобы «с диска» не обернулось тишиной через секунду: файл
+// отдаёт ровно то, что в нём записано, а дальше трек продолжается обычным потоком (см.
+// Idle-обработчик и earlyEndResumeFrom). Готовый файл (без '.dl.') сюда не попадает -- у
+// него своя дорога (cacheFind), но он всегда лучше недокачанного, и его проверяют раньше.
+function cachePartFind (track, posSec)
+{
+    if (!MUSIC_CACHE || !track || track.isLive || !cacheDirReady ()) return null;
+    // С нуля трек берётся обычным путём (поток или предзагрузка): играть «с начала» с
+    // недокачанного файла смысла нет -- он кончится через секунды и всё равно потребует
+    // продолжения потоком (нам нужен именно обгон, а его с нуля не бывает).
+    if (!(Number (posSec) >= 1)) return null;
+    // Фоновое скачивание пишет файл этого же трека -- играть из-под него нельзя: оно
+    // или не отдаст занятое имя (Windows), или файл исчезнет у нас под руками.
+    if (cacheLongBusy.has (cacheKeyOf (track))) return null;
+    const base = cacheKeyOf (track) + '.dl.';
+    let names = [];
+    try { names = fsMod.readdirSync (MUSIC_CACHE_DIR); } catch { return null; }
+    const want = Math.max (0, Math.round (Number (posSec) || 0));
+    let best = null;
+    for (const n of names)
+    {
+        if (!n.startsWith (base)) continue;
+        if (cachePartSpent.has (n)) continue; // с этого уже отыграли -- больше не берём
+        const p = pathMod.join (MUSIC_CACHE_DIR, n);
+        let st = null;
+        try { st = fsMod.statSync (p); } catch { continue; }
+        if (!st.isFile () || st.size < CACHE_PART_MIN_BYTES) continue;
+        const sec = cachePartSeconds (st.size) * CACHE_PART_SAFE;
+        if (want + CACHE_PART_MIN_AHEAD > sec) continue; // в файле просто нет этой секунды
+        if (!best || sec > best.sec) best = { file: p, name: n, sec: Math.round (sec) };
+    }
+    return best;
+}
+// [v2.72] Недокачанный файл отыграл с диска до конца -- он больше не нужен: помечаем
+// «использован» (чтобы его не взяли второй раз) и убираем. Windows не всегда отдаёт
+// занятый файл сразу (его ещё отпускает только что убитый ffmpeg), поэтому есть короткая
+// повторная попытка -- как в прочей уборке кэша.
+function cacheSpendPart (file)
+{
+    const name = pathMod.basename (String (file || ''));
+    if (!name) return;
+    cachePartSpent.add (name);
+    const drop = () =>
+    {
+        try { if (!fsMod.existsSync (file)) return true; fsMod.unlinkSync (file); return true; }
+        catch { return false; }
+    };
+    if (drop ()) return;
+    setTimeout (() => { if (!drop ()) setTimeout (drop, 700).unref (); }, 400).unref ();
 }
 // Скачанный кусок становится готовым файлом: убираем пометку '.dl.' из имени.
 function cachePromoteParts (key, track)
@@ -7787,7 +7941,60 @@ async function cacheDownload (track, holder = {})
         if (holder.cancelled) return null;
         throw e;
     }
-    return cachePromoteParts (key, track);
+    const file = cachePromoteParts (key, track);
+    // [v2.72] и сразу применяем лимит места: раньше готовый файл проверял лимит только у
+    // тега (cacheTeeStart.finalize), а фоновое скачивание сета -- это тот же кэш.
+    if (file) pruneCache ([file]);
+    return file;
+}
+// [v2.72] ДЛИННЫЙ СЕТ -- НА ДИСК ЦЕЛИКОМ, В ФОНЕ (MUSIC.cache_long_sets). Отдельный запрос
+// тянет трек на полной скорости, НЕ оглядываясь на проигрывание, поэтому файл уходит ВПЕРЁД
+// музыки: перезапуск, обрыв и перемотка потом обходятся без YouTube (cachePartFind берёт
+// этот самый файл). Ошибка здесь -- не событие: звук идёт своим чередом, в лог -- одна строка.
+// Файлы, которые это скачивание пишет, помечаются занятыми (cacheLongBusy), чтобы игра
+// не начала читать файл из-под пишущего процесса.
+function longSetCached (track)
+{
+    return !!(MUSIC_CACHE_LONG_SETS && track && !track.isLive &&
+        Number (track.duration) > MUSIC_CACHE_FULL_MAX);
+}
+function cancelLongDownload (m)
+{
+    const h = m && m.longDl;
+    if (!h) return;
+    m.longDl = null;
+    try { if (typeof h.stop === 'function') h.stop (); } catch {}
+    cacheLongBusy.delete (h.key);
+}
+function startLongDownload (guildId, track)
+{
+    const m = $music[guildId];
+    if (!m || !longSetCached (track) || m.longDl) return;
+    const key = cacheKeyOf (track);
+    const holder = { key: key, track: track };
+    m.longDl = holder;
+    cacheLongBusy.add (key);
+    console.log ('[' + (d()) + '] [music] качаю сет на диск целиком в фоне (файл идёт вперёд музыки -- ' +
+        'перезапуск потом продолжит с диска): ' + (track.title || 'трек'));
+    cacheDownload (track, holder).then
+    (
+        file =>
+        {
+            if (m.longDl === holder) m.longDl = null;
+            cacheLongBusy.delete (key);
+            if (file)
+                console.log ('[' + (d()) + '] [music] сет целиком на диске: ' + (track.title || 'трек') +
+                    ' -- теперь он продолжается и перематывается без YouTube');
+        },
+        e =>
+        {
+            if (m.longDl === holder) m.longDl = null;
+            cacheLongBusy.delete (key);
+            if (holder.cancelled) return; // выбросили сами (трек сменился) -- это не событие
+            console.error ('[music] сет на диск не лёг (' + (track.title || 'трек') + '): ' + ytDlpErr (e, 150) +
+                ' -- музыку это не ломает, играю потоком');
+        }
+    );
 }
 // ПИСАТЬ ПОТОК НА ДИСК ПО ХОДУ ИГРЫ (длинные сеты): тот же звук, что уходит в Discord,
 // дублируется в файл. Доиграло до конца -- файл готов; прервали -- недописанное убираем.
@@ -8005,8 +8212,20 @@ function cacheCli (args = [])
         return 0;
     }
     console.log ('[cache] готовых треков: ' + done.length + ' (' + _mb (total) + ')' +
-        (parts.length ? ', недописанных хвостов: ' + parts.length + ' (' + _mb (partSize) + ')' : '') +
+        (parts.length ? ', недокачанных файлов: ' + parts.length + ' (' + _mb (partSize) + ')' : '') +
         ', лимит: ' + (MUSIC_CACHE_MAX_MB ? MUSIC_CACHE_MAX_MB + ' МБ' : 'без лимита'));
+    if (parts.length)
+    {
+        console.log ('[cache] недокачанное НЕ выбрасывается (v2.72): если позиция трека внутри записанного куска, ' +
+            'продолжение идёт С ДИСКА сразу, без YouTube; мельче ' + Math.round (CACHE_PART_MIN_BYTES / 1024) +
+            ' КБ бот убирает сам -- продолжать с них нечего');
+        console.log ('[cache] с чего можно продолжить (в имени -- <sha1 адреса>, не название):');
+        for (const f of parts.slice (0, 8))
+            console.log ('  ' + f.n.padEnd (26) + _mb (f.size).padStart (10) + '  ~' +
+                fmtDur (Math.round (cachePartSeconds (f.size))) + ' записи');
+        if (parts.length > 8) console.log ('  ... и ещё ' + (parts.length - 8));
+        console.log ('[cache] стирать их можно в любой момент: это не данные бота, а запись звука');
+    }
     if (!files.length)
     {
         console.log ('[cache] пока пусто -- ничего не скачано');
@@ -8058,6 +8277,25 @@ async function createTrackStream (track, seekSec = 0, seekMode = 'sections')
     {
         const r = openCachedTrack (track, _cached, seekSec);
         if (r) return r; // не вышло -- играем как раньше, потоком
+    }
+    // [v2.72] ГОТОВОГО ФАЙЛА НЕТ, НО ЕСТЬ НЕДОКАЧАННЫЙ ИЗ ПРОШЛОГО ЗАПУСКА, КОТОРЫЙ УЖЕ
+    // ЗАКРЫВАЕТ НУЖНУЮ СЕКУНДУ -- играем с него: ни YouTube, ни прокси, ни ожидания не надо.
+    // Когда он кончится, трек продолжится обычным потоком с той же секунды: файл отдаёт
+    // ровно то, что в нём записано, а дальше идёт сеть (см. earlyEndResumeFrom и Idle).
+    if (seekSec >= 1 && !track.isLive)
+    {
+        const _part = cachePartFind (track, seekSec);
+        if (_part)
+        {
+            const rp = openCachedTrack (track, _part.file, seekSec);
+            if (rp)
+            {
+                console.log ('[' + (d()) + '] [music] продолжаю с диска (недокачанный файл прошлого запуска: ' +
+                    'записи примерно на ' + fmtDur (_part.sec) + ', беру с ' + fmtDur (Math.round (seekSec)) + '): ' +
+                    (track.title || 'трек'));
+                return { ...rp, fromPart: true, partFile: _part.file, partName: _part.name, partSec: _part.sec };
+            }
+        }
     }
     let viaProxy = ((await ytRoutes ())[0] || {}).proxy || '';   // [v2.52, v2.60] см. ytRoutes
     // [v2.10] продолжение с места после перезапуска: yt-dlp отдаёт поток с N-й секунды
@@ -8153,8 +8391,10 @@ async function createTrackStream (track, seekSec = 0, seekMode = 'sections')
     // [v2.37] ДЛИННЫЙ ТРЕК: играем сразу потоком, но тот же звук пишем на диск -- если он
     // доиграет до конца, файл останется готовым и со следующего раза трек играет с диска.
     // Только при игре С НАЧАЛА: продолжение с места дало бы обрезанный файл.
+    // [v2.72] С включённым cache_long_sets этот трек и так качается ЦЕЛИКОМ отдельным
+    // запросом -- второй раз то же самое писать незачем (двойной трафик на тот же звук).
     let tee = null;
-    if (!seek && !seekInFfmpeg && !track.isLive && MUSIC_CACHE)
+    if (!seek && !seekInFfmpeg && !track.isLive && MUSIC_CACHE && !longSetCached (track))
     {
         tee = cacheTeeStart (track);
         if (tee)
@@ -8304,6 +8544,18 @@ function streamEndedEarly (track, at, startedAt = 0)
     return at < from + 20;
 }
 
+// [v2.72] С КАКОЙ СЕКУНДЫ ПРОДОЛЖАТЬ ТРЕК, ЗАМОЛЧАВШИЙ РАНЬШЕ КОНЦА. Обычно -- с текущей;
+// и только если «продолжение с места» не вышло СРАЗУ (поток замолчал в первые 15 секунд
+// после старта), ясно, что сдвиг этому источнику противопоказан: начинаем с начала, лишь
+// бы не потерять трек совсем. НО когда играли с НЕДОКАЧАННОГО файла (v2.72), повод другой:
+// он просто кончился, всё до этой секунды человек уже слушал, и начинать с нуля нельзя.
+function earlyEndResumeFrom (at, startedFromSeek, fromPart, startedAtSec)
+{
+    const sec = Math.max (0, Math.round (Number (at) || 0));
+    if (fromPart) return sec;
+    return (startedFromSeek && sec < (Number (startedAtSec) || 0) + 15) ? 0 : sec;
+}
+
 // ============================================================================
 // [v2.70] СЕТЬ/ПРОКСИ ОТВАЛИЛИСЬ -- ЭТО НЕ «БИТЫЙ ТРЕК».
 // Живой случай владельца: прокси икнул -- бот честно пробовал дальше, очередь
@@ -8438,6 +8690,10 @@ async function playNext (guildId)
     {
         let resource = null, viaProxy = false, handle = null;
         let startedAt = 0; // [v2.12] с какой секунды трек реально начал играть (0 -- с начала)
+        // [v2.72] Играем с НЕДОКАЧАННОГО файла прошлого запуска (продолжение с диска)?
+        // Разбирается в Idle: файл кончится -- трек продолжаем с той же секунды, а не
+        // с начала, и повторно этот файл не берём (earlyEndResumeFrom, cacheSpendPart).
+        let fromPart = false, partFile = null;
         const p = m.preload;
         // [v2.35] ТРЕКИ С ПОМЕТКОЙ `gone` СЮДА НЕ ДОХОДЯТ -- их убирает цикл выше
         // ("видео больше нет на YouTube (проверено предзагрузкой)"), поэтому брать
@@ -8554,6 +8810,8 @@ async function playNext (guildId)
             viaProxy = opened.viaProxy;
             handle = { resource: opened.resource, source: opened.source, proc: opened.proc, ff: opened.ff };
             startedAt = seekSec;
+            fromPart = !!opened.fromPart;
+            partFile = opened.partFile || null;
         }
         // [v2.12.2] позиция «прерванного» трека не теряется, если он стоит в очереди
         // не первым: кладём её в сам трек (вернётся, когда очередь до него дойдёт).
@@ -8571,6 +8829,9 @@ async function playNext (guildId)
         // начать трек с начала (см. streamEndedEarly).
         m.startedAtSec = startedAt;
         m.startedFromSeek = startedAt >= 1;
+        // [v2.72] Играем с недокачанного файла прошлого запуска? Запомним его: когда файл
+        // кончится, трек продолжится потоком с той же секунды, а сам файл уйдёт (Idle).
+        m.partFile = partFile;
         m.pausedByNobody = false;
         wireStreamErrors (m, track, resource, viaProxy, guildId);
         m.streamHandle = handle; // [v2.14] чем глушить этот трек (см. killStream)
@@ -8594,6 +8855,12 @@ async function playNext (guildId)
             track.warn = '';
             track.warnAt = 0;
         }
+        // [v2.72] ДЛИННЫЙ СЕТ И cache_long_sets: качаем его на диск ЦЕЛИКОМ, в фоне -- тогда
+        // файл идёт ВПЕРЕДИ музыки, и следующий перезапуск (или обрыв) продолжит с диска
+        // сразу, без YouTube. Играть это не мешает: звук идёт как обычно, потоком. Если
+        // играем с недокачанного файла сами -- не лезем в тот же файл из-под себя.
+        if (m.longDl && m.longDl.track !== track) cancelLongDownload (m);
+        if (!fromPart) startLongDownload (guildId, track);
         startPreload (guildId); // [v2.9] пока играет -- готовим следующий трек
         cacheDropUnused (); // [v2.39] проигранное уходит с диска -- остаёмся при текущем и предзагрузке
         // [v2.12] играет кому-то живому? тогда естественный конец очереди = забыть её;
@@ -12305,6 +12572,12 @@ function joinVoiceNow (guildId, voiceChannel, guild, reason = '')
                 // ffmpeg оставались жить в памяти до конца работы бота.
                 killStream (m.streamHandle);
                 m.streamHandle = null;
+                // [v2.72] Играли ли мы с НЕДОКАЧАННОГО файла прошлого запуска (продолжение
+                // с диска) -- решается ниже: если файл КОНЧИЛСЯ, его надо пометить
+                // использованным и убрать; если трек прервали сами (/skip, /stop),
+                // файл цел и ещё пригодится для следующего продолжения.
+                const _partFile = m.partFile;
+                m.partFile = null;
                 if (m.leaving) return; // [v2.9] это Idle от нашего же выхода, а не конец трека
                 // [v2.30] СМЕРТЬ ПОТОКА ВЫГЛЯДИТ КАК КОНЕЦ ТРЕКА -- И ТРЕК МОЛЧА ПРОПАДАЛ.
                 // Когда yt-dlp/ffmpeg умирают на середине (или возобновление «с места»
@@ -12342,15 +12615,29 @@ function joinVoiceNow (guildId, voiceChannel, guild, reason = '')
                         // Возобновили с места -- и почти сразу замолчало? Значит сдвиг
                         // этому источнику противопоказан: играем тот же трек С НАЧАЛА,
                         // лишь бы не потерять его совсем (как обещано владельцу).
-                        const fromStart = !!(m.startedFromSeek && at < (m.startedAtSec || 0) + 15);
-                        const seekTo = fromStart ? 0 : at;
-                        m.streamRetries = attempt;
+                        // [v2.72] С недокачанного файла повод другой: он КОНЧИЛСЯ, и всё до
+                        // этой секунды уже прозвучало -- начинать с нуля здесь нельзя.
+                        const _fromPart = !!_partFile;
+                        // файл отдал всё, что в нём было: второй раз он не нужен (иначе трек
+                        // зациклился бы на одном и том же куске), а трек продолжаем потоком
+                        if (_fromPart) cacheSpendPart (_partFile);
+                        const seekTo = earlyEndResumeFrom (at, m.startedFromSeek, _fromPart, m.startedAtSec);
+                        const fromStart = seekTo === 0;
+                        // кончился файл -- это не «источник не умеет навигацию», бюджет повторов
+                        // не тратим: треку ещё предстоит жить на обычном потоке
+                        m.streamRetries = _fromPart ? 0 : attempt;
                         m.playedMs = seekTo * 1000;
                         m.playingSince = null;
                         m.current = null;
                         m.tracks.unshift (playing);
                         m.seekTrack = playing;
                         m.seekSec = seekTo;
+                        if (_fromPart)
+                            console.error ('[' + (d()) + '] [music] недокачанный файл кончился (' +
+                                (at ? 'на ' + fmtDur (at) : 'в самом начале') + ') -- ' +
+                                (seekTo ? 'продолжаю тот же трек потоком, с этой же секунды'
+                                        : 'звука в нём не оказалось -- беру трек с начала'));
+                        else
                         console.error ('[' + (d()) + '] [music] поток оборвался (' +
                             (at ? 'на ' + fmtDur (at) : 'в самом начале') + ') -- трек не бросаю: играю его ' +
                             (fromStart ? 'с начала (продолжение с места не вышло)' : 'с этой же секунды') +
@@ -12599,6 +12886,9 @@ function destroyMusic (guildId, opts = {})
     m.playedMs = at * 1000;
     m.playingSince = null;
     dropPreload (m); // [v2.9] убираем за собой: заготовка следующего трека тоже не нужна
+    // [v2.72] Бот выходит из канала -- фоновая закачка сета больше никому не нужна
+    // (файл уже лежит сам по себе, а тянуть гигабайты впустую незачем)
+    cancelLongDownload (m);
     // [v2.14] Глушим играющий поток явно: если плеер уже в Idle, stop() не сработает
     // и без этой строки процессы yt-dlp/ffmpeg остались бы висеть.
     killStream (m.streamHandle);
