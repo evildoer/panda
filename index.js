@@ -26,6 +26,62 @@
 //     стоит в чьём-то config.json): [config] подскажет новое, бот не сломается. Этот ключ и
 //     cache_long_sets -- про разное: первый решает, какие треки качать ЦЕЛИКОМ ДО старта,
 //     второй -- качать ли длинные сеты в ФОНЕ, пока играет текущий.
+// CHANGELOG v2.81 (символ ключа в нике -- из конфига; ключ cache_short_max_minutes;
+//                  пример конфига совпадает с боевым):
+//   * СИМВОЛ КЛЮЧА В НИКЕ ТЕПЕРЬ СТРОКА ИЗ КОНФИГА (ключ сервера `tag`, по умолчанию 🔑).
+//     Владелец: «это просто строка -- её должна быть возможность сменить», в том числе на
+//     многосимвольную; раньше символ был вписан в код в двух местах. Пустая строка -- ключ
+//     не ставится вообще.
+//   * КЛЮЧ ВСЕГДА СПЕРЕДИ, А НИК МОЖЕТ УКОРОТИТЬСЯ: если вместе не влезает в 32 символа
+//     (лимит Discord), бот режет ник СПРАВА, а не отказывается от ключа, как раньше
+//     ([v2.24]: «ник уже 32 символа» -- человек с правами в канале оставался без ключа).
+//   * КЛЮЧ ПЕРЕИМЕНОВАН: cache_short_max_min -> cache_short_max_minutes (владелец: «не
+//     понимаю max_min -- это минимум или максимум?»). max -- максимум, min было
+//     сокращением от minutes; теперь написано целиком. Оба прежних имени (и самое старое
+//     cache_full_max_min) читаются по-прежнему, [config] подсказывает новое.
+//   * ПРИМЕР КОНФИГА БОЛЬШЕ НЕ РАСХОДИТСЯ С БОЕВЫМ (вопрос владельца: «почему
+//     cache_long_sets у меня включён, а в примере выключен?»): в примере и по умолчанию в
+//     коде cache_long_sets ВКЛЮЧЁН (без него продолжение сета снова тянет звук с начала),
+//     channel_status в примере ВЫКЛЮЧЕН (бот затирал бы строку автора канала -- вся та же
+//     информация есть в профильном статусе), PREFIX в примере -- общее слово-заглушка.
+// CHANGELOG v2.80 (маршрут музыки -- только владельцу; `node . config`; честные слова):
+//   * СТРОКА «🌐 МАРШРУТ» В /queue И /nowplaying ВИДНА ТОЛЬКО ВЛАДЕЛЬЦУ ХОСТИНГА (id в
+//     ключе OWNER): адреса прокси и состояние маршрутов -- кухня хостинга, а не информация
+//     для слушателя. Проверка стоит ВНУТРИ функции -- ни один вызов не может её забыть, а
+//     бюджет страницы считает длину строки для владельца.
+//   * «ИКНУВШИЙ» ПРОКСИ -- БОЛЬШЕ НЕ СЛОВО (владелец: «я такое впервые слышу, это про
+//     икоту»): везде «со сбоем» / «давший сбой» -- ровно то, что бот и делает (пропускает
+//     адрес минуту и идёт следующим).
+//   * `node . config` -- НОВАЯ КОНСОЛЬНАЯ КОМАНДА: таблица «ключ | значение | откуда взято»
+//     по верхнему уровню, MUSIC и каждому серверу плюс те же замечания [config], что бот
+//     говорит при старте -- и всё это БЕЗ запуска бота. Ответ на «а что теперь стоит у меня
+//     в конфиге?» после его чистки до обязательного. Секретов в отчёте нет (TOKEN и db_key --
+//     только «задан/пусто»).
+//   * ПРЕДУПРЕЖДЕНИЕ О ПЛОХОМ ВИДЕО -- ОДНОЙ ФРАЗОЙ: раньше текст был разрезан переносами
+//     прямо в строке кода и в чате смотрелся тремя обрывками.
+//   * СВОДКА О КОНФИГЕ БЕЗ ОЦЕНОК: строка [config] всегда говорила «config.json -- чистый»,
+//     даже если в файле стояли ВСЕ ключи; теперь это просто счёт (сколько в файле, сколько в
+//     примере), и она больше не выдаётся за «замечание».
+// CHANGELOG v2.79 (чистый config.json -- это норма; секция через HTTP-прокси):
+//   * СЕКЦИЯ ДЛЯ ffmpeg ИДЁТ ЧЕРЕЗ HTTP-ПРОКСИ: измерено на живом 156-минутном сете --
+//     ffmpeg понимает ТОЛЬКО -http_proxy (SOCKS не умеет вовсе), поэтому адрес HTTP-прокси
+//     отдаётся секции явно, а бюджет ожидания зависит от маршрута (8 с без прокси и 20 с
+//     через него: рабочий сдвиг приходит за 7,6 с и раньше выбрасывался из-за секунд).
+//   * [config] больше НЕ перечисляет ключи примера, которых нет в боевом файле: после чистки
+//     это была бы простыня на 180 строк; теперь одна строка-счёт, а списком называются только
+//     ключи, которых в примере НЕТ вовсе (опечатка или ключ старой версии).
+// CHANGELOG v2.78 (видно, ЧЕМ идёт музыка и у кого сбой):
+//   * МАРШРУТ ЗВУКА И ЗАПАСНОЙ АДРЕС -- прямо в /queue и /nowplaying (раньше -- только в
+//     консоли). Маршрут запоминается в ОБОИХ путях открытия потока (в том числе из
+//     предзагрузки -- иначе в самом частом случае показывался бы адрес прошлого трека) и
+//     сбрасывается, когда играть уже нечего.
+// CHANGELOG v2.75 (фильтр по названию, «взять один трек», имена констант как у ключей):
+//   * /FILTER И «🧽 ФИЛЬТР…»: удалить найденные по подстроке или оставить только их -- во
+//     всей очереди или только в своих (админы и модеры). Подтверждение показывает ПЕРВЫЕ
+//     ПЯТЬ названий, а не только число, и не повторяет одно и то же двумя строками.
+//   * ИЗ ПАЧКИ В /history ВИДНО ВЗЯТЬ ОДИН ТРЕК, а не только поставить всю пачку заново.
+//   * ВНУТРЕННИЕ КОНСТАНТЫ НАЗВАНЫ ТАК ЖЕ, КАК КЛЮЧИ, И С ЕДИНИЦЕЙ В ИМЕНИ (MINUTES/SEC/
+//     BYTES), чтобы код не спорил с конфигом, а читающий не гадал, где минуты, а где минуты.
 // CHANGELOG v2.73 (режим повтора /repeat; начатый трек не теряет свой файл):
 //   * /REPEAT -- РЕЖИМ АВТОРА, А НЕ ОТДЕЛЬНОГО ТРЕКА (только админы и модеры; в списке
 //     команд видна всем, у остальных -- отказ). Пока режим включён, треки этого автора
@@ -1637,6 +1693,7 @@ function filesCli ()
     console.log ('  node . clearstatus 1414754348139020359 -- снять свою строку из шапки канала (id канала)');
     console.log ('  node . privacy                -- пересобрать PRIVACY.md из шаблона (имена спросит у Discord)');
     console.log ('  node . privacy --offline      -- то же, но без обращения к сети');
+    console.log ('  node . config                 -- чем бот РЕАЛЬНО работает: все ключи, значения и откуда взяты');
     console.log ('  node . files                  -- этот отчёт');
     console.log ('  node . cache                  -- кэш музыки: что скачано, сколько занимает, что удалять');
     console.log ('  node . cache --clear          -- стереть кэш целиком (бот скачает заново)');
@@ -1719,9 +1776,10 @@ function privacyCli (_check, _offline)
     const _def = {};
     const _head = /^\s*<!--([\s\S]*?)-->/.exec (_tpl);
     if (_head) for (const _m of _head[1].matchAll (/^\s*([A-Z][A-Z_0-9]*)\s*=\s*(.+?)\s*$/gm)) _def[_m[1]] = _m[2];
-    // Значок ключа -- прямо из кода (он там один и тот же в двух местах).
+    // Значок ключа -- прямо из кода: там он теперь РОВНО ОДИН (TAG_DEFAULT; v2.81 -- до
+    // этого символ был прописан в двух местах, в modNick и sweepNicks).
     // точку с запятой требуем специально: так регулярка не находит саму себя в этом файле
-    const _markM = /const tag = '([^']+)';/.exec (_fs.readFileSync (_path.join (__dirname, 'index.js'), 'utf8'));
+    const _markM = /const TAG_DEFAULT = '([^']+)';/.exec (_fs.readFileSync (_path.join (__dirname, 'index.js'), 'utf8'));
     const _mark = _markM ? _markM[1] : (_def.MARK || '🔑');
     // Серверы и сроки -- из config.json (берём только включённые экземпляры).
     const _srv = Object.keys (SERVERS).filter (_k => /^\d{17,20}$/.test (_k) && SERVERS[_k].allow !== false);
@@ -2043,7 +2101,7 @@ const STARTUP_DM_TEXT =
     'Если в канале никого, музыка встаёт на паузу и продолжается, когда кто-то зашёл: бот помнит и трек, и место в нём -- перезапуск и обрыв связи их не сбрасывают.\n' +
     '\n' +
     '🔑 **Свой голосовой канал**\n' +
-    'Создал свой канал -- ты его владелец: бот выдаёт права и ставит 🔑 в ник. 🔑 = права в этом канале есть; у админов и модеров ключа нет -- у них права и так.\n' +
+    'Создал свой канал -- ты его владелец: бот выдаёт права и ставит ключ в ник (по умолчанию 🔑). Ключ = права в этом канале есть; у админов и модеров ключа нет -- у них права и так.\n' +
     '\n' +
     '🛡️ **Что бот делает сам**\n' +
     '• мут и глухота действуют только в том канале, где выданы: в других говорить можно, а вернёшься -- ограничение на месте\n' +
@@ -2607,7 +2665,9 @@ dbStartupGuard ();
 // 0 -- как было: только при старте). В лог пишем, только когда что-то изменилось
 // или когда не вышло: иначе за сутки набралось бы 24 одинаковые строки.
 // ============================================================================
-const BACKUP_EVERY_MIN = (() =>
+// [v2.81] Имя с единицей измерения целиком: MIN здесь -- "минуты" (ключ backup_minutes),
+// а не "минимум"; сокращения min/minutes рядом только путали.
+const BACKUP_EVERY_MINUTES = (() =>
 {
     const _v = Number (backup_minutes);
     if (!Number.isFinite (_v) || _v < 0) return 60; // ключа нет или мусор -- поведение по умолчанию
@@ -2633,11 +2693,11 @@ function dbBackupTick ()
                 plural (_res.rows, 'запись', 'записи', 'записей') + ')');
     }
 }
-if (BACKUP_EVERY_MIN > 0)
+if (BACKUP_EVERY_MINUTES > 0)
 {
     console.log ('[' + new Date ().toLocaleString () + '] [db] плановые копии базы: каждые ' +
-        BACKUP_EVERY_MIN + ' мин, пока бот работает (backup_minutes; 0 -- только при старте)');
-    setInterval (dbBackupTick, BACKUP_EVERY_MIN * 60 * 1000);
+        BACKUP_EVERY_MINUTES + ' мин, пока бот работает (backup_minutes; 0 -- только при старте)');
+    setInterval (dbBackupTick, BACKUP_EVERY_MINUTES * 60 * 1000);
 }
 
 // ## DB!:
@@ -3773,6 +3833,42 @@ function isStaff (server, member)
 // ставит ник, и сразу правит локальное состояние, не дожидаясь события от Discord.
 // [v2.15] И запоминаем его для свипа: если свежий ник прочитать не удалось, сверяться
 // будем с тем, что бот поставил сам, а не ставить одно и то же каждые 45 секунд.
+// [v2.81] СИМВОЛ КЛЮЧА -- ИЗ КОНФИГА. Владелец: «это просто строка -- её должна быть
+// возможность сменить», в том числе на многосимвольную (ключ сервера `tag`; ключа нет --
+// значение по умолчанию). Пустая строка -- «ключа нет»: тогда бот его ни ставит, ни снимает.
+const TAG_DEFAULT = '🔑';
+// Ник в Discord -- до 32 символов, а ключ добавляется СВЕРХУ. Раньше при полном нике бот
+// просто отказывался ставить ключ (Discord отвечал 'Invalid Form Body'), хотя правильнее
+// укоротить ник СПРАВА ровно настолько, чтобы ключ влез целиком: ключ -- всегда спереди.
+const NICK_MAX = 32;
+function tagOf (server)
+{
+    const raw = SERVERS[server] ? SERVERS[server].tag : undefined;
+    // Ключа нет ИЛИ в нём мусор (число, объект) -- значение по умолчанию: в ник не должно
+    // уходить "5" или "[object Object]" (про мусор говорит строка [config] при старте).
+    if (typeof raw !== 'string') return TAG_DEFAULT;
+    return raw;   // строка как есть: пустая -- ключ не ставим
+}
+// Ключ стоит в начале ника -- по этому и сверяемся (а не «есть ли где-то похожий символ»).
+function nickHasTag (server, nick)
+{
+    const tag = tagOf (server);
+    return !!tag && String (nick === undefined || nick === null ? '' : nick).startsWith (tag);
+}
+// Ключ + ник, вместе не длиннее 32 символов. Считаем ПО СИМВОЛАМ (кодовым точкам): эмодзи
+// занимает несколько кодовых единиц, и обрезка по length рвала бы его пополам.
+function nickWithTag (server, nick)
+{
+    const cp = s => [...String (s === undefined || s === null ? '' : s)];
+    return [...cp (tagOf (server)).slice (0, NICK_MAX), ...cp (nick)].slice (0, NICK_MAX).join ('');
+}
+// Снять ключ: режем РОВНО префикс (а не все вхождения символа в нике).
+function nickWithoutTag (server, nick)
+{
+    const tag = tagOf (server);
+    const s = String (nick === undefined || nick === null ? '' : nick);
+    return (tag && s.startsWith (tag)) ? s.slice (tag.length) : s;
+}
 const $nickSet = {}; // server -> Map<uid, true|false>  (есть ли ключ, что поставил бот)
 function nickSetMark (server, uid, hasTag)
 {
@@ -3784,13 +3880,14 @@ async function setNickLogged (member, newNick, server)
 {
     await member.setNickname (newNick);
     member.nickname = newNick;
-    nickSetMark (server, member.user.id, newNick.startsWith ('🔑'));
+    nickSetMark (server, member.user.id, nickHasTag (server, newNick));
 }
 
 async function modNick (server, member/*, add = false*/)
 {
-    const tag = '🔑'; // 🔴
-    if (SERVERS[server].addTag || false)
+    const tag = tagOf (server);   // [v2.81] символ ключа -- из конфига (по умолчанию 🔑)
+    // Пустая строка в ключе `tag` -- «ключа нет»: тогда ничего не ставим и не снимаем.
+    if (tag && (SERVERS[server].addTag || false))
     {
         if (!member.user.bot) // [v2.2.3] тег -- ЛЮБОМУ с правами в канале
         {
@@ -3802,8 +3899,8 @@ async function modNick (server, member/*, add = false*/)
             {
                 if (nick.startsWith (tag))
                 {
-                    console.log ('[' + (d()) + '] [nick] -🔑 (staff) ' + member.user.username);
-                    await setNickLogged (member, nick.slice (tag.length), server)
+                    console.log ('[' + (d()) + '] [nick] -' + tag + ' (staff) ' + member.user.username);
+                    await setNickLogged (member, nickWithoutTag (server, nick), server)
                         .catch (e => console.error ('[nick] ошибка смены ника: ' + e.message));
                 }
                 return;
@@ -3824,18 +3921,14 @@ async function modNick (server, member/*, add = false*/)
                 // эмодзи в начале ника (💙, 🔊...) и срезал его, думая что это ключ:
                 if (!nick.startsWith (tag))
                 {
-                    // [v2.24] Ник в Discord -- до 32 символов, а тег 🔑 добавляется СВЕРХУ.
-                    // Если ник уже во всю длину, ключ физически не влезает: Discord отвечал
-                    // 'Invalid Form Body' (а в лог шла невнятная ошибка). Чужое имя ради
-                    // галочки не режем -- просто не трогаем ник и говорим, почему.
-                    if ([...tag, ...nick].length > 32)
-                    {
-                        console.log ('[' + (d()) + '] [nick] 🔑 не поставил: ник уже 32 символа (' +
-                            member.user.username + ')');
-                        return;
-                    }
-                    let nickNew = tag + nick;
-                    console.log ('[' + (d()) + '] [nick] +🔑 ' + member.user.username + ' в ' + member.voice.channel.name);
+                    // [v2.81] НЕ ОТКАЗЫВАЕМСЯ, А УКОРАЧИВАЕМ НИК (владелец: «с учётом длины
+                    // обрезать ник справа, если подстрока не влезает в максимальную длину»).
+                    // Раньше при полном нике ключ просто не ставился ('Invalid Form Body' в
+                    // логе), и человек с правами в канале оставался без ключа -- а ключ и есть
+                    // обещание этих прав. Ключ всегда спереди, хвост имени уходит.
+                    const nickNew = nickWithTag (server, nick);
+                    console.log ('[' + (d()) + '] [nick] +' + tag + ' ' + member.user.username + ' в ' + member.voice.channel.name +
+                        (nickNew !== tag + nick ? ' (ник укоротил справа: "' + nick + '" -> "' + nickNew + '")' : ''));
                     await setNickLogged (member, nickNew, server)
                         .catch (e => console.error ('[nick] ошибка смены ника: ' + e.message)); // [!] при ошибке прав -- видно в логе
                 }
@@ -3843,10 +3936,10 @@ async function modNick (server, member/*, add = false*/)
             else
             {
                 // [FIX v2] убираем только ВЕДУЩИЙ тег, а не все вхождения:
-                nickNew = nick.startsWith (tag) ? nick.slice (tag.length) : nick;
+                const nickNew = nickWithoutTag (server, nick);
                 if (nickNew !== nick)
                 {
-                    console.log ('[' + (d()) + '] [nick] -🔑 ' + member.user.username);
+                    console.log ('[' + (d()) + '] [nick] -' + tag + ' ' + member.user.username);
                     await setNickLogged (member, nickNew, server)
                         .catch (e => console.error ('[nick] ошибка смены ника: ' + e.message));
                 }
@@ -6333,7 +6426,8 @@ async function sweepNicks (server)
     {
         const guild = client.guilds.cache.get (server);
         if (!guild || !(SERVERS[server].addTag || false)) return;
-        const tag = '🔑';
+        const tag = tagOf (server);   // [v2.81] символ ключа -- из конфига
+        if (!tag) return;             // ключ отключён пустой строкой -- сверять нечего
         // [FIX v2.3.2] REST-эндпоинт voice-states ботам недоступен (404) -- берём
         // кэш гейтвея: guild.voiceStates заполнен из GUILD_CREATE/voice-событий:
         let states = guild.voiceStates.cache;
@@ -6376,18 +6470,18 @@ async function sweepNicks (server)
             let nick = member.nickname || member.user.username;
             // [FIX v2.3.3] charCodeAt (0xD83D) ловит ЛЮБОЙ эмодзи в начале ника
             // (💙, 🔊...) и свип срезал их, думая что это ключ. Точная проверка:
-            let hasTag = nick.startsWith (tag); // 🔑
+            let hasTag = nick.startsWith (tag);
             // Свежий ник не прочитался (REST не отдал, сети нет)? Тогда верим тому, что
             // бот поставил сам: повторная установка -- не событие и не должна шуметь.
             if (!fresh && known !== undefined) hasTag = known;
             if (hasTag === wantTag) { nickSetMark (server, vs.id, hasTag); continue; } // уже так
             if (wantTag)
-                await setNickLogged (member, tag + nick, server)
-                    .then (() => { added++; console.log ('[' + (d()) + '] [nick] +🔑 (sweep) ' + member.user.username + ' в ' + channel.name); })
+                await setNickLogged (member, nickWithTag (server, nick), server)
+                    .then (() => { added++; console.log ('[' + (d()) + '] [nick] +' + tag + ' (sweep) ' + member.user.username + ' в ' + channel.name); })
                     .catch (e => console.error ('[nick][sweep] ошибка для ' + member.user.username + ': ' + e.message));
             else
-                await setNickLogged (member, nick.slice (tag.length), server)
-                    .then (() => { removed++; console.log ('[' + (d()) + '] [nick] -🔑 ' + (isStaff (server, member) ? '(staff) ' : '(sweep) ') + member.user.username); })
+                await setNickLogged (member, nickWithoutTag (server, nick), server)
+                    .then (() => { removed++; console.log ('[' + (d()) + '] [nick] -' + tag + ' ' + (isStaff (server, member) ? '(staff) ' : '(sweep) ') + member.user.username); })
                     .catch (e => console.error ('[nick][sweep] ошибка для ' + member.user.username + ': ' + e.message));
         }
         // [v2.4] итог свипа -- только в DEBUG (периодический шум в логе ни к чему):
@@ -6451,13 +6545,14 @@ async function tempCreateFor (server, member)
         await member.voice.setChannel (created.id)
             .catch (e => console.error ('[temp] ошибка перевода: ' + e.message));
     // ключ владельцу (он в своём канале -- права есть; ADM/MOD -- не трогаем):
-    if ((SERVERS[server].addTag || false) && !isStaff (server, member))
+    const tempTag = tagOf (server);   // [v2.81] символ ключа -- из конфига
+    if (tempTag && (SERVERS[server].addTag || false) && !isStaff (server, member))
     {
         let nick = member.nickname || member.user.username;
         // [FIX v2.3.3] точная проверка ключа (см. комментарий в sweepNicks):
-        if (!nick.startsWith ('🔑'))
-            await setNickLogged (member, '🔑' + nick, server)
-                .then (() => console.log ('[' + (d()) + '] [nick] +🔑 (temp) ' + member.user.username))
+        if (!nickHasTag (server, nick))
+            await setNickLogged (member, nickWithTag (server, nick), server)
+                .then (() => console.log ('[' + (d()) + '] [nick] +' + tempTag + ' (temp) ' + member.user.username))
                 .catch (e => console.error ('[temp] ошибка смены ника: ' + e.message));
     }
     await tempSweep (server); // заодно убрать осиротевшие
@@ -6591,11 +6686,19 @@ function configSanityIssues ()
     if (MUSIC_CFG.cache_long_sets === true && MUSIC_CFG.cache === false)
         out.push ('MUSIC.cache_long_sets: true, но MUSIC.cache: false -- кэш выключен целиком, качать сеты некуда: ' +
             'настройка не работает (или включи cache, или убери cache_long_sets)');
-    // [v2.74] Старое имя ключа «короткие треки качаем целиком»: понимаем по-прежнему, но
-    // молчать не будем -- иначе владелец искал бы в примере ключ, которого там уже нет.
-    if (MUSIC_CFG.cache_full_max_min !== undefined && MUSIC_CFG.cache_short_max_min === undefined)
-        out.push ('MUSIC.cache_full_max_min: ключ переименован в cache_short_max_min (смысл и значение ' +
-            'по умолчанию те же) -- старое имя ещё понимаю, но лучше переименуй в конфиге');
+    // [v2.74/v2.81] ДВА СТАРЫХ ИМЕНИ КЛЮЧА «короткие треки качаем целиком»: понимаем
+    // по-прежнему, но молчать не будем -- иначе владелец искал бы в примере ключ, которого
+    // там уже нет. v2.74: cache_full_max_min -> cache_short_max_min; v2.81: -> ..._minutes
+    // (владелец: «не max_min, а max_minutes -- тогда сразу понятно»).
+    if (MUSIC_CFG.cache_short_max_minutes === undefined)
+    {
+        if (MUSIC_CFG.cache_short_max_min !== undefined)
+            out.push ('MUSIC.cache_short_max_min: ключ переименован в cache_short_max_minutes (min -- ' +
+                'это минуты, и в имени теперь это сказано) -- старое имя ещё понимаю, переименуй в конфиге');
+        else if (MUSIC_CFG.cache_full_max_min !== undefined)
+            out.push ('MUSIC.cache_full_max_min: самое старое имя ключа; сейчас он называется ' +
+                'cache_short_max_minutes (смысл и значение по умолчанию те же) -- переименуй в конфиге');
+    }
     // [v2.55] Живой лог в файл: мусор в ключе не должен молча менять поведение --
     // строка "шесть" превратилась бы в 0 (не удалять ничего) или "no" в NaN.
     if (log_keep_months !== undefined &&
@@ -6658,6 +6761,14 @@ function configSanityIssues ()
         if (has (s.owner_server) && !idOk (s.owner_server))
             out.push ('сервер ' + nm + ': owner_server = "' + s.owner_server + '": не похоже на id -- ' +
                 'в помощи он не показывается');
+        // [v2.81] СИМВОЛ КЛЮЧА В НИКЕ (tag). Это строка (один символ или несколько), а не
+        // число/объект: иначе в ник ушло бы "5" или "[object Object]" вместо ключа.
+        if (s.tag !== undefined && s.tag !== null && typeof s.tag !== 'string')
+            out.push ('сервер ' + nm + ': tag = ' + JSON.stringify (s.tag) + ': ожидается строка ' +
+                '(символ или несколько, по умолчанию 🔑) -- беру значение по умолчанию');
+        else if (typeof s.tag === 'string' && [...s.tag].length > NICK_MAX)
+            out.push ('сервер ' + nm + ': tag = "' + s.tag + '": длиннее ' + NICK_MAX + ' символов -- ' +
+                'ключ будет обрезан (в нике Discord всего ' + NICK_MAX + ' символов)');
         if (has (s.queue_page) && Number.isFinite (Number (s.queue_page)) && Number (s.queue_page) > 25)
             out.push ('сервер ' + nm + ': queue_page = ' + s.queue_page + ' -- страница будет 25 ' +
                 '(больше Discord не принимает)');
@@ -7826,7 +7937,7 @@ function probeNormalize ()
 // слышали слушатели, а перемотка и продолжение после перезапуска каждый раз заново
 // просили звук у YouTube. Теперь трек живёт на диске.
 // КАК (гибрид -- так выбрал владелец):
-//   * короткий трек (до MUSIC.cache_short_max_min минут) скачивается ЦЕЛИКОМ и играет
+//   * короткий трек (до MUSIC.cache_short_max_minutes минут) скачивается ЦЕЛИКОМ и играет
 //     уже файл: перемотка мгновенная и точная, YouTube во время игры не нужен. Обычно
 //     этого даже не замечаешь: пока играет текущий трек, следующий уже скачивается
 //     (предзагрузка), то есть паузы между песнями нет;
@@ -7867,30 +7978,44 @@ const MUSIC_CACHE_MAX_MB = MUSIC_CFG.cache_max_mb === undefined || MUSIC_CFG.cac
 // боевом конфиге, и ломать его нельзя); если оно там есть -- [config] подскажет новое.
 // [v2.75] ВНУТРЕННИЕ КОНСТАНТЫ НАЗВАНЫ ТАК ЖЕ, КАК КЛЮЧИ, и с единицей в имени: код не
 // должен спорить с конфигом, а читающий -- гадать, «max_min» это минуты или минимум.
-//   MUSIC_CACHE_SHORT_MAX_MIN  -- значение из конфига: МИНУТЫ, максимум минут;
-//   MUSIC_CACHE_SHORT_MAX_SEC  -- те же минуты в СЕКУНДАХ (с ними сравнивается длина трека);
+//   MUSIC_CACHE_SHORT_MAX_MINUTES -- значение из конфига: МИНУТЫ, максимум минут;
+//   MUSIC_CACHE_SHORT_MAX_SEC     -- те же минуты в СЕКУНДАХ (с ними сравнивается длина трека);
 //   MUSIC_CACHE_LONG_SETS / MUSIC_CACHE_KEEP_PLAYED / MUSIC_CACHE_MAX_MB / MUSIC_CACHE_DIR
 //   -- читаются из ключей cache_long_sets / cache_keep_played / cache_max_mb / cache_dir.
-const MUSIC_CACHE_SHORT_MAX_MIN = (MUSIC_CFG.cache_short_max_min === undefined || MUSIC_CFG.cache_short_max_min === null)
-    ? MUSIC_CFG.cache_full_max_min
-    : MUSIC_CFG.cache_short_max_min;
-const MUSIC_CACHE_SHORT_MAX_SEC = (MUSIC_CACHE_SHORT_MAX_MIN === undefined || MUSIC_CACHE_SHORT_MAX_MIN === null
+// [v2.81] В КЛЮЧЕ ТЕПЕРЬ ЧЕСТНОЕ ИМЯ: cache_short_max_minutes (min -- это минуты, и в
+// имени это сказано). Оба прежних имени (cache_short_max_min и самое старое
+// cache_full_max_min) читаются так же -- [config] подскажет новое, ничего не ломается.
+const MUSIC_CACHE_SHORT_MAX_MINUTES = (MUSIC_CFG.cache_short_max_minutes !== undefined && MUSIC_CFG.cache_short_max_minutes !== null)
+    ? MUSIC_CFG.cache_short_max_minutes
+    : ((MUSIC_CFG.cache_short_max_min !== undefined && MUSIC_CFG.cache_short_max_min !== null)
+        ? MUSIC_CFG.cache_short_max_min
+        : MUSIC_CFG.cache_full_max_min);
+const MUSIC_CACHE_SHORT_MAX_SEC = (MUSIC_CACHE_SHORT_MAX_MINUTES === undefined || MUSIC_CACHE_SHORT_MAX_MINUTES === null
     ? 15
-    : Math.max (0, Math.round (Number (MUSIC_CACHE_SHORT_MAX_MIN) || 0))) * 60;
+    : Math.max (0, Math.round (Number (MUSIC_CACHE_SHORT_MAX_MINUTES) || 0))) * 60;
 // [v2.39] ХРАНИТЬ ЛИ УЖЕ ПРОИГРАННОЕ. По умолчанию нет: файл отыгравшего трека
 // удаляется сразу, на диске живут только играющий трек и предзагрузка. Иначе
 // скачанное копилось бы до лимита гигабайтами, хотя заново оно уже не понадобится
 // (интернет безлимитный -- перекачать не грех). false -- удалять, true -- старое
 // поведение (файлы живут до лимита cache_max_mb, удобно слушать плейлист по кругу).
 const MUSIC_CACHE_KEEP_PLAYED = MUSIC_CFG.cache_keep_played === true;
-// [v2.72] КАЧАТЬ ДЛИННЫЕ СЕТЫ ЦЕЛИКОМ, В ФОНЕ (MUSIC.cache_long_sets, по умолчанию false).
+// [v2.72/v2.81] КАЧАТЬ ДЛИННЫЕ СЕТЫ ЦЕЛИКОМ, В ФОНЕ (MUSIC.cache_long_sets; с v2.81 --
+// по умолчанию ВКЛЮЧЕНО, как и в примере: владелец заметил, что боевой конфиг и пример
+// расходились, и выбрал рабочее значение. Выключается явным false).
 // Живой случай владельца: перезапуск на середине часового сета -- и музыка ждала, пока
 // yt-dlp отдаст звук с нужной секунды (а секции этот источник не умеет вовсе). Если файл
 // качается отдельным запросом на полной скорости, он обгоняет музыку, и продолжать всегда
-// есть с чего: позиция внутри записанного куска. Это ДОБРОВОЛЬНАЯ плата (второй запрос и
-// место), поэтому по умолчанию выключено: обычный кэш и так пишет сет потоком, но его файл
-// не обгоняет проигрывание.
-const MUSIC_CACHE_LONG_SETS = MUSIC_CACHE && MUSIC_CFG.cache_long_sets === true;
+// есть с чего: позиция внутри записанного куска. Плата за это -- второй запрос к YouTube и
+// место на диске (примерно 57 МБ на час звука) и именно ее владелец и выбрал, включив ключ
+// на боевом; с v2.81 это и значение по умолчанию. Без него обычный кэш тоже пишет сет
+// потоком, но его файл НЕ обгоняет проигрывание -- продолжать все равно придется с начала.
+// [v2.81] Значение по умолчанию -- true (ключа в файле нет). Явное true/false берём как есть,
+// а МУСОР в ключе (строка, число, объект) -- это выключено, а не включено: на неверном
+// значении тянуть лишний запрос и место на диске -- худший вариант из двух (про это и
+// говорит строка [config]). Кэш выключен целиком (cache: false) -- качать некуда, молчим.
+const MUSIC_CACHE_LONG_SETS = MUSIC_CACHE &&
+    ((MUSIC_CFG.cache_long_sets === undefined || MUSIC_CFG.cache_long_sets === null)
+        ? true : MUSIC_CFG.cache_long_sets === true);
 const CACHE_PART_USEFUL_BYTES  = 65536;  // мельче -- огрызок, продолжать с него нечего
 const CACHE_PART_BYTES_PER_SEC = 16384;  // 128 кбит/с = 16 КБ за секунду звука
 const CACHE_PART_SAFE_FACTOR   = 0.9;    // запас оценки: ошибка допустима только в меньшую
@@ -8518,7 +8643,7 @@ function configCli ()
     row ('db_key_prev', Array.isArray (db_key_prev) ? db_key_prev.length + ' шт' : '0', hasTop ('db_key_prev') ? 'config.json' : 'по умолчанию (0)');
     row ('privacy_url', PRIVACY_URL ? 'задан' : 'пусто (ссылки не будет)', hasTop ('privacy_url') ? 'config.json' : '-- (в файле нет)');
     row ('show_privacy_url', YN (SHOW_PRIVACY_URL), hasTop ('show_privacy_url') ? 'config.json' : 'по умолчанию (показывать)');
-    row ('backup_minutes', BACKUP_EVERY_MIN + (BACKUP_EVERY_MIN ? ' мин' : ' (только при старте)'), hasTop ('backup_minutes') ? 'config.json' : 'по умолчанию (60)');
+    row ('backup_minutes', BACKUP_EVERY_MINUTES + (BACKUP_EVERY_MINUTES ? ' мин' : ' (только при старте)'), hasTop ('backup_minutes') ? 'config.json' : 'по умолчанию (60)');
     row ('backup_keep', BACKUP_KEEP, hasTop ('backup_keep') ? 'config.json' : 'по умолчанию (10)');
     row ('log_dir', LOG_DIR, hasTop ('log_dir') ? 'config.json' : 'по умолчанию (logs)');
     row ('log_keep_months', LOG_KEEP_MONTHS || '0 (не удалять)', hasTop ('log_keep_months') ? 'config.json' : 'по умолчанию (0)');
@@ -8531,8 +8656,10 @@ function configCli ()
     row ('skip_absent_author', YN (MUSIC_SKIP_ABSENT), hasM ('skip_absent_author') ? 'config.json' : 'по умолчанию (да)');
     row ('cache (диск)', YN (MUSIC_CACHE), hasM ('cache') ? 'config.json' : 'по умолчанию (вкл)');
     row ('cache_dir', MUSIC_CACHE_DIR, hasM ('cache_dir') ? 'config.json' : 'по умолчанию (music_cache)');
-    row ('cache_short_max_min', Math.round (MUSIC_CACHE_SHORT_MAX_SEC / 60) + ' мин', hasM ('cache_short_max_min') || hasM ('cache_full_max_min') ? 'config.json' : 'по умолчанию (15)');
-    row ('cache_long_sets', YN (MUSIC_CACHE_LONG_SETS), hasM ('cache_long_sets') ? 'config.json' : 'по умолчанию (выкл)');
+    row ('cache_short_max_minutes', Math.round (MUSIC_CACHE_SHORT_MAX_SEC / 60) + ' мин',
+        hasM ('cache_short_max_minutes') ? 'config.json'
+            : ((hasM ('cache_short_max_min') || hasM ('cache_full_max_min')) ? 'config.json (старое имя)' : 'по умолчанию (15)'));
+    row ('cache_long_sets', YN (MUSIC_CACHE_LONG_SETS), hasM ('cache_long_sets') ? 'config.json' : 'по умолчанию (вкл)');
     row ('cache_max_mb', MUSIC_CACHE_MAX_MB || '0 (без лимита)', hasM ('cache_max_mb') ? 'config.json' : 'по умолчанию (4096)');
     row ('cache_keep_played', YN (MUSIC_CACHE_KEEP_PLAYED), hasM ('cache_keep_played') ? 'config.json' : 'по умолчанию (выкл)');
     row ('queue_check (заранее)', YN (MUSIC_QUEUE_CHECK), hasM ('queue_check') ? 'config.json' : 'по умолчанию (вкл)');
@@ -8561,6 +8688,12 @@ function configCli ()
                          'welcome_public_channel', 'welcome_public_message', 'owner_server'])
             row (k, orDash (s[k]), has (k) ? 'config.json' : '-- (в файле нет)');
         row ('addTag', YN (s.addTag), has ('addTag') ? 'config.json' : 'в коде выкл (тег не ставится)');
+        // [v2.81] Ключ в нике: показываем САМ символ (он виден и в отчёте, и в конфиге --
+        // это не секрет), иначе владелец не понял бы, что за ключ применяется.
+        row ('tag (ключ в нике)', typeof s.tag === 'string'
+                ? (s.tag ? s.tag : 'пусто -- ключ не ставится')
+                : TAG_DEFAULT + ' (по умолчанию)',
+            has ('tag') ? 'config.json' : 'по умолчанию (' + TAG_DEFAULT + ')');
         row ('welcome_prefix', s.welcome_prefix === false ? 'нет (без описания бота)' : 'да', has ('welcome_prefix') ? 'config.json' : 'по умолчанию (да)');
         row ('queue_page', (Number (s.queue_page) || 15) + ' треков (в коде максимум 25)', has ('queue_page') ? 'config.json' : 'по умолчанию (15)');
         row ('onLeaveBanTimeout', (Number (s.onLeaveBanTimeout) || 0) + (Number (s.onLeaveBanTimeout) ? ' мин' : ' (механизм выкл)'), has ('onLeaveBanTimeout') ? 'config.json' : 'в коде 0 -- без ключа не работает');
@@ -9595,7 +9728,8 @@ function wireStreamErrors (m, track, resource, viaProxy, guildId)
 // У роута жёсткий лимит, поэтому вызовы склеиваются дебаунсом, а в лог идёт ТОЛЬКО
 // ошибка -- иначе статус забил бы журнал событий (там должны быть люди, не интерфейс).
 // ============================================================================
-const VOICE_STATUS_MIN_GAP = 3000; // мс: не чаще одного раза в 3 сек на сервер (лимит роута)
+// [v2.81] MIN здесь -- МИНИМУМ (минимальный промежуток), а единица -- мс: она и в имени.
+const VOICE_STATUS_MIN_GAP_MS = 3000; // мс: не чаще одного раза в 3 сек на сервер (лимит роута)
 const musicRest = new REST ({ version: '10' }).setToken (TOKEN);
 const $voiceStatus = {}; // guildId -> { timer, last, text, channelId }
 
@@ -9788,7 +9922,7 @@ function scheduleVoiceStatus (guildId, immediate = false)
     if (!$music[guildId] || !$music[guildId].connection) return; // не сидим -- нечего показывать
     const st = $voiceStatus[guildId] = $voiceStatus[guildId] || {};
     if (st.timer) return;
-    const wait = immediate ? Math.max (VOICE_STATUS_MIN_GAP - (Date.now () - (st.last || 0)), 0) : VOICE_STATUS_MIN_GAP;
+    const wait = immediate ? Math.max (VOICE_STATUS_MIN_GAP_MS - (Date.now () - (st.last || 0)), 0) : VOICE_STATUS_MIN_GAP_MS;
     st.timer = setTimeout
     (
         () =>
@@ -13437,7 +13571,8 @@ function jsonToTrack (t)
 // Discord лимитирует обновления presence, поэтому здесь та же схема, что у статуса
 // канала: дебаунс + текст берётся В МОМЕНТ записи (на экране всегда актуальное).
 // ============================================================================
-const PRESENCE_MIN_GAP = 5000; // мс между обновлениями (лимит Discord на presence)
+// [v2.81] MIN -- минимум (минимальный промежуток), единица в имени -- мс.
+const PRESENCE_MIN_GAP_MS = 5000; // мс между обновлениями (лимит Discord на presence)
 let $presenceTimer = null;
 let $presenceLast = 0;
 let $presenceDone = null; // что уже выставлено на экран (чтобы не дёргать API зря)
@@ -13500,7 +13635,7 @@ function writePresence ()
 function schedulePresence (immediate = false)
 {
     if ($presenceTimer) return; // уже запланировано -- текст возьмётся свежий в момент записи
-    const wait = immediate ? Math.max (PRESENCE_MIN_GAP - (Date.now () - $presenceLast), 0) : PRESENCE_MIN_GAP;
+    const wait = immediate ? Math.max (PRESENCE_MIN_GAP_MS - (Date.now () - $presenceLast), 0) : PRESENCE_MIN_GAP_MS;
     $presenceTimer = setTimeout (() => { $presenceTimer = null; writePresence (); }, wait);
 }
 
