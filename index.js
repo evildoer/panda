@@ -31,6 +31,25 @@
 //     стоит в чьём-то config.json): [config] подскажет новое, бот не сломается. Этот ключ и
 //     cache_long_sets -- про разное: первый решает, какие треки качать ЦЕЛИКОМ ДО старта,
 //     второй -- качать ли длинные сеты в ФОНЕ, пока играет текущий.
+// CHANGELOG v2.87 (ни одно исходящее сообщение не падает по длине):
+//   * ЖИВОЙ СБОЙ: /history НА ДЛИННОЙ ИСТОРИИ ПЕРЕСТАВАЛ ОТВЕЧАТЬ. Текст собирался длиннее
+//     лимита, Discord отбивал СООБЩЕНИЕ ЦЕЛИКОМ ('Invalid Form Body:
+//     data.content[BASE_TYPE_MAX_LENGTH]: Must be 2000 or fewer in length'), и ошибка
+//     долетала до сбоя уровня процесса (в логе -- [uncaughtException] и отчёт crash-*.txt).
+//     Причина была в сборке: бюджет строк считал шапку и пачки, а ХВОСТ пояснения внизу --
+//     нет. Теперь бюджет = лимит минус шапка и минус хвост (берётся ХУДШИЙ вариант -- со
+//     строкой «Раньше -- ещё N»), плюс последняя страховка по длине самого текста.
+//   * ОДНА СТРАХОВКА НА ВСЕ ОТПРАВКИ, А НЕ НА КАЖДЫЙ ОТЧЕТ. fitPayload/fitEmbed держат
+//     лимиты Discord: content 2000, embed -- title 256, description 4096, полей не больше
+//     25 (имя 256, значение 1024), footer 2048, author 256, embed'ов не больше 10 и сумма
+//     текста -- 6000. Обрезка идёт по границе строки и говорит, что показано не всё.
+//   * ПОДМЕНА МЕТОДОВ У КОНКРЕТНОЙ ИНТЕРАКЦИИ (shieldOutgoing): reply/editReply/followUp/
+//     update и правка сообщения под кнопкой проходят через страховку -- забыть её на
+//     отдельном вызове (их десятки) невозможно. Отправки в каналы и ЛС идут через
+//     sendFit; прямых вызовов .send/.edit в коде больше нет.
+//   * ЗАОДНО ЗАКРЫТЫ МЕСТА БЕЗ ПРОВЕРКИ: /queue в ветке «очереди нет» и в крайнем случае
+//     с одной строкой возвращал текст без проверки длины; теперь мимо лимита не проходит
+//     ни один вид страницы, включая автообновление и перерисовки после кнопок.
 // CHANGELOG v2.86 (булевы ключи: «а если ключа нет?»; имя файла лога -- из префикса):
 //   * МУСОР В БУЛЕВОМ КЛЮЧЕ = «КЛЮЧА НЕТ». Вопрос владельца: «что будет, если ключа нет?» --
 //     ответ теперь один и безопасный, а значение не true/false (строка "false", единица) --
@@ -2307,7 +2326,7 @@ function helpEmbeds (server) { return helpMessages (server).flat (); }
 async function sendHelpDm (user, server)
 {
     const msgs = helpMessages (server);
-    for (const embeds of msgs) await user.send ({ embeds });
+    for (const embeds of msgs) await sendFit (user, { embeds });
     return msgs.length;
 }
 
@@ -3533,7 +3552,7 @@ async function relayPipe (targetId, message)
     if (!channel || typeof channel.send !== 'function') return { ok: false, notFound: true };
     try
     {
-        await channel.send ({ content: text ? text : undefined, ...attach });
+        await sendFit (channel, { content: text ? text : undefined, ...attach });
     }
     catch (e) { return { ok: false, error: e.message }; }
     return { ok: true, channel: channel, text: text, files: files };
@@ -3619,7 +3638,7 @@ client.on ('messageCreate', async message =>
         // «оппозиция» -- команда писала ЕМУ, а не тому, кто её вызвал. Теперь -- вызывающему.
         if (isCmd (message.content, 'test'))
         {
-            message.author.send ({ content: 'pong 🐼 ЛС работают.' })
+            sendFit (message.author, { content: 'pong 🐼 ЛС работают.' })
             .then
             (
                 () => console.log ('[' + (d()) + '] [dm] self-test -> ' + message.author.username + ' -- отправлено')
@@ -3803,7 +3822,7 @@ client.on ('messageCreate', async message =>
                         }
                         else
                         {
-                            user.send ({content: letter ? letter : undefined, ...attach})
+                            sendFit (user, {content: letter ? letter : undefined, ...attach})
                             .then
                             (
                                 () =>
@@ -3862,7 +3881,7 @@ client.on ('messageCreate', async message =>
                     let user = client.users.cache.get (targetId) ||
                         await client.users.fetch (targetId).catch (() => null);
                     if (!user)
-                        return message.channel.send ({ content: '🤔 Пользователь `' + targetId + '` не найден.' })
+                        return sendFit (message.channel, { content: '🤔 Пользователь `' + targetId + '` не найден.' })
                         .catch (console.error);
                     // [v2.18] Логика переехала в welcomeCheckSend -- та же, что у
                     // слэш-команды /welcome (без интента Message Content она останется).
@@ -3870,11 +3889,11 @@ client.on ('messageCreate', async message =>
                     const res = await welcomeCheckSend (server, user, who);
                     if (res.ok)
                     {
-                        message.channel.send ({ content: '✅ Приветствие отправлено в ЛС: ' + u (user.id) }).catch (console.error);
+                        sendFit (message.channel, { content: '✅ Приветствие отправлено в ЛС: ' + u (user.id) }).catch (console.error);
                         message.delete ().catch (console.error);
                     }
                     else
-                        message.channel.send ({ content: '⚠️ ' + res.why }).catch (console.error);
+                        sendFit (message.channel, { content: '⚠️ ' + res.why }).catch (console.error);
                 }
                 // command 'test' ## в текстовом канале команда просто убирается из чата
                 // (само ЛС отправил блок выше -- см. 'test' / self-test)
@@ -4540,7 +4559,7 @@ function logTo (channelId)
                     console.error ('[log] канал журнала ' + channelId + ' недоступен -- запись пропущена');
                     return;
                 }
-                await ch.send (payload);
+                await sendFit (ch, payload);   // [v2.87] лимиты соблюдены (см. fitPayload)
             }
             catch (e)
             {
@@ -5604,6 +5623,149 @@ function fitMsgText (text, limit = MSG_TEXT_LIMIT)
         '\n_…показано не всё: ответ не влезает в лимит Discord (' + limit + ' символов)._ ';
 }
 
+// ============================================================================
+// [v2.87] ЛИМИТЫ DISCORD: НИ ОДНО ИСХОДЯЩЕЕ СООБЩЕНИЕ НЕ ПАДАЕТ ПО ДЛИНЕ.
+// Живой случай: /history с длинной историей собрал текст больше 2000 символов, и Discord
+// отбил сообщение ЦЕЛИКОМ ('Invalid Form Body: data.content[BASE_TYPE_MAX_LENGTH]: Must be
+// 2000 or fewer in length'), а ошибка долетела до сбоя уровня процесса. Сама причина была
+// в сборке текста (в /history хвост пояснения не попал в бюджет), но проверять руками
+// КАЖДЫЙ из десятков ответов бессмысленно: любой отчёт растёт от живых данных (длинные
+// причины наказаний, длинные названия, ники). Поэтому здесь одна страховка, через которую
+// проходят все отправки.
+// Лимиты Discord, про которые она знает:
+//   * content -- 2000 символов;
+//   * embed: title 256, description 4096, полей не больше 25 (имя 256, значение 1024),
+//     footer 2048, author 256; embed'ов в одном сообщении не больше 10, а сумма их
+//     текста -- 6000.
+// Чего страховка НЕ делает: не лезет в файлы (там multipart) и не трогает кнопки, меню и
+// flags. Обрезка -- по границе строки (тем же fitMsgText), чтобы текст не выглядел
+// порезанным посреди слова, и с честной припиской, что показано не всё.
+// ============================================================================
+const DISCORD_CONTENT_MAX   = 2000;
+const DISCORD_EMBEDS_MAX    = 10;
+const DISCORD_TITLE_MAX     = 256;
+const DISCORD_DESC_MAX      = 4096;
+const DISCORD_FIELDS_MAX    = 25;
+const DISCORD_FIELD_NAME_MAX = 256;
+const DISCORD_FIELD_VALUE_MAX = 1024;
+const DISCORD_FOOTER_MAX    = 2048;
+const DISCORD_AUTHOR_MAX    = 256;
+const DISCORD_EMBED_SUM_MAX = 6000;
+
+// Текст -- в лимит (строка или число, что угодно).
+function fitContent (text, limit = DISCORD_CONTENT_MAX) { return fitMsgText (String (text), limit); }
+
+// Один embed -- в пределах лимитов. Принимаем и готовый объект, и EmbedBuilder (у него
+// есть toJSON), наружу отдаём простой объект -- Discord принимает и его.
+function fitEmbed (embed)
+{
+    let out;
+    // Копия делается ВСЕГДА: то, что пришло (EmbedBuilder или чужой объект), менять нельзя --
+    // иначе укорачивание описания изменило бы и сам источник, и он укоротился бы дважды.
+    try
+    {
+        const raw = (embed && typeof embed.toJSON === 'function') ? embed.toJSON () : embed;
+        out = JSON.parse (JSON.stringify (raw || {}));
+    }
+    catch (e) { return null; }   // непонятный embed лучше выбросить, чем уронить ответ целиком
+    if (!out || typeof out !== 'object') return null;
+    if (typeof out.title === 'string') out.title = clipText (out.title, DISCORD_TITLE_MAX);
+    if (typeof out.description === 'string') out.description = fitMsgText (out.description, DISCORD_DESC_MAX);
+    if (out.author && typeof out.author.name === 'string')
+        out.author.name = clipText (out.author.name, DISCORD_AUTHOR_MAX);
+    if (out.footer && typeof out.footer.text === 'string')
+        out.footer.text = clipText (out.footer.text, DISCORD_FOOTER_MAX);
+    if (Array.isArray (out.fields))
+        out.fields = out.fields.slice (0, DISCORD_FIELDS_MAX).map (f =>
+        ({
+            // пустые имя/значение Discord не принимает: подставляем пробел, а не
+            // выбрасываем поле с данными
+            name: clipText (String ((f && f.name) || '').trim () || ' ', DISCORD_FIELD_NAME_MAX),
+            value: clipText (String ((f && f.value) || '').trim () || ' ', DISCORD_FIELD_VALUE_MAX),
+            inline: !!(f && f.inline),
+        }));
+    // Текст ОДНОГО embed'а -- не больше 6000 (Discord считает эту сумму и отбивает
+    // сообщение целиком). Режем то, что выросло от живых данных: сперва описание, затем
+    // самые длинные поля, затем сами поля. Заголовок и подпись остаются -- в них как раз
+    // и есть смысл отчёта.
+    // ВНИМАНИЕ: длина считается ЧИСЛАМИ (`+=` в цикле). Если бы поля складывались
+    // выражением вида `строка + строка + reduce`, число приклеилось бы к строке и длина
+    // вышла бы бессмысленной -- на этом сам стенд и поймал ошибку в этой же строке.
+    const embedSum = o =>
+    {
+        let n = String (o.title || '').length + String (o.description || '').length;
+        if (o.footer && o.footer.text) n += String (o.footer.text).length;
+        if (o.author && o.author.name) n += String (o.author.name).length;
+        for (const f of (Array.isArray (o.fields) ? o.fields : []))
+            n += String ((f && f.name) || '').length + String ((f && f.value) || '').length;
+        return n;
+    };
+    if (embedSum (out) > DISCORD_EMBED_SUM_MAX && typeof out.description === 'string')
+        out.description = fitMsgText (out.description,
+            Math.max (120, out.description.length - (embedSum (out) - DISCORD_EMBED_SUM_MAX)));
+    for (let guard = 0; guard < 500 && embedSum (out) > DISCORD_EMBED_SUM_MAX && (out.fields || []).length; guard++)
+    {
+        const fieldSum = f => String (f.name || '').length + String (f.value || '').length;
+        let worst = out.fields[0];
+        for (const f of out.fields) if (fieldSum (f) > fieldSum (worst)) worst = f;
+        const was = fieldSum (worst);
+        if (was <= 2) { out.fields = out.fields.filter (f => f !== worst); continue; }   // короче некуда -- поле уходит
+        worst.value = String (worst.value || '').slice (0, Math.max (1, was - (embedSum (out) - DISCORD_EMBED_SUM_MAX)));
+        if (fieldSum (worst) >= was) out.fields = out.fields.filter (f => f !== worst);  // укоротить не вышло -- тоже уходит
+    }
+    // Совсем крайний случай (текста больше, чем Discord принимает в принципе): убираем части
+    // embed'а, пока он не влезет. Пустой embed лучше целого отбитого сообщения.
+    if (embedSum (out) > DISCORD_EMBED_SUM_MAX) delete out.description;
+    if (embedSum (out) > DISCORD_EMBED_SUM_MAX) out.fields = [];
+    if (embedSum (out) > DISCORD_EMBED_SUM_MAX) delete out.footer;
+    if (embedSum (out) > DISCORD_EMBED_SUM_MAX) delete out.author;
+    if (embedSum (out) > DISCORD_EMBED_SUM_MAX) return null;
+    return out;
+}
+
+// Любой payload (строка или options) -- в пределах лимитов. Остальные поля (components,
+// flags, allowedMentions, files) копируем как есть: страховка не должна менять смысл ответа.
+function fitPayload (payload)
+{
+    if (typeof payload === 'string') return fitContent (payload);
+    if (!payload || typeof payload !== 'object' || Array.isArray (payload)) return payload;
+    if (typeof payload.toJSON === 'function') return payload;                        // EmbedBuilder и подобные -- не наш формат
+    if (payload.constructor && payload.constructor.name === 'MessagePayload') return payload;
+    const out = Object.assign ({}, payload);
+    if (typeof out.content === 'string') out.content = fitContent (out.content);
+    if (Array.isArray (out.embeds)) out.embeds = out.embeds.map (fitEmbed).filter (Boolean).slice (0, DISCORD_EMBEDS_MAX);
+    else if (out.embeds && typeof out.embeds === 'object') out.embeds = [fitEmbed (out.embeds)].filter (Boolean);
+    return out;
+}
+
+// Отправить ЧТО УГОДНО с гарантией лимитов (канал, ЛС, группу).
+function sendFit (target, payload) { return target.send (fitPayload (payload)); }
+
+// Ответ на интеракцию -- через страховку. Методы подменяются у КОНКРЕТНОЙ интеракции
+// (а не у классов discord.js): так ни один из десятков вызовов reply/editReply/followUp/
+// update не может «забыть» про лимиты, и при этом мы не вмешиваемся в саму библиотеку.
+function shieldOutgoing (interaction)
+{
+    if (!interaction || interaction.__limitSafe) return interaction;
+    interaction.__limitSafe = true;
+    for (const m of ['reply', 'editReply', 'followUp', 'update'])
+    {
+        const orig = interaction[m];
+        if (typeof orig !== 'function') continue;
+        interaction[m] = function (options, ...rest) { return orig.call (this, fitPayload (options), ...rest); };
+    }
+    // Правка сообщения, под которым нажали кнопку (interaction.message.edit), идёт мимо этих
+    // методов, а текст в неё уходит тот же (страница очереди) -- оборачиваем и её.
+    const msg = interaction.message;
+    if (msg && typeof msg.edit === 'function' && !msg.__limitSafe)
+    {
+        msg.__limitSafe = true;
+        const origEdit = msg.edit;
+        msg.edit = function (options, ...rest) { return origEdit.call (this, fitPayload (options), ...rest); };
+    }
+    return interaction;
+}
+
 // Текст отчёта для человека (ЛС/ответ на /bans): имена, сроки, причина + история.
 function bansReportText (o, max = 20)
 {
@@ -5923,7 +6085,7 @@ async function welcomeCheckSend (server, user, whoLabel)
     try
     {
         const src = await welcomeSource (server, true);
-        await user.send ({ embeds: [await welcomeEmbed (server, user)] });
+        await sendFit (user, { embeds: [await welcomeEmbed (server, user)] });
         console.log ('[' + (d()) + '] [welcome] проверка: ' + whoLabel + ' -> ' + uu (user) +
             (src ? ' -- с текстом' + (src.images.length ? ' и картинкой' : '') + ' из сообщения с правилами'
                  : ' -- только ссылка (сообщение с правилами не прочиталось)'));
@@ -5950,7 +6112,7 @@ async function welcomeDM (server, uid, raw)
             return;
         }
         const src = await welcomeSource (server);
-        await user.send ({ embeds: [await welcomeEmbed (server, user)] });
+        await sendFit (user, { embeds: [await welcomeEmbed (server, user)] });
         console.log ('[' + (d()) + '] [welcome] ЛС новичку ' + name + ' отправлена (' + link + ')' +
             (src ? ' -- текст и картинки взяты из сообщения с правилами' : ' -- только ссылка (сообщение с правилами не прочиталось)') +
             (((SERVERS[server] || {}).welcome_prefix === false) ? ' [welcome_prefix: false -- без описания бота]' : ''));
@@ -10777,6 +10939,10 @@ function historyLinks (e)
 // пятью пачками плейлистов, поэтому строки идут от свежих к старым, а остаток честно
 // называется. У каждой пачки может быть вторая строка «↳» -- судьба, запрос /play и
 // ссылки; если она не влезает, пачка уходит в «Раньше -- ещё N» целиком.
+// [v2.87] В БЮДЖЕТЕ УЧТЁН И ХВОСТ: раньше он добавлялся уже после подсчёта длины, и на
+// длинной истории текст уходил за лимит Discord -- сообщение отбивалось целиком
+// ('Must be 2000 or fewer in length'), а /history перестал отвечать. См. fitPayload
+// (общая страховка лимитов для ВСЕХ исходящих сообщений).
 function historyText (guildId)
 {
     const m = musicOf (guildId);
@@ -10798,8 +10964,23 @@ function historyText (guildId)
             (MUSIC_HISTORY_TRACKS && sum >= MUSIC_HISTORY_TRACKS)
             ? ' (_MUSIC.history_len_: ' + MUSIC_HISTORY_LEN +
               (MUSIC_HISTORY_TRACKS ? ', _history_tracks_: ' + MUSIC_HISTORY_TRACKS : '') + ')' : '') + ':\n' + QSEP;
+    // [v2.87] ХВОСТ СЧИТАЕТСЯ В БЮДЖЕТЕ. Раньше он добавлялся ПОСЛЕ подсчёта длины, и при
+    // длинной истории текст уходил за лимит Discord («Must be 2000 or fewer in length») --
+    // команда перестала отвечать совсем. Теперь бюджет = лимит минус шапка и минус хвост,
+    // причём берём ХУДШУЮ из двух длин: со строкой «Раньше -- ещё N пачек» (самый длинный
+    // вариант, когда не влезло ничего) или без неё.
+    const tailOf = hid => '\n' + QSEP + '\n_Один `/play` = одна пачка: кто, когда и что поставил.\n' +
+        'Строка «↳» -- судьба пачки (что ждёт в очереди, что доиграно и убрано),\n' +
+        'что ты написал в `/play` -- это можно вставить заново, ссылки на сами треки.\n' +
+        'Состав пачки целиком -- кнопкой «📜 Все треки» ниже.\n' +
+        (hid ? 'Раньше -- ещё ' + hid + ' ' + plural (hid, 'пачка', 'пачки', 'пачек') + '.\n' : '') +
+        'Старое уходит само: помню ' + MUSIC_HISTORY_LEN + ' ' + plural (MUSIC_HISTORY_LEN, 'пачку', 'пачки', 'пачек') +
+        (MUSIC_HISTORY_TRACKS ? ' и до ' + MUSIC_HISTORY_TRACKS + ' треков суммарно (пачка уходит целиком)' : '') +
+        ' -- ключи `MUSIC.history_len`' + (MUSIC_HISTORY_TRACKS ? ' и `MUSIC.history_tracks`' : '') + '._';
+    const budget = HISTORY_MSG_LIMIT - head.length - 2 -
+        Math.max (tailOf (0).length, tailOf (list.length).length);
     const shown = [];
-    let len = head.length, hidden = 0;
+    let len = 0, hidden = 0;
     for (const e of list)
     {
         // [v2.69] В самом сообщении -- первые HISTORY_INLINE_TITLES названий, сколько бы
@@ -10822,7 +11003,7 @@ function historyText (guildId)
         const links = historyLinks (e);
         if (links.length && !/^https?:/i.test (String (e.q || ''))) sub.push (links.join (' '));
         const subLine = sub.length ? '\n   ↳ ' + sub.join (' · ') : '';
-        if (len + line.length + subLine.length + 2 > HISTORY_MSG_LIMIT)
+        if (len + line.length + subLine.length + 2 > budget)
         {
             hidden = list.length - shown.length;
             break;
@@ -10830,15 +11011,11 @@ function historyText (guildId)
         shown.push (line + subLine);
         len += line.length + subLine.length + 1;
     }
-    const tail = '\n' + QSEP + '\n_Один `/play` = одна пачка: кто, когда и что поставил.\n' +
-        'Строка «↳» -- судьба пачки (что ждёт в очереди, что доиграно и убрано),\n' +
-        'что ты написал в `/play` -- это можно вставить заново, ссылки на сами треки.\n' +
-        'Состав пачки целиком -- кнопкой «📜 Все треки» ниже.\n' +
-        (hidden ? 'Раньше -- ещё ' + hidden + ' ' + plural (hidden, 'пачка', 'пачки', 'пачек') + '.\n' : '') +
-        'Старое уходит само: помню ' + MUSIC_HISTORY_LEN + ' ' + plural (MUSIC_HISTORY_LEN, 'пачку', 'пачки', 'пачек') +
-        (MUSIC_HISTORY_TRACKS ? ' и до ' + MUSIC_HISTORY_TRACKS + ' треков суммарно (пачка уходит целиком)' : '') +
-        ' -- ключи `MUSIC.history_len`' + (MUSIC_HISTORY_TRACKS ? ' и `MUSIC.history_tracks`' : '') + '._';
-    return head + '\n' + shown.join ('\n') + tail;
+    const text = head + '\n' + shown.join ('\n') + tailOf (hidden);
+    // Последняя страховка: если шапка/хвост сами по себе не влезли (длинные настройки,
+    // гигантские имена), текст всё равно уходит не длиннее лимита. Без неё молчаливая
+    // надежда на арифметику -- а живой случай показал, чем это кончается.
+    return text.length <= HISTORY_MSG_LIMIT ? text : fitMsgText (text, HISTORY_MSG_LIMIT);
 }
 
 // ============================================================================
@@ -12895,6 +13072,9 @@ function queueView (m, start, moveSel = 0, opts = {})
         // Лучше короткая справка, чем отбитое Discord по длине сообщение.
         if (content.length > QUEUE_MSG_LIMIT) content = build (QUEUE_HINT_SHORT);
     }
+    // [v2.87] Последняя страховка страницы: ветка «очереди нет» и крайний случай с одной
+    // строкой возвращали текст БЕЗ проверки длины. Теперь мимо лимита не проскочит ни один вид.
+    if (content.length > QUEUE_MSG_LIMIT) content = fitMsgText (content, QUEUE_MSG_LIMIT);
     return { content: content, components: queueComponents (page, m, moveSel, opts) };
 }
 
@@ -12967,9 +13147,10 @@ async function queueLiveTick (guildId)
         const ch = client.channels.cache.get (w.ch) || await client.channels.fetch (w.ch).catch (() => null);
         if (!ch) { m.qMsg = null; return; }
         const msg = await ch.messages.fetch (w.id);
-        await msg.edit (Object.assign (
+        // [v2.87] даже автообновление идёт через страховку лимитов (см. fitPayload)
+        await msg.edit (fitPayload (Object.assign (
             view.components.length ? { content: content, components: view.components } : { content: content },
-            { allowedMentions: { parse: [] } }));   // [v2.61] авторы -- ссылками, без пингов
+            { allowedMentions: { parse: [] } })));   // [v2.61] авторы -- ссылками, без пингов
         // [v2.61] Первую самоправку видно в логе (дальше -- молча, иначе было бы 60 строк в час).
         if (w.first) { w.first = false; console.log ('[' + (d()) + '] [music] сообщение /queue обновил сам (стр. ' + w.page + ')'); }
         w.text = content;
@@ -13001,9 +13182,9 @@ async function queueMsgRedraw (guildId, delayMs = 0)
         const ch = client.channels.cache.get (w.ch) || await client.channels.fetch (w.ch).catch (() => null);
         if (!ch) return;
         const msg = await ch.messages.fetch (w.id);
-        await msg.edit (Object.assign (
+        await msg.edit (fitPayload (Object.assign (
             view.components.length ? { content: view.content, components: view.components } : { content: view.content },
-            { allowedMentions: { parse: [] } }));
+            { allowedMentions: { parse: [] } })));
         w.text = view.content;   // запоминаем -- самообновление не станет править то же самое
         w.at = Date.now ();
     }
@@ -13222,7 +13403,7 @@ function musicNotice (guildId, text)
     if (!m || !m.textChannelId || !text) return;
     const ch = client.channels.cache.get (m.textChannelId);
     if (!ch || typeof ch.send !== 'function') return;
-    ch.send (text).catch (() => {});
+    sendFit (ch, text).catch (() => {});
 }
 
 // [v2.39] КОМУ ГОВОРИТЬ О ПРОБЛЕМЕ С ТРЕКОМ. Раньше любое «этот трек не заиграл/его
@@ -13238,7 +13419,7 @@ function trackNotice (guildId, track, text)
     if (!m || !text) return;
     const _id = track && track.addIn ? String (track.addIn) : '';
     const ch = _id ? client.channels.cache.get (_id) : null;
-    if (ch && typeof ch.send === 'function') { ch.send (text).catch (() => {}); return; }
+    if (ch && typeof ch.send === 'function') { sendFit (ch, text).catch (() => {}); return; }
     musicNotice (guildId, text);
 }
 
@@ -13436,7 +13617,7 @@ function deadWarnSend (told)
         // [v2.80] ОДНА НЕПРЕРЫВНАЯ ФРАЗА: раньше текст был разрезан переносами прямо в
         // строке ("...видео просто не" / "отдаётся сейчас..."), и в чате это выглядело
         // как три обрывка вместо предложения -- переносы делает сам Discord по ширине окна.
-        ch.send ('⚠️ **Возможно, это видео недоступно:** ' +
+        sendFit (ch, '⚠️ **Возможно, это видео недоступно:** ' +
             titles.slice (0, 8).map (t => '**' + oneLine (t, 60) + '**').join (', ') +
             (titles.length > 8 ? ' и ещё ' + (titles.length - 8) : '') +
             '. Проверка идёт заранее и через мой прокси -- бывает, что видео просто не ' +
@@ -14623,6 +14804,12 @@ async function registerMusicCommands ()
 // Обработка слэш-команд:
 client.on ('interactionCreate', async (interaction) =>
 {
+    // [v2.87] ЛИМИТЫ DISCORD -- ДО ЛЮБОГО ОТВЕТА. Живой случай: /history с длинной
+    // историей собрал текст длиннее 2000 символов, Discord отбил сообщение целиком, и
+    // команда перестала отвечать (ошибка дошла до сбоя уровня процесса). Одно место
+    // закрывает все десятки ответов этой интеракции: reply/editReply/followUp/update
+    // и правку сообщения, под которым нажали кнопку.
+    shieldOutgoing (interaction);
     // [v2.14] Кнопки и меню под ответом /queue:
     //   ◀/▶ -- листание (номер страницы зашит в customId, состояние между нажатиями
     //           не нужно, содержимое берётся из ЖИВОЙ очереди);
@@ -14675,7 +14862,7 @@ client.on ('interactionCreate', async (interaction) =>
             {
                 const view0 = queueView (m0, page0, 0, ctx0);
                 if (interaction.message && typeof interaction.message.edit === 'function')
-                    interaction.message.edit ({ content: view0.content, components: view0.components, allowedMentions: { parse: [] } }).catch (() => {});
+                    interaction.message.edit (fitPayload ({ content: view0.content, components: view0.components, allowedMentions: { parse: [] } })).catch (() => {});
             }, 1500);
             return interaction.reply ({ content: res0.text, flags: MessageFlags.Ephemeral });
         }
@@ -14727,7 +14914,7 @@ client.on ('interactionCreate', async (interaction) =>
         const view2 = queueView (m, queuePageOf (m, res.to), res.to,
             { actorId: interaction.user.id, actorName: who, staff: staff2 });
         if (interaction.message && typeof interaction.message.edit === 'function')
-            await interaction.message.edit ({ content: view2.content, components: view2.components, allowedMentions: { parse: [] } }).catch (() => {});
+            await interaction.message.edit (fitPayload ({ content: view2.content, components: view2.components, allowedMentions: { parse: [] } })).catch (() => {});
         return interaction.reply ({ content: res.text, flags: MessageFlags.Ephemeral });
     }
     if (interaction.isButton () || interaction.isStringSelectMenu ())
@@ -15065,7 +15252,7 @@ client.on ('interactionCreate', async (interaction) =>
                 };
                 const at = queueKeptPage (srcId);   // остаёмся на той же странице (v2.66)
                 const view = queueView (m, at, 0, oCtx);
-                await src.edit ({ content: view.content, components: view.components, allowedMentions: { parse: [] } }).catch (() => {});
+                await src.edit (fitPayload ({ content: view.content, components: view.components, allowedMentions: { parse: [] } })).catch (() => {});
                 // ...и запоминаем новый текст: иначе самообновление сравнило бы его со
                 // СТАРЫМ и сделало лишнюю правку (а со сменой страницы -- и вернуло бы её).
                 // Если это ТО ЖЕ сообщение -- обновляем запись на месте, а не создаём её
