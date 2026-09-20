@@ -5,6 +5,31 @@
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
+// CHANGELOG v2.73 (режим повтора /repeat; начатый трек не теряет свой файл):
+//   * /REPEAT -- РЕЖИМ АВТОРА, А НЕ ОТДЕЛЬНОГО ТРЕКА (только админы и модеры; в списке
+//     команд видна всем, у остальных -- отказ). Пока режим включён, треки этого автора
+//     после проигрывания НЕ убираются: доиграв, трек встаёт в КОНЕЦ очереди с нулевой
+//     позицией и потому рано или поздно играет снова, а когда чужие треки кончились --
+//     его треки идут по кругу (владелец: «тогда треки после проигрывания не удаляются,
+//     а сбрасываются к началу, а проигрывание продолжается»). Без аргумента -- себе,
+//     `/repeat user:@кто` -- другому автору (можно «поставить на повтор» чужие треки,
+//     главное потом выключить). Автор может и не быть на сервере: режим -- свойство
+//     ЗАПИСИ об авторе, а не присутствия. /REPEAT-LIST -- кто в режиме и сколько у кого
+//     в очереди (видна всем, как /queue), а в /queue такие авторы помечены 🔁 (в списке,
+//     в шапке «Сейчас» и в сводке по авторам). Пропущенный (/skip, /jump) или выброшенный
+//     по обрыву потока трек в повтор НЕ возвращается -- иначе один сломанный трек зациклил
+//     бы всю очередь. Настройка живёт отдельной записью (musicState/repeat): /stop и /clear
+//     её не трогают, перезапуск она переживает (строка при старте: «режим повтора с прошлого
+//     запуска: N авторов»).
+//   * НАЧАТЫЙ, НО НЕ ДОИГРАННЫЙ ТРЕК ДЕРЖИТ СВОЙ ФАЙЛ. Отложенный трек (срочный переход
+//     /jump, /leave, сбой сети) оставался в очереди с секундой на месте, а звук к нему уже
+//     был убран (уборка кэша знала только «играющий и предзагрузка») -- и бот тянул его
+//     заново. Владелец: «надо сохранять, если скачал, до полного прослушивания или удаления
+//     из очереди». Теперь файл защищён, пока у трека стоит метка места (track.seek).
+//   * МУЗЫКАЛЬНЫЙ (ЛИЧНЫЙ) КАНАЛ -- ОБЫЧНАЯ ВРЕМЕННАЯ КОМНАТА: пустой -- уходит, как любая
+//     другая, и никакого исключения для него больше нет (оно было в v2.71). Владелец:
+//     «Бот должен возвращаться К СЛУШАТЕЛЮ, а не тупо в канал»; если канал исчез, очередь
+//     это переживает (бот ждёт /join или идёт туда, где появился слушатель).
 // CHANGELOG v2.72 (недокачанный файл переживает перезапуск; длинный сет можно качать в фоне):
 //   * НЕДОКАЧАННОЕ БОЛЬШЕ НЕ ВЫБРАСЫВАЕТСЯ. Раньше при старте любые '.dl.' удалялись
 //     ("тот поток мёртв"), и продолжить длинный сет можно было только заново попросив
@@ -6416,14 +6441,13 @@ async function tempSweep (server)
     for (let [, ch] of guild.channels.cache)
     {
         if (ch.parentId !== catId || ch.type !== ChannelType.GuildVoice || ch.id === lobbyId) continue;
-        // [v2.71] МУЗЫКАЛЬНЫЙ КАНАЛ НЕ ТРОГАЕМ. После рестарта бота в канале ещё нет
-        // голосового состояния (оно появится через секунду -- resumeMusic идёт параллельно
-        // со снимком и отчётами), и пустой ЛИЧНЫЙ канал, который бот помнит как музыкальный,
-        // был бы удалён прямо у него из-под ног. Смотрим и на «где сижу», и на «где жду».
-        const _mM = $music[server];
-        const _mine = _mM && (_mM.savedChannelId === ch.id ||
-            (_mM.connection && _mM.connection.joinConfig.channelId === ch.id));
-        if (_mine) continue;
+        // [v2.73] ИСКЛЮЧЕНИЯ ДЛЯ «СВОЕГО» МУЗЫКАЛЬНОГО КАНАЛА БОЛЬШЕ НЕТ (оно было в v2.71).
+        // Владелец: «Бот должен возвращаться К СЛУШАТЕЛЮ, а не тупо в канал. Если канала
+        // нет или он пустой -- слушателя там нет», то есть личный временный канал живёт
+        // ровно как любая временная комната: опустел -- убирается. Если музыкальный канал
+        // из-за этого исчез, очередь это переживает: resumeMusic пишет «канала из прошлого
+        // запуска нет -- очередь ждёт /join», а дальше бот уходит туда, где появится
+        // слушатель (checkListeners/событие в голосовых).
         let busy = false;
         for (let [, vs] of guild.voiceStates.cache)
             if (vs.channelId === ch.id) { busy = true; break; }
@@ -7521,6 +7545,9 @@ function musicOf (guildId)
             // (читается один раз при старте или перед первой записью, см. historyLoad).
             history: null,
             historyFromDb: false,   // была ли уже НАСТОЯЩАЯ запись (иначе перенесём из очереди)
+            // [v2.73] режим повтора (/repeat): null -- ещё не читали из базы; список
+            // объектов {id, name, at} -- у кого повтор включён (см. repeatLoad).
+            repeat: null,
         };
     if (!$music[guildId].guildId) $music[guildId].guildId = guildId;
     return $music[guildId];
@@ -8091,6 +8118,16 @@ function cacheKeysInUse ()
         if (!m) continue;
         for (const t of [m.current, m.preload && m.preload.track])
             if (t && !t.isLive) set.add (cacheKeyOf (t));
+        // [v2.73] НАЧАТЫЙ, НО НЕ ДОИГРАННЫЙ ТРЕК -- ЭТО ЕЩЁ НЕ «ЗАБЫЛИ». Владелец:
+        // «надо сохранять, если скачал, до полного прослушивания или удаления из
+        // очереди». Файл трека, который звучал и был ОТЛОЖЕН (срочный переход /jump,
+        // /leave, сбой сети), раньше уходил при первом же переходе -- трек оставался в
+        // очереди с секундой на месте, а звука к нему уже не было, и бот тянул его
+        // заново. Отложенные треки и так помечены (track.seek -- та же метка, по которой
+        // /queue показывает `02:44/03:14`), поэтому список защищённого остаётся крошечным:
+        // никогда не звучавшие треки файлов не имеют и сюда не попадают.
+        for (const t of m.tracks)
+            if (t && !t.isLive && Number (t.seek) >= 1) set.add (cacheKeyOf (t));
     }
     return set;
 }
@@ -9820,6 +9857,121 @@ async function historySave (guildId)
     catch (e) { console.error ('[music] не смог сохранить историю добавлений: ' + oneLine ((e && e.message) || e)); }
 }
 
+// ============================================================================
+// [v2.73] РЕЖИМ ПОВТОРА (/repeat) -- ЭТО РЕЖИМ АВТОРА, А НЕ ОТДЕЛЬНОГО ТРЕКА.
+// Владелец: «ADM/MOD можно сделать режим /repeat ... тогда треки после проигрывания
+// не удаляются, а сбрасываются к началу, а проигрывание продолжается». Работает так:
+// доиграв, трек автора с включённым повтором НЕ пропадает, а встаёт в конец очереди
+// с нулевой позицией; чужие треки (автор без повтора) уходят как обычно. Поэтому
+// рано или поздно в очереди остаются только «повторяемые» -- и они играют по кругу,
+// пока кто-то с правами их не уберёт (/remove, /clear author) или сам автор не
+// выключит /repeat. Автор может при этом не быть на сервере: режим -- свойство
+// ЗАПИСИ ОБ АВТОРЕ, а не присутствия.
+// Хранится ОТДЕЛЬНОЙ записью (musicState/repeat): /stop и /clear стирают очередь, но
+// не режим -- это разные вещи, и режим переживает и их, и перезапуск бота.
+// ============================================================================
+function repeatListOf (guildId)
+{
+    const m = $music[guildId];
+    if (!m) return [];
+    if (!Array.isArray (m.repeat)) m.repeat = [];
+    return m.repeat;
+}
+// Включён ли повтор у автора. Пустой id (треки из старых баз) -- никогда: повторять
+// «ничьи» треки бессмысленно, у них нет хозяина, который это выключит.
+function repeatOn (guildId, userId)
+{
+    const id = String (userId || '');
+    if (!id) return false;
+    return repeatListOf (guildId).some (e => String (e && e.id) === id);
+}
+// [v2.73] Пометка автора в /queue, если у него включён повтор: режим должен быть
+// виден, а не только в /repeat-list (иначе непонятно, почему треки не исчезают).
+function repeatMark (m, t)
+{
+    const g = m && m.guildId;
+    const id = byIdOf (t);
+    return (g && id && repeatOn (g, id)) ? ' 🔁' : '';
+}
+// Сколько треков автора сейчас в очереди (без играющего -- он в m.current).
+function repeatTracksOf (guildId, userId)
+{
+    const m = $music[guildId];
+    if (!m) return 0;
+    const id = String (userId || '');
+    return (m.tracks || []).filter (t => t && String (t.byId || '') === id).length;
+}
+async function repeatLoad (guildId)
+{
+    const m = musicOf (guildId);
+    if (Array.isArray (m.repeat)) return m.repeat;   // уже читали -- в базу не ходим
+    m.repeat = [];
+    try
+    {
+        const rec = await db (guildId, 'musicState', 'repeat');
+        const list = rec && Array.isArray (rec.list) ? rec.list : [];
+        m.repeat = list
+            .filter (e => e && /^\d{17,20}$/.test (String (e.id || '')))
+            .slice (0, 100)
+            .map (e => ({ id: String (e.id), name: String (e.name || '').slice (0, 80), at: Number (e.at) || 0 }));
+    }
+    catch (e) { console.error ('[music] не смог прочитать режим повтора: ' + oneLine ((e && e.message) || e)); }
+    return m.repeat;
+}
+async function repeatSave (guildId)
+{
+    const m = $music[guildId];
+    if (!m || !Array.isArray (m.repeat)) return;
+    try { await db (guildId, 'musicState', 'repeat', { at: Date.now (), list: m.repeat.slice (0, 100) }); }
+    catch (e) { console.error ('[music] не смог сохранить режим повтора: ' + oneLine ((e && e.message) || e)); }
+}
+// Включить/выключить повтор автору. Возвращает: было ли изменение и что теперь.
+// Имя храним рядом с id: ушедший с сервера человек упоминанием показывается как
+// «unknown», а по имени в /repeat-list всегда видно, о ком речь.
+async function repeatSet (guildId, userId, userName, on)
+{
+    const id = String (userId || '');
+    if (!/^\d{17,20}$/.test (id)) return { ok: false, text: '🤔 Не понял, для кого включать повтор.' };
+    await repeatLoad (guildId);
+    const list = repeatListOf (guildId);
+    const at = list.findIndex (e => String (e.id) === id);
+    if (on && at < 0)
+        list.push ({ id: id, name: String (userName || '').slice (0, 80), at: Date.now () });
+    else if (!on && at >= 0)
+        list.splice (at, 1);
+    else if (!on)
+        return { ok: true, changed: false, on: false, text: '' };
+    else
+        return { ok: true, changed: false, on: true, text: '' };
+    await repeatSave (guildId);
+    return { ok: true, changed: true, on: !!on };
+}
+
+// Что показать в /repeat-list: кто в режиме и сколько у него в очереди.
+function repeatListText (guildId)
+{
+    const m = musicOf (guildId);
+    const list = repeatListOf (guildId);
+    if (!list.length)
+        return '🔁 Режим повтора ни для кого не включён.\n' +
+            '_Включают админы и модеры: `/repeat` (себе) или `/repeat user:@кто`. Тогда треки ' +
+            'этого автора после проигрывания остаются в очереди и играют дальше по кругу._';
+    const lines = ['🔁 **Режим повтора: ' + list.length + '** ' +
+        plural (list.length, 'автор', 'автора', 'авторов') + '\n'];
+    for (const e of list)
+    {
+        const inQ = repeatTracksOf (guildId, e.id);
+        const playing = (m.current && String (m.current.byId || '') === String (e.id)) ? 1 : 0;
+        lines.push ('• ' + u (e.id) + (e.name ? ' (`' + e.name + '`)' : '') + ' -- ' +
+            (inQ ? inQ + ' ' + plural (inQ, 'трек', 'трека', 'треков') + ' в очереди' : 'в очереди треков нет') +
+            (playing ? ' + играет прямо сейчас' : '') +
+            (e.at ? ' · включён ' + d (e.at, true) : ''));
+    }
+    lines.push ('\n_Треки этих авторов не удаляются после проигрывания: доиграв, трек встаёт в конец ' +
+        'очереди и играет снова. Выключить: `/repeat user:@кто` (или `/repeat` себе)._');
+    return lines.join ('\n');
+}
+
 // Одна пачка /play -- одна запись. Зовётся из /play ПОСЛЕ того, как треки уже встали
 // в очередь (иначе в историю попало бы то, чего в очереди не оказалось).
 async function historyAdd (guildId, entry)
@@ -10322,8 +10474,10 @@ function queueAuthorsText (m)
         if (!t) return;
         const key = t.byId ? String (t.byId) : '';
         if (!key) { noAuthor++; return; }
+        // [v2.73] repeatOn -- у автора с включённым /repeat в сводке стоит 🔁 (это
+        // первое место, куда смотрят, когда «треки почему-то не исчезают»).
         let o = map.get (key);
-        if (!o) { o = { name: t.byName || u (key), n: 0, sec: 0, live: 0 }; map.set (key, o); }
+        if (!o) { o = { name: t.byName || u (key), n: 0, sec: 0, live: 0, rep: repeatOn (m.guildId, key) }; map.set (key, o); }
         o.n++;
         if (t.isLive) o.live++;
         else if (t.duration > 0) o.sec += t.duration;
@@ -10335,7 +10489,8 @@ function queueAuthorsText (m)
     const top = list.slice (0, 6).map (o => o.name + ' — ' + o.n + ' ' +
         plural (o.n, 'трек', 'трека', 'треков') +
         (o.sec ? ' (~' + fmtAgo (o.sec * 1000) + ')' : '') +
-        (o.live ? ' + ' + o.live + ' 🔴' : ''));
+        (o.live ? ' + ' + o.live + ' 🔴' : '') +
+        (o.rep ? ' 🔁' : ''));
     return QSMALL + '👥 По авторам: ' + (top.length ? top.join (', ') : 'только треки без автора') +
         (list.length > 6 ? ' и ещё ' + (list.length - 6) + ' ' + plural (list.length - 6, 'автор', 'автора', 'авторов') : '') +
         (noAuthor ? (top.length ? ', ' : '') + 'без автора: ' + noAuthor : '');
@@ -10393,8 +10548,8 @@ function queueLines (slice, start, titleClip, m)
         // очереди отправляется и правится с allowedMentions: { parse: [] }.
         const byId = byIdOf (t);
         const by = byNameOf (t);
-        const label = byId ? ' · ' + u (byId)
-            : (by ? ' · 👤 ' + clipText (by, 24) : '');
+        const label = (byId ? ' · ' + u (byId)
+            : (by ? ' · 👤 ' + clipText (by, 24) : '')) + repeatMark (m, t);
         // [v2.32] Номер -- в косых кавычках (`12`), а не «12.»: Discord принимает «12.»
         // за начало markdown-СПИСКА и сам переформатирует строки (первый пункт «уезжал»
         // от остальных и в логе, и на экране). В кавычках номер ровный, моноширинный,
@@ -11457,7 +11612,7 @@ function queueHeadText (m)
                 ? ' `' + posTxt (Math.min (posSec, m.current.duration)) + ' / ' + fmtDur (m.current.duration) + '`'
                 : '');
         return '🎵 **Сейчас:** ' + (m.current.isLive ? '🔴 ' : '') + '**' + (m.current.title || 'трек') + '**' + pos +
-            byLabel (m.current) +
+            byLabel (m.current) + repeatMark (m, m.current) +
             (m.pausedByNobody ? ' _(пауза: нет слушателей)_' : '');
     }
     // [v2.34] Бот может уже сидеть в канале и просто ждать человека (после перезапуска
@@ -11792,6 +11947,15 @@ async function resumeMusic (server)
                     '» -- бот сидел там до перезапуска' +
                     (_h ? '' : ' (живых слушателей нет)'));
         }
+        // --- 1б) РЕЖИМ ПОВТОРА [v2.73] ---
+        // Читаем всегда, даже если очереди нет: режим -- свойство авторов, а не
+        // очереди, и после /stop он остаётся включённым (тогда новые треки этих
+        // авторов снова будут играть по кругу).
+        await repeatLoad (server);
+        if (m.repeat.length)
+            console.log ('[' + (d()) + '] [music] режим повтора с прошлого запуска: ' +
+                m.repeat.length + ' ' + plural (m.repeat.length, 'автор', 'автора', 'авторов') +
+                ' -- их треки остаются в очереди после проигрывания (/repeat-list)');
         // --- 2а) ИСТОРИЯ ДОБАВЛЕНИЙ [v2.54] ---
         // Читаем ДО очереди и не выходим раньше времени: история живёт своей жизнью
         // (очередь могла доиграть или быть стёрта /stop, а добавления помним).
@@ -12617,6 +12781,10 @@ function joinVoiceNow (guildId, voiceChannel, guild, reason = '')
                 const at = playing ? Math.round (playedMsOf (m) / 1000) : 0;
                 const asked = !!m.skipRequested; // /skip и /jump -- осознанный уход вперёд
                 m.skipRequested = false;
+                // [v2.73] Сюда же -- «трек выброшен потому, что поток обрывается снова»:
+                // такой трек режим повтора возвращать в очередь НЕ должен, иначе один
+                // сломанный трек зациклил бы всю очередь (см. ветку “обрывается снова”).
+                let _dropped = false;
                 // [v2.35] ВИДЕО БОЛЬШЕ НЕТ -- ЭТО НЕ ОБРЫВ: продолжать нечего, повтор не
                 // поможет. Убираем сразу и говорим людям (раньше падало в лог голым
                 // 'Video unavailable', а трек молча пропадал из очереди).
@@ -12679,6 +12847,26 @@ function joinVoiceNow (guildId, voiceChannel, guild, reason = '')
                         return;
                     console.error ('[' + (d()) + '] [music] поток обрывается снова (' + attempt +
                         ' раз) -- пропускаю: ' + (playing.title || 'трек'));
+                    _dropped = true;
+                }
+                // [v2.73] РЕЖИМ ПОВТОРА: трек автора, для которого включён /repeat, доиграв,
+                // НЕ пропадает -- он встаёт в конец очереди с нулевой позицией, а значит
+                // рано или поздно заиграет снова (остальные треки уходят как обычно, и
+                // последними остаются именно «повторяемые» -- они и играют по кругу).
+                // Пропущенный руками (/skip, /jump) и выброшенный по обрыву трек сюда
+                // не попадает: повтор -- это про естественный конец, а не про «верни мне
+                // то, что я сам убрал».
+                if (playing && !asked && !_dropped && repeatOn (guildId, playing.byId))
+                {
+                    playing.seek = 0; // повтор -- всегда с начала
+                    m.tracks.push (playing);
+                    console.log ('[' + (d()) + '] [music] 🔁 повтор (' + byNameOf (playing) + '): ' +
+                        (playing.title || 'трек') + ' доиграл и встал в конец очереди (№' + m.tracks.length + ')' +
+                        ' -- режим повтора у этого автора, выключить: /repeat');
+                    scheduleVoiceStatus (guildId);
+                    schedulePresence ();
+                    saveMusicState (guildId);
+                    queueMsgRedraw (guildId, 300).catch (() => {});
                 }
                 // трек кончился -- следующий:
                 m.current = null;
@@ -13212,6 +13400,19 @@ const musicCommands =
     new SlashCommandBuilder ()
         .setName ('history')
         .setDescription ('История добавлений: кто, когда и что поставил (треки, эфиры, плейлисты)'),
+    // [v2.73] /repeat -- РЕЖИМ ПОВТОРА ДЛЯ АВТОРА (только админы/модеры; в списке команд
+    // видна всем, но у остальных отвечает отказом). Без аргумента -- себе, с user --
+    // другому автору (иногда хочется “поставить на повтор” чужие треки, главное потом не
+    // забыть выключить). Список авторов в режиме -- /repeat-list.
+    new SlashCommandBuilder ()
+        .setName ('repeat')
+        .setDescription ('Повтор треков автора: не убирать после проигрывания (админы/модеры)')
+        .addUserOption (o =>
+            o.setName ('user')
+             .setDescription ('Чей повтор переключить (без него -- свой)')),
+    new SlashCommandBuilder ()
+        .setName ('repeat-list')
+        .setDescription ('Кто сейчас в режиме повтора и сколько у него треков в очереди'),
     new SlashCommandBuilder ()
         .setName ('leave')
         .setDescription ('Отложить свои треки и играть чужое; из канала выхожу, если играть нечего'),
@@ -14262,7 +14463,7 @@ client.on ('interactionCreate', async (interaction) =>
             '\nСохрани его отдельно от config.json -- без него записи базы не читаются. Перезапуск не нужен.');
     }
     // [v2.32] seek -- в том же списке, что музыка (проверка прав ниже общая)
-    if (!['play','join','stop','skip','pause','resume','seek','queue','nowplaying','history','leave','remove','clear','jump','move','push'].includes (name)) return;
+    if (!['play','join','stop','skip','pause','resume','seek','queue','nowplaying','history','leave','remove','clear','jump','move','push','repeat','repeat-list'].includes (name)) return;
     const guildId = interaction.guildId;
     const m = musicOf (guildId);
     // [v2.67] ПОСЛЕ ДЕЙСТВИЯ КОМАНДОЙ СРАЗУ ОБНОВЛЯЕМ СООБЩЕНИЕ ОЧЕРЕДИ, которое бот ведёт
@@ -14274,8 +14475,11 @@ client.on ('interactionCreate', async (interaction) =>
 
     try
     {
-        // DJ-проверка (смотреть /queue, /nowplaying и /history может каждый):
-        if (name !== 'queue' && name !== 'nowplaying' && name !== 'history' && !isDJ (interaction))
+        // DJ-проверка (смотреть /queue, /nowplaying, /history и /repeat-list может каждый):
+        // /repeat из неё исключён намеренно: это команда staff, и отвечать на неё должен
+        // её же отказ («только админы и модеры»), а не «музыка только для DJ» (то же
+        // правило у /jump -- свои и чужие треки решает jumpGuard).
+        if (!['queue', 'nowplaying', 'history', 'repeat', 'repeat-list'].includes (name) && !isDJ (interaction))
         {
             let role_dj = SERVERS[guildId].role_dj || '';
             return interaction.reply ({ content: '🚫 Музыка только для ' + (role_dj ? '<@&' + role_dj + '>' : 'DJ'), flags: MessageFlags.Ephemeral });
@@ -14617,6 +14821,65 @@ client.on ('interactionCreate', async (interaction) =>
             return interaction.reply (hiRows.length
                 ? { content: hText, components: hiRows }
                 : hText);
+        }
+        else if (name === 'repeat')
+        {
+            // [v2.73] РЕЖИМ ПОВТОРА АВТОРА: его треки после проигрывания не убираются, а
+            // встают в конец очереди (см. repeatOn в Idle-обработчике). Только админы и
+            // модеры: обычному DJ это дало бы возможность зациклить очередь так, что её
+            // никто не дослушает. Без аргумента -- себе, с user -- другому автору.
+            if (!isStaffInteraction (interaction))
+                return interaction.reply
+                ({
+                    content: '🚫 Режим повтора включают только админы и модеры.\n' +
+                        '_Себе: `/repeat`; другому автору: `/repeat user:@кто`. Кто сейчас в режиме -- `/repeat-list`._',
+                    flags: MessageFlags.Ephemeral,
+                });
+            const pick = interaction.options.getUser ('user');
+            const targetId = pick ? pick.id : interaction.user.id;
+            const targetName = pick ? pick.username
+                : (interaction.member ? interaction.user.username : '?');
+            const who = interaction.member ? uuu (interaction.member) : interaction.user.username;
+            await repeatLoad (guildId);
+            const wasOn = repeatOn (guildId, targetId);
+            const res = await repeatSet (guildId, targetId, targetName, !wasOn);
+            if (!res.ok)
+                return interaction.reply ({ content: res.text, flags: MessageFlags.Ephemeral });
+            const inQ = repeatTracksOf (guildId, targetId);
+            const playingNow = !!(m.current && String (m.current.byId || '') === String (targetId));
+            if (!res.on)
+            {
+                console.log ('[' + (d()) + '] [music] ' + whoText (who) + 'выключил режим повтора для ' +
+                    targetName + ' (в очереди было ' + inQ + ')');
+                qRedraw ();
+                return interaction.reply
+                ({
+                    content: '➡️ Повтор для **' + targetName + '** выключен -- его треки снова убираются ' +
+                        'после проигрывания.' +
+                        (inQ ? '\n_В очереди остаётся ' + inQ + '; убрать сразу: `/clear author:@кто`._' : ''),
+                    flags: MessageFlags.Ephemeral,
+                });
+            }
+            console.log ('[' + (d()) + '] [music] ' + whoText (who) + 'включил режим повтора для ' +
+                targetName + ' (в очереди ' + inQ + ')');
+            qRedraw ();
+            return interaction.reply
+            ({
+                content: '🔁 Повтор включён для **' + targetName + '**: ' +
+                    (inQ ? 'его ' + inQ + ' ' + plural (inQ, 'трек', 'трека', 'треков') + ' в очереди'
+                         : 'треков в очереди сейчас нет') +
+                    (playingNow ? ', и играющий сейчас тоже' : '') +
+                    ' больше не убираются после проигрывания -- доиграв, трек встаёт в конец очереди и играет снова.\n' +
+                    '_Выключить: `/repeat user:@кто`; список авторов в режиме -- `/repeat-list`._',
+                flags: MessageFlags.Ephemeral,
+            });
+        }
+        else if (name === 'repeat-list')
+        {
+            // [v2.73] Кто в режиме (видно всем, как /queue): по этой команде понятно,
+            // кому потом переключать режим обратно.
+            await repeatLoad (guildId);
+            return interaction.reply (repeatListText (guildId));
         }
         else if (name === 'queue')
         {
