@@ -5,6 +5,34 @@
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
+// CHANGELOG v2.53 (чужой трек нельзя ни перемотать, ни пропустить; подсказка /queue спрятана):
+//   * ПРОПУСК ПОПАЛ ПОД ТО ЖЕ ПРАВИЛО, ЧТО ПЕРЕМОТКА (v2.50): свой трек пропускает
+//     его автор, любой -- админы и модеры. Пропустить чужую песню -- не «перемотать»,
+//     а выбросить её из эфира совсем, и раньше это делал любой DJ. Проверка -- внутри
+//     queueSkip, поэтому кнопка «⏭ Пропустить» и /skip подчиняются ей одинаково.
+//     Трек без автора (из старой базы) -- ничей: его пропускает тот, кому он играет.
+//   * ПОДСКАЗКА ПОД /queue СЕЙЧАС НЕ ПОКАЗЫВАЕТСЯ -- просьба владельца («выглядит очень
+//     ненужным, во всяком случае на данный момент»). Текст СОХРАНЁН целиком и включается
+//     одним переключателем QUEUE_HINT_SHOW = true в коде (ни ключа в конфиге, ни второй
+//     ветки сборки нет: бюджет страницы считается по тому же queueHintText (), поэтому
+//     список просто получает освободившееся место).
+// CHANGELOG v2.52 (прокси отвалился -- музыка не встаёт на мёртвом локальном DNS):
+//   * РЕАЛЬНЫЙ СЛУЧАЙ ВЛАДЕЛЬЦА: прокси на миг отвалился, бот «честно» ушёл на DIRECT,
+//     а youtube.com на этой машине ЛОКАЛЬНО НЕ РЕЗОЛВИТСЯ -- именно поэтому весь
+//     YouTube и ходит через прокси (по той же причине в proxyForAgent схема поднимается
+//     до socks5h: имя резолвит прокси). Итог: вместо музыки в логе была невнятная
+//     «Unable to download API page ... Read timed out», а причина не читалась.
+//   * ТЕПЕРЬ БОТ ЗНАЕТ, ЕСТЬ ЛИ ЗАПАСНОЙ ПУТЬ: при старте одна строка ('запасной путь
+//     DIRECT: НЕ работает -- youtube.com локально не резолвится...'), а решения о
+//     маршруте принимает один ytRoutes (): если имя локально не резолвится, DIRECT даже
+//     не рассматривается и прокси остаётся рабочим маршрутом -- включая случай
+//     proxyStreamDead. Если имя резолвится, DIRECT остаётся запасным путём, как раньше.
+//   * 3-СЕКУНДНАЯ ПРОВЕРКА ПРОКСИ КЭШИРУЕТСЯ (30 с для живой / 60 с для молчащей).
+//     Раньше она выполнялась перед КАЖДЫМ запуском yt-dlp -- метаданные, скачивание
+//     на диск и поток, то есть до трёх раз на трек: при молчащем прокси это лишние
+//     секунды на каждой песне.
+//   * Кэширование IP вместо DNS сознательно НЕ делаем: yt-dlp резолвит имена сам, а
+//     подсунуть ему готовый IP для HTTPS без правки самого yt-dlp нельзя.
 // CHANGELOG v2.50 (перемотать чужой трек нельзя -- ни командой, ни кнопками):
 //   * ЖИВОЙ СЛУЧАЙ ОТ ВЛАДЕЛЬЦА: «Почему я могу другим человеком (хоть и DJ) прыгать
 //     по таймкодам МОЕГО трека?» Действительно мог: роль DJ проверялась, а АВТОРСТВО
@@ -6534,6 +6562,80 @@ function pingProxy (timeoutMs = MUSIC_PROXY_TIMEOUT)
     });
 }
 
+// [v2.52] ЕСЛИ ПРОКСИ МОЛЧИТ, А ЛОКАЛЬНЫЙ DNS НЕ ВИДИТ youtube.com -- DIRECT НЕ ЗАПАСНОЙ
+// ПУТЬ, А ПУСТАЯ ТРАТА ВРЕМЕНИ. Живой случай владельца: прокси на миг отвалился,
+// бот честно ушёл на DIRECT -- а на этой машине YouTube именно потому и ходят через
+// прокси, что имя не резолвится локально. В итоге вместо музыки была невнятная
+// «Unable to download API page ... Read timed out», а настоящую причину по строке
+// не понять. Теперь бот один раз спрашивает DNS и знает: если имя локально не
+// резолвится -- работаем ТОЛЬКО через прокси (yt-dlp резолвит имя на стороне прокси,
+// см. socks5h в proxyForAgent), а если резолвится -- DIRECT остаётся запасным путём.
+// Заодно 3-секундная проверка прокси кэшируется (раньше она шла НЕСКОЛЬКО РАЗ НА ТРЕК --
+// метаданные, скачивание и поток; при мёртвом прокси это лишние секунды на каждую песню).
+const PING_OK_TTL = 30000;   // мс: живой прокси не переспрашиваем
+const PING_BAD_TTL = 60000;  // мс: молчащий -- тем более (успеет очнуться)
+const DNS_TTL = 60000;       // мс: состояние локального DNS
+let pingCache = { ok: false, at: 0 };
+let dnsCache = { ok: null, at: 0 };
+
+async function proxyAlive ()
+{
+    if (!MUSIC_PROXY || proxyStreamDead) return false;
+    const now = Date.now ();
+    const ttl = pingCache.ok ? PING_OK_TTL : PING_BAD_TTL;
+    if (pingCache.at && (now - pingCache.at) < ttl) return pingCache.ok;
+    const ok = await pingProxy ();
+    pingCache = { ok: ok, at: now };
+    return ok;
+}
+
+// Резолвится ли youtube.com ЛОКАЛЬНО. null не бывает: не смогли проверить -- считаем,
+// что резолвится (прежнее поведение, ничего не ломаем).
+async function directUsable ()
+{
+    const now = Date.now ();
+    if (dnsCache.ok !== null && (now - dnsCache.at) < DNS_TTL) return dnsCache.ok;
+    let ok = true;
+    try
+    {
+        const dns = require ('dns').promises;
+        const r = await dns.lookup ('www.youtube.com');
+        ok = !!(r && r.address);
+    }
+    catch { ok = false; }
+    dnsCache = { ok: ok, at: now };
+    return ok;
+}
+
+// КАКИМИ МАРШРУТАМИ ИДТИ. Возвращаем по порядку: обычно прокси, потом DIRECT
+// (ошибка маршрута -- не ошибка видео, см. isNetworkError). Если локальный DNS мёртв,
+// DIRECT из списка выкидывается совсем: иначе на выходе была бы невнятная DNS-ошибка
+// вместо внятной причины. Именно от прокси тянется всё, а значит выкинуть его при
+// 3-секундной заминке нельзя -- поэтому в этом случае прокси остаётся даже когда
+// proxyStreamDead (альтернативы просто нет).
+let directWarnedAt = 0;
+async function ytRoutes ()
+{
+    if (!MUSIC_PROXY) return ['DIRECT'];
+    const dnsOk = await directUsable ();
+    if (!dnsOk && (Date.now () - directWarnedAt) > 600000)
+    {
+        directWarnedAt = Date.now ();
+        console.log ('[' + (d()) + '] [music] youtube.com не резолвится локально -- иду через прокси (DIRECT на этой машине невозможен)');
+    }
+    if (!dnsOk) return ['proxy'];                 // DIRECT бесполезен -- даже если прокси молчит
+    if (await proxyAlive ()) return ['proxy', 'DIRECT'];
+    return ['DIRECT', 'proxy'];                   // прокси молчит, но имя резолвится -- начнём с DIRECT
+}
+
+// Строка при старте: честно видно, ЕСТЬ ли запасной путь DIRECT (владелец: «у меня
+// отвалилось прокси -- DIRECT видимо не знает ip ютуба»). Если DIRECT невозможен, это
+// надо знать сразу, а не выяснять чтением ошибки yt-dlp.
+if (MUSIC_PROXY)
+    directUsable ().then (ok => console.log ('[' + (d()) + '] [music] запасной путь DIRECT: ' + (ok
+        ? 'есть -- youtube.com резолвится локально'
+        : 'НЕ работает -- youtube.com локально не резолвится, поэтому всё идёт ТОЛЬКО через прокси (прокси отвалился -- музыка встанет, и это будет видно по этой строке)')));
+
 // [v2.30] Обрезать по СЛОВУ, а не посередине: в логе стоял хвост вида
 // '... Error opening input files: In', по которому ничего не понять.
 function clipWords (s, max)
@@ -6668,8 +6770,7 @@ function isNetworkError (e)
 let ytDlpQuiet = 0;
 async function ytDlpRun (query, optsBase)
 {
-    let viaProxy = !proxyStreamDead && await pingProxy ();
-    let routes = viaProxy ? ['proxy', 'DIRECT'] : ['DIRECT'];
+    let routes = await ytRoutes ();   // [v2.52] маршруты с учётом того, резолвится ли имя локально
     let lastErr;
     for (let route of routes)
     {
@@ -7018,7 +7119,9 @@ function cachePromoteParts (key, track)
 async function cacheDownload (track, holder = {})
 {
     cacheDirReady ();
-    const viaProxy = !proxyStreamDead && await pingProxy ();
+    // [v2.52] маршрут -- как везде (см. ytRoutes): при мёртвом локальном DNS DIRECT
+    // даже не рассматривается, иначе вместо музыки была бы DNS-ошибка
+    const viaProxy = (await ytRoutes ())[0] === 'proxy';
     const key = cacheKeyOf (track);
     cacheDropParts (key); // не докачиваем старое -- качаем заново
     const proc = ytdlp.exec
@@ -7321,7 +7424,7 @@ async function createTrackStream (track, seekSec = 0, seekMode = 'sections')
         const r = openCachedTrack (track, _cached, seekSec);
         if (r) return r; // не вышло -- играем как раньше, потоком
     }
-    let viaProxy = !proxyStreamDead && await pingProxy ();
+    let viaProxy = (await ytRoutes ())[0] === 'proxy';   // [v2.52] см. ytRoutes
     // [v2.10] продолжение с места после перезапуска: yt-dlp отдаёт поток с N-й секунды
     // (--download-sections, нужен ffmpeg). Если так не умеет -- процесс падает сразу,
     // и playNext пробует резервный путь (ffseek), а потом берёт трек с начала.
@@ -8582,6 +8685,14 @@ const QSEP = '────────────';
 // В subtext кладём ТОЛЬКО простой текст (без `**` и без косых кавычек): так он
 // одинаково выглядит в любом клиенте, а не превращается в звёздочки.
 const QSMALL = '-# ';
+// [v2.53] ПОДСКАЗКА СЕЙЧАС НЕ ПОКАЗЫВАЕТСЯ. Просьба владельца: «подумал, убрать
+// этот текст совсем -- выглядит очень ненужным, во всяком случае на данный момент;
+// полностью из кода не убирай, может передумаю; даже конфиг не нужен». Поэтому текст
+// СОХРАНЁН ниже целиком, а в сообщение его подставляет queueHintText(): вернуть --
+// поставить QUEUE_HINT_SHOW = true. Ни ключа в конфиге, ни второй ветки сборки нет --
+// бюджет страницы считается по тому же queueHintText (), поэтому список треков просто
+// получает освободившееся место, а сообщение остаётся в тех же границах.
+const QUEUE_HINT_SHOW = false;
 const QUEUE_HINT_SHORT = QSMALL + 'Действия -- кнопками ниже.';
 const QUEUE_HINT_FULL =
     QSMALL + 'Перемотать внутри трека -- «◀ 30 с» / «30 с ▶» / «⏱ На таймкод…» или /seek;' +
@@ -8592,6 +8703,12 @@ const QUEUE_HINT_FULL =
     QSMALL + 'Чистить -- /clear (остаться) или /stop (уйти): спросят подтверждение.' + '\n' +
     QSMALL + 'DJ распоряжается только своими треками (и ставит их только на свои же' +
     ' места), админы и модеры -- любыми.';
+
+// Что именно поставить в сообщение как подсказку (см. QUEUE_HINT_SHOW).
+function queueHintText ()
+{
+    return QUEUE_HINT_SHOW ? QUEUE_HINT_FULL : '';
+}
 
 // [v2.28] Сводка ПО АВТОРАМ для /queue: сколько треков и сколько времени у каждого.
 // На миксе из нескольких DJ сразу видно, чья это гора; убрать чужое/своё можно через
@@ -8672,7 +8789,7 @@ function queueListBudget (m)
     // Не влезает -- укорачивается САМ СПИСОК, а не справка (см. queueView).
     const chrome = queueHeadText (m).length + queueWaitText (m).length +
         queueAuthorsText (m).length + queueAddsText (m).length + queueCheckText (m).length +
-        QUEUE_GLUE + QUEUE_HINT_FULL.length;
+        QUEUE_GLUE + queueHintText ().length;
     return Math.max (200, QUEUE_MSG_LIMIT - chrome);
 }
 
@@ -8989,10 +9106,17 @@ function queueComponents (page, m, moveSel = 0, opts = {})
 // { ok, text }: ok = действие выполнено (ответ можно показывать всем), иначе
 // причина (её показываем только нажавшему). В лог идёт авторство -- видно, кто убрал.
 // ============================================================================
-function queueSkip (guildId, who)
+function queueSkip (guildId, who, opts = {})
 {
     const m = musicOf (guildId);
     if (!m.current) return { ok: false, text: '🤷 Сейчас ничего не играет.' };
+    // [v2.53] ПРОПУСК -- ТОЛЬКО ПО СВОЕМУ ТРЕКУ. То же правило, что у перемотки (v2.50):
+    // пропустить чужую песню -- это не «перемотать», а выбросить её из эфира совсем,
+    // и раньше её мог выбросить любой DJ (владелец: «и пропускать трек без нужных прав
+    // нельзя»). Свой трек пропускает его автор, а любой -- админы и модеры; трек без
+    // автора (из старой базы) -- ничей, его пропускает тот, кому он играет.
+    if (!opts.staff && byIdOf (m.current) && !isBy (m.current, opts.actorId))
+        return { ok: false, text: ownOnlyText ('Пропустить', m.current) };
     const skipped = m.current.title || 'трек';
     m.skipRequested = true; // [v2.30] это осознанный пропуск, а не обрыв потока:
                             // Idle-обработчик не должен возвращать трек в очередь
@@ -9661,13 +9785,13 @@ function queueView (m, start, moveSel = 0, opts = {})
         // выставлен большим, все названия страницы длиннющие и у каждого трека свой
         // длинный ник (ник не укорачиваем -- он адресат). Ничего не теряется: хвост
         // сообщения ведёт на реальный следующий номер.
-        content = build (QUEUE_HINT_FULL);
+        content = build (queueHintText ());
         let guard = 0;
         while (content.length > QUEUE_MSG_LIMIT && page.count > 1 && guard++ < 50)
         {
             page.count--;
             page.list = page.list.split ('\n').slice (0, page.count).join ('\n');
-            content = build (QUEUE_HINT_FULL);
+            content = build (queueHintText ());
         }
         // Крайний случай (нужны сразу: максимальный queue_page, названия-монстры и
         // длинный ник у каждого трека): список уже из одного трека, сокращаем подсказку.
@@ -9914,12 +10038,17 @@ const YT_URL_RE = /^https?:\/\/(?:www\.|m\.|music\.)?youtube\.com\/(?:watch|shor
 async function oembedProbe (url)
 {
     if (!YT_URL_RE.test (String (url || ''))) return 'unknown';
+    // [v2.52] Прокси берём и когда он помечен «мёртвым», если локальный DNS его
+    // не видит: на такой машине DIRECT не работает вообще, а oEmbed-проверка без
+    // маршрута отвечает 'neterr' -- то есть очередь просто перестаёт проверяться.
+    // (Считаем ЗАРАНЕЕ: внутри new Promise уже нельзя ждать.)
+    const useProxy = !!MUSIC_PROXY && (!proxyStreamDead || !(await directUsable ()));
     return new Promise (resolve =>
     {
         let httpsMod;
         try { httpsMod = require ('https'); } catch { return resolve ('neterr'); }
         let agent = null;
-        if (MUSIC_PROXY && !proxyStreamDead)
+        if (useProxy)
             try
             {
                 const M = require ('socks-proxy-agent'); // рядом с discord.js -- берём, если есть
@@ -10860,7 +10989,7 @@ const musicCommands =
         .setDescription ('Остановить музыку и очистить очередь'),
     new SlashCommandBuilder ()
         .setName ('skip')
-        .setDescription ('Пропустить текущий трек'),
+        .setDescription ('Пропустить текущий трек -- своего (у админов и модеров -- любого)'),
     // [v2.12] управление очередью (DJ): убрать трек, очистить очередь, прыгнуть к номеру
     new SlashCommandBuilder ()
         .setName ('remove')
@@ -11517,7 +11646,7 @@ client.on ('interactionCreate', async (interaction) =>
         if (cid === 'q:clear') return askClear (false);
         if (cid === 'q:stop') return askClear (true);
         let res;
-        if (cid === 'q:skip') res = queueSkip (guildId, who);
+        if (cid === 'q:skip') res = queueSkip (guildId, who, ctx);   // [v2.53] права: чужой трек не пропускаем
         else res = queueRemove (guildId, parseInt ((interaction.values || [])[0], 10), who, ctx);
         // Сообщение очереди обновляем для ВСЕХ (видно результат) и коротко
         // подтверждаем нажавшему -- ответ виден только ему.
@@ -12191,8 +12320,11 @@ client.on ('interactionCreate', async (interaction) =>
         else if (name === 'skip')
         {
             // [v2.15] Общая логика с кнопкой «⏭ Пропустить» под /queue.
+            // [v2.53] И то же правило: чужой трек пропускают только его автор и staff
+            // (проверка внутри queueSkip, чтобы кнопка и команда не разъехались).
             const res = queueSkip (guildId,
-                interaction.member ? uuu (interaction.member) : interaction.user.username);
+                interaction.member ? uuu (interaction.member) : interaction.user.username,
+                { actorId: interaction.user.id, staff: isStaffInteraction (interaction) });
             return interaction.reply (res.ok ? res.text : { content: res.text, flags: MessageFlags.Ephemeral });
         }
         else if (name === 'seek')
