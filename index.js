@@ -26,6 +26,16 @@
 //     стоит в чьём-то config.json): [config] подскажет новое, бот не сломается. Этот ключ и
 //     cache_long_sets -- про разное: первый решает, какие треки качать ЦЕЛИКОМ ДО старта,
 //     второй -- качать ли длинные сеты в ФОНЕ, пока играет текущий.
+// CHANGELOG v2.84 (ключ в нике -- только явным true; символ ключа можно менять):
+//   * В ПРИМЕРЕ КОНФИГА addTag ТЕПЕРЬ false (и в коде то же умолчание -- как у
+//     channel_status): ключ -- это про права в ЛИЧНЫХ каналах, и включать его там, где он
+//     не нужен, незачем. Ключа в файле нет -- ключ не ставится, ровно как в примере;
+//     включается только явным true. Мусор в ключе ("да", 1) -- это ВЫКЛЮЧЕНО: раньше
+//     `addTag || false` считал его включённым и бот ставил ключ без спроса -- об этом
+//     говорит строка [config].
+//   * СМЕНА СИМВОЛА КЛЮЧА НЕ ОСТАВЛЯЕТ ДВА КЛЮЧА: если tag поменяли (был 🔑, стал ★),
+//     бот снимает ПРЕЖНИЙ (тот, что стоял по умолчанию) и ставит новый -- а не дописывает
+//     новый сверху старого («★🔑Вася»).
 // CHANGELOG v2.83 (шапка канала -- по умолчанию НЕ наша):
 //   * MUSIC.channel_status: УМОЛЧАНИЕ СМЕНЕНО НА false (было true). Нашлось на вопросе
 //     владельца «а в minimal оно будет трогать?»: в config.minimal.json блока MUSIC нет,
@@ -3881,6 +3891,14 @@ const TAG_DEFAULT = '🔑';
 // просто отказывался ставить ключ (Discord отвечал 'Invalid Form Body'), хотя правильнее
 // укоротить ник СПРАВА ровно настолько, чтобы ключ влез целиком: ключ -- всегда спереди.
 const NICK_MAX = 32;
+// [v2.84] КЛЮЧ СТАВИТСЯ ТОЛЬКО ПРИ ЯВНОМ `addTag: true` (как и шапка канала -- `channel_status`).
+// Раньше проверялось `addTag || false`: мусор в ключе ("да", 1, {}) считался ВКЛЮЧЁННЫМ, и
+// бот ставил ключ там, где владелец явно не просил. Теперь мусор -- это выключено, как и
+// значение по умолчанию, а причина видна строкой [config] при старте.
+function tagEnabled (server)
+{
+    return SERVERS[server] ? SERVERS[server].addTag === true : false;
+}
 function tagOf (server)
 {
     const raw = SERVERS[server] ? SERVERS[server].tag : undefined;
@@ -3903,11 +3921,19 @@ function nickWithTag (server, nick)
     return [...cp (tagOf (server)).slice (0, NICK_MAX), ...cp (nick)].slice (0, NICK_MAX).join ('');
 }
 // Снять ключ: режем РОВНО префикс (а не все вхождения символа в нике).
+// [v2.84] И СНИМАЕМ ПРЕЖНИЙ КЛЮЧ: если символ ключа в конфиге СМЕНИЛИ (был 🔑, стал ★),
+// у старых ников спереди стоит прежний символ. Без этого сверка искала бы новый, не
+// находила и дописывала его сверху -- выходило бы «★🔑Вася». Теперь прежний ключ (то, что
+// стояло по умолчанию) снимается, а новый встаёт на его место.
 function nickWithoutTag (server, nick)
 {
     const tag = tagOf (server);
-    const s = String (nick === undefined || nick === null ? '' : nick);
-    return (tag && s.startsWith (tag)) ? s.slice (tag.length) : s;
+    let s = String (nick === undefined || nick === null ? '' : nick);
+    const strip = p => { if (p && s.startsWith (p)) s = s.slice (p.length); };
+    strip (tag);
+    if (TAG_DEFAULT && TAG_DEFAULT !== tag) strip (TAG_DEFAULT);
+    strip (tag);
+    return s;
 }
 const $nickSet = {}; // server -> Map<uid, true|false>  (есть ли ключ, что поставил бот)
 function nickSetMark (server, uid, hasTag)
@@ -3927,7 +3953,7 @@ async function modNick (server, member/*, add = false*/)
 {
     const tag = tagOf (server);   // [v2.81] символ ключа -- из конфига (по умолчанию 🔑)
     // Пустая строка в ключе `tag` -- «ключа нет»: тогда ничего не ставим и не снимаем.
-    if (tag && (SERVERS[server].addTag || false))
+    if (tag && tagEnabled (server))
     {
         if (!member.user.bot) // [v2.2.3] тег -- ЛЮБОМУ с правами в канале
         {
@@ -3966,7 +3992,7 @@ async function modNick (server, member/*, add = false*/)
                     // Раньше при полном нике ключ просто не ставился ('Invalid Form Body' в
                     // логе), и человек с правами в канале оставался без ключа -- а ключ и есть
                     // обещание этих прав. Ключ всегда спереди, хвост имени уходит.
-                    const nickNew = nickWithTag (server, nick);
+                    const nickNew = nickWithTag (server, nickWithoutTag (server, nick));
                     console.log ('[' + (d()) + '] [nick] +' + tag + ' ' + member.user.username + ' в ' + member.voice.channel.name +
                         (nickNew !== tag + nick ? ' (ник укоротил справа: "' + nick + '" -> "' + nickNew + '")' : ''));
                     await setNickLogged (member, nickNew, server)
@@ -6465,7 +6491,7 @@ async function sweepNicks (server)
     try
     {
         const guild = client.guilds.cache.get (server);
-        if (!guild || !(SERVERS[server].addTag || false)) return;
+        if (!guild || !tagEnabled (server)) return;
         const tag = tagOf (server);   // [v2.81] символ ключа -- из конфига
         if (!tag) return;             // ключ отключён пустой строкой -- сверять нечего
         // [FIX v2.3.2] REST-эндпоинт voice-states ботам недоступен (404) -- берём
@@ -6516,7 +6542,7 @@ async function sweepNicks (server)
             if (!fresh && known !== undefined) hasTag = known;
             if (hasTag === wantTag) { nickSetMark (server, vs.id, hasTag); continue; } // уже так
             if (wantTag)
-                await setNickLogged (member, nickWithTag (server, nick), server)
+                await setNickLogged (member, nickWithTag (server, nickWithoutTag (server, nick)), server)
                     .then (() => { added++; console.log ('[' + (d()) + '] [nick] +' + tag + ' (sweep) ' + member.user.username + ' в ' + channel.name); })
                     .catch (e => console.error ('[nick][sweep] ошибка для ' + member.user.username + ': ' + e.message));
             else
@@ -6586,12 +6612,12 @@ async function tempCreateFor (server, member)
             .catch (e => console.error ('[temp] ошибка перевода: ' + e.message));
     // ключ владельцу (он в своём канале -- права есть; ADM/MOD -- не трогаем):
     const tempTag = tagOf (server);   // [v2.81] символ ключа -- из конфига
-    if (tempTag && (SERVERS[server].addTag || false) && !isStaff (server, member))
+    if (tempTag && tagEnabled (server) && !isStaff (server, member))
     {
         let nick = member.nickname || member.user.username;
         // [FIX v2.3.3] точная проверка ключа (см. комментарий в sweepNicks):
         if (!nickHasTag (server, nick))
-            await setNickLogged (member, nickWithTag (server, nick), server)
+            await setNickLogged (member, nickWithTag (server, nickWithoutTag (server, nick)), server)
                 .then (() => console.log ('[' + (d()) + '] [nick] +' + tempTag + ' (temp) ' + member.user.username))
                 .catch (e => console.error ('[temp] ошибка смены ника: ' + e.message));
     }
@@ -6814,6 +6840,11 @@ function configSanityIssues ()
         else if (typeof s.tag === 'string' && [...s.tag].length > NICK_MAX)
             out.push ('сервер ' + nm + ': tag = "' + s.tag + '": длиннее ' + NICK_MAX + ' символов -- ' +
                 'ключ будет обрезан (в нике Discord всего ' + NICK_MAX + ' символов)');
+        // [v2.84] Ключ в нике включается ТОЛЬКО явным true (см. tagEnabled): мусор в ключе
+        // ("да", 1) -- это выключено, а не включено.
+        if (s.addTag !== undefined && s.addTag !== null && typeof s.addTag !== 'boolean')
+            out.push ('сервер ' + nm + ': addTag = ' + JSON.stringify (s.addTag) + ': ожидается true или false -- ' +
+                'считаю выключенным (ключ в нике не ставлю; сам символ -- ключ tag)');
         if (has (s.queue_page) && Number.isFinite (Number (s.queue_page)) && Number (s.queue_page) > 25)
             out.push ('сервер ' + nm + ': queue_page = ' + s.queue_page + ' -- страница будет 25 ' +
                 '(больше Discord не принимает)');
@@ -8740,7 +8771,13 @@ function configCli ()
                          'temp_category', 'temp_lobby', 'welcome_channel', 'welcome_message',
                          'welcome_public_channel', 'welcome_public_message', 'owner_server'])
             row (k, orDash (s[k]), has (k) ? 'config.json' : '-- (в файле нет)');
-        row ('addTag', YN (s.addTag), has ('addTag') ? 'config.json' : 'в коде выкл (тег не ставится)');
+        // [v2.84] Значение показываем по факту (ключ ставится только явным true), а вот
+        // источник: если в файле лежит не true/false, «config.json» читалось бы как раз
+        // наоборот -- рядом с «нет». Поэтому мусор назван мусором.
+        const addRaw = s.addTag;
+        row ('addTag', YN (tagEnabled (id)),
+            !has ('addTag') ? 'по умолчанию (не ставится)'
+                : (typeof addRaw === 'boolean' ? 'config.json' : 'config.json (мусор -- выкл, см. замечания)'));
         // [v2.81] Ключ в нике: показываем САМ символ (он виден и в отчёте, и в конфиге --
         // это не секрет), иначе владелец не понял бы, что за ключ применяется.
         row ('tag (ключ в нике)', typeof s.tag === 'string'
