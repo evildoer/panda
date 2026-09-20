@@ -26,6 +26,12 @@
 //     стоит в чьём-то config.json): [config] подскажет новое, бот не сломается. Этот ключ и
 //     cache_long_sets -- про разное: первый решает, какие треки качать ЦЕЛИКОМ ДО старта,
 //     второй -- качать ли длинные сеты в ФОНЕ, пока играет текущий.
+// CHANGELOG v2.82 (`node . privacy --check` не спорит с датой):
+//   * ДАТА В СРАВНЕНИИ НЕ УЧАСТВУЕТ: строка «_Last updated: …_» собирается из сегодняшнего
+//     числа, и каждый следующий день проверка сообщала о расхождении там, где не менялось
+//     НИЧЕГО (19.09 -> 20.09: даже байты те же, отличается одна цифра). Теперь текст
+//     сравнивается без даты, а про дату -- отдельная строка и код возврата 0.
+//   * ЕСЛИ РАСХОЖДЕНИЕ НАСТОЯЩЕЕ -- ВИДНО, ГДЕ: первые разные строки обоих файлов (до трёх).
 // CHANGELOG v2.81 (символ ключа в нике -- из конфига; ключ cache_short_max_minutes;
 //                  пример конфига совпадает с боевым):
 //   * СИМВОЛ КЛЮЧА В НИКЕ ТЕПЕРЬ СТРОКА ИЗ КОНФИГА (ключ сервера `tag`, по умолчанию 🔑).
@@ -1836,13 +1842,37 @@ function privacyCli (_check, _offline)
     const _old = _fs.existsSync (_outFile) ? _fs.readFileSync (_outFile, 'utf8').replace (/\r\n/g, '\n') : '';
     if (_check)
     {
-        if (_old === _text)
+        // [v2.82] ДАТА В СРАВНЕНИИ НЕ УЧАСТВУЕТ. Строка «_Last updated: …_» собирается из
+        // СЕГОДНЯШНЕГО числа, поэтому каждый следующий день скрипт честно сообщал о
+        // расхождении там, где не менялось ничего (19.09 -> 20.09 -- и байты те же, только
+        // цифра другая). Сравниваем текст БЕЗ даты, а про саму дату говорим отдельно: это
+        // не расхождение, но знать о нём полезно (шапка политики устаревает).
+        const _noDate = _s => _s.replace (/^_Last updated: .*_$/m, '_Last updated: <дата>_');
+        const _dateIn = _s => { const _m = /^_Last updated: (.*)_$/m.exec (_s); return _m ? _m[1] : ''; };
+        if (_noDate (_old) === _noDate (_text))
         {
-            console.log ('[privacy] PRIVACY.md совпадает с шаблоном -- обновлять нечего');
+            const _dOld = _dateIn (_old), _dNew = _dateIn (_text);
+            console.log (_dOld === _dNew
+                ? '[privacy] PRIVACY.md совпадает с шаблоном -- обновлять нечего'
+                : '[privacy] PRIVACY.md совпадает с шаблоном ПО ТЕКСТУ; отличается только дата в шапке ' +
+                  '(в файле ' + (_dOld || '--') + ', сейчас ' + (_dNew || '--') + ') -- обновить при желании: `node . privacy`');
             return 0;
         }
         console.log ('[privacy] PRIVACY.md ОТЛИЧАЕТСЯ от шаблона (' + Buffer.byteLength (_old) + ' байт -> ' +
             Buffer.byteLength (_text) + '): пересобрать -- `node . privacy`');
+        // Что именно разошлось -- показываем: «отличается» без подробностей заставляет
+        // сравнивать руками, а различий обычно одно-два.
+        const _lo = _noDate (_old).split ('\n'), _ln = _noDate (_text).split ('\n');
+        let _shown = 0;
+        for (let _i = 0; _i < Math.max (_lo.length, _ln.length) && _shown < 3; _i++)
+        {
+            if (_lo[_i] === _ln[_i]) continue;
+            _shown++;
+            console.log ('[privacy]   строка ' + (_i + 1) + ':');
+            console.log ('[privacy]     в файле:  ' + String (_lo[_i] === undefined ? '-- строки нет' : _lo[_i]).slice (0, 120));
+            console.log ('[privacy]     шаблон:   ' + String (_ln[_i] === undefined ? '-- строки нет' : _ln[_i]).slice (0, 120));
+        }
+        if (_shown === 3) console.log ('[privacy]   ...и ещё различия -- смотри `node . privacy` целиком');
         return 1;
     }
     _fs.writeFileSync (_outFile, _text);
