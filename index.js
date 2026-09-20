@@ -5,6 +5,24 @@
 // node >= 22 (портативный: ./node-v24.21.0-win-x64/node.exe)
 // discord.js v14:
 //   npm install discord.js @keyv/sqlite keyv
+// CHANGELOG v2.71 (музыка возвращается быстрее; /history ставит пачку заново):
+//   * БЫСТРЫЙ ВОЗВРАТ МУЗЫКИ. Пока прокси молчит, маршрут проверяется ДЁШЕВО: раз в 3 с
+//     -- только TCP-пинг (yt-dlp при молчащем прокси не запускаем вообще), и как только
+//     он ответил -- играем СРАЗУ, не дожидаясь выросшей паузы. Живой лог владельца:
+//     «оно заиграло, но совсем не сразу как я переключил сервер прокси» -- теперь это
+//     секунды, а не десятки секунд.
+//   * ПОСЛЕ ПЕРЕЗАПУСКА МУЗЫКА ПОДНИМАЕТСЯ ПАРАЛЛЕЛЬНО ОСТАЛЬНОМУ СТАРТУ. Живой лог:
+//     вход 08:13:47, снимок участников 08:14:02, очередь и канал -- только 08:14:04, то
+//     есть на ровном месте терялось ~17 секунд; то же и с отчётами по серверу.
+//   * «ИСТОЧНИК НЕ УМЕЕТ СЕКЦИИ» ПОМНИМ МЕЖДУ ПЕРЕЗАПУСКАМИ (musicState/queue.noSec):
+//     каждый старт начинался с «секция с 35:12 ничего не отдала за 8 с -- беру тот же
+//     трек через ffmpeg», то есть 8 секунд тишины, хотя про этот адрес всё было известно.
+//   * WATCHDOG ВОЗВРАЩАЕТ БОТА В ГОЛОСОВОЙ: если после сбоя сети его выкинуло из канала,
+//     а слушатели там есть -- возвращается сам, не дожидаясь события в голосовых.
+//   * СОСТОЯНИЕ СЕТИ ВИДНО В /QUEUE И /NOWPLAYING (попыток столько-то, следующая попытка
+//     через столько-то, очередь и место держатся) -- не надо бегать в консоль.
+//   * /HISTORY: «▶ Поставить заново» -- вся пачка возвращается в очередь одним нажатием
+//     (повторяем то, что вводили в /play; в очередь её ставит тот, кто нажал).
 // CHANGELOG v2.70 (сбой сети/прокси не тратит очередь):
 //   * СБОЙ МАРШРУТА -- НЕ «БИТЫЙ ТРЕК». Живой случай владельца: отвалился прокси,
 //     очередь посыпалась (каждый трек считался «не запустившимся»), после десяти подряд
@@ -6363,6 +6381,14 @@ async function tempSweep (server)
     for (let [, ch] of guild.channels.cache)
     {
         if (ch.parentId !== catId || ch.type !== ChannelType.GuildVoice || ch.id === lobbyId) continue;
+        // [v2.71] МУЗЫКАЛЬНЫЙ КАНАЛ НЕ ТРОГАЕМ. После рестарта бота в канале ещё нет
+        // голосового состояния (оно появится через секунду -- resumeMusic идёт параллельно
+        // со снимком и отчётами), и пустой ЛИЧНЫЙ канал, который бот помнит как музыкальный,
+        // был бы удалён прямо у него из-под ног. Смотрим и на «где сижу», и на «где жду».
+        const _mM = $music[server];
+        const _mine = _mM && (_mM.savedChannelId === ch.id ||
+            (_mM.connection && _mM.connection.joinConfig.channelId === ch.id));
+        if (_mine) continue;
         let busy = false;
         for (let [, vs] of guild.voiceStates.cache)
             if (vs.channelId === ch.id) { busy = true; break; }
@@ -6824,6 +6850,15 @@ client.on
             console.log ('[' + (d()) + '] [login] приложение в ' + client.guilds.cache.size + ' серверах, участников суммарно ~' + total +
                 (list.length ? ' (' + list.join (' | ') + more + ')' : ''));
         }
+        // [v2.71] МУЗЫКУ ПОДНИМАЕМ ПАРАЛЛЕЛЬНО ВСЕМУ ОСТАЛЬНОМУ СТАРТУ. Живой лог
+        // (20.09, 08:13): бот вошёл в 08:13:47, снимок участников был готов в 08:14:02,
+        // а очередь и канал вернулись только в 08:14:04 -- то есть музыка опаздывала на
+        // старте на ~17 секунд, пока шли снимок и отчёты. Очередь и канал от них не
+        // зависят, поэтому теперь ждать нечего: возвращаемся в голосовой сразу.
+        for (let server in SERVERS)
+            if (SERVERS[server].allow)
+                resumeMusic (server).catch (e => console.error ('[music] не смог возобновить очередь: ' +
+                    oneLine ((e && e.message) || e)));
         for (let server in SERVERS)
         {
             if (!SERVERS[server].allow) continue;
@@ -6857,8 +6892,7 @@ client.on
             await sweepBanHistory (server);
             // [v2.3] почистить пустые личные каналы после рестарта:
             await tempSweep (server);
-            // [v2.10] вернуть музыку с прошлого запуска (очередь + тот же канал):
-            await resumeMusic (server);
+            // [v2.10] музыка уже поднята выше -- параллельно с этим блоком (v2.71)
         }            setInterval
             (
                 async () =>
@@ -7060,10 +7094,12 @@ console.log ('[' + (d()) + '] [music] YouTube: ' + (MUSIC_PROXY
 const NET_WAIT_MS = Math.max (2000, Math.min (120000,
     Math.round (Number (MUSIC_CFG.net_wait_ms === undefined ? 10000 : MUSIC_CFG.net_wait_ms) || 10000)));
 const NET_WAIT_MAX_MS = Math.max (NET_WAIT_MS, 30000);   // дальше -- не реже раза в полминуты
-const NET_WATCH_STEP_MS = Math.max (2000, Math.min (15000, Math.round (NET_WAIT_MS / 2)));
+// [v2.71] Шаг «стучусь, отвечает ли маршрут»: не чаще раза в 3 секунды спрашиваем только
+// TCP-пинг прокси (десятки миллисекунд) и, как только он ответил, играем сразу -- см. musicNetTick.
+const NET_PING_STEP_MS = 3000;
 console.log ('[' + (d()) + '] [music] если сеть/прокси отвалится: очередь НЕ тратится -- держу место в треке и пробую снова каждые ' +
     Math.round (NET_WAIT_MS / 1000) + ' с (до ' + Math.round (NET_WAIT_MAX_MS / 1000) + ' с, MUSIC.net_wait_ms); ' +
-    (MUSIC_PROXY ? 'как только прокси оживёт -- музыка пойдёт сама' : 'как только сеть вернётся -- музыка пойдёт сама'));
+    'маршрут (прокси) проверяю каждые ' + Math.round (NET_PING_STEP_MS / 1000) + ' с и играю сразу, как только он ответит');
 // [v2.26] Одна строка при старте: трогаем ли мы шапку голосового канала (см. выше).
 console.log ('[' + (d()) + '] [music] статус голосового канала (шапка): ' + (MUSIC_CHANNEL_STATUS
     ? 'пишу свой (что играет, очередь, люди) -- прежний текст автора канала вернуть нельзя, он затирается'
@@ -7191,6 +7227,25 @@ if (MUSIC_PROXY)
     directUsable ().then (ok => console.log ('[' + (d()) + '] [music] запасной путь DIRECT: ' + (ok
         ? 'есть -- youtube.com резолвится локально'
         : 'НЕ работает -- youtube.com локально не резолвится, поэтому всё идёт ТОЛЬКО через прокси (прокси отвалился -- музыка встанет, и это будет видно по этой строке)')));
+
+// [v2.71] ЕСТЬ ЛИ ЖИВОЙ МАРШРУТ ПРЯМО СЕЙЧАС -- за десятки МИЛЛИСЕКУНД, а не за десятки
+// секунд. Это НЕ попытка играть: только TCP-пинг прокси (или локальный DNS, если прокси
+// нет). Смысл -- в скорости возврата музыки: настоящая попытка стоит 10-30 секунд (таймаут
+// сокета на каждом шаге), а пинг -- один коннект, поэтому владелец, переключивший сервер
+// прокси, слышит музыку через те же секунды, а не после выросшей паузы.
+// Кэш «икнувших» тут УМЫШЛЕННО игнорируется: мы как раз и проверяем, очнулся ли он.
+async function netRouteAnswers ()
+{
+    if (!MUSIC_PROXIES.length) return await directUsable ();
+    for (const p of MUSIC_PROXIES)
+        if (await pingProxy (p, 1500))
+        {
+            proxyMarkGood (p);
+            pingCache.set (String (p), { ok: true, at: Date.now () });
+            return true;
+        }
+    return false;
+}
 
 // [v2.30] Обрезать по СЛОВУ, а не посередине: в логе стоял хвост вида
 // '... Error opening input files: In', по которому ничего не понять.
@@ -9136,25 +9191,67 @@ if (musicSaveTick.unref) musicSaveTick.unref ();
 // и здесь мы пробуем снова, НЕ дожидаясь ни события в голосовых, ни команды человека:
 // владелец переключил сервер прокси -- музыка должна пойти сама и как можно раньше.
 // Слушателей нет -- сеть впустую не будим: очередь поднимет заход человека (checkListeners).
+// [v2.71] СТУЧИМСЯ ЧАСТО И ДЕШЁВО: раз в NET_PING_STEP_MS спрашиваем только «отвечает ли
+// маршрут» (пинг прокси / локальный DNS), и как только он ожил -- сразу настоящая попытка,
+// не дожидаясь выросшей паузы. Пока маршрут молчит, yt-dlp вообще не запускаем: это и
+// быстрее, и без лишних запросов.
 const musicNetTick = setInterval
 (
-    () =>
+    async () =>
     {
-        const now = Date.now ();
-        for (const g of Object.keys ($music))
+        try
         {
-            const m = $music[g];
-            if (!m || m.leaving || !m.netWait || m.current) continue;
-            if (!m.tracks.length && !m.seekTrack) { m.netWait = null; continue; }
-            if (now < (m.netWait.nextAt || 0)) continue;
-            const chId = m.connection ? m.connection.joinConfig.channelId : m.savedChannelId;
-            if (!m.connection || !chId || humansInChannel (g, chId) <= 0) continue;
-            // на время попытки отодвигаем срок: playNext сам пересчитает его заново
-            m.netWait.nextAt = now + NET_WAIT_MAX_MS;
-            Promise.resolve (playNext (g)).catch (() => {}); // playNext свои ошибки ловит сам
+            const now = Date.now ();
+            for (const g of Object.keys ($music))
+            {
+                const m = $music[g];
+                if (!m || m.leaving || !m.netWait || m.current) continue;
+                if (!m.tracks.length && !m.seekTrack) { m.netWait = null; continue; }
+                // [v2.71] КОМУ СЛУШАТЬ НЕКОМУ И КОГО НЕТ В КАНАЛЕ -- сначала возвращаем
+                // присутствие (бот мог вылететь из голосового вместе со сбоем сети), и
+                // только потом играем. Без этой ветки возврат к людям ждал события в
+                // голосовых, которого могло не быть вовсе (все уже сидят).
+                if (!m.connection && !m.leftByUser && m.savedChannelId)
+                {
+                    // Только КЭШ каналов (никаких запросов к Discord каждые три секунды):
+                    // канал мы либо уже знаем, либо не знаем вовсе.
+                    const guild = client.guilds.cache.get (g);
+                    const ch = guild ? guild.channels.cache.get (m.savedChannelId) : null;
+                    if (guild && ch && typeof ch.isVoiceBased === 'function' && ch.isVoiceBased () &&
+                        humansInChannel (g, ch.id) > 0 && (now - (m.netWait.rejoinAt || 0)) > 15000)
+                    {
+                        m.netWait.rejoinAt = now;
+                        // В лог -- ОДИН раз (не вышло вернуться -- незачем писать это каждые 15 с).
+                        if (!m.netWait.rejoinLogged)
+                        {
+                            m.netWait.rejoinLogged = true;
+                            console.log ('[' + (d()) + '] [music] меня нет в голосовом, а в «' + ch.name +
+                                '» есть слушатели -- возвращаюсь сам');
+                        }
+                        startRestored (g, ch, guild);
+                        continue;
+                    }
+                    if (!m.connection) continue;   // вернулись/некуда -- до игры дело не дошло
+                }
+                const chId = m.connection ? m.connection.joinConfig.channelId : m.savedChannelId;
+                if (!m.connection || !chId || humansInChannel (g, chId) <= 0) continue;
+                // дешёвая проверка маршрута: молчит -- ждём следующего тика (настоящую попытку
+                // не тратим), ожил (только что) -- играем СРАЗУ, иначе ждём свой срок
+                const ready = await netRouteAnswers ();
+                const justCame = ready && !m.netWait.up;
+                m.netWait.up = ready;
+                if (!ready) continue;
+                if (!justCame && now < (m.netWait.nextAt || 0)) continue;
+                if (justCame)
+                    console.log ('[' + (d()) + '] [music] маршрут снова отвечает (прокси/сеть) -- сразу пробую играть');
+                // на время попытки отодвигаем срок: playNext сам пересчитает его заново
+                m.netWait.nextAt = Date.now () + NET_WAIT_MAX_MS;
+                Promise.resolve (playNext (g)).catch (() => {}); // playNext свои ошибки ловит сам
+            }
         }
+        catch (e) { console.error ('[music] watchdog сети: ' + oneLine ((e && e.message) || e)); }
     },
-    NET_WATCH_STEP_MS
+    NET_PING_STEP_MS
 );
 if (musicNetTick.unref) musicNetTick.unref ();
 
@@ -9304,6 +9401,10 @@ async function saveMusicState (guildId)
             qMsg: (QUEUE_LIVE_MS && m.qMsg) ? { ch: m.qMsg.ch, id: m.qMsg.id, page: m.qMsg.page,
                 actorId: m.qMsg.ctx && m.qMsg.ctx.actorId, actorName: m.qMsg.ctx && m.qMsg.ctx.actorName,
                 staff: !!(m.qMsg.ctx && m.qMsg.ctx.staff) } : null,
+            // [v2.71] Какие адреса не умеют «секции» (--download-sections): знание переживает
+            // перезапуск, иначе большой сдвиг после каждого старта начнётся с 8 секунд тишины
+            // (в логе это строка «секция с ... ничего не отдала за 8 с»).
+            noSec: Array.isArray (m.seekNoSections) ? m.seekNoSections.slice (-20) : [],
         });
     }
     catch (e) { console.error ('[music] не смог сохранить очередь: ' + oneLine (e.message)); }
@@ -9684,6 +9785,13 @@ function historyExpandRows (e, off, n)
             .setCustomId ('q:hp:' + (Number (e.at) || 0) + ':' + (first + HISTORY_TITLES_PAGE))
             .setLabel ('Позже ▶').setStyle (ButtonStyle.Secondary).setDisabled (p >= pages - 1));
     }
+    // [v2.71] «▶ Поставить заново» -- ВСЯ пачка обратно в очередь одним нажатием: это
+    // повторный /play того же (помним, что человек вводил -- ссылку, адрес плейлиста или
+    // запрос). Кнопка есть только там, где вводимое помним: у пачек, перенесённых из
+    // очереди старой версии, его нет -- там текст объясняет, почему.
+    if (e && e.q)
+        btns.push (new ButtonBuilder ().setCustomId ('q:hre:' + (Number (e.at) || 0))
+            .setLabel ('▶ Поставить заново').setStyle (ButtonStyle.Primary));
     btns.push (new ButtonBuilder ().setCustomId ('q:hclose').setLabel ('✖ Закрыть').setStyle (ButtonStyle.Secondary));
     return [new ActionRowBuilder ().addComponents (...btns)];
 }
@@ -9698,7 +9806,9 @@ function historyExpandView (e, off)
         ((e.live && e.n > 1) ? ' (' + e.live + ' 🔴 ' + plural (e.live, 'эфир', 'эфира', 'эфиров') + ')' : '');
     if (!titles.length)
         return { text: head + '\n_' + 'Состав не сохранён -- пачка записана до v2.69: тогда в базе'
-            + ' оставались только первые три названия (в /history они видны)._', rows: [] };
+            + ' оставались только первые три названия (в /history они видны).' +
+            (e.q ? ' Зато я помню, что вводили в /play -- кнопка ниже вернёт пачку в очередь.' : '') + '_',
+            rows: e.q ? historyExpandRows (e, 0, 0) : [] };
     const pages = Math.max (1, Math.ceil (titles.length / HISTORY_TITLES_PAGE));
     const p = Math.min (Math.max (0, Math.floor ((Number (off) || 0) / HISTORY_TITLES_PAGE) || 0), pages - 1);
     const first = p * HISTORY_TITLES_PAGE;
@@ -9710,12 +9820,73 @@ function historyExpandView (e, off)
         notes.push ('В базе сохранено ' + titles.length + ' названий из ' + total +
             ' -- пачка из ' + (titles.length <= 3 ? 'старой записи (до v2.69)' : 'более чем ' +
             HISTORY_TITLES_STORE + ' треков'));
-    if (e.q) notes.push ('запуск: `' + clipped (e.q, 60) + '`');
+    if (e.q) notes.push ('запуск: `' + clipped (e.q, 60) + '` -- кнопкой «▶ Поставить заново» эта пачка вернётся в очередь целиком');
+    else notes.push ('поставить заново не смогу: в записи нет того, что вводили в /play (пачка старой версии или перенесённая из очереди)');
     const text = head + (pages > 1 ? ' · стр. ' + (p + 1) + '/' + pages + ' (всего показано ' +
             titles.length + ')' : '') + '\n' + QSEP + '\n' +
         '```\n' + lines.join ('\n') + '\n```' +
         (notes.length ? '\n' + notes.map (s => '_' + s + '_').join ('\n') : '');
     return { text: text, rows: historyExpandRows (e, off, titles.length), titles: titles.length };
+}
+
+// [v2.71] «▶ ПОСТАВИТЬ ЗАНОВО»: вернуть в очередь ЦЕЛУЮ пачку из /history. Это ровно
+// повторный /play: адрес -- разворот плейлиста/трека, запрос -- поиск первого совпадения
+// (иначе вместо любимого плейлиста в очередь попали бы случайные чужие результаты).
+// Автор ставится тот, кто НАЖАЛ (как у /play): именно он сейчас слушает, а бот едет за
+// автором играющего трека, так что чужое авторство увело бы его к человеку, которого в
+// канале нет. В историю это попадает НОВОЙ пачкой -- «один /play = одна пачка».
+async function historyReAdd (guildId, at, userId, byName, inCh)
+{
+    const m = musicOf (guildId);
+    await historyLoad (guildId);
+    const e = historyFind (m.history, at);
+    if (!e)
+        return { ok: false, text: '🕘 Этой пачки в истории уже нет -- она ушла по лимиту. Вызови `/history` заново.' };
+    const q = String (e.q || '').trim ();
+    if (!q)
+        return { ok: false, text: '🕘 В записи этой пачки нет того, что вводили в `/play` '
+            + '(пачка из старой версии или перенесённая из очереди) -- добавь её заново ссылкой в `/play`.' };
+    let tracks;
+    try { tracks = isUrl (q) ? await playlistInfo (q) : [await trackInfo ('ytsearch1:' + q)]; }
+    catch (err)
+    {
+        return { ok: false, text: '❌ Не смог поставить заново (`' + clipped (q, 60) + '`): `' + ytDlpErr (err, 150) + '`' };
+    }
+    if (!tracks.length)
+        return { ok: false, text: '❌ Пустой результат -- похоже, этой пачки больше нет.' };
+    const addedAt = Date.now ();
+    for (const t of tracks)
+    {
+        t.byId = String (userId);
+        t.byName = String (byName || '');
+        t.addAt = addedAt;
+        t.addIn = inCh || null;
+    }
+    // Так же, как /play: пачка встаёт в конец блока этого автора (чужие блоки не рвутся).
+    const insAt = authorBlockInsertAt (m.tracks, userId);
+    m.tracks.splice (insAt, 0, ...tracks);
+    scheduleVoiceStatus (guildId);
+    schedulePresence ();
+    scheduleDeadScan (guildId);
+    if (!m.current) startPreload (guildId);
+    saveMusicState (guildId);
+    historyAdd (guildId,
+    {
+        at: addedAt, byId: userId, byName: byName, inCh: inCh, n: tracks.length,
+        live: tracks.filter (t => t.isLive).length,
+        titles: tracks.map (t => t.title || t.url || ''),
+        q: q, urls: tracks.map (t => t.url || ''), ids: tracks.map (t => ytKey (t.url)),
+    }).catch (err => console.error ('[music] история добавлений: ' + oneLine ((err && err.message) || err)));
+    // Играть нечего (очередь стояла) -- начинаем сразу, права уже проверены вызывающим.
+    if (m.connection && !m.current) playNext (guildId);
+    const live = tracks.filter (t => t.isLive).length;
+    return { ok: true, text: '▶ **Поставил пачку заново -- в очередь:** ' + tracks.length + ' ' +
+        plural (tracks.length, 'трек', 'трека', 'треков') +
+        (live ? ' (' + live + ' 🔴 ' + plural (live, 'эфир', 'эфира', 'эфиров') + ')' : '') +
+        '\n' + QSMALL + 'место в очереди: №' + (insAt + 1) + '-' + (insAt + tracks.length) +
+        ' (в конце твоего блока, как обычный `/play`); всего в очереди: ' + m.tracks.length +
+        '\n' + QSMALL + 'источник: `' + clipped (q, 80) + '`\n' +
+        QSMALL + '_В очередь их поставил ты: бот едет к автору играющего трека, иначе он уехал бы к тому, кого в канале нет._' };
 }
 
 // Найти пачку по метке времени (из value меню или из customId кнопок листания).
@@ -11068,6 +11239,23 @@ function queueCheckText (m)
         (parts.length ? parts.join (', ') + '; ' : 'ещё не проходила; ') + when;
 }
 
+// [v2.70/v2.71] СОСТОЯНИЕ СЕТИ -- ПРЯМО В /queue И /nowplaying. Владелец: «чтобы не
+// бегать в консоль». Показываем ТОЛЬКО когда есть что показывать (прокси молчит и
+// очередь ждёт): сколько попыток сделано, когда следующая и что место держится.
+function netWaitText (m)
+{
+    const w = m && m.netWait;
+    if (!w) return '';
+    const tries = Math.max (1, Number (w.tries) || 0);
+    const left = Math.max (0, Math.ceil (((w.nextAt || 0) - Date.now ()) / 1000));
+    return QSMALL + '🌐 ' + (w.up
+        ? 'Сеть/прокси: маршрут отвечает, музыка ещё не пошла'
+        : 'Сеть/прокси молчит: стучусь каждые ' + Math.round (NET_PING_STEP_MS / 1000) + ' с') +
+        ' -- попыток: ' + tries +
+        (left ? ', следующая настоящая попытка через ' + fmtAgo (left * 1000) : '') +
+        '; очередь и место в треке держатся';
+}
+
 // [v2.44] /nowplaying -- ОДНА КАРТОЧКА «ЧТО ИГРАЕТ ПРЯМО СЕЙЧАС», не открывая /queue
 // целиком: трек, позиция и остаток, кто его поставил и в каком канале, сколько людей
 // слушает, сколько всего в очереди и когда она закончится, что будет дальше. Доступна
@@ -11104,6 +11292,8 @@ function nowPlayingText (m, guildId)
     lines.push (QSMALL + '🎧 ' + (ch ? 'пою в «' + ch.name + '»' : (chId ? 'пою в <#' + chId + '>' : 'в канале не сижу')) +
         ' · слушателей: ' + (chId ? humansInChannel (guildId, chId) : 0) +
         ' · в очереди: ' + m.tracks.length);
+    const net = netWaitText (m);   // [v2.71] почему тишина: прокси/сеть (видно без консоли)
+    if (net) lines.push (net);
     lines.push (queueWaitText (m));
     // Дальше: сперва то, что уже готово (предзагрузка), иначе первый в очереди.
     const next = (m.preload && m.preload.track) || m.tracks[0] || null;
@@ -11133,9 +11323,12 @@ function queueView (m, start, moveSel = 0, opts = {})
     // [v2.32] Блоки разделены линией (QSEP): «Сейчас» / справка / «Очередь».
     // [v2.44] ПОРЯДОК: шапка -> справка (мелким) -> подсказка -> СПИСОК (он теперь
     // последний, вплотную к кнопкам: треки и управление видны на одном экране).
+    // [v2.71] Состояние сети -- первым в справке: когда прокси молчит, это самое важное,
+    // что нужно знать человеку (пустой строки здесь не появляется, если всё в порядке).
+    const net = netWaitText (m);
     const build = hint => queueHeadText (m) +
         '\n' + QSEP + '\n' +
-        [check, authors, queueWaitText (m), move, hint].filter (Boolean).join ('\n') +
+        [net, check, authors, queueWaitText (m), move, hint].filter (Boolean).join ('\n') +
         '\n' + QSEP +
         '\n**Очередь (' + total + ')**' + (page.start > 1 ? ' · с №' + page.start : '') + ':\n' + page.list +
         (restNow () > 0 ? '\n*...и ещё ' + restNow () + ': `/queue from:' + (page.start + page.count) + '`*' : '');
@@ -11350,6 +11543,12 @@ async function resumeMusic (server)
         // после перезапуска оно замирало бы на состоянии до рестарта (а перезапускаем мы
         // часто). Текст в базе не держим -- первая же проверка обновит его сама.
         m.qMsg = queueWatchRestore (saved.qMsg);
+        // [v2.71] ПОМНИМ МЕЖДУ ПЕРЕЗАПУСКАМИ, ЧТО ИСТОЧНИК НЕ УМЕЕТ СЕКЦИИ. Живой лог:
+        // каждый рестарт начинался с «секция с 35:12 ничего не отдала за 8 с -- беру тот же
+        // трек через ffmpeg», то есть 8 секунд тишины на ровном месте -- знание было только
+        // в памяти и умирало вместе с процессом. Теперь оно в базе, и после перезапуска
+        // большой сдвиг идёт сразу правильным путём (владелец: «уменьшить задержку»).
+        m.seekNoSections = Array.isArray (saved.noSec) ? saved.noSec.filter (s => typeof s === 'string').slice (-20) : [];
         // [v2.12.2] ждущий трек возвращается НА СВОЁ место из очереди (curIdx), а не
         // всегда в начало: если DJ переставил его через /move, порядок сохраняется
         const at = Math.min (Math.max (0, Math.round (saved.curIdx || 0)), tracks.length);
@@ -12913,7 +13112,7 @@ client.on ('interactionCreate', async (interaction) =>
         // не было, и нажатие молча уходило в return: Discord показывал «взаимодействие
         // не удалось», а перенос кнопками не работал (при этом /move работал -- это и
         // сбивало с толку). Теперь все три пути перестановки разрешены одинаково.
-        if (!/^q:(skip|join|leave|clear|stop|da|dau|dax|dx|cq|rm|mv|mt|mb|mp|mu|md|mx|s|sk|tr|rx|jmp|jsel|jpage|jclose)(:|$)/.test (cid)) return;
+        if (!/^q:(skip|join|leave|clear|stop|da|dau|dax|dx|cq|rm|mv|mt|mb|mp|mu|md|mx|s|sk|tr|rx|jmp|jsel|jpage|jclose|hre)(:|$)/.test (cid)) return;
         if (!isDJ (interaction))
         {
             const role_dj = SERVERS[guildId].role_dj || '';
@@ -12926,6 +13125,22 @@ client.on ('interactionCreate', async (interaction) =>
             );
         }
         const who = interaction.member ? uuu (interaction.member) : interaction.user.username;
+        // [v2.71] «▶ Поставить заново» из состава пачки (/history): повторяем то, что
+        // человек вводил в /play, одной кнопкой. Гейт «только DJ» уже пройден выше,
+        // поэтому отказ в правах человек увидит той же строкой, что и у /play.
+        const mHre = /^q:hre:(\d+)$/.exec (cid);
+        if (mHre)
+        {
+            // Сперва отвечаем на нажатие (иначе Discord покажет «взаимодействие не удалось»
+            // через 3 секунды), а потом показываем результат -- поиск пачки ходит в YouTube.
+            await interaction.update ({ content: '⏳ Ставлю пачку заново (спрашиваю YouTube)...', components: [] });
+            const res = await historyReAdd (guildId, mHre[1], interaction.user.id,
+                interaction.user.username, interaction.channelId);
+            console.log ('[' + (d()) + '] [music] (кто: ' + who + ') поставил пачку из /history заново: ' +
+                (res.ok ? 'ок' : 'не вышло'));
+            queueMsgRedraw (guildId, 300).catch (() => {});   // /queue в канале -- сразу с новой очередью
+            return interaction.editReply ({ content: (res.ok ? '' : '⚠️ ') + res.text });
+        }
         // [v2.62] «⤴ Другой трек» (до v2.68 -- «⤴ Перепрыгнуть») -- [v2.66] не окно с
         // номером, а СПИСОК ТРЕКОВ:
         // выбрал -- спрашиваем вариант (срочный переход / обрезка) теми же кнопками,
