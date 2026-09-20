@@ -6672,6 +6672,14 @@ function configSanityIssues ()
 // ID_СЕРВЕРА из примера. Молчим, когда всё на месте: нет расхождения -- нет строки.
 // Предупреждаем только о СТРОКАХ файла: подсказка это (_comment) или значение,
 // которое бот применит и без ключа, -- решает владелец, это не ошибка.
+// [v2.79] ЧИСТЫЙ КОНФИГ -- И ЧТО ОБ ЭТОМ ГОВОРИТ [config]. До этого функция называла КАЖДЫЙ
+// ключ примера, которого нет в боевом файле, и это было полезно, пока боевой конфиг
+// повторял пример целиком (так и нашёлся backup_keep). Но у владельца задача обратная:
+// держать в config.json ТОЛЬКО обязательное и то, что ОТЛИЧАЕТСЯ от значений по умолчанию,
+// а остальное брать из кода. При таком файле прежний отчёт выдал бы простыню «нет 180
+// строк» -- то есть сказал бы «всё сломано» про нормально настроенного бота. Поэтому
+// теперь так: одна строка О СОСТОЯНИИ (сколько ключей реально в файле), а списком -- только
+// ключи, которых в примере НЕТ вовсе (опечатка или ключ старой версии: их бот не читает).
 function configDriftIssues ()
 {
     const _fs = require ('fs'), _path = require ('path');
@@ -6680,26 +6688,32 @@ function configDriftIssues ()
     let _ex = null;
     try { _ex = JSON.parse (_fs.readFileSync (_exFile, 'utf8')); } catch (e) { return []; }
     const _cfg = require ('./config.json');
-    const _miss = (a, b) => Object.keys (b || {}).filter (_k => !(_k in (a || {})));
+    const _srvEx = (_ex.SERVERS || {})['ID_СЕРВЕРА'] || {};
+    // Ключ-настройка (не подсказка) -- только такие имеет смысл считать.
+    const _isKey = _k => !/_comment$/.test (_k) && !/^_/.test (_k);
+    const _count = _o => Object.keys (_o || {}).filter (_isKey).length;
+    const _extra = (a, b) => Object.keys (a || {}).filter (_k => _isKey (_k) && !(_k in (b || {})));
     const out = [];
-    const _say = (where, keys) =>
+    const _strangers = [];
+    for (const _k of _extra (_cfg, _ex)) _strangers.push ('верхний уровень: ' + _k);
+    for (const _k of _extra (_cfg.MUSIC, _ex.MUSIC)) _strangers.push ('MUSIC: ' + _k);
+    const _srvBits = [];
+    for (const _id of Object.keys (_cfg.SERVERS || {}))
     {
-        if (!keys.length) return;
-        out.push ('в config.json нет ' + keys.length + (keys.length === 1 ? ' строки' : ' строк') +
-            ' из config.example.json -- ' + where + ': ' + keys.slice (0, 8).join (', ') +
-            (keys.length > 8 ? ', ...и ещё ' + (keys.length - 8) : ''));
-    };
-    _say ('верхний уровень', _miss (_cfg, _ex));
-    _say ('MUSIC', _miss (_cfg.MUSIC, _ex.MUSIC));
-    const _srvEx = (_ex.SERVERS || {})['ID_СЕРВЕРА'];
-    if (_srvEx)
-        for (const _id of Object.keys (SERVERS))
-            if (/^\d{17,20}$/.test (_id) && SERVERS[_id].allow !== false)
-                _say ('сервер ' + _id + (SERVERS[_id].name ? ' («' + SERVERS[_id].name + '»)' : ''),
-                    _miss (SERVERS[_id], _srvEx));
-    if (out.length)
-        out.push ('это строки-подсказки (_comment) и ключи со значениями по умолчанию: без них бот работает, ' +
-            'но значения берёт из кода, а не из примера -- перенести их проще всего копией из config.example.json');
+        if (!/^\d{17,20}$/.test (_id)) continue;   // заготовка/подсказка -- не сервер
+        for (const _k of _extra ((_cfg.SERVERS || {})[_id], _srvEx)) _strangers.push (_id + '.' + _k);
+        _srvBits.push (_count ((_cfg.SERVERS || {})[_id]));
+    }
+    if (_strangers.length)
+        out.push ('ключей, которых нет в config.example.json: ' + _strangers.length + ' -- ' +
+            _strangers.slice (0, 8).join (', ') + (_strangers.length > 8 ? ', ...и ещё ' + (_strangers.length - 8) : '') +
+            ' -- бот их не читает: это опечатка или ключ старой версии');
+    // Блоки (MUSIC, SERVERS) в верхний счёт не входят -- они названы отдельно.
+    const _isBlock = _v => _v && typeof _v === 'object' && !Array.isArray (_v);
+    const _topKeys = Object.keys (_cfg).filter (_k => _isKey (_k) && !_isBlock (_cfg[_k])).length;
+    out.push ('config.json -- чистый: ключей верхнего уровня ' + _topKeys + ', в MUSIC ' + _count (_cfg.MUSIC) +
+        (_srvBits.length ? ', у серверов ' + _srvBits.join (' и ') : '') +
+        '; остальное бот берёт из значений по умолчанию, а полный список ключей с пояснениями лежит в config.example.json');
     return out;
 }
 
@@ -7344,6 +7358,42 @@ async function ytRoutes ()
     return [...alive.map (p => ({ proxy: p })), { proxy: '' }, ...rest.map (p => ({ proxy: p }))];
 }
 
+// [v2.79] ПРОКСИ ДЛЯ ФФМПЕГ-СЕКЦИЙ (`--download-sections`) -- измерено на живом 156-мин сете.
+// Секцию скачивает ВНЕШНИЙ ffmpeg (yt-dlp зовёт его как FFmpegFD), и прокси ему НЕ передаёт:
+// в verbose-логе yt-dlp нет ни `-http_proxy`, ни прокси в строке запуска ffmpeg -- ffmpeg идёт
+// НАПРЯМУЮ, а сам yt-dlp честно предупреждает: «ffmpeg does not support SOCKS proxies».
+// Прямой путь к googlevideo у нас то есть, то нет; через HTTP-инбаунд (10809) -- есть всегда:
+//  * `ffmpeg -http_proxy http://127.0.0.1:10809 -i https://www.youtube.com/robots.txt` --
+//    скачал (а без прокси и с SOCKS -- `I/O error`: ffmpeg понимает ТОЛЬКО http-прокси);
+//  * на самом сете `--downloader-args ffmpeg_i:"-http_proxy http://127.0.0.1:10809"` отдал
+//    356 КБ секции с 33:20 -- а время до первого байта 7.6 с (то есть сдвиг реально быстрый).
+// Поэтому секции отдаём HTTP-адрес прокси, если он есть (свой маршрут, если он уже HTTP, -
+// иначе первый живой HTTP из конфига). Только SOCKS -- увы, ffmpeg его не понимает, и тут
+// секция всё равно идёт напрямую (и, скорее всего, не сработает).
+// Оговорка: адрес видео подписан под выходной IP того маршрута, которым шёл разбор ссылки.
+// У нас оба инбаунда выходят одним IP (в живых ссылках обоих запусков был один `ip=`), а
+// если когда-нибудь разойдутся -- секция просто не отдаст данные, и сработает прежний
+// резервный путь (ffseek).
+function sectionProxyFor (viaProxy)
+{
+    const self = /^https?:\/\//i.test (String (viaProxy || '')) ? viaProxy : '';
+    if (self && !proxyBrieflyBad (self)) return self;   // свой живой HTTP -- самый точный
+    for (const p of MUSIC_PROXIES)
+        if (/^https?:\/\//i.test (p) && p !== self && !proxyBrieflyBad (p)) return p;
+    // Свой HTTP «икнул», а других нет -- всё равно отдаём его: идти напрямую ещё хуже
+    // (ffmpeg SOCKS не понимает), а не сработает -- сработает резервный путь.
+    return self;
+}
+
+// Почему секция шла без прокси (только для строки ЛОГА при неудаче -- врать в логе нельзя).
+function sectionProxyWhy (sectionProxy)
+{
+    if (sectionProxy) return ' (секция шла через ' + sectionProxy + ')';
+    return MUSIC_PROXIES.some (p => /^https?:\/\//i.test (p))
+        ? ' (HTTP-прокси икнул -- секция шла напрямую)'
+        : ' (в конфиге только SOCKS, а ffmpeg его не понимает -- секция шла напрямую)';
+}
+
 // Строка при старте: честно видно, ЕСТЬ ли запасной путь DIRECT (владелец: «у меня
 // отвалилось прокси -- DIRECT видимо не знает ip ютуба»). Если DIRECT невозможен, это
 // надо знать сразу, а не выяснять чтением ошибки yt-dlp.
@@ -7484,13 +7534,28 @@ function streamFirstData (source, proc, ms)
 //   * сдвиг до 2 минут делается НАШИМ ffmpeg-ом (-ss) за считанные секунды: поток с
 //     начала отдаёт первые байты через ~5 с, звук после -ss -- через ~5-6 с (при
 //     сдвиге 110 с -- ~10 с);
-//   * `--download-sections` (быстрый путь) на этих источниках не работает: 45 секунд
-//     ожидания, НОЛЬ байт и `ERROR: ffmpeg exited with code 4294967274`.
+//   * `--download-sections` (быстрый путь) работает НЕ ВСЕГДА, и причина не в источнике
+//     (это выяснено позже, v2.79): секцию скачивает ВНЕШНИЙ ffmpeg, прокси ему не
+//     передаётся, а сам ffmpeg SOCKS не понимает -- через SOCKS-маршрут секция всегда
+//     идёт НАПРЯМУЮ и живёт, только пока googlevideo доступен напрямую. Отсюда и старые
+//     «45 секунд ожидания, НОЛЬ байт и ERROR: ffmpeg exited with code 4294967274», и
+//     вторая причина -- бюджет ожидания 8 с при измеренных 7.6 с. Теперь HTTP-адрес
+//     прокси отдаётся секции явно (sectionProxyFor), а бюджет зависит от маршрута.
 // Поэтому маленький сдвиг идём сразу через ffmpeg (надёжно), а sections пробуем только
 // на больших сдвигах (там он окупается, если источник умеет) и ТОЛЬКО с проверкой,
 // что поток реально отдал данные; не отдал -- сразу к обычному пути.
 const SEEK_FFSEEK_MAX = 120;   // сдвиги до 2 минут -- сразу своим ffmpeg
 const SEEK_SECTIONS_WAIT_MS = 8000; // сколько ждать первый байт от --download-sections
+// [v2.79] А ЕСЛИ СЕКЦИЯ ИДЁТ ЧЕРЕЗ HTTP-ПРОКСИ -- ждём дольше, и вот почему: измерено на
+// живом 156-минутном сете -- первый байт приезжает через 7.6 с (разбор ссылки + сама секция
+// в одном флаконе). Прежние 8 с были ВПРИТЫК, и рабочий сдвиг выбрасывался как «ничего не
+// отдала» из-за каких-то секунд. Пациентность нужна только там, где у секции ЕСТЬ рабочий
+// маршрут (см. sectionProxyFor): без него ждать нечего (ffmpeg всё равно идёт напрямую).
+const SEEK_SECTIONS_WAIT_PROXY_MS = 20000;
+function seekSectionWait (opened)
+{
+    return (opened && opened.sectionProxy) ? SEEK_SECTIONS_WAIT_PROXY_MS : SEEK_SECTIONS_WAIT_MS;
+}
 
 // [v2.2.2] Сетевая ли это ошибка (прокси/сеть), а не реальный ответ YouTube:
 function isNetworkError (e)
@@ -8450,6 +8515,9 @@ async function createTrackStream (track, seekSec = 0, seekMode = 'sections')
     // и playNext пробует резервный путь (ffseek), а потом берёт трек с начала.
     // [v2.12] продолжать с места -- всегда, когда есть с чего (даже с секунды)
     const seek = (seekMode === 'sections' && seekSec >= 1 && !track.isLive);
+    // [v2.79] Кому достанется секция: yt-dlp передаёт прокси ВНУТРЕННЕМУ загрузчику (yt-dlp сам
+    // SOCKS умеет), а внешнему ffmpeg -- нет, поэтому отдаём ему HTTP-адрес явно.
+    const seekProxy = seek ? sectionProxyFor (viaProxy) : '';
     // [v2.25] резервный путь: сдвиг делает НАШ ffmpeg (см. ниже)
     const seekInFfmpeg = (seekMode === 'ffseek' && seekSec >= 1 && !track.isLive);
     const ytdlpStream = ytdlp.exec
@@ -8468,6 +8536,9 @@ async function createTrackStream (track, seekSec = 0, seekMode = 'sections')
             bufferSize: '4M',
             retries: 3,
             ...(seek ? { ffmpegLocation: ffmpegPath, downloadSections: '*' + Math.max (0, Math.floor (seekSec) - 1) + '-inf' } : {}),
+            // [v2.79] ...и прокси именно для ffmpeg (см. sectionProxyFor): без этой строки
+            // внешний загрузчик идёт напрямую, и секция то работает, то нет.
+            ...(seekProxy ? { downloaderArgs: 'ffmpeg_i:-http_proxy ' + seekProxy } : {}),
         }
     );
     // [FIX v2.2.1] yt-dlp может упасть (видео недоступно, сеть, прокси) -- его промис раньше
@@ -8568,6 +8639,7 @@ async function createTrackStream (track, seekSec = 0, seekMode = 'sections')
     // [v2.25] seeked -- сработал ли ЗАПРОШЕННЫЙ сдвиг (playNext по этому решает,
     // пробовать резервный путь или брать трек с начала):
     return { resource, viaProxy, source: ytdlpStream.stdout, proc: ytdlpStream, ff: ff, tee: tee,
+             sectionProxy: seekProxy,   // [v2.79] чем шла секция (для честной строки в логе)
              seeked: (seekMode === 'sections' && seek) || (seekMode === 'ffseek' && !!ff) };
 }
 
@@ -8922,8 +8994,12 @@ async function playNext (guildId)
             // «а отдал ли поток байты» здесь не нужно (иначе готовый файл выбрасывался бы зря)
             if (_trySections && !opened.fromCache)
             {
+                // [v2.79] Ждём с учётом маршрута секции: через HTTP-прокси нужно больше
+                // (живой сет отдаёт первый байт за 7.6 с), а когда прокси для ffmpeg нет --
+                // ждать нечего (см. seekSectionWait / sectionProxyFor).
+                const _waitMs = seekSectionWait (opened);
                 const _ok = opened.seeked && !(await failedFast (opened.proc)) &&
-                    await streamFirstData (opened.source, opened.proc, SEEK_SECTIONS_WAIT_MS);
+                    await streamFirstData (opened.source, opened.proc, _waitMs);
                 if (!_ok)
                 {
                     // помним до конца работы бота: этот адрес sections не умеет --
@@ -8934,7 +9010,8 @@ async function playNext (guildId)
                 {
                     killStream (opened);
                     console.error ('[' + (d()) + '] [music] секция с ' + fmtDur (seekSec) +
-                        ' ничего не отдала за ' + Math.round (SEEK_SECTIONS_WAIT_MS / 1000) + ' с -- беру тот же трек через ffmpeg');
+                        ' ничего не отдала за ' + Math.round (_waitMs / 1000) + ' с' +
+                        sectionProxyWhy (opened.sectionProxy) + ' -- беру тот же трек через ffmpeg');
                     opened = await createTrackStream (track, seekSec, 'ffseek');
                 }
             }
