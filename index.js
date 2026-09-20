@@ -645,6 +645,44 @@
 //   * [БОНУС] ban-таймауты теперь рестарт-безопасны: при старте и в каждом тике
 //     просроченные membersBanTimeout из SQLite снимаются (sweepExpiredBans).
 
+// [v2.57] КОНФИГ ЧИТАЕТСЯ ПЕРВЫМ ДЕЛОМ, и раньше поломка в нём (лишняя запятая,
+// потерянная кавычка, файла нет) валила процесс ДО всех наших обработчиков: в консоли
+// была голая стрелка Node, а рядом с логом -- ничего. Теперь и такой сбой даёт отчёт
+// (минимальный: он ещё не знает ни log_dir, ни серверов, ни db_key -- пишем в logs/).
+function earlyConfigCrash (e)
+{
+    try
+    {
+        const _fs = require ('fs');
+        const _dir = __dirname + '/logs';
+        const _now = new Date ();
+        const _two = n => String (n).padStart (2, '0');
+        _fs.mkdirSync (_dir, {recursive: true});
+        const _p = _dir + '/crash-' + _now.getFullYear () + '-' + _two (_now.getMonth () + 1) + '-' + _two (_now.getDate ()) +
+            '_' + _two (_now.getHours ()) + '-' + _two (_now.getMinutes ()) + '-' + _two (_now.getSeconds ()) + '.txt';
+        _fs.writeFileSync (_p, [
+            'ОТЧЁТ О СБОЕ -- 🐼 PANDAMIA Bot',
+            'когда: ' + _now.toLocaleString ('ru-RU'),
+            'что: бот не смог прочитать config.json (упал на старте)',
+            'причина: ' + String ((e && e.message) || e),
+            '',
+            'СТЕК:',
+            (e && e.stack) ? String (e.stack) : '(стека нет)',
+            '',
+            'ЧТО ДЕЛАТЬ: проверь config.json -- почти всегда это лишняя/потерянная запятая или кавычка.',
+            'Сверить можно с config.example.json (там всё то же, но с комментариями), а значения -- не трогать:',
+            'в файле лежат token и db_key, без которых бота не запустить. Живого лога тут нет -- этот сбой',
+            'случается раньше первой строки.',
+        ].join ('\n') + '\n');
+        process.stderr.write ('[crash] бот не смог прочитать config.json -- отчёт: ' + _p + '\n');
+    }
+    catch (e2) {}   // файл отчёта -- не повод усложнять: главное показать причину
+    process.exit (2);
+}
+let CONFIG_RAW = null;
+try { CONFIG_RAW = require ('./config.json'); }
+catch (e) { earlyConfigCrash (e); }
+
 const
 {
     ID, TOKEN, PREFIX, SERVERS,
@@ -690,7 +728,7 @@ const
     // Папка logs/ и любые *.log уже в .gitignore: в репозиторий это не попадает.
     log_dir, log_keep_months,
 }
-= require ('./config.json');
+= CONFIG_RAW;
 const space = ' ';
 
 // ============================================================================
@@ -779,6 +817,116 @@ if (BOT_RUN)
     console.log = _mirror (console.log.bind (console));
     console.error = _mirror (console.error.bind (console));
 }
+
+// ============================================================================
+// [v2.57] ОТЧЁТ О СБОЕ -- рядом с логом (logs/crash-ГГГГ-ММ-ДД_ЧЧ-ММ-СС.txt).
+// Зачем: в консоли после падения видно только хвост, а окно уже прокручено -- и по
+// логу не понять, С ЧЕГО всё началось. Теперь при сбое рядом с логом ложится один
+// короткий файл: что случилось, стек, состояние музыки и последние строки лога.
+//   * пишем при uncaughtException и при unhandledRejection (с оговоркой, что бот
+//     продолжил работу: это страховки уровня процесса, а не обязательно падение);
+//   * пишем и при АВАРИЙНОМ выходе (код не 0): `process.on('exit')` -- единственное
+//     место, где ещё можно что-то записать (например, если бот упал на старте из-за
+//     config.json или не смог войти в Discord);
+//   * один инцидент -- один файл: повторные отказы в течение минуты не создают гору
+//     файлов, а сам факт падения с кодом 0 (Ctrl+C) отчёта не создаёт -- это выход,
+//     а не сбой;
+//   * сервисные команды (node . dump/backup/...) отчётов не пишут вовсе -- любой
+//     аргумент значит, что запущена команда, а не бот (см. BOT_RUN выше).
+// ============================================================================
+const CRASH_TAIL_LINES = 40;   // сколько последних строк лога кладём в отчёт
+let $crashAt = 0, $crashCount = 0, $crashWritten = false;
+
+function logTailLines (n)
+{
+    try
+    {
+        const p = logFilePath () || (LOG_DIR + '/panda-' + logMonthKey (new Date ()) + '.log');
+        const arr = fsLog.readFileSync (p, 'utf8').split ('\n').filter (l => l !== '');
+        return arr.slice (Math.max (0, arr.length - n));
+    }
+    catch (e) { return []; }
+}
+
+function crashMusicSummary ()
+{
+    const out = [];
+    try
+    {
+        for (const g of Object.keys ($music))
+        {
+            const m = $music[g];
+            if (!m) continue;
+            const where = SERVERS[g] ? SERVERS[g].name : g;
+            out.push ('  ' + where + ': ' + (m.current ? 'играет «' + (m.current.title || '?') + '»' : 'ничего не играет') +
+                ', в очереди ' + ((m.tracks && m.tracks.length) || 0) +
+                (m.connection ? ', в канале ' + (m.connection.joinConfig.channelId || '?') : ', не в канале'));
+        }
+    }
+    catch (e) { out.push ('  (состояние музыки ещё не успело появиться)'); }
+    return out.length ? out : ['  (бот ещё не успел ничего заиграть)'];
+}
+
+// Единственная точка записи -- её же зовут и обработчики сбоя, и выход с кодом != 0.
+function crashReport (kind, e, note)
+{
+    if (!BOT_RUN || $crashWritten) return '';
+    const now = new Date ();
+    const two = n => String (n).padStart (2, '0');
+    const path = LOG_DIR + '/crash-' + now.getFullYear () + '-' + two (now.getMonth () + 1) + '-' + two (now.getDate ()) +
+        '_' + two (now.getHours ()) + '-' + two (now.getMinutes ()) + '-' + two (now.getSeconds ()) + '.txt';
+    const reason = e ? String ((e && e.message) || e) : '(без исключения -- выход с ненулевым кодом)';
+    const stack = (e && e.stack) ? String (e.stack) : '(стека нет)';
+    const tail = logTailLines (CRASH_TAIL_LINES);
+    const lines = [];
+    lines.push ('ОТЧЁТ О СБОЕ -- 🐼 PANDAMIA Bot');
+    lines.push ('когда: ' + now.toLocaleString ('ru-RU'));
+    lines.push ('что: ' + kind);
+    lines.push ('причина: ' + reason);
+    if (note) lines.push ('примечание: ' + note);
+    lines.push ('повторов сбоя в этой сессии: ' + $crashCount);
+    lines.push ('');
+    lines.push ('СОСТОЯНИЕ: узел ' + process.version + ', поднят ' + Math.round (process.uptime ()) + ' сек назад, папка ' + __dirname);
+    lines.push ('музыка:');
+    for (const l of crashMusicSummary ()) lines.push (l);
+    lines.push ('');
+    lines.push ('СТЕК:');
+    lines.push (stack);
+    lines.push ('');
+    lines.push ('ПОСЛЕДНИЕ СТРОКИ ЛОГА (' + tail.length + '; полный лог -- ' + (logFilePath () || 'logs/') + '):');
+    if (tail.length) for (const l of tail) lines.push (l);
+    else lines.push ('  (лог ещё пуст -- сбой случился раньше первой строки)');
+    lines.push ('');
+    lines.push ('Что дальше: этого файла достаточно, чтобы понять, с чего всё началось; сам бот можно');
+    lines.push ('запустить снова командой `node .` -- очередь и позиция в треке не теряются.');
+    try { fsLog.mkdirSync (LOG_DIR, {recursive: true}); } catch (e2) {}
+    try { fsLog.writeFileSync (path, lines.join ('\n') + '\n'); }
+    catch (e2) { return ''; }
+    $crashWritten = true;
+    return path;
+}
+
+// Обработчики сбоя: и в консоль с логом, и в файл-отчёт. Повторные отказы в течение
+// минуты просто считаются -- иначе буря из отклонённых промисов засыпала бы папку.
+function crashIncident (kind, e, note)
+{
+    $crashCount++;
+    const now = Date.now ();
+    if (now - $crashAt < 60000) return '';
+    $crashAt = now;
+    $crashWritten = false;
+    return crashReport (kind, e, note);
+}
+
+// Аварийный выход (код != 0): последняя возможность записать отчёт. Обычный Ctrl+C
+// выходит нулём и отчёта НЕ создаёт -- это штатный выход, а не сбой.
+process.on ('exit', code =>
+{
+    if (!code || !BOT_RUN) return;
+    const p = crashReport ('аварийный выход (код ' + code + ')', null,
+        'бот завершился не сам -- например, упал на старте или его закрыли');
+    if (p) { try { process.stderr.write ('[' + d () + '] [crash] отчёт о сбое: ' + p + '\n'); } catch (e2) {} }
+});
 
 // ============================================================================
 // [v2.20] ШИФРОВАНИЕ СОХРАНЁННЫХ ДАННЫХ (AES-256-GCM)
@@ -1207,6 +1355,8 @@ function filesCli ()
             'можно ВСЁ -- бот скачает заново (отчёт и очистка: `node . cache`)'];
         if (/^intents-.*\.md$/i.test (_name)) return ['заявка/шпаргалка по интентам (данные реального сервера -- в git не попадает)', 'можно (но заявка ещё может пригодиться)'];
         if (/\.log$/i.test (_name)) return ['старый лог', 'можно'];
+        if (/^crash-.*\.txt$/i.test (_name)) return ['отчёт о сбое (бот сам кладёт его рядом с логом при падении: причина, стек, последние строки лога)',
+            'можно, когда разберёшься со сбоем'];
         if (/^node-v?\d/i.test (_name)) return ['портативный Node: именно на нём запускается бот', 'НЕТ -- бот не запустится'];
         if (_name === '.freebuff') return ['служебная папка инструмента разработки (Freebuff) -- к боту не относится', 'можно, если инструментом не пользуешься'];
         return ['не знаю такой файл -- скорее всего твой личный', 'решай сам'];
@@ -1245,8 +1395,8 @@ function filesCli ()
         const _info = _e.name === 'node_modules' ? ['скачанные зависимости npm', 'МОЖНО -- npm i вернёт, и в git они не попадают']
             : _e.name === 'images' ? ['старые картинки из истории бота (код их не использует)', 'можно (оставлены как память)']
             : _e.name === '.git' ? ['история git (коммиты): отсюда можно откатиться', 'НЕТ']
-            : _e.name === 'logs' ? ['ЖИВОЙ ЛОГ бота в файлах panda-ГГГГ-ММ.log (файл на месяц, в git не попадает)',
-                'можно -- файл создастся заново; старые месяцы уходят по log_keep_months']
+            : _e.name === 'logs' ? ['ЖИВОЙ ЛОГ бота (panda-ГГГГ-ММ.log -- файл на месяц; рядом crash-*.txt -- отчёты о сбоях, если они были)',
+                'можно -- файлы создадутся заново; старые месяцы уходят по log_keep_months']
             : (_e.isDirectory () ? _what (_e.name) : _what (_e.name));
         _lines.push ('  ' + _e.name.padEnd (34).slice (0, 34) + ' ' + _sizeTxt.padStart (14) + '  ' +
             _d (_st.mtimeMs).padEnd (21) + '  ' + _info[0] + '\n    удалять: ' + _info[1]);
@@ -1671,7 +1821,7 @@ const STARTUP_DM_TEXT =
     '🎧 **Слушать музыку**\n' +
     'Заходи в голосовой канал, где сидит бот, -- и слушай. Включает и добавляет музыку тот, у кого есть роль **DJ** (её выдают администраторы и модеры).\n' +
     '`/play` ссылка или запрос -- поставить трек, плейлист или прямой эфир\n' +
-    '`/queue` -- что играет сейчас и что дальше: кто что поставил и сколько ещё ждать\n' +
+    '`/queue` -- что играет сейчас и что дальше: кто что поставил и сколько ещё ждать (сообщение обновляется само, пока музыка играет)\n' +
     '`/nowplaying` -- коротко про текущий трек: позиция, кто поставил, что дальше\n' +
     '`/history` -- кто и когда ставил музыку: последние добавления (треки, эфиры, плейлисты)\n' +
     'Если в канале никого, музыка встаёт на паузу и продолжается, когда кто-то зашёл: бот помнит и трек, и место в нём -- перезапуск и обрыв связи их не сбрасывают.\n' +
@@ -2646,8 +2796,20 @@ async function db (server, namespace, id, value = undefined, item = undefined)
 
 // [FIX v2.2.1] страховка на уровне процесса: непойманное исключение/промис больше НЕ убивает бота
 // (битые видео, сеть, прокси -- всё уходит в лог, бот продолжает работать):
-process.on ('unhandledRejection', e => console.error ('[' + (d()) + '] [unhandledRejection] ' + String ((e && e.message) || e).slice (0, 300)));
-process.on ('uncaughtException',  e => console.error ('[' + (d()) + '] [uncaughtException] '  + String ((e && e.message) || e).slice (0, 300)));
+process.on ('unhandledRejection', e =>
+{
+    console.error ('[' + (d()) + '] [unhandledRejection] ' + String ((e && e.message) || e).slice (0, 300));
+    // [v2.57] ...и короткий отчёт рядом с логом: в консоли к моменту разбора уже
+    // прокручен хвост, а начало сбоя не видно (см. crashReport выше).
+    const p = crashIncident ('unhandledRejection', e, 'бот продолжает работу -- это необработанный промис, а не падение');
+    if (p) console.error ('[' + (d()) + '] [crash] отчёт о сбое: ' + p);
+});
+process.on ('uncaughtException',  e =>
+{
+    console.error ('[' + (d()) + '] [uncaughtException] '  + String ((e && e.message) || e).slice (0, 300));
+    const p = crashIncident ('uncaughtException', e, 'бот продолжает работу -- сработала страховка уровня процесса');
+    if (p) console.error ('[' + (d()) + '] [crash] отчёт о сбое: ' + p);
+});
 
 // [v2.5] Discord отдаёт текст сообщений только с интентом Message Content. Если он
 // отзовёт доступ (заявка не одобрена до 09.10.2026) -- бот всё равно ЗАПУСТИТСЯ,
@@ -6176,6 +6338,15 @@ function configSanityIssues ()
     else if (Number (MUSIC_CFG.history_tracks) > 5000)
         out.push ('MUSIC.history_tracks: ' + MUSIC_CFG.history_tracks + ' -- держу 5000 ' +
             '(это запись в базе и текст сообщения, а не архив)');
+    // [v2.57] Самообновление /queue: мусор в ключе выключил бы его молча (0), а слишком
+    // частое -- упирало бы в лимиты Discord на правки сообщений (5 за 5 секунд на канал).
+    if (MUSIC_CFG.queue_live_ms !== undefined &&
+        !(Number.isFinite (Number (MUSIC_CFG.queue_live_ms)) && String (MUSIC_CFG.queue_live_ms).trim () !== ''))
+        out.push ('MUSIC.queue_live_ms = "' + MUSIC_CFG.queue_live_ms + '": ожидается число миллисекунд -- ' +
+            'иначе выходит 0 и /queue перестанет обновляться сам (ставь 60000 или не пиши ключ вовсе)');
+    else if (Number (MUSIC_CFG.queue_live_ms) > 0 && Number (MUSIC_CFG.queue_live_ms) < 10000)
+        out.push ('MUSIC.queue_live_ms: ' + MUSIC_CFG.queue_live_ms + ' -- поднимаю до 10000 (правки сообщений ' +
+            'в Discord ограничены примерно 5 за 5 секунд на канал; минута -- безопасный шаг)');
     // [v2.55] Живой лог в файл: мусор в ключе не должен молча менять поведение --
     // строка "шесть" превратилась бы в 0 (не удалять ничего) или "no" в NaN.
     if (log_keep_months !== undefined &&
@@ -6711,6 +6882,17 @@ const MUSIC_HISTORY_LEN = Math.max (0, Math.min (200,
 // Верхняя граница -- 5000: это уже сотни килобайт в базе и текст на сотни строк.
 const MUSIC_HISTORY_TRACKS = Math.max (0, Math.min (5000,
     Math.round (Number (MUSIC_CFG.history_tracks === undefined ? 500 : MUSIC_CFG.history_tracks) || 0)));
+// [v2.57] ЖИВОЕ СООБЩЕНИЕ /queue: как часто бот сам перерисовывает его, пока висит
+// (ключ MUSIC.queue_live_ms; по умолчанию 60000 = минута, 0 -- не обновлять само).
+// Discord меняет сообщение ТОЛЬКО по нашему запросу, поэтому без этого текст застывал
+// на моменте вызова и оживал лишь при листании или «🔄 Обновить». Ниже 10 секунд не
+// опускаю даже по конфигу -- про лимиты Discord см. комментарий у queueLiveTick.
+const QUEUE_LIVE_MS = (function ()
+{
+    const raw = Number (MUSIC_CFG.queue_live_ms === undefined ? 60000 : MUSIC_CFG.queue_live_ms) || 0;
+    if (!raw) return 0;
+    return Math.max (10000, Math.round (raw));
+})();
 if (MUSIC_QUEUE_CHECK && QUEUE_CHECK_DEPTH)
     console.log ('[' + (d()) + '] [music] проверка очереди заранее: ВКЛЮЧЕНА -- до ' + QUEUE_CHECK_DEPTH +
         ' треков за проход, пауза ' + Math.round (QUEUE_CHECK_GAP_MS / 1000) + ' с (первые ' + QUEUE_CHECK_STRICT +
@@ -8766,6 +8948,13 @@ async function saveMusicState (guildId)
             elapsed: elapsed,
             tracks: rest.map (trackToJson),
             left: !!m.leftByUser, // вышел по /leave -- сами не возвращаемся, ждём /join
+            // [v2.57] Какое сообщение /queue ведёт самообновление (чтобы оно пережило
+            // перезапуск). ТЕКСТА тут нет сознательно: он длинный, а сохраняем мы часто
+            // (каждая смена трека и позиции) -- незачем гонять его в базу. После
+            // перезапуска текст пуст, поэтому первая же проверка обновит сообщение.
+            qMsg: (QUEUE_LIVE_MS && m.qMsg) ? { ch: m.qMsg.ch, id: m.qMsg.id, page: m.qMsg.page,
+                actorId: m.qMsg.ctx && m.qMsg.ctx.actorId, actorName: m.qMsg.ctx && m.qMsg.ctx.actorName,
+                staff: !!(m.qMsg.ctx && m.qMsg.ctx.staff) } : null,
         });
     }
     catch (e) { console.error ('[music] не смог сохранить очередь: ' + oneLine (e.message)); }
@@ -10263,6 +10452,101 @@ function queueView (m, start, moveSel = 0, opts = {})
     return { content: content, components: queueComponents (page, m, moveSel, opts) };
 }
 
+// ============================================================================
+// [v2.57] СООБЩЕНИЕ /queue ОБНОВЛЯЕТСЯ САМО, ПОКА ЕГО ВИДЯТ.
+// Раньше текст застывал на моменте вызова: Discord перерисовывает сообщение только
+// по нашему запросу, поэтому позиция в треке, остаток и счётчики оживали, лишь если
+// листать или нажать «🔄 Обновить». Теперь бот помнит то сообщение, которое сам
+// отправил (m.qMsg), и раз в QUEUE_LIVE_MS собирает ту же СТРАНИЦУ заново из живой
+// очереди -- только если текст реально изменился (одинаковая правка всё равно
+// считалась бы правкой).
+//
+// ПРО ЛИМИТЫ DISCORD, к которым это может упереться. На правки сообщений действует
+// ограничение примерно 5 правок за 5 секунд на КАНАЛ (и оно одинаково для любого
+// сообщения в нём). Наш шаг -- минута: в час выходит ~60 правок вместо допустимых
+// ~3600, то есть в 60 раз реже предела, и даже минимальный разрешённый порог
+// (10 секунд) в шесть раз безопаснее. Дополнительно:
+//   * неизменившийся текст НЕ правим вообще (на паузе без слушателей правок нет);
+//   * пока в сообщении открыто перенос/меню автора, самообновление молчит -- иначе
+//     оно перерисовало бы меню прямо под руками; оно оживает, как только вернётся
+//     обычный вид очереди (w.move);
+//   * когда очередь доиграла совсем, делается ОДНА финальная правка и бот забывает
+//     сообщение (m.qMsg = null) -- дальше в этом канале нет ни правок, ни запросов;
+//   * сообщение удалили/нет прав (10008 и прочее) -- молча перестаём его вести;
+//   * 0 в конфиге выключает самообновление целиком (таймер даже не заводится).
+// ============================================================================
+const QUEUE_LIVE_STEP = 5000;   // как часто проверяем, кому пора обновиться (5 с)
+
+// Запомнить сообщение очереди как «живое». Зовётся при обычном /queue и при любой
+// перерисовке кнопками -- иначе после листания самообновление вернуло бы первую страницу.
+function queueWatch (m, msg, ctx, page, text, move)
+{
+    if (!QUEUE_LIVE_MS || !m || !msg || !msg.id) return;
+    m.qMsg = { ch: msg.channelId, id: msg.id, ctx: ctx, page: Math.max (1, Number (page) || 1),
+               text: String (text || ''), move: Math.max (0, Number (move) || 0), at: Date.now () };
+}
+
+// Восстановить живое сообщение из записи в базе (переживает перезапуск). Текст не
+// берём -- его всё равно пересобираем из живой очереди на первой же проверке.
+function queueWatchRestore (saved)
+{
+    if (!QUEUE_LIVE_MS || !saved || !saved.ch || !saved.id) return null;
+    return { ch: String (saved.ch), id: String (saved.id), page: Math.max (1, Number (saved.page) || 1),
+             ctx: { actorId: String (saved.actorId || ''), actorName: String (saved.actorName || ''),
+                    staff: !!saved.staff },
+             text: '', move: 0, at: Date.now () };
+}
+
+// Одна перерисовка для одного сервера. НИКОГДА не бросает: сбой правки не должен
+// ронять бота -- он просто выключает самообновление для этого сообщения.
+async function queueLiveTick (guildId)
+{
+    const m = $music[guildId], w = m && m.qMsg;
+    if (!w) return;
+    if (w.move) { w.at = Date.now (); return; }   // открыт перенос: не мешаем руками
+    let view;
+    try { view = queueView (m, w.page, 0, w.ctx); }
+    catch (e) { m.qMsg = null; return; }
+    const empty = !m.current && !m.tracks.length && !m.seekTrack;
+    const content = view.content;
+    if (content === w.text)               // менять нечего
+    {
+        if (empty) m.qMsg = null;         // очередь доиграла -- и этот вид уже показан
+        return;
+    }
+    try
+    {
+        const ch = client.channels.cache.get (w.ch) || await client.channels.fetch (w.ch).catch (() => null);
+        if (!ch) { m.qMsg = null; return; }
+        const msg = await ch.messages.fetch (w.id);
+        await msg.edit (view.components.length
+            ? { content: content, components: view.components }
+            : { content: content });
+        w.text = content;
+        if (empty) m.qMsg = null;         // финальный вид показали -- больше не правим
+    }
+    catch (e)
+    {
+        const code = String ((e && (e.code || (e.rawError && e.rawError.code))) || '');
+        if (code !== '10008')             // 10008 -- сообщение удалили, это не ошибка
+            console.error ('[music] сам не смог обновить сообщение /queue: ' + oneLine ((e && e.message) || e));
+        m.qMsg = null;
+    }
+}
+
+if (QUEUE_LIVE_MS)
+    setInterval (() =>
+    {
+        const now = Date.now ();
+        for (const g of Object.keys ($music))
+        {
+            const w = $music[g] && $music[g].qMsg;
+            if (!w || (now - w.at) < QUEUE_LIVE_MS) continue;
+            w.at = now;
+            queueLiveTick (g).catch (() => {});
+        }
+    }, QUEUE_LIVE_STEP).unref ();
+
 // Старт после перезапуска/падения: вернуть ПРИСУТСТВИЕ бота в канале, а также очередь,
 // текущий трек и позицию.
 // [v2.24] Порядок именно такой: состояние «сижу в канале» не зависит от очереди
@@ -10314,6 +10598,10 @@ async function resumeMusic (server)
         if (!current && !tracks.length) return;
         m.savedChannelId = vch ? vch.id : (saved.channelId || null);
         m.textChannelId = saved.textChannelId || m.textChannelId;
+        // [v2.57] Сообщение /queue, которое ведёт самообновление, тоже возвращаем: иначе
+        // после перезапуска оно замирало бы на состоянии до рестарта (а перезапускаем мы
+        // часто). Текст в базе не держим -- первая же проверка обновит его сама.
+        m.qMsg = queueWatchRestore (saved.qMsg);
         // [v2.12.2] ждущий трек возвращается НА СВОЁ место из очереди (curIdx), а не
         // всегда в начало: если DJ переставил его через /move, порядок сохраняется
         const at = Math.min (Math.max (0, Math.round (saved.curIdx || 0)), tracks.length);
@@ -11780,10 +12068,14 @@ client.on ('interactionCreate', async (interaction) =>
             actorName: interaction.member ? uuu (interaction.member) : interaction.user.username,
             staff: staff,
         };
-        const replyView = (at = page, moveSel = 0) =>
+        const replyView = async (at = page, moveSel = 0) =>
         {
             const view = queueView (m, at, moveSel, ctx);
-            return interaction.update ({ content: view.content, components: view.components });
+            await interaction.update ({ content: view.content, components: view.components });
+            // [v2.57] ...и запоминаем, ЧТО именно сейчас показано и на какой странице:
+            // иначе самообновление вернуло бы сообщение на первую страницу, а в режиме
+            // переноса -- перерисовало бы меню прямо под руками (moveSel != 0 -- стоп).
+            queueWatch (m, interaction.message, ctx, at, view.content, moveSel);
         };
         // --- листание: в customId -- кнопка и ЦЕЛЕВАЯ страница; чужие нажатия не
         // трогают чужое сообщение. Старый вид («q:p:12», без имени кнопки) тоже
@@ -12932,13 +13224,26 @@ client.on ('interactionCreate', async (interaction) =>
                 actorName: interaction.member ? uuu (interaction.member) : interaction.user.username,
                 staff: isStaffInteraction (interaction),
             };
-            const view = queueView (m, interaction.options.getInteger ('from') || 1, 0, ctxQ);
-            return interaction.reply
+            const fromQ = interaction.options.getInteger ('from') || 1;
+            const view = queueView (m, fromQ, 0, ctxQ);
+            // [v2.57] withResponse нужен ради id самого сообщения: без него ответ
+            // вернёт только InteractionResponse (там id -- от взаимодействия, а не от
+            // сообщения), а нам надо помнить ИМЕННО сообщение, чтобы потом его править.
+            const sent = await interaction.reply
             (
-                view.components.length
-                    ? { content: view.content, components: view.components }
-                    : { content: view.content }
+                Object.assign
+                (
+                    view.components.length
+                        ? { content: view.content, components: view.components }
+                        : { content: view.content },
+                    { withResponse: true }
+                )
             );
+            const sentMsg = (sent && sent.resource && sent.resource.message) || null;
+            // Сообщение не пришло (Discord не отдал его в ответе) -- живого вести нечего,
+            // и прежнее тоже забываем: иначе самообновление продолжало бы править старое.
+            if (sentMsg) queueWatch (m, sentMsg, ctxQ, fromQ, view.content, 0);
+            else m.qMsg = null;
         }
         else if (name === 'leave')
         {
