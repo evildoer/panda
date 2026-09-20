@@ -2149,6 +2149,7 @@ const
     ModalBuilder,              // [v2.36] окно ввода номера для «#️⃣ На позицию…»
     TextInputBuilder,
     TextInputStyle,
+    LabelBuilder,              // [v2.74] окно фильтра: подпись + поле/меню (модальные меню)
 } = require ('discord.js');
 
 // [v2.17] Guild Members ПОДКЛЮЧАЕМ (раньше он был убран по [v2.1]). Даёт мгновенные
@@ -10347,6 +10348,28 @@ function historyExpandRows (e, off, n)
     return [new ActionRowBuilder ().addComponents (...btns)];
 }
 
+// [v2.74] «⤓ ВЗЯТЬ ОДИН ТРЕК»: меню с треками ТЕКУЩЕЙ страницы. Значение -- сам видео-id
+// (он же адрес: https://youtu.be/<id>), поэтому в customId кнопки хранить нечего, а трек
+// ставится прямо по ключу из записи. Повторы ключей выбрасываем: Discord не принимает
+// меню с одинаковыми значениями (а один и тот же трек в пачке бывает дважды).
+function historyOneRow (part)
+{
+    const opts = [], seen = new Set ();
+    for (const p of (Array.isArray (part) ? part : []))
+    {
+        const id = String ((p && p.id) || '');
+        if (!id || seen.has (id) || !historyLinkOf (id)) continue;
+        seen.add (id);
+        opts.push ({ label: clipped ('⤓ ' + (p.title || id), 100), value: id });
+    }
+    if (!opts.length) return null;
+    const sel = new StringSelectMenuBuilder ()
+        .setCustomId ('q:hget')
+        .setPlaceholder ('⤓ Взять в очередь ОДИН трек из этой страницы…');
+    sel.addOptions (opts);
+    return new ActionRowBuilder ().addComponents (sel);
+}
+
 // Текст одной страницы состава (+ метаданные для кнопок).
 function historyExpandView (e, off)
 {
@@ -10382,11 +10405,22 @@ function historyExpandView (e, off)
             HISTORY_TITLES_STORE + ' треков'));
     if (e.q) notes.push ('запуск: `' + clipped (e.q, 60) + '` -- кнопкой «▶ Поставить заново» эта пачка вернётся в очередь целиком');
     else notes.push ('поставить заново не смогу: в записи нет того, что вводили в /play (пачка старой версии или перенесённая из очереди)');
+    // [v2.74] «⤓ Взять ОДИН трек» -- список треков ЭТОЙ страницы, у которых есть адрес
+    // (ключ). В меню Discord влезает 25 пунктов, а на странице их не больше 20 -- значит
+    // весь список всегда виден целиком, без листания (та же арифметика, что у страницы
+    // /queue: размер страницы не может перерасти меню).
+    const rows = historyExpandRows (e, off, titles.length);
+    const oneRow = historyOneRow (pairs.slice (first, first + size));
+    if (oneRow)
+    {
+        rows.push (oneRow);
+        notes.push ('из состава можно вернуть в очередь ОДИН трек -- меню ниже (адрес берётся из записи); «▶ Поставить заново» вернёт всю пачку');
+    }
     const text = head + (pages > 1 ? ' · стр. ' + (p + 1) + '/' + pages + ' (всего показано ' +
             titles.length + ')' : '') + '\n' + QSEP + '\n' +
         '```\n' + lines.join ('\n') + '\n```' +
         (notes.length ? '\n' + notes.map (s => '_' + s + '_').join ('\n') : '');
-    return { text: text, rows: historyExpandRows (e, off, titles.length), titles: titles.length };
+    return { text: text, rows: rows, titles: titles.length };
 }
 
 // [v2.71] «▶ ПОСТАВИТЬ ЗАНОВО»: вернуть в очередь ЦЕЛУЮ пачку из /history. Это ровно
@@ -10447,6 +10481,49 @@ async function historyReAdd (guildId, at, userId, byName, inCh)
         ' (в конце твоего блока, как обычный `/play`); всего в очереди: ' + m.tracks.length +
         '\n' + QSMALL + 'источник: `' + clipped (q, 80) + '`\n' +
         QSMALL + '_В очередь их поставил ты: бот едет к автору играющего трека, иначе он уехал бы к тому, кого в канале нет._' };
+}
+
+// [v2.74] «⤓ ВЗЯТЬ ОДИН ТРЕК ИЗ ПАЧКИ»: вернуть в очередь не всю пачку, а один выбранный.
+// Адрес собирается из КЛЮЧА трека (того же, откуда /history берёт строку): ключ -- это
+// видео-id, значит адрес -- обычная watch-ссылка. Дальше ровно как /play: один трек,
+// в конец блока того, кто нажал, новой пачкой в истории (один заход -- одна пачка).
+async function historyReAddOne (guildId, keyId, userId, byName, inCh)
+{
+    const m = musicOf (guildId);
+    const url = historyLinkOf (keyId);
+    if (!url)
+        return { ok: false, text: '🕘 У этого трека в записи нет адреса -- поставить его можно только заново (ссылкой в `/play`).' };
+    let t;
+    try { t = await trackInfo (url); }
+    catch (err)
+    {
+        return { ok: false, text: '❌ Не смог поставить трек из пачки (`' + url + '`): `' + ytDlpErr (err, 150) + '`' };
+    }
+    if (!t)
+        return { ok: false, text: '❌ Пустой результат -- похоже, этого трека больше нет.' };
+    const addedAt = Date.now ();
+    t.byId = String (userId);
+    t.byName = String (byName || '');
+    t.addAt = addedAt;
+    t.addIn = inCh || null;
+    const insAt = authorBlockInsertAt (m.tracks, userId);
+    m.tracks.splice (insAt, 0, t);
+    scheduleVoiceStatus (guildId);
+    schedulePresence ();
+    scheduleDeadScan (guildId);
+    if (!m.current) startPreload (guildId);
+    saveMusicState (guildId);
+    historyAdd (guildId,
+    {
+        at: addedAt, byId: userId, byName: byName, inCh: inCh, n: 1,
+        live: t.isLive ? 1 : 0,
+        titles: [t.title || url], q: url, urls: [t.url || ''], ids: [ytKey (t.url)],
+    }).catch (err => console.error ('[music] история добавлений: ' + oneLine ((err && err.message) || err)));
+    if (m.connection && !m.current) playNext (guildId);
+    return { ok: true, text: '⤓ **Взял из пачки -- в очередь:** ' + (t.title || url) +
+        (t.isLive ? ' 🔴 (эфир)' : '') +
+        '\n' + QSMALL + 'место в очереди: №' + (insAt + 1) + ' (в конце твоего блока, как обычный `/play`)' +
+        '\n' + QSMALL + '_Остальные треки пачки не тронуты: можно взять ещё по одному или вернуть всё кнопкой «▶ Поставить заново»._' };
 }
 
 // Найти пачку по метке времени (из value меню или из customId кнопок листания).
@@ -10854,7 +10931,8 @@ function queueComponents (page, m, moveSel = 0, opts = {})
     //   [1] листание (4)
     //   [2] ИГРАЮЩИЙ ТРЕК: ◀ 30 с / 30 с ▶ / ⏱ На таймкод… / ⏭ Пропустить /
     //       ⤴ Другой трек (5 -- ровно предел ряда)
-    //   [3] канал и чистка: ▶ Войти / ⏏ Выйти / 🧹 Очистить / 🧹⏏ Очистка/Выход (4)
+    //   [3] канал и чистка: ▶ Войти / ⏏ Выйти / 🧽 Фильтр… / 🧹 Очистить /
+    //       🧹⏏ Очистка/Выход (5 -- ровно предел ряда с v2.74)
     //   [4] список треков, [5] меню автора.
     // Так «⏱ На таймкод…» (просьба владельца) получил своё место, а листание и меню
     // автора остались на виду: раньше при шестом ряде Discord молча выбрасывал последний.
@@ -10905,6 +10983,13 @@ function queueComponents (page, m, moveSel = 0, opts = {})
                 .setCustomId ('q:join').setLabel ('▶ Войти').setStyle (ButtonStyle.Secondary),
             new ButtonBuilder ()
                 .setCustomId ('q:leave').setLabel ('⏏ Выйти').setStyle (ButtonStyle.Secondary),
+            // [v2.74] «🧽 Фильтр…» -- чистка ПО НАЗВАНИЮ (удалить найденные или оставить
+            // только их). Просьба владельца: «до "Очистить", тоже покрасить красным» --
+            // это такая же чистка, просто по подстроке. Кнопка видна всем (как и
+            // остальные), а права проверяются при нажатии: только админы и модеры.
+            new ButtonBuilder ()
+                .setCustomId ('q:flt').setLabel ('🧽 Фильтр…').setStyle (ButtonStyle.Danger)
+                .setDisabled (!total && !m.current),
             new ButtonBuilder ()
                 .setCustomId ('q:clear').setLabel ('🧹 Очистить').setStyle (ButtonStyle.Danger)
                 .setDisabled (!total && !m.current),
@@ -11482,6 +11567,169 @@ function queueClear (guildId, who, opts = {})
             (w.left ? ' В очереди осталось ' + w.left + ' -- музыку не выключаю.' : '') +
             (left ? ' Вышел из канала.' : ''),
     };
+}
+
+// ============================================================================
+// [v2.74] ФИЛЬТР ОЧЕРЕДИ ПО НАЗВАНИЮ (только админы и модеры). Владелец: «кнопка и
+// команда /filter: задаётся "удалить" / "оставить только" и подстрока -- удалять
+// найденные по названию треки или оставить только найденные, а остальные удалить; плюс
+// параметр "во всех треках" или "только своих"».
+//   - режим 'remove' -- уходят НАЙДЕННЫЕ;
+//   - режим 'keep'   -- уходят ВСЕ, КРОМЕ найденных (вне области поиска не трогаем);
+//   - область 'all' -- вся очередь, 'mine' -- только записи того, кто фильтрует.
+// Убирает ровно тем же путём, что /clear author и «Очистить» (queuePurge): играющий
+// трек под правило тоже попадает -- уходит и ПРЕРЫВАЕТСЯ, а не доигрывается «ничейным».
+// Массовое действие ОБЯЗАТЕЛЬНО спрашивает подтверждение (как /clear): в нём видно,
+// сколько уйдёт и что прервётся. Подтверждение одноразовое: метка и параметры лежат в
+// m.filterAsk, поэтому нажатие через час (когда очередь уже другая) ничего не сломает.
+// ============================================================================
+const FILTER_TEXT_MAX = 60;             // подстрока: длиннее -- только палец устанет
+const FILTER_ASK_MS = 5 * 60 * 1000;    // сколько живёт подтверждение (как прочие окна)
+let $filterToken = 0;
+
+function filterTextOf (s)
+{
+    return String (s === undefined || s === null ? '' : s).replace (/\s+/g, ' ').trim ().slice (0, FILTER_TEXT_MAX);
+}
+// Совпадает ли трек: подстрока в НАЗВАНИИ, без учёта регистра. У трека без названия
+// (старая база) искать не в чем -- он не совпадает никогда.
+function filterMatch (t, text)
+{
+    const q = String (text || '').toLowerCase ();
+    if (!q || !t) return false;
+    return String (t.title || '').toLowerCase ().includes (q);
+}
+// ЧТО ИМЕННО УЙДЁТ -- одна арифметика и на подтверждение, и на само действие.
+function filterPlan (m, mode, text, scope, actorId)
+{
+    const keepMode = (mode === 'keep');
+    const inScope = t => !!t && (scope === 'all' || isBy (t, actorId));
+    const hit = t => inScope (t) && filterMatch (t, text);
+    // keep-предикат для queuePurge: трек ОСТАЁТСЯ, если он истинен.
+    const keep = keepMode ? (t => !inScope (t) || filterMatch (t, text)) : (t => !hit (t));
+    const gone = m.tracks.filter (t => !keep (t)).length;
+    const playing = (m.current && !keep (m.current)) ? m.current : null;
+    const waiting = (!playing && m.seekTrack && !keep (m.seekTrack)) ? m.seekTrack : null;
+    return {
+        keep: keep, mode: keepMode ? 'keep' : 'remove', scope: (scope === 'all') ? 'all' : 'mine',
+        gone: gone, playing: playing, waiting: waiting,
+        matchN: m.tracks.filter (hit).length,
+        left: m.tracks.length - gone, total: m.tracks.length,
+        any: !!(gone || playing || waiting),
+    };
+}
+
+// Подтверждение фильтра. Кнопки несут только метку (см. m.filterAsk) -- всё остальное
+// берётся из неё, поэтому пересчитать «по старому» ничего не может.
+function queueFilterConfirm (m, mode, text, scope, actorId, msgId)
+{
+    const plan = filterPlan (m, mode, text, scope, actorId);
+    const modeName = (plan.mode === 'keep') ? 'оставить ТОЛЬКО треки с «' : 'убрать треки с «';
+    const head = '🧽 **Фильтр очереди:** ' + modeName + text + '»' +
+        (plan.scope === 'all' ? ' (во всех треках)' : ' (только твои)');
+    const found = '• найдено по названию: ' + plan.matchN + ' ' +
+        plural (plan.matchN, 'трек', 'трека', 'треков');
+    // [v2.75] Здесь нечего подтверждать -- и кнопка НЕ «Отмена» (иначе получалось бы,
+    // что человек что-то отменил, хотя действие и не собиралось происходить): у неё свой
+    // ответ («очередь не менялась»), см. ветку q:fl:k ниже.
+    if (!plan.any)
+        return {
+            text: head + '\n' + found + '\n_Убирать нечего -- всё, что нашлось, и так осталось бы в очереди._',
+            rows: [new ActionRowBuilder ().addComponents
+            (
+                new ButtonBuilder ().setCustomId ('q:fl:k').setLabel ('✖ Понятно').setStyle (ButtonStyle.Secondary)
+            )],
+        };
+    const token = String (++$filterToken);
+    m.filterAsk = { token: token, mode: plan.mode, text: text, scope: plan.scope,
+                    actorId: String (actorId), at: Date.now (),
+                    // [v2.74] Какое сообщение очереди обновить после действия: окно
+                    // уходит раньше, чем действие делается (иначе оно осталось бы старым).
+                    msgId: String (msgId || '0') };
+    const total = plan.gone + (plan.playing ? 1 : 0) + (plan.waiting ? 1 : 0);
+    const goneTxt = [];
+    if (plan.gone) goneTxt.push (plan.gone + ' ' + plural (plan.gone, 'трек', 'трека', 'треков') + ' из очереди');
+    if (plan.playing) goneTxt.push ('играющий **' + (plan.playing.title || 'трек') + '**');
+    else if (plan.waiting) goneTxt.push ('ждущий **' + (plan.waiting.title || 'трек') + '**');
+    return {
+        text: head + '\n' + found + '\n' +
+            '• уйдёт: ' + goneTxt.join (' + ') + '\n' +
+            (plan.playing ? '• играющий прервётся -- сразу пойдёт следующий\n' : '') +
+            '• останется в очереди: ' + plan.left +
+            '\n_Действие необратимое. Вернуть трек можно только заново ( `/play` или «📜 Все треки» в `/history` )._',
+        rows: [new ActionRowBuilder ().addComponents
+        (
+            new ButtonBuilder ().setCustomId ('q:fl:c:' + token)
+                .setLabel (('🗑 Да, убрать: ' + total + ' ' + plural (total, 'трек', 'трека', 'треков')).slice (0, 80))
+                .setStyle (ButtonStyle.Danger),
+            new ButtonBuilder ().setCustomId ('q:fl:x').setLabel ('✖ Отмена').setStyle (ButtonStyle.Secondary)
+        )],
+    };
+}
+
+// Само действие (как остальные: возвращает { ok, text } и пишет строку в журнал).
+function queueFilter (guildId, opts)
+{
+    const m = musicOf (guildId);
+    const text = filterTextOf (opts.text);
+    if (!text) return { ok: false, text: '🤔 Пустая подстрока -- искать нечего.' };
+    const plan = filterPlan (m, opts.mode, text, opts.scope, opts.actorId);
+    if (!plan.any)
+        return { ok: false, text: '🈳 Убирать нечего: треков с «' + text + '» в очереди ' +
+            (plan.scope === 'all' ? 'нет' : 'среди твоих нет') + '.' };
+    const w = queuePurge (guildId, plan.keep);
+    if (!w) return { ok: false, text: '🈳 Убирать нечего -- очередь уже другая (может, её убрали с тех пор).' };
+    console.log ('[' + (d()) + '] [music] ' + whoText (opts.who) +
+        (plan.mode === 'keep' ? 'оставил только треки по «' + text + '»' : 'убрал треки по «' + text + '»') +
+        ' (' + (plan.scope === 'all' ? 'вся очередь' : 'только его треки') + '): убрал ' + w.goneQ +
+        (w.playing ? ' и снял играющий трек' : (w.waiting ? ' и снял ждущий трек' : '')) +
+        ', осталось ' + w.left);
+    const bits = [];
+    if (w.goneQ) bits.push (w.goneQ + ' ' + plural (w.goneQ, 'трек', 'трека', 'треков'));
+    if (w.playing) bits.push ('играющий **' + w.playing + '**' + (w.left ? ' -- играю следующий' : ' -- тишина'));
+    else if (w.waiting) bits.push ('ждущий **' + w.waiting + '**');
+    return {
+        ok: true,
+        text: (plan.mode === 'keep' ? '🧽 Оставил только «' + text + '»' : '🧽 Убрал по «' + text + '»') +
+            (bits.length ? ': ' + bits.join (' + ') + '.' : '.') +
+            (w.left ? ' В очереди осталось ' + w.left + '.' : ' Очередь пуста.'),
+    };
+}
+
+// Окно фильтра (кнопка «🧽 Фильтр…»): и подстрока, и режим, и область -- в одном окне,
+// одним нажатием (текст в сообщение не вписать, а режим без него не имел бы смысла).
+function filterModal (msgId)
+{
+    // id сообщения очереди едет ВНУТРИ окна: подтверждение придёт уже позже, а сообщение
+    // под ним к тому моменту уже сменится (кнопки/страница) -- обновим именно его.
+    return new ModalBuilder ()
+        .setCustomId ('q:flt:' + (String (msgId || '0').replace (/\D+/g, '') || '0'))
+        .setTitle ('Фильтр очереди по названию')
+        .addLabelComponents
+        (
+            new LabelBuilder ().setLabel ('Подстрока в названии трека')
+                .setDescription ('Без учёта регистра')
+                .setTextInputComponent (new TextInputBuilder ()
+                    .setCustomId ('text').setStyle (TextInputStyle.Short)
+                    .setRequired (true).setMaxLength (FILTER_TEXT_MAX)
+                    .setPlaceholder ('например: KARA')),
+            // Вариант по умолчанию обязателен: с required-меню без выбора окно просто
+            // не отправится, а человек этого не поймёт -- пусть будет как выбрано.
+            new LabelBuilder ().setLabel ('Что сделать с найденными')
+                .setStringSelectMenuComponent (new StringSelectMenuBuilder ().setCustomId ('mode')
+                    .setRequired (true).addOptions
+                    (
+                        { label: '🗑 Удалить найденные', value: 'remove', default: true },
+                        { label: '✅ Оставить только найденные', value: 'keep' }
+                    )),
+            new LabelBuilder ().setLabel ('Где искать')
+                .setStringSelectMenuComponent (new StringSelectMenuBuilder ().setCustomId ('scope')
+                    .setRequired (true).addOptions
+                    (
+                        { label: '👥 Во всех треках', value: 'all', default: true },
+                        { label: '🙋 Только в моих', value: 'mine' }
+                    ))
+        );
 }
 
 // [v2.31] Кто есть в очереди -- для меню «🗑 Удалить треки автора». Обычному DJ видно
@@ -13591,6 +13839,35 @@ const musicCommands =
     new SlashCommandBuilder ()
         .setName ('leave')
         .setDescription ('Отложить свои треки и играть чужое; из канала выхожу, если играть нечего'),
+    // [v2.74] /filter -- убрать из очереди треки, найденные по подстроке в НАЗВАНИИ,
+    // или оставить ТОЛЬКО их. Только админы и модеры (в списке команд видна всем, как
+    // /repeat, а отвечает своим отказом): убирать пачкой чужие треки -- не DJ-дело.
+    // Перед действием -- подтверждение, в котором видно, сколько уйдёт.
+    new SlashCommandBuilder ()
+        .setName ('filter')
+        .setDescription ('Фильтр очереди по названию: убрать найденные или оставить только их')
+        .addStringOption (o =>
+            o.setName ('text')
+             .setDescription ('Подстрока в названии трека (без учёта регистра)')
+             .setMaxLength (FILTER_TEXT_MAX)
+             .setRequired (true))
+        .addStringOption (o =>
+            o.setName ('mode')
+             .setDescription ('Что сделать с найденными')
+             .setRequired (true)
+             .addChoices
+             (
+                 { name: '🗑 Удалить найденные', value: 'remove' },
+                 { name: '✅ Оставить только найденные', value: 'keep' }
+             ))
+        .addStringOption (o =>
+            o.setName ('scope')
+             .setDescription ('Где искать (без этого -- во всей очереди)')
+             .addChoices
+             (
+                 { name: '👥 Во всех треках', value: 'all' },
+                 { name: '🙋 Только в моих', value: 'mine' }
+             )),
 ].map (c => c.toJSON ());
 
 // Регистрация команд на всех разрешённых серверах (guild-команды -- мгновенно):
@@ -13674,6 +13951,31 @@ client.on ('interactionCreate', async (interaction) =>
                     interaction.message.edit ({ content: view0.content, components: view0.components, allowedMentions: { parse: [] } }).catch (() => {});
             }, 1500);
             return interaction.reply ({ content: res0.text, flags: MessageFlags.Ephemeral });
+        }
+        // [v2.74] ОКНО ФИЛЬТРА («🧽 Фильтр…»): подстрока + что делать + где искать.
+        // Права проверяем ЗДЕСЬ же: в окно можно было попасть только кнопкой staff, но
+        // окно и его ответ живут дольше -- поэтому не доверяем "раз кнопку нажали".
+        const mFlt = /^q:flt:(\d+)?$/.exec (interaction.customId || '');
+        if (mFlt)
+        {
+            if (!isStaffInteraction (interaction))
+                return interaction.reply ({ content: '🚫 Фильтр очереди -- только админы и модеры.', flags: MessageFlags.Ephemeral });
+            const m0 = musicOf (guildId);
+            const text0 = filterTextOf (interaction.fields.getTextInputValue ('text'));
+            if (!text0)
+                return interaction.reply ({ content: '🤔 Пустая подстрока -- искать нечего.', flags: MessageFlags.Ephemeral });
+            // Меню в окне может прийти и без выбора (если человек его не открывал) --
+            // тогда это "ничего не сдвинул": у нас в каждом есть вариант по умолчанию,
+            // но читаем всё равно через try: Discord решает сам, что прислать.
+            const pickSel0 = (id) =>
+            {
+                try { return String ((interaction.fields.getStringSelectValues (id) || [])[0] || ''); }
+                catch (e) { return ''; }
+            };
+            const mode0 = (pickSel0 ('mode') === 'keep') ? 'keep' : 'remove';
+            const scope0 = (pickSel0 ('scope') === 'mine') ? 'mine' : 'all';
+            const c0 = queueFilterConfirm (m0, mode0, text0, scope0, interaction.user.id, mFlt[1] || '0');
+            return interaction.reply ({ content: c0.text, components: c0.rows, flags: MessageFlags.Ephemeral });
         }
         // [v2.66] Окно ввода номера для «⤴ Перепрыгнуть» (q:jumpm) убрано: теперь у кнопки
         // СПИСОК треков (jumpPickerRows -> q:jsel), номер набирать не нужно. Ветка удалена
@@ -13804,8 +14106,13 @@ client.on ('interactionCreate', async (interaction) =>
         // не было, и нажатие молча уходило в return: Discord показывал «взаимодействие
         // не удалось», а перенос кнопками не работал (при этом /move работал -- это и
         // сбивало с толку). Теперь все три пути перестановки разрешены одинаково.
-        if (!/^q:(skip|join|leave|clear|stop|da|dau|dax|dx|cq|rm|mv|mt|mb|mp|mu|md|mx|s|sk|tr|rx|jmp|jsel|jpage|jclose|hre)(:|$)/.test (cid)) return;
-        if (!isDJ (interaction))
+        // [v2.74] hget -- «⤓ Взять один трек» из состава пачки (/history): это добавление
+        // в очередь, поэтому права те же, что у /play и «▶ Поставить заново» (DJ).
+        // [v2.74] fl/flt -- фильтр очереди: это команда STAFF ("только ADM/MOD"), поэтому
+        // обычному админу без роли DJ она доступна, а обычному DJ -- нет (проверка ниже).
+        const isFilterCid = /^q:flt?(:|$)/.test (cid);
+        if (!/^q:(skip|join|leave|clear|stop|da|dau|dax|dx|cq|rm|mv|mt|mb|mp|mu|md|mx|s|sk|tr|rx|jmp|jsel|jpage|jclose|hre|hget|fl|flt)(:|$)/.test (cid)) return;
+        if (!isDJ (interaction) && !(isFilterCid && staff))
         {
             const role_dj = SERVERS[guildId].role_dj || '';
             return interaction.reply
@@ -13832,6 +14139,24 @@ client.on ('interactionCreate', async (interaction) =>
                 (res.ok ? 'ок' : 'не вышло'));
             queueMsgRedraw (guildId, 300).catch (() => {});   // /queue в канале -- сразу с новой очередью
             return interaction.editReply ({ content: (res.ok ? '' : '⚠️ ') + res.text });
+        }
+        // [v2.74] «⤓ ВЗЯТЬ ОДИН ТРЕК» из состава пачки (/history -> «📜 Все треки»).
+        // В меню лежит видео-id; в customId ничего держать не надо -- адрес собирается
+        // из ключа, а права уже проверены гейтом выше (это добавление в очередь, DJ).
+        if (cid === 'q:hget')
+        {
+            const idGet = String ((interaction.values || [])[0] || '');
+            if (!historyLinkOf (idGet))
+                return interaction.update ({ content: '🕘 Этот трек взять не из чего -- в записи нет его адреса.', components: [] });
+            // Сперва отвечаем (иначе Discord покажет «взаимодействие не удалось»):
+            // дальше идёт поиск у YouTube.
+            await interaction.update ({ content: '⏳ Беру трек из пачки (спрашиваю YouTube)...', components: [] });
+            const one = await historyReAddOne (guildId, idGet, interaction.user.id,
+                interaction.user.username, interaction.channelId);
+            console.log ('[' + (d()) + '] [music] (кто: ' + who + ') взял из пачки /history один трек: ' +
+                (one.ok ? 'ок' : 'не вышло'));
+            queueMsgRedraw (guildId, 300).catch (() => {});
+            return interaction.editReply ({ content: (one.ok ? '' : '⚠️ ') + one.text });
         }
         // [v2.62] «⤴ Другой трек» (до v2.68 -- «⤴ Перепрыгнуть») -- [v2.66] не окно с
         // номером, а СПИСОК ТРЕКОВ:
@@ -14128,6 +14453,58 @@ client.on ('interactionCreate', async (interaction) =>
             const res = queueClear (guildId, who, { scope: mCq[1], actorId: ctx.actorId });
             await refreshQueueMsg (mCq[2]);
             return interaction.update ({ content: res.ok ? res.text : '⚠️ ' + res.text, components: [] });
+        }
+        // [v2.74] «🧽 ФИЛЬТР…» -- одно окно: подстрока, что делать (удалить найденные /
+        // оставить только их) и где искать (во всех треках / только в моих). Гейт выше
+        // пропускает сюда только staff (обычный DJ получил бы отказ).
+        if (cid === 'q:flt')
+        {
+            // Обычного DJ гейт выше пропускает (он DJ), но фильтр -- действие staff:
+            // без этой проверки он мог бы дойти до окна и получить отказ только в конце.
+            if (!staff)
+                return interaction.reply
+                ({
+                    content: '🚫 Фильтр очереди -- только админы и модеры.\n_Обычный DJ распоряжается своими записями: ' +
+                        '«🗂 Трек: подвинуть или убрать…» под `/queue` и `/remove`._',
+                    flags: MessageFlags.Ephemeral,
+                });
+            if (!m.tracks.length && !m.current)
+                return interaction.reply ({ content: '🈳 Очередь пуста -- фильтровать нечего.', flags: MessageFlags.Ephemeral });
+            return interaction.showModal (filterModal (msgId));
+        }
+        // Подтверждение фильтра. Параметры не в customId, а в m.filterAsk: подстрока
+        // бывает на 60 символов, а в customId их не вписать (лимит Discord -- 100).
+        const mFl = /^q:fl:(c|x|k)(?::(\d+))?$/.exec (cid);
+        if (mFl)
+        {
+            const ask = m.filterAsk;
+            // [v2.75] k -- «Понятно» из окна «убирать нечего»: ничего не отменялось,
+            // потому что и не начиналось.
+            if (mFl[1] === 'k')
+            {
+                m.filterAsk = null;
+                return interaction.update ({ content: '✖ Очередь не менялась -- фильтровать было нечего.', components: [] });
+            }
+            if (mFl[1] === 'x')
+            {
+                m.filterAsk = null;
+                return interaction.update ({ content: '✖ Фильтр отменён -- очередь на месте.', components: [] });
+            }
+            const fresh = !!ask && (Date.now () - (Number (ask.at) || 0) < FILTER_ASK_MS) &&
+                String (ask.actorId) === String (ctx.actorId) &&
+                (!mFl[2] || String (ask.token) === String (mFl[2]));
+            if (!fresh)
+                return interaction.update
+                ({
+                    content: '⌛ Это подтверждение уже не действует (очередь с тех пор менялась, прошло больше 5 минут ' +
+                        'или фильтр открыл другой человек).\nВызови `/filter` заново или нажми «🧽 Фильтр…» под `/queue`.',
+                    components: [],
+                });
+            m.filterAsk = null;
+            const res = queueFilter (guildId, { mode: ask.mode, text: ask.text, scope: ask.scope,
+                actorId: ctx.actorId, who: who });
+            await refreshQueueMsg (ask.msgId);
+            return interaction.update ({ content: (res.ok ? '' : '⚠️ ') + res.text, components: [] });
         }
         // [v2.32] МЕНЮ АВТОРА: выбрали автора -- показываем, ЧТО с ним можно сделать
         // (⬆ поднять наверх / 🗑 убрать), и спрашиваем подтверждение. Массовые действия
@@ -14638,7 +15015,7 @@ client.on ('interactionCreate', async (interaction) =>
             '\nСохрани его отдельно от config.json -- без него записи базы не читаются. Перезапуск не нужен.');
     }
     // [v2.32] seek -- в том же списке, что музыка (проверка прав ниже общая)
-    if (!['play','join','stop','skip','pause','resume','seek','queue','nowplaying','history','leave','remove','clear','jump','move','push','repeat','repeat-list'].includes (name)) return;
+    if (!['play','join','stop','skip','pause','resume','seek','queue','nowplaying','history','leave','remove','clear','jump','move','push','repeat','repeat-list','filter'].includes (name)) return;
     const guildId = interaction.guildId;
     const m = musicOf (guildId);
     // [v2.67] ПОСЛЕ ДЕЙСТВИЯ КОМАНДОЙ СРАЗУ ОБНОВЛЯЕМ СООБЩЕНИЕ ОЧЕРЕДИ, которое бот ведёт
@@ -14654,7 +15031,7 @@ client.on ('interactionCreate', async (interaction) =>
         // /repeat из неё исключён намеренно: это команда staff, и отвечать на неё должен
         // её же отказ («только админы и модеры»), а не «музыка только для DJ» (то же
         // правило у /jump -- свои и чужие треки решает jumpGuard).
-        if (!['queue', 'nowplaying', 'history', 'repeat', 'repeat-list'].includes (name) && !isDJ (interaction))
+        if (!['queue', 'nowplaying', 'history', 'repeat', 'repeat-list', 'filter'].includes (name) && !isDJ (interaction))
         {
             let role_dj = SERVERS[guildId].role_dj || '';
             return interaction.reply ({ content: '🚫 Музыка только для ' + (role_dj ? '<@&' + role_dj + '>' : 'DJ'), flags: MessageFlags.Ephemeral });
@@ -14876,6 +15253,28 @@ client.on ('interactionCreate', async (interaction) =>
                 return interaction.reply ({ content: '🈳 Очередь и так пуста -- чистить нечего.', flags: MessageFlags.Ephemeral });
             const c = queueClearConfirm (m, interaction.user.id, staffClear, { leave: false, msgId: '0' });
             return interaction.reply ({ content: c.text, components: c.rows, flags: MessageFlags.Ephemeral });
+        }
+        else if (name === 'filter')
+        {
+            // [v2.74] ФИЛЬТР ОЧЕРЕДИ ПО НАЗВАНИЮ -- только админы и модеры (владелец:
+            // «команда и кнопка только для ADM/MOD»). Как /clear и «Очистить»: сначала
+            // подтверждение, в котором видно, что именно уйдёт и что прервётся.
+            if (!isStaffInteraction (interaction))
+                return interaction.reply
+                ({
+                    content: '🚫 Фильтр очереди -- только админы и модеры.\n' +
+                        '_Обычный DJ распоряжается своими записями: `/remove`, `/clear author:@себя` ' +
+                        'или «🗂 Трек: подвинуть или убрать…» под `/queue`._',
+                    flags: MessageFlags.Ephemeral,
+                });
+            const textF = filterTextOf (interaction.options.getString ('text'));
+            if (!textF)
+                return interaction.reply ({ content: '🤔 Пустая подстрока -- искать нечего.', flags: MessageFlags.Ephemeral });
+            if (!m.tracks.length && !m.current && !m.seekTrack)
+                return interaction.reply ({ content: '🈳 Очередь и так пуста -- фильтровать нечего.', flags: MessageFlags.Ephemeral });
+            const cF = queueFilterConfirm (m, interaction.options.getString ('mode'), textF,
+                interaction.options.getString ('scope') || 'all', interaction.user.id, '0');
+            return interaction.reply ({ content: cF.text, components: cF.rows, flags: MessageFlags.Ephemeral });
         }
         else if (name === 'jump')
         {
