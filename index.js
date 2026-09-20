@@ -10338,23 +10338,59 @@ function jumpConfirm (n)
 // [v2.66] СПИСОК ТРЕКОВ ДЛЯ «ПЕРЕПРЫГНУТЬ» -- вместо окна с номером (просьба владельца:
 // «в перепрыгнуть вместо номера выводится список треков, и нашим и вашим»). Номера --
 // те же, что в /queue. Обычному DJ показываем только его треки (jumpGuard всё равно
-// откажет по чужому), staff -- любые; не больше 25 -- лимит меню Discord.
-function jumpPickerRows (m, actorId, staff)
+// откажет по чужому), staff -- любые.
+//
+// [v2.67] У ОДНОГО меню Discord жёсткий предел -- 25 пунктов, поэтому длинный список
+// ЛИСТАЕТСЯ: внизу «◀ Раньше / Позже ▶» (и всегда «✖ Закрыть»). Без этого треки за
+// 25-м были бы недостижимы через кнопку (владелец: «а как тогда перейти к пунктам
+// за 25-м?»). Номера в value -- по-прежнему номера в /queue, а не место в списке.
+const JUMP_PICK = 25;   // сколько пунктов влезает в одно меню Discord
+
+// Вступительный текст над списком (один и тот же на всех страницах).
+function jumpPickerText ()
 {
-    const opts = [];
-    for (let i = 0; i < m.tracks.length && opts.length < 25; i++)
+    return '⤴ **Перепрыгнуть к треку** -- выбери из списка (номера как в `/queue`):';
+}
+
+// Строки меню. from -- с какого по счёту доступного трека начинать (кратно JUMP_PICK;
+// значение приходит из customId кнопок листания). Возвращает [select] или
+// [select, кнопки листания] или null, если этому человеку перепрыгивать некуда.
+function jumpPickerRows (m, actorId, staff, from = 0)
+{
+    // какие номера очереди ему доступны ( порядок -- как в /queue )
+    const nums = [];
+    for (let i = 0; i < m.tracks.length; i++)
     {
         const t = m.tracks[i];
         if (!t) continue;
         if (!staff && !isBy (t, actorId)) continue;
-        opts.push ({ label: ('№' + (i + 1) + ' · ' + (t.title || 'трек')).slice (0, 100), value: String (i + 1) });
+        nums.push (i + 1);
     }
-    if (!opts.length) return null;
+    if (!nums.length) return null;
+    const pages = Math.max (1, Math.ceil (nums.length / JUMP_PICK));
+    const p = Math.min (Math.max (0, Math.floor ((Number (from) || 0) / JUMP_PICK) || 0), pages - 1);
+    const first = p * JUMP_PICK;
+    const part = nums.slice (first, first + JUMP_PICK);
     const sel = new StringSelectMenuBuilder ()
         .setCustomId ('q:jsel')
-        .setPlaceholder (staff ? '⤴ Перепрыгнуть к треку…' : '⤴ Перепрыгнуть к своему треку…');
-    sel.addOptions (opts);
-    return [new ActionRowBuilder ().addComponents (sel)];
+        .setPlaceholder (pages > 1
+            ? ('⤴ ' + (staff ? '' : 'Свои треки ') + (first + 1) + '–' + (first + part.length) + ' из ' + nums.length + '…')
+            : (staff ? '⤴ Перепрыгнуть к треку…' : '⤴ Перепрыгнуть к своему треку…'));
+    sel.addOptions (part.map (n =>
+        ({ label: ('№' + n + ' · ' + (m.tracks[n - 1].title || 'трек')).slice (0, 100), value: String (n) })));
+    const row = new ActionRowBuilder ().addComponents (sel);
+    const btns = [];
+    if (pages > 1)
+    {
+        btns.push (new ButtonBuilder ()
+            .setCustomId ('q:jpage:' + (first - JUMP_PICK)).setLabel ('◀ Раньше')
+            .setStyle (ButtonStyle.Secondary).setDisabled (p <= 0));
+        btns.push (new ButtonBuilder ()
+            .setCustomId ('q:jpage:' + (first + JUMP_PICK)).setLabel ('Позже ▶')
+            .setStyle (ButtonStyle.Secondary).setDisabled (p >= pages - 1));
+    }
+    btns.push (new ButtonBuilder ().setCustomId ('q:jclose').setLabel ('✖ Закрыть').setStyle (ButtonStyle.Secondary));
+    return [row, new ActionRowBuilder ().addComponents (...btns)];
 }
 
 function queueClear (guildId, who, opts = {})
@@ -10680,10 +10716,17 @@ function queueHeadText (m)
         // [v2.61] У ПРЯМОГО ЭФИРА ПОЗИЦИИ НЕТ, но есть «сколько уже слушаем» -- и это
         // ещё и делает самообновление /queue заметным: у эфира раньше не менялось НИЧЕГО,
         // и сообщение казалось «неживым» (владелец: «что-то не особо сам обновляется»).
+        // [v2.67] fmtDur(0) отвечает «--:--» (это «длительность неизвестна»), но НОЛЬ
+        // СЕКУНД -- значение известное: сразу после прыжка/перезапуска или в самом
+        // начале трека в шапке стояло загадочное «--:-- / 1:57:20» (владелец заметил).
+        // Теперь в начале трека честное «0:00», а «--:--» остаётся только там, где
+        // длина и вправду неизвестна.
+        const posSec = Math.max (0, Math.floor (playedMsOf (m) / 1000));
+        const posTxt = s => (s > 0 ? fmtDur (s) : '0:00');
         const pos = m.current.isLive
-            ? ' `🔴 в эфире ' + fmtDur (Math.floor (playedMsOf (m) / 1000)) + '`'
+            ? ' `🔴 в эфире ' + posTxt (posSec) + '`'
             : (m.current.duration > 0
-                ? ' `' + fmtDur (Math.min (Math.floor (playedMsOf (m) / 1000), m.current.duration)) + ' / ' + fmtDur (m.current.duration) + '`'
+                ? ' `' + posTxt (Math.min (posSec, m.current.duration)) + ' / ' + fmtDur (m.current.duration) + '`'
                 : '');
         return '🎵 **Сейчас:** ' + (m.current.isLive ? '🔴 ' : '') + '**' + (m.current.title || 'трек') + '**' + pos +
             byLabel (m.current) +
@@ -10922,6 +10965,32 @@ async function queueLiveTick (guildId)
             console.error ('[music] сам не смог обновить сообщение /queue: ' + oneLine ((e && e.message) || e));
         m.qMsg = null;
     }
+}
+
+// [v2.67] ПЕРЕРИСОВАТЬ ВЕДОМОЕ СООБЩЕНИЕ СРАЗУ после действия КОМАНДОЙ (/jump, /play,
+// /skip...). До этого его подхватывало только самообновление -- до 30 секунд, а после
+// прыжка это особенно заметно: в канале оставалась старая очередь и старое «Сейчас»
+// (владелец: «после перепрыгивания embed сам мгновенно не обновился»). Задержка нужна
+// там, где плеер перезапускается (jump/seek): иначе в строке «Сейчас» стояло бы 0:00.
+// Ничего не бросает: это косметика, при сбое тихо ждём обычного самообновления.
+async function queueMsgRedraw (guildId, delayMs = 0)
+{
+    const m = $music[guildId], w = m && m.qMsg;
+    if (!w) return;
+    if (delayMs > 0) await new Promise (r => setTimeout (r, delayMs));
+    try
+    {
+        const view = queueView (m, Math.max (1, Number (w.page) || 1), 0, w.ctx);
+        const ch = client.channels.cache.get (w.ch) || await client.channels.fetch (w.ch).catch (() => null);
+        if (!ch) return;
+        const msg = await ch.messages.fetch (w.id);
+        await msg.edit (Object.assign (
+            view.components.length ? { content: view.content, components: view.components } : { content: view.content },
+            { allowedMentions: { parse: [] } }));
+        w.text = view.content;   // запоминаем -- самообновление не станет править то же самое
+        w.at = Date.now ();
+    }
+    catch (e) { /* сообщение удалили или прав нет -- самообновление разберётся само */ }
 }
 
 if (QUEUE_LIVE_MS)
@@ -12501,6 +12570,11 @@ client.on ('interactionCreate', async (interaction) =>
                 return interaction.update ({ content: '✖ Прыжок отменён -- очередь на месте.', components: [] });
             const res = jumpMusic (guildId, parseInt (mJp[2], 10) || 0, mJp[1] === 'c',
                 { actorId: interaction.user.id, staff: staff });
+            // [v2.67] Подтверждение -- эфемерное, а сообщение очереди в канале живёт своей
+            // жизнью: без этого оно оставалось старым до самообновления (владелец заметил).
+            // 1500 мс -- плеер тем же событием перезапускается, и раньше времени в шапке
+            // стоял бы ноль вместо позиции.
+            if (res.ok) queueMsgRedraw (guildId, 1500).catch (() => {});
             return interaction.update ({ content: (res.ok ? '' : '⚠️ ') + res.text, components: [] });
         }
         // --- действия: как и слэш-команды, только для админов/модеров и роли DJ ---
@@ -12508,7 +12582,7 @@ client.on ('interactionCreate', async (interaction) =>
         // не было, и нажатие молча уходило в return: Discord показывал «взаимодействие
         // не удалось», а перенос кнопками не работал (при этом /move работал -- это и
         // сбивало с толку). Теперь все три пути перестановки разрешены одинаково.
-        if (!/^q:(skip|join|leave|clear|stop|da|dau|dax|dx|cq|rm|mv|mt|mb|mp|mu|md|mx|s|sk|tr|rx|jmp|jsel)(:|$)/.test (cid)) return;
+        if (!/^q:(skip|join|leave|clear|stop|da|dau|dax|dx|cq|rm|mv|mt|mb|mp|mu|md|mx|s|sk|tr|rx|jmp|jsel|jpage|jclose)(:|$)/.test (cid)) return;
         if (!isDJ (interaction))
         {
             const role_dj = SERVERS[guildId].role_dj || '';
@@ -12528,7 +12602,7 @@ client.on ('interactionCreate', async (interaction) =>
         {
             if (!m.tracks.length)
                 return interaction.reply ({ content: '🈳 В очереди нет треков -- перепрыгивать некуда.', flags: MessageFlags.Ephemeral });
-            const rows = jumpPickerRows (m, ctx.actorId, staff);
+            const rows = jumpPickerRows (m, ctx.actorId, staff, 0);
             if (!rows)
                 return interaction.reply
                 ({
@@ -12538,11 +12612,24 @@ client.on ('interactionCreate', async (interaction) =>
                 });
             return interaction.reply
             ({
-                content: '⤴ **Перепрыгнуть к треку** -- выбери из списка (номера как в `/queue`):',
+                content: jumpPickerText (),
                 components: rows,
                 flags: MessageFlags.Ephemeral,
             });
         }
+        // [v2.67] ЛИСТАНИЕ СПИСКА «ПЕРЕПРЫГНУТЬ»: в одном меню Discord влезает 25 пунктов,
+        // поэтому дальше -- кнопками «◀ Раньше / Позже ▶» (номера пересчитываются из
+        // ЖИВОЙ очереди, так что список не устаревает).
+        const mJpage = /^q:jpage:(-?\d+)$/.exec (cid);
+        if (mJpage)
+        {
+            const rows = jumpPickerRows (m, ctx.actorId, staff, parseInt (mJpage[1], 10) || 0);
+            if (!rows)
+                return interaction.update ({ content: '🈳 В очереди больше нечего выбрать -- вызови `/queue` заново.', components: [] });
+            return interaction.update ({ content: jumpPickerText (), components: rows });
+        }
+        if (cid === 'q:jclose')
+            return interaction.update ({ content: '✖ Список закрыт -- очередь не тронута.', components: [] });
         // [v2.66] Выбор трека из списка «Перепрыгнуть» -- показываем подтверждение варианта.
         if (cid === 'q:jsel')
         {
@@ -12656,9 +12743,22 @@ client.on ('interactionCreate', async (interaction) =>
         // Меню пересобираем по правам того, КТО ОТКРЫЛ это сообщение: иначе чужое нажатие
         // пересобирало бы список под нажавшего, и владелец видел бы чужое меню (действия
         // всё равно перепроверяются при нажатии, но так честнее и понятнее).
+        // [v2.67] СТРАНИЦА ЭТОГО СООБЩЕНИЯ. У кнопок без страницы в customId (пропуск,
+        // «⏏ Выйти», «🧹 Очистить», ±30 с) раньше всегда бралась первая -- и список
+        // уезжал наверх. Теперь берём ту страницу, которую ведёт самообновление (m.qMsg),
+        // если речь именно об этом сообщении.
+        const queueKeptPage = (srcId, fallback = page) =>
+        {
+            const w = m.qMsg;
+            if (w && srcId && String (w.id) === String (srcId)) return Math.max (1, Number (w.page) || 1);
+            return Math.max (1, Number (fallback) || 1);
+        };
         const refreshQueueMsg = async (srcId) =>
         {
-            if (!srcId || srcId === '0' || !interaction.channel ||
+            // [v2.67] Сообщения не передали (подтверждение пришло КОМАНДОЙ -- /clear,
+            // /stop): правим то, которое бот ведёт сам.
+            if (!srcId || srcId === '0') return queueMsgRedraw (guildId, 0).catch (() => {});
+            if (!interaction.channel ||
                 typeof interaction.channel.messages.fetch !== 'function') return;
             const src = await interaction.channel.messages.fetch (srcId).catch (() => null);
             if (src && src.editable)
@@ -12672,8 +12772,22 @@ client.on ('interactionCreate', async (interaction) =>
                     actorName: opener ? uuu (opener) : openerId,
                     staff: isStaffInteraction ({ guildId: interaction.guildId, member: opener }),
                 };
-                const view = queueView (m, 1, 0, oCtx);
+                const at = queueKeptPage (srcId);   // остаёмся на той же странице (v2.66)
+                const view = queueView (m, at, 0, oCtx);
                 await src.edit ({ content: view.content, components: view.components, allowedMentions: { parse: [] } }).catch (() => {});
+                // ...и запоминаем новый текст: иначе самообновление сравнило бы его со
+                // СТАРЫМ и сделало лишнюю правку (а со сменой страницы -- и вернуло бы её).
+                // Если это ТО ЖЕ сообщение -- обновляем запись на месте, а не создаём её
+                // заново: иначе сбрасывался бы «first» и в лог шла бы лишняя строка.
+                const w2 = m.qMsg;
+                if (w2 && String (w2.id) === String (srcId))
+                {
+                    w2.text = view.content;
+                    w2.page = at;
+                    w2.move = 0;
+                    w2.at = Date.now ();
+                }
+                else queueWatch (m, src, oCtx, at, view.content, 0);
             }
         };
         // [v2.31] Подтверждение чистки -- общее для кнопок «🧹 Очистить» и «⏹ Стоп»:
@@ -12871,7 +12985,9 @@ client.on ('interactionCreate', async (interaction) =>
         else res = queueRemove (guildId, parseInt ((interaction.values || [])[0], 10), who, ctx);
         // Сообщение очереди обновляем для ВСЕХ (видно результат) и коротко
         // подтверждаем нажавшему -- ответ виден только ему.
-        await replyView (page);
+        // [v2.67] Страница -- та, ЧТО СЕЙЧАС ВИДНА (у «⏭ Пропустить» своей страницы в
+        // customId нет, и раньше сообщение уезжало на первую).
+        await replyView (queueKeptPage (msgId, page));
         return interaction.followUp ({ content: res.text, flags: MessageFlags.Ephemeral });
     }
     // [v2.18] КОМАНДА-КОНТЕКСТНОЕ МЕНЮ на сообщении (правый клик -> Приложения ->
@@ -13286,6 +13402,12 @@ client.on ('interactionCreate', async (interaction) =>
     if (!['play','join','stop','skip','pause','resume','seek','queue','nowplaying','history','leave','remove','clear','jump','move','push'].includes (name)) return;
     const guildId = interaction.guildId;
     const m = musicOf (guildId);
+    // [v2.67] ПОСЛЕ ДЕЙСТВИЯ КОМАНДОЙ СРАЗУ ОБНОВЛЯЕМ СООБЩЕНИЕ ОЧЕРЕДИ, которое бот ведёт
+    // (m.qMsg): раньше его подхватывало только самообновление, до 30 секунд, и в канале
+    // оставались старая очередь и старое «Сейчас» (владелец: «после перепрыгивания embed
+    // сам мгновенно не обновился»). 1500 мс -- там, где плеер перезапускается (прыжок,
+    // перемотка): сразу после них в строке «Сейчас» был бы ноль.
+    const qRedraw = (ms = 300) => queueMsgRedraw (guildId, ms).catch (() => {});
 
     try
     {
@@ -13414,6 +13536,8 @@ client.on ('interactionCreate', async (interaction) =>
                 (_blockBefore ? '\n📚 Пачка встала в конец твоего блока в очереди (№' + _insAt + ').' : ''),
                 { components: askMoveRow ? [askMoveRow] : [] }
             );
+            // [v2.67] Ведомое сообщение /queue в канале -- сразу с новой очередью.
+            qRedraw ();
             if (shouldStart)
                 playNext (guildId);
         }
@@ -13438,6 +13562,7 @@ client.on ('interactionCreate', async (interaction) =>
             const res = queueRemove (guildId, interaction.options.getInteger ('number'),
                 interaction.member ? uuu (interaction.member) : interaction.user.username,
                 { staff: isStaffInteraction (interaction), actorId: interaction.user.id });
+            if (res.ok) qRedraw ();
             return interaction.reply (res.ok ? res.text : { content: res.text, flags: MessageFlags.Ephemeral });
         }
         else if (name === 'move')
@@ -13451,6 +13576,7 @@ client.on ('interactionCreate', async (interaction) =>
                 interaction.options.getInteger ('to'),
                 interaction.member ? uuu (interaction.member) : interaction.user.username,
                 { staff: isStaffInteraction (interaction), actorId: interaction.user.id });
+            if (res.ok) qRedraw ();
             return interaction.reply (res.ok ? res.text : { content: res.text, flags: MessageFlags.Ephemeral });
         }
         else if (name === 'push')
@@ -13473,6 +13599,7 @@ client.on ('interactionCreate', async (interaction) =>
                 });
             const res = queuePush (guildId, targetId,
                 interaction.member ? uuu (interaction.member) : interaction.user.username);
+            if (res.ok) qRedraw ();
             return interaction.reply (res.ok ? res.text : { content: res.text, flags: MessageFlags.Ephemeral });
         }
         else if (name === 'clear')
@@ -13496,6 +13623,7 @@ client.on ('interactionCreate', async (interaction) =>
                     });
                 const res = queueClearAuthor (guildId, who.id,
                     interaction.member ? uuu (interaction.member) : interaction.user.username);
+                if (res.ok) qRedraw ();
                 return interaction.reply (res.ok ? res.text : { content: res.text, flags: MessageFlags.Ephemeral });
             }
             // [v2.15] Очистка очереди -- общая логика с кнопками под /queue.
@@ -13540,6 +13668,7 @@ client.on ('interactionCreate', async (interaction) =>
                 return interaction.reply ({ content: c.text, components: c.rows, flags: MessageFlags.Ephemeral });
             }
             const res = jumpMusic (guildId, n, mode === 'cut', ctxJ);
+            if (res.ok) qRedraw (1500);   // [v2.67] место в очереди и «Сейчас» видны сразу
             return interaction.reply (res.ok ? res.text : { content: res.text, flags: MessageFlags.Ephemeral });
         }
         else if (name === 'skip')
@@ -13550,6 +13679,7 @@ client.on ('interactionCreate', async (interaction) =>
             const res = queueSkip (guildId,
                 interaction.member ? uuu (interaction.member) : interaction.user.username,
                 { actorId: interaction.user.id, staff: isStaffInteraction (interaction) });
+            if (res.ok) qRedraw ();
             return interaction.reply (res.ok ? res.text : { content: res.text, flags: MessageFlags.Ephemeral });
         }
         else if (name === 'seek')
@@ -13571,6 +13701,7 @@ client.on ('interactionCreate', async (interaction) =>
             const res = seekMusic (guildId, sec,
                 interaction.member ? uuu (interaction.member) : interaction.user.username,
                 { actorId: interaction.user.id, staff: isStaffInteraction (interaction) });
+            if (res.ok) qRedraw (1500);   // [v2.67] позиция в шапке -- уже новая
             return interaction.reply (res.ok ? res.text : { content: res.text, flags: MessageFlags.Ephemeral });
         }
         else if (name === 'pause')
@@ -13586,6 +13717,7 @@ client.on ('interactionCreate', async (interaction) =>
             // сидеть в другом канале уже сейчас, и нового события в голосовых не будет.
             // Есть живые слушатели - checkListeners ничего не тронет.
             checkListeners (guildId);
+            qRedraw ();   // [v2.67] в шапке сразу видно «Пауза»
             return interaction.reply ('⏸ Пауза.');
         }
         else if (name === 'resume')
@@ -13595,6 +13727,7 @@ client.on ('interactionCreate', async (interaction) =>
             saveMusicState (guildId);
             scheduleVoiceStatus (guildId, true);
             schedulePresence (true);
+            qRedraw ();
             return interaction.reply ('▶️ Продолжаем.');
         }
         else if (name === 'nowplaying')
@@ -13654,6 +13787,7 @@ client.on ('interactionCreate', async (interaction) =>
             // дальше (см. leaveMusicVoice). Грубый выход -- только когда играть нечего.
             const res = leaveMusicVoice (guildId, interaction.user.id,
                 interaction.member ? uuu (interaction.member) : interaction.user.username);
+            if (res.ok) qRedraw ();
             return interaction.reply (res.ok ? res.text : { content: res.text, flags: MessageFlags.Ephemeral });
         }
     }
