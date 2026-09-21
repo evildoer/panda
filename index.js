@@ -10,6 +10,24 @@
 // номером просто не было -- номер мог быть пропущен, когда правки шли вперемешку. История
 // читается по блокам, а не по номерам: у одной партии может быть много коммитов, а блок
 // пишется только на то, что видно владельцу.
+// CHANGELOG v2.96 (обрыв связи виден всегда; честная причина вместо «проверь бинарник»; выход без каши в окне):
+//   * ОБРЫВ СВЯЗИ С DISCORD ВИДЕН ВСЕГДА. Живой лог 21.09.2026: «переподключаюсь к Discord
+//     (шард 0)» и «связь восстановлена» идут подряд, а САМОЙ потери в логе нет -- и сторож,
+//     который поднимает подключение сам, на таком обрыве не вооружался вовсе. Причина:
+//     discord.js на МЯГКИЙ (ремонтируемый) обрыв даёт только shardReconnecting, а
+//     shardDisconnect -- лишь когда переподключаться уже нельзя (4004 и подобные). Теперь
+//     отметка обрыва и строка ставятся в обоих случаях, состояние связи меняется в одном
+//     месте (gwOn), и его целиком проверяет стенд. Вход заново (shardReady) тоже снимает
+//     отметку: без этого она висела бы вечно, следующий обрыв не попал бы в лог, а «были без
+//     связи» показало бы часы.
+//   * «ПРОВЕРЬ БИНАРНИК» БОЛЬШЕ НЕ ОБВИНЯЕТ ЦЕЛЫЙ yt-dlp. В том же логе строка «yt-dlp: не смог
+//     узнать версию -- проверь бинарник» появилась из-за зависшего окна консоли: проба шла,
+//     но её таймаут сработал уже при Ctrl+C. Теперь проба делает две попытки с паузой, а на
+//     неудаче называет ПРИЧИНУ (таймаут / не запускается / код выхода) и молчит в момент
+//     выхода бота.
+//   * ВЫХОД НЕ ОСТАВЛЯЕТ КАШУ В ОКНЕ. Если за 400 мс (Ctrl+C) очередь в консоль не ушла, она
+//     сбрасывается ПЕРЕД возвратом кодовой страницы: иначе окно показало бы те же UTF-8 байты
+//     страницей 866. Всё это уже записано в файл -- терять нечего.
 // CHANGELOG v2.95 (окно консоли больше не может заморозить бота; MUSIC.proxy в примере пустой):
 //   * ОКНО КОНСОЛИ БОЛЬШЕ НЕ МОЖЕТ ЗАМОРОЗИТЬ БОТА. Живой случай владельца: бот запустился,
 //     окно консоли перестало принимать вывод -- и процесс встал НАСМЕРТЬ: ноль сокетов
@@ -1323,7 +1341,7 @@ function logFileWrite (line)
 // строкой в логе: редкая заморозка с читаемым текстом честнее каши на экране.
 // ============================================================================
 const CON_QUEUE_MAX_BYTES = 512 * 1024;
-let $conWrite = null, $conDrain = null, $conMode = '', $conNote = '', $conCpBefore = 0;
+let $conWrite = null, $conDrain = null, $conHalt = null, $conMode = '', $conNote = '', $conCpBefore = 0;
 // Как писать строку в консоль, когда асинхронный путь недоступен (или ещё не поднят):
 // как раньше -- синхронно в stderr. Своя функция, а не прямая ссылка, чтобы порядок
 // объявлений выше по файлу не превратился в ошибку (см. сторож $conWrite).
@@ -1433,6 +1451,10 @@ function consoleWriter ()
             };
             step ();
         }),
+        // [v2.96] Выход: окно так и не приняло вывод (drain вернул false) -- очередь не
+        // оставляем. Сейчас бот вернёт кодовую страницу окна (866), и те же байты (UTF-8)
+        // оно показало бы кашей -- а всё это уже лежит в файле, терять нечего.
+        halt: () => { dead = true; q.length = 0; bytes = 0; },
     };
 }
 
@@ -1448,7 +1470,7 @@ if (BOT_RUN)
     const _con = _safe.ok ? consoleWriter () : null;
     $conMode = _con ? 'async' : 'sync';
     $conNote = _safe.note;
-    if (_con) { $conWrite = _con.write; $conDrain = _con.drain; }
+    if (_con) { $conWrite = _con.write; $conDrain = _con.drain; $conHalt = _con.halt; }
     const _mirror = (syncSink, asyncSink) => (...args) =>
     {
         const line = utilMod.format (...args);   // как печатал бы console: подстановки и объекты
@@ -2744,28 +2766,62 @@ let $gwRelogins = 0;        // сколько раз поднимали подк
 let $gwReloginning = false;
 
 function gwWhen (ms) { try { return d (ms); } catch (e) { return new Date (ms).toLocaleString (); } }
-client.on ('shardDisconnect', (ev, id) =>
+
+// [v2.96] ОБРЫВ И ВОЗВРАТ -- по ОДНОЙ строке, из какого бы события они ни пришли.
+// Живой лог 21.09.2026 показал щель: подряд идут «переподключаюсь к Discord (шард 0)»
+// и «связь восстановлена», а самой потери в логе НЕТ -- и сторож переподключения на
+// таком обрыве не вооружался вовсе. Причина: discord.js на МЯГКИЙ (ремонтируемый) обрыв
+// даёт ТОЛЬКО shardReconnecting; shardDisconnect приходит лишь тогда, когда
+// переподключаться уже нельзя (код 4004 и подобные). Поэтому отметку обрыва ($gwDown)
+// и строку ставим в ОБОИХ случаях, а состояние меняется в одном месте -- gwOn:
+// его целиком проверяет стенд (без сети и без живого клиента).
+function gwDropText (logged, drops, id, code, reason)
 {
-    if ($gwDown === null) $gwDown = Date.now ();
-    $gwDrops++;
-    console.error ('[' + gwWhen (Date.now ()) + '] [gw] связь с Discord потеряна' +
-        (ev && ev.code ? ' (код ' + ev.code + ((ev.reason && String (ev.reason).trim ()) ? ' ' + oneLine (ev.reason, 80) : '') + ')' : '') +
-        ' -- переподключаюсь сам, очередь и музыка это не затрагивает' +
-        ($gwDrops > 1 ? ' (за этот запуск уже ' + $gwDrops + ' раз)' : ''));
-});
-client.on ('shardReconnecting', id =>
+    if (logged) return null;   // про этот обрыв уже сказали -- второй раз не повторяем
+    const tail = (drops > 1 ? ' (за этот запуск уже ' + drops + ' ' + plural (drops, 'раз', 'раза', 'раз') + ')' : '') +
+        ' -- музыка и очередь это не затрагивает';
+    if (code)
+        return '[gw] связь с Discord потеряна (код ' + code +
+            ((reason && String (reason).trim ()) ? ' ' + oneLine (reason, 80) : '') + ')' + tail +
+            '; сам discord.js её уже не поднимет -- сторож перезапустит подключение (до ' +
+            Math.round (GATEWAY_RELOGIN_MS / 1000) + ' с)';
+    return '[gw] связь с Discord оборвалась (шард ' + id + ') -- переподключаюсь сам' + tail;
+}
+function gwUpText (gapMs, how)
 {
-    console.log ('[' + gwWhen (Date.now ()) + '] [gw] переподключаюсь к Discord (шард ' + id + ')');
-});
-client.on ('shardResume', (id, replayed) =>
+    if (!gapMs) return null;   // обрыва не было -- шард просто встал на место: говорить нечего
+    return '[gw] связь с Discord восстановлена (были без связи ' + fmtAgo (gapMs) + ')' +
+        (how ? ', ' + how : '') +
+        ' -- если это повторяется часто, проверь интернет (бот поднял связь сам)';
+}
+// kind: 'drop' -- мягкий обрыв (discord.js переподключится сам), 'hard' -- жёсткий
+// (переподключаться уже нельзя), 'resume' -- сессия продолжилась, 'ready' -- вход заново.
+function gwOn (kind, info)
 {
-    const _gap = $gwDown ? Date.now () - $gwDown : 0;
+    info = info || {};
+    const now = Date.now ();
+    if (kind === 'drop' || kind === 'hard')
+    {
+        const logged = ($gwDown !== null);
+        if (!logged) { $gwDown = now; $gwDrops++; }
+        const text = gwDropText (logged, $gwDrops, info.id, kind === 'hard' ? info.code : null, info.reason);
+        if (text) (kind === 'hard' ? console.error : console.log) ('[' + gwWhen (now) + '] ' + text);
+        return;
+    }
+    const gap = $gwDown ? now - $gwDown : 0;
     $gwDown = null;
-    console.log ('[' + gwWhen (Date.now ()) + '] [gw] связь с Discord восстановлена' +
-        (_gap ? ' (были без связи ' + fmtAgo (_gap) + ')' : '') +
-        (replayed ? ', событий добрано: ' + replayed : '') +
-        ' -- если это повторяется часто, проверь интернет (бот сам ничего не делает)' );
-});
+    const text = gwUpText (gap, kind === 'resume'
+        ? (info.replayed ? 'событий добрано: ' + info.replayed : 'сессия продолжена')
+        : 'вход выполнен заново');
+    if (text) console.log ('[' + gwWhen (now) + '] ' + text);
+}
+client.on ('shardReconnecting', id => gwOn ('drop', { id: id }));
+client.on ('shardDisconnect', (ev, id) => gwOn ('hard', { id: id, code: ev && ev.code, reason: ev && ev.reason }));
+client.on ('shardResume', (id, replayed) => gwOn ('resume', { replayed: replayed }));
+// Вход заново (discord.js опознал сессию заново, а не продолжил её): shardResume тут
+// НЕ приходит, и без этой ветки отметка обрыва осталась бы висеть навсегда -- следующий
+// обрыв не попал бы в лог, а «были без связи» показало бы часы.
+client.on ('shardReady', id => gwOn ('ready', { id: id }));
 client.on ('shardError', (e, id) =>
 {
     console.error ('[' + gwWhen (Date.now ()) + '] [gw] ошибка связи (шард ' + id + '): ' + oneLine ((e && e.message) || e));
@@ -9199,12 +9255,42 @@ async function ytdlpVersionRead ()
     ytdlpVersion = String (r.out || '').trim ().split ('\n')[0];
     return ytdlpVersion;
 }
+// [v2.96] ПОЧЕМУ версия не прочиталась -- одной фразой. Раньше в этом случае была
+// только строка «проверь бинарник», и живой лог 21.09.2026 показал, чем это плохо: бот
+// стоял в зависшем окне консоли, таймаут пробы сработал уже при Ctrl+C, и вывод обвинял
+// бинарник, который был совершенно цел (в следующем запуске -- тот самый 2026.08.19).
+function ytdlpNoVersionWhy (r)
+{
+    const e = oneLine (String ((r && r.err) || '').replace (/\s+/g, ' ').trim (), 160);
+    if (!r) return 'нет ответа';
+    if (r.code === -1) return 'не ответил за 15 с (таймаут)';
+    if (r.code === -2) return 'не запускается' + (e ? ': ' + e : '');
+    return 'код ' + r.code + (e ? ': ' + e : '');
+}
+// «Бот уже выходит?» -- спрашиваем безопасно: $exiting объявлен НИЖЕ по файлу, и при самой
+// первой (синхронной) проверке его ещё нет; в этот момент выхода и нет -- это ожидаемо,
+// а не ошибка, поэтому проверка не должна бросать. (Проба при выходе не нужна: пугать
+// владельца «проверь бинарник» в момент Ctrl+C нечем.)
+function botIsExiting () { try { return $exiting === true; } catch (e) { return false; } }
 async function ytdlpStartupReport ()
 {
-    const v = await ytdlpVersionRead ();
+    // [v2.96] Две попытки. На шумном старте (машина занята диском, антивирус, только что
+    // поднятая сеть) одна попытка может истечь по таймауту -- и это ещё не повод говорить
+    // «проверь бинарник». Второй запуск идёт через паузу, чтобы не толкаться.
+    let r = null, v = '';
+    for (let attempt = 1; attempt <= 2; attempt++)
+    {
+        r = await ytdlpRunOnce (['--version'], 15000);
+        v = String (r.out || '').trim ().split ('\n')[0];
+        ytdlpVersion = v;
+        if (v) break;
+        if (attempt === 1) await new Promise (res => setTimeout (res, 3000));
+    }
     if (!v)
     {
-        console.error ('[' + (d()) + '] [music] yt-dlp: не смог узнать версию -- проверь бинарник: ' + YTDLP_PATH);
+        if (botIsExiting ()) return;
+        console.error ('[' + (d()) + '] [music] yt-dlp: версию узнать не вышло (' + ytdlpNoVersionWhy (r) +
+            ') -- если повторяется, проверь бинарник или обнови его: ' + YTDLP_PATH + ' (вручную: node . ytdlp)');
         return;
     }
     const age = ytdlpAgeDays ();
@@ -11456,6 +11542,12 @@ for (let sig of ['SIGINT', 'SIGTERM'])
         // зависло, Ctrl+C всё равно должен работать -- выход не ждёт зависшее окно.
         saveAllMusic ()
             .then (() => ($conDrain ? $conDrain (400) : null))
+            .then (drained =>
+            {
+                // [v2.96] Не успело уйти в окно за 400 мс -- сбрасываем очередь ПЕРЕД
+                // возвратом кодовой страницы (иначе те же строки показались бы кашей).
+                if ($conHalt && drained === false) $conHalt ();
+            })
             .catch (() => {})
             .finally (() => { consoleRestoreCodePage (); process.exit (0); });
     });
