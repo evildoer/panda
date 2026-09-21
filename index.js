@@ -10,6 +10,48 @@
 // номером просто не было -- номер мог быть пропущен, когда правки шли вперемешку. История
 // читается по блокам, а не по номерам: у одной партии может быть много коммитов, а блок
 // пишется только на то, что видно владельцу.
+// CHANGELOG v2.94 (связь с Discord видно и она поднимается сама; cookie из браузера; yt-dlp -- версия и автообновление):
+//   * СВЯЗЬ С DISCORD (GATEWAY) ВИДНА И ПОДНИМАЕТСЯ САМА. Владелец: «gate может иногда
+//     падать, бот теряет связь -- надо это учесть, выводить в лог и пытаться
+//     переподключиться; раньше я просто перезагружал бот периодически». Теперь каждый
+//     обрыв и возврат -- строка [gw] (раньше их в логе вообще не было), а если связи нет
+//     дольше 90 с (или Discord признал сессию недействительной), бот сам делает
+//     destroy + login -- то же, что владелец раньше делал руками, но БЕЗ остановки музыки
+//     (голосовое соединение живёт отдельно). Повторный вход НЕ повторяет одноразовую
+//     работу (ffmpeg-проверка, ЛС с инструкцией, подъём музыки, снимок и отчёты) -- за
+//     это отвечают флаги $bootOnce и $pollBooted у двух обработчиков clientReady.
+//   * COOKIE ИЗ БРАУЗЕРА (MUSIC.cookies_from_browser): ответ на вопрос владельца «а ты сам
+//     не можешь сгенерировать этот файл?» -- сам не могу (это его сессия входа), но файл
+//     и НЕ НУЖЕН: yt-dlp умеет читать cookie прямо из браузера (--cookies-from-browser),
+//     и бот передаёт их во все три запуска так же, как файл. Новые команды:
+//     `node . cookies` (что задано и читается ли: файл проверяется по формату Netscape,
+//     а браузерные cookie -- живым запросом yt-dlp по заведомо несуществующему адресу,
+//     то есть без похода за видео).
+//   * yt-dlp: ВЕРСИЯ ПРИ СТАРТЕ И САМОВОССТАНОВЛЕНИЕ ОБНОВЛЕНИЕМ. Владелец: «порой его
+//     надо обновлять -- он перестаёт качать ролики вообще... проверять при запуске, или
+//     делать попытку обновить (yt-dlp -U); если много и часто ошибки загрузки, то это
+//     метод восстановления». При старте бот печатает версию и её возраст, а если за
+//     15 минут не заиграло ytdlp_update_after_fails треков -- ОДИН раз пробует -U (не
+//     чаще раза в час) и говорит, что вышло. Вручную: `node . ytdlp` и `node . ytdlp -U`.
+// CHANGELOG v2.93 (трек не сгорает при сбое маршрута; cookie для yt-dlp; копии базы с датой в имени и пачкой):
+//   * СБОЙ МАРШРУТА -- БОЛЬШЕ НЕ ПРИГОВОР ТРЕКУ (isRouteError). Проверка «Sign in to confirm
+//     you're not a bot», таймаут, обрыв соединения, 403/429 и «Giving up after N retries»
+//     -- это про наш адрес/сеть, а не про видео (владелец: «иначе бы всю очередь рано или
+//     поздно съело на длительном обрыве прокси, если бы я, например, спал»). Теперь трек
+//     встаёт на место со своей секундой и ждёт сеть тем же механизмом netWait, а попытки
+//     не тратятся; пропуск -- только для настоящих ошибок видео (Video unavailable и др.).
+//   * COOKIE ДЛЯ yt-dlp (MUSIC.cookies_file): файл формата Netscape уходит в КАЖДЫЙ
+//     запуск yt-dlp (метаданные, скачивание на диск, поток) и убирает саму проверку
+//     «вы не робот». Строка при старте, строка [config], если файла нет; cookies*.txt и
+//     firefox.txt -- в .gitignore (это доступ к аккаунту).
+//   * КОПИИ БАЗЫ -- С ДАТОЙ В ИМЕНИ И ПАЧКОЙ (владелец: «у основного бекапа всегда писать
+//     время, а в параметре только сколько бекапов, мы договорились 5»): каждая плановая
+//     копия -- отдельный файл <id>.backup-<дата>_<время>.sqlite, рядом живёт история за
+//     backup_keep часов (по умолчанию 5), самая старая уходит сама. КОНТРОЛЬНЫЕ ТОЧКИ
+//     (`node . checkpoint`) -- личное дело владельца: бот их никогда не создаёт и не удаляет.
+//     Пустая база больше ничего не портит по конструкции -- копии не перезаписываются;
+//     если 0 записей это осознанная чистка, dbStartupGuard называет `node . backup`.
+//     Строка про пропущенный проход больше не гадает о причине («ПК спал» убрано).
 // CHANGELOG v2.92 (маршрут -- вниз, честные строки об обрыве потока, копии видно всегда):
 //   * «🌐 МАРШРУТ: ...» В /queue ПЕРЕЕХАЛ ВНИЗ, в ту же сводку (владелец: «тоже перенести!»):
 //     это справка для владельца хостинга, и вверху она мешала. Вверху из сетевого
@@ -1114,8 +1156,11 @@ const
     // [v2.27] Сколько минут между ПЛАНОВЫМИ копиями базы, пока бот работает.
     // По умолчанию 60; 0 -- как было раньше, копия только при старте (и вручную).
     backup_minutes,
-    // [v2.28] Сколько контрольных точек (файлов <id>.check-<дата>.sqlite) держать.
-    // По умолчанию 10; 0 -- не убирать старые вовсе.
+    // [v2.93] СКОЛЬКО ПОСЛЕДНИХ КОПИЙ БАЗЫ ДЕРЖАТЬ (файлы <id>.backup-<дата>_<время>.sqlite).
+    // Владелец: «бекапы важны регулярностью; за 5-6 часов я увижу, что что-то идёт не
+    // так» -- поэтому по умолчанию 5. Когда появляется новая сверх лимита, уходит самая
+    // старая. 0 -- не удалять старые вовсе. КОНТРОЛЬНЫЕ ТОЧКИ (`node . checkpoint`) этот
+    // лимит НЕ трогает: владелец делает их сам и сколько хочет, бот их никогда не удаляет.
     backup_keep,
     // [v2.55] Живой лог бота пишется ещё и в файл -- папку задаёт log_dir (по умолчанию
     // "logs"), а log_keep_months говорит, сколько МЕСЯЧНЫХ файлов держать (0 -- все).
@@ -1366,7 +1411,7 @@ const DB_ENC_HEX = /^[0-9a-fA-F]{64}$/;
 // игнорировался -- `node . unkey` или опечатка в `node . dum` запускали БОТА, а не
 // давали ошибку: одна случайная строка в консоли = лишний процесс. Список -- ровно то,
 // что обрабатывается ниже; всё остальное считается опечаткой.
-const CONSOLE_CMDS = ['help', 'config', 'keygen', 'dump', 'files', 'cache', 'privacy', 'backup', 'checkpoint', 'backups', 'restore', 'clearstatus', 'unkey', 'fixauthors'];
+const CONSOLE_CMDS = ['help', 'config', 'keygen', 'dump', 'files', 'cache', 'privacy', 'backup', 'checkpoint', 'backups', 'restore', 'clearstatus', 'unkey', 'fixauthors', 'cookies', 'ytdlp'];
 // [v2.32] СПИСОК КОМАНД -- ОДИН НА ВСЕ СЛУЧАИ: его печатает `node . help`, его же
 // показывает ошибка про опечатку. Раньше про этот список знала только ошибка, и
 // `node . help` отвечал «Неизвестная команда: help» -- то есть спросить было не у кого.
@@ -1383,12 +1428,14 @@ const CONSOLE_HELP =
     ['node . config',             'чем бот РЕАЛЬНО работает: все ключи, их значения и откуда взяты (бот не запускается)'],
     ['node . files',              'что за каждый файл в папке и что можно удалять'],
     ['node . cache [--clear]',    'кэш музыки: что скачано, сколько занимает, что удалять (--clear -- стереть всё)'],
+    ['node . cookies',            'cookie для YouTube: что задано и читается ли оно (файл или cookies браузера)'],
+    ['node . ytdlp [--update]',   'версия yt-dlp и её возраст (--update -- обновить: yt-dlp -U)'],
     ['node . privacy [--check]',  'пересобрать PRIVACY.md из шаблона (--check -- только проверить)'],
     ['node . privacy --offline',  'то же, но без обращения к Discord за именами'],
-    ['node . backup',             'обновить штатную копию базы (одна, перезаписывается)'],
-    ['node . checkpoint [метка]', 'сделать контрольную точку (отдельный файл с датой в имени)'],
-    ['node . backups',            'что есть: база, штатная копия и все контрольные точки'],
-    ['node . restore [метка]',    'вернуть базу из штатной копии или из конкретной точки'],
+    ['node . backup',             'сделать копию базы с датой в имени (как при старте и по таймеру)'],
+    ['node . checkpoint [метка]', 'сделать контрольную точку (файл с датой в имени; бот их не удаляет)'],
+    ['node . backups',            'что есть: база, копии с датой и контрольные точки'],
+    ['node . restore [метка]',    'вернуть базу из самой свежей копии (без метки) или из копии/точки по метке'],
     ['node . clearstatus <id>',   'разово снять свою строку из статуса голосового канала'],
     ['node . fixauthors <id> [имя] [--dry]', 'проставить автора трекам в очереди, где его нет'],
 ];
@@ -1403,7 +1450,11 @@ function printConsoleHelp ()
 }
 // [v2.32] Единственная консольная команда, которой нужно ДОЖДАТЬСЯ базы (fixauthors):
 // на время её работы вход бота в Discord блокируется (см. проверку у client.login).
-const $cliHold = CONSOLE_CMDS.some (_c => _c === 'fixauthors' && process.argv.slice (2).some (_a => new RegExp ('^' + _c + '$', 'i').test (_a)));
+// [v2.94] Список расширен: 'cookies' и 'ytdlp' работают с сетью/диском (и могут занять
+// секунды), поэтому вход в Discord на время их работы надо тоже придержать -- иначе
+// бот успел бы залогиниться и мешал бы (fixauthors держался так же).
+const $cliHold = ['fixauthors', 'cookies', 'ytdlp'].some (_c =>
+    CONSOLE_CMDS.includes (_c) && process.argv.slice (2).some (_a => new RegExp ('^' + _c + '$', 'i').test (_a)));
 {
     const _first = String (process.argv[2] === undefined ? '' : process.argv[2]).trim ();
     if (/^help$/i.test (_first)) // [v2.32] `node . help` -- тот же список, что у ошибки
@@ -1815,10 +1866,11 @@ function filesCli ()
         if (/^console\.bat$/i.test (_name)) return ['личная мелочь владельца (в git не попадает)', 'можно, если не нужна'];
         if (_name === '.gitignore' || _name === '.gitattributes') return ['что не попадает в git (токены, базы, точки)', 'НЕТ'];
         if (/^\d{17,20}\.sqlite$/i.test (_name)) return ['ВСЕ ДАННЫЕ БОТА: роли для возврата, история наказаний, таймауты, очередь музыки (зашифрованы)', 'НЕТ'];
-        if (/\.backup\.sqlite$/i.test (_name)) return ['штатная копия базы (одна, перезаписывается при старте и каждые backup_minutes)', 'можно -- создастся при следующем запуске'];
+        if (/\.backup-.*\.sqlite$/i.test (_name)) return ['копия базы с датой в имени (сделана при старте, по таймеру backup_minutes или командой `node . backup`)', 'можно (самые старые уходят сами по backup_keep)'];
+        if (/\.backup\.sqlite$/i.test (_name)) return ['старая копия базы без даты (до v2.93); заменена копиями с датой -- только ЧИТАЕТСЯ', 'можно, когда есть копия с датой'];
         if (/\.broken\.sqlite$/i.test (_name)) return ['побитая база, отложенная командой restore', 'можно, когда убедишься, что не нужна'];
         if (/\.unkey\.sqlite$/i.test (_name)) return ['копия базы ОТКРЫТЫМ ТЕКСТОМ (красная кнопка `node . unkey`)', 'ДА, и прямо сейчас'];
-        if (/\.check-.*\.sqlite$/i.test (_name)) return ['контрольная точка базы (`node . checkpoint`)', 'можно (самые старые уходят сами по backup_keep)'];
+        if (/\.check-.*\.sqlite$/i.test (_name)) return ['контрольная точка базы (`node . checkpoint`); бот их не удаляет', 'можно, когда сам решишь'];
         if (/\.sqlite-(journal|wal|shm)$/i.test (_name)) return ['хвост незакрытой транзакции SQLite', 'можно, когда бот выключен'];
         if (_name === 'music_cache') return ['кэш музыки (MUSIC.cache): скачанные треки. Это НЕ данные бота -- просто музыка',
             'можно ВСЁ -- бот скачает заново (отчёт и очистка: `node . cache`); но недокачанное ему полезно: ' +
@@ -1882,12 +1934,12 @@ function filesCli ()
     console.log ('  node . keygen                 -- напечатать НОВЫЙ ключ шифрования (вставить в config.json -> db_key)');
     console.log ('  node . dump                   -- что лежит в базе, по серверам (только чтение)');
     console.log ('  node . dump 247110936115150848 -- то же, но по одному человеку (фильтр по id)');
-    console.log ('  node . backup                 -- обновить штатную копию базы прямо сейчас');
-    console.log ('  node . checkpoint             -- контрольная точка базы (файл с датой в имени)');
+    console.log ('  node . backup                 -- сделать копию базы с датой в имени прямо сейчас');
+    console.log ('  node . checkpoint             -- контрольная точка базы (файл с датой в имени; бот их не удаляет)');
     console.log ('  node . checkpoint before-cleanup -- то же, но с меткой (её видно в имени файла)');
-    console.log ('  node . backups                -- что есть: база, штатная копия и все точки');
-    console.log ('  node . restore                -- вернуть базу из штатной копии');
-    console.log ('  node . restore before-cleanup -- вернуть из контрольной точки (метка -- часть имени или дата)');
+    console.log ('  node . backups                -- что есть: база, копии с датой и все точки');
+    console.log ('  node . restore                -- вернуть базу из самой свежей копии');
+    console.log ('  node . restore before-cleanup -- вернуть из копии или точки по метке (часть имени или дата)');
     console.log ('  node . clearstatus 1414754348139020359 -- снять свою строку из шапки канала (id канала)');
     console.log ('  node . privacy                -- пересобрать PRIVACY.md из шаблона (имена спросит у Discord)');
     console.log ('  node . privacy --offline      -- то же, но без обращения к сети');
@@ -2484,6 +2536,119 @@ const client = new Client
 );
 
 // ============================================================================
+// [v2.94] СВЯЗЬ С DISCORD (GATEWAY): ВИДЕТЬ ОБРЫВ И ПОДНИМАТЬ ЕЁ САМОМУ.
+// Владелец: «discord gate может иногда падать, бот теряет с ним связь -- надо это учесть,
+// выводить в лог и пытаться переподключиться; раньше я просто периодически перезагружал
+// бот». Своими силами это лечится так:
+//   * КАЖДЫЙ обрыв и возврат связи пишется строкой [gw] -- раньше их в логе НЕ БЫЛО, и
+//     «бот молчит» от «бот отвалился от Discord» было не отличить;
+//   * мягкий обрыв (сеть мигнула) discord.js переподключает сам -- мы только сообщаем;
+//   * если сессия потеряна окончательно (сеть лежала долго, Discord отказал -- код 4004
+//     или событие invalidated), сам он уже НЕ переподключит: нужен новый вход. Поэтому
+//     есть сторож: связи нет дольше GATEWAY_RELOGIN_MS -- бот делает destroy + login
+//     заново, то есть ровно то, что владелец раньше делал руками (музыка при этом не
+//     трогается: голосовое соединение живёт отдельно от gateway).
+// ВАЖНО: повторный вход НЕ должен заново поднимать музыку, отчёты и рассылку в ЛС --
+// это одноразовая работа (см. $bootOnce у двух обработчиков clientReady).
+// ============================================================================
+const GATEWAY_RELOGIN_MS = 90 * 1000;   // столько без связи -- и перезаходим сами
+const WS_STATUS = { 0: 'готов', 1: 'соединяюсь', 2: 'переподключаюсь', 3: 'idle', 4: 'почти готов', 5: 'отключён', 6: 'жду гильдии', 7: 'возобновляю сессию' };
+let $bootOnce = false;      // одноразовый старт первого clientReady (ffmpeg + рассылка ЛС)
+let $pollBooted = false;    // одноразовый старт второго clientReady (музыка, снимки, отчёты)
+let $gwDown = null;         // когда связь пропала (ms) или null
+let $gwDrops = 0;           // сколько раз связь терялась за этот запуск
+let $gwRelogins = 0;        // сколько раз поднимали подключение заново
+let $gwReloginning = false;
+
+function gwWhen (ms) { try { return d (ms); } catch (e) { return new Date (ms).toLocaleString (); } }
+client.on ('shardDisconnect', (ev, id) =>
+{
+    if ($gwDown === null) $gwDown = Date.now ();
+    $gwDrops++;
+    console.error ('[' + gwWhen (Date.now ()) + '] [gw] связь с Discord потеряна' +
+        (ev && ev.code ? ' (код ' + ev.code + ((ev.reason && String (ev.reason).trim ()) ? ' ' + oneLine (ev.reason, 80) : '') + ')' : '') +
+        ' -- переподключаюсь сам, очередь и музыка это не затрагивает' +
+        ($gwDrops > 1 ? ' (за этот запуск уже ' + $gwDrops + ' раз)' : ''));
+});
+client.on ('shardReconnecting', id =>
+{
+    console.log ('[' + gwWhen (Date.now ()) + '] [gw] переподключаюсь к Discord (шард ' + id + ')');
+});
+client.on ('shardResume', (id, replayed) =>
+{
+    const _gap = $gwDown ? Date.now () - $gwDown : 0;
+    $gwDown = null;
+    console.log ('[' + gwWhen (Date.now ()) + '] [gw] связь с Discord восстановлена' +
+        (_gap ? ' (были без связи ' + fmtAgo (_gap) + ')' : '') +
+        (replayed ? ', событий добрано: ' + replayed : '') +
+        ' -- если это повторяется часто, проверь интернет (бот сам ничего не делает)' );
+});
+client.on ('shardError', (e, id) =>
+{
+    console.error ('[' + gwWhen (Date.now ()) + '] [gw] ошибка связи (шард ' + id + '): ' + oneLine ((e && e.message) || e));
+});
+client.on ('invalidated', () =>
+{
+    console.error ('[' + gwWhen (Date.now ()) + '] [gw] сессия Discord признана недействительной (сеть лежала долго или вход отозван) -- захожу заново');
+    forceRelogin ('сессия недействительна');
+});
+client.on ('error', e =>
+{
+    console.error ('[' + gwWhen (Date.now ()) + '] [gw] ошибка клиента: ' + oneLine ((e && e.message) || e));
+});
+
+// Перезапуск ПОДКЛЮЧЕНИЯ (не бота): destroy + login. Музыку не трогаем -- голосовое
+// соединение своё, и при мягком обрыве оно вообще не затрагивается.
+function forceRelogin (why)
+{
+    if ($gwReloginning) return;
+    $gwReloginning = true;
+    $gwRelogins++;
+    console.log ('[' + gwWhen (Date.now ()) + '] [gw] перезапускаю подключение к Discord (' + why +
+        ') -- то же, что раньше делал руками, но без остановки музыки');
+    (async () =>
+    {
+        try { client.destroy (); } catch (e) { }
+        await new Promise (r => setTimeout (r, 3000));
+        try
+        {
+            await client.login (TOKEN);
+            $gwDown = null;
+            console.log ('[' + gwWhen (Date.now ()) + '] [gw] подключение поднято заново' +
+                ($gwRelogins > 1 ? ' (всего автоперезапусков: ' + $gwRelogins + ')' : '') +
+                ' -- если это повторяется, проверь интернет и токен');
+        }
+        catch (e)
+        {
+            console.error ('[' + gwWhen (Date.now ()) + '] [gw] заново подключиться не вышло: ' +
+                oneLine ((e && e.message) || e) + ' -- попробую ещё через ' + Math.round (GATEWAY_RELOGIN_MS / 1000) + ' с');
+        }
+        finally { $gwReloginning = false; }
+    }) ();
+}
+
+// Решение сторожа -- отдельной чистой функцией, чтобы его можно было проверить стендом
+// (без сети и без живого клиента). Перезаходим только когда: не заняты, связи нет дольше
+// порога И состояние gateway при этом НЕ «готов» (0): при мявком обрыве discord.js уже
+// сам переподключается, и мешать ему нельзя -- иначе получим два входа одновременно.
+function gwShouldRelogin (gapMs, status, busy)
+{
+    if (busy) return null;
+    if (!(gapMs >= GATEWAY_RELOGIN_MS)) return null;
+    if (status === 0) return null;
+    return 'связи нет ' + fmtAgo (gapMs) + ', состояние gateway: ' + (WS_STATUS[status] || status);
+}
+// Сторож: связи нет слишком долго -- поднимаем подключение сами.
+setInterval (() =>
+{
+    if (!$gwDown) return;
+    const _gap = Date.now () - $gwDown;
+    const _st = (client.ws && typeof client.ws.status === 'number') ? client.ws.status : -1;
+    const _why = gwShouldRelogin (_gap, _st, $gwReloginning);
+    if (_why) forceRelogin (_why);
+}, 30000);
+
+// ============================================================================
 // [v2.23] РЕЗЕРВНАЯ КОПИЯ БАЗЫ И ЗАЩИТА ОТ ЗАПУСКА С ПОВРЕЖДЁННОЙ БАЗОЙ.
 // Зачем: база -- единственное место, где живут роли, история и очередь, и пострадать
 // она может не от бота, а от резкого выключения ПК, обрыва питания, диска, антивируса.
@@ -2494,11 +2659,18 @@ const client = new Client
 //   * `node . backup` -- сделать и проверить копию вручную;
 //   * `node . restore` -- положить копию на место базы, а побитую отложить рядом
 //     (<имя>.broken.sqlite).
-// Копий НЕ копится: на сервер максимум два служебных файла, и оба перезаписываются --
-// это копия «на случай обрыва», а не архив по датам.
+// [v2.93] КОПИИ ТЕПЕРЬ С ДАТОЙ В ИМЕНИ И ХРАНЯТСЯ ПАЧКОЙ. Владелец: «у основного
+// бекапа всегда писать время, а в параметре только сколько бекапов, мы договорились 5».
+// Каждая плановая копия -- <id>.backup-<ГГГГ-ММ-ДД_ЧЧ-ММ-СС>.sqlite, и самых свежих
+// держим backup_keep (по умолчанию 5). Старое имя <id>.backup.sqlite (без даты) только
+// ЧИТАЕТСЯ: если датированных копий ещё нет, restore и проверка старта берут его -- чтобы
+// у тех, кто обновился, ничего не потерялось; после первой же копии с датой он не нужен
+// (бот скажет об этом строкой). КОНТРОЛЬНЫЕ ТОЧКИ (`node . checkpoint`) -- ЛИЧНОЕ ДЕЛО
+// ВЛАДЕЛЬЦА: бот их никогда не удаляет и лимитом не считает.
 // ============================================================================
 function dbFileOf (_srv)   { return __dirname + '/' + _srv + '.sqlite'; }
-function dbBackupOf (_srv) { return __dirname + '/' + _srv + '.backup.sqlite'; }
+function dbBackupOf (_srv) { return __dirname + '/' + _srv + '.backup.sqlite'; }   // до v2.93: копия без даты
+function dbBackupStampOf (_srv) { return __dirname + '/' + _srv + '.backup-' + dbCheckStamp (); }
 function dbBrokenOf (_srv) { return __dirname + '/' + _srv + '.broken.sqlite'; }
 function dbServerList ()   { return Object.keys (SERVERS).filter (_k => /^\d{17,20}$/.test (_k)); }
 // [v2.85] ЕДИНОЕ ПРАВИЛО ВКЛЮЧЁННОСТИ: экземпляр обслуживается только при ЯВНОМ
@@ -2577,25 +2749,12 @@ function dbCopyAndVerify (_src, _dst, _expectRows)
     }
 }
 
-// Обновление копии. Предосторожностей две:
-//   (1) неудачная копия не подменяет целую -- копируем через временный файл и проверяем
-//       ЕГО чтением (см. dbCopyAndVerify);
-//   (2) пустая база при непустой копии копию не перезаписывает -- это уже признак потери
-//       данных, и на нём бот вообще не запускается (см. dbStartupGuard).
-// [v2.23] А вот уменьшение числа записей копию БОЛЬШЕ НЕ останавливает: в обычной жизни
-// записи и вправду уменьшаются (вернулся -- запись roles больше не нужна; /forget стёр
-// роли и историю; таймаут истёк), и копия начинала отставать -- в логе висело «копия НЕ
-// обновлена» с советом удалить файл руками, а копия при восстановлении возвращала бы уже
-// ненужное. Уменьшение видно в логе строкой «было N -- записи уменьшились», то есть не
-// молча. SQLite при этом атомарен: незакрывшаяся транзакция откатывается целиком, а
-// половины записей не теряет.
-function dbBackupRefresh (_file, _bak, _rows, _old)
-{
-    if (_rows === 0 && _old.exists && _old.rows > 0)
-        return { ok: false, why: 'в базе 0 записей, а в копии ' + _old.rows +
-            ' ' + plural (_old.rows, 'запись', 'записи', 'записей') + ' -- оставил копию как есть' };
-    return dbCopyAndVerify (_file, _bak, _rows);
-}
+// [v2.93] КОПИЯ БОЛЬШЕ НЕ ПЕРЕЗАПИСЫВАЕТСЯ -- каждый раз получается НОВЫЙ файл с датой
+// в имени (см. dbBackupMake ниже). Поэтому «неудачная копия затрёт целую», «пустая база
+// затрёт непустую копию», «копия отстаёт при уменьшении записей» -- всё это больше не
+// возможно по конструкции: прежние копии просто остаются на месте, пока их не вытеснят
+// свежие (backup_keep). Уменьшение видно в самих файлах: рядом лежат копии «до» и «после»,
+// и любую из них можно вернуть (`node . backups`, `node . restore <дата>`).
 
 // Одна строка при нормальном старте и ГРОМКИЙ отказ -- при побитой базе.
 function dbStartupGuard ()
@@ -2604,25 +2763,31 @@ function dbStartupGuard ()
     const _good = [], _bad = [];
     for (const _srv of dbServerListOn ())
     {
-        const _file = dbFileOf (_srv), _bak = dbBackupOf (_srv);
+        const _file = dbFileOf (_srv);
         const _nm = (_srv + ((SERVERS[_srv] || {}).name ? ' («' + SERVERS[_srv].name + '»)' : ''));
-        const _cur = dbIntegrity (_file), _old = dbIntegrity (_bak);
+        const _cur = dbIntegrity (_file);
+        // [v2.93] Сверяемся с САМОЙ СВЕЖЕЙ копией (с датой, а если таких ещё нет -- со
+        // старым <id>.backup.sqlite): именно она показывает, что было в базе до аварии.
+        const _last = dbBackupLatest (_srv);
+        const _old = _last ? dbIntegrity (_last.path) : { exists: false, ok: true, rows: 0, why: '' };
         if (_cur.exists && !_cur.ok) { _bad.push ({ nm: _nm, why: _cur.why, old: _old }); continue; }
-        // Файл целый, но пустой, а в копии записи -- похоже на обрезанную базу.
+        // Файл целый, но пустой, а в свежей копии записи -- похоже на обрезанную базу.
         if (_cur.exists && _cur.rows === 0 && _old.exists && _old.rows > 0)
         {
-            _bad.push ({ nm: _nm, why: 'в базе 0 записей, а в копии ' + _old.rows, old: _old });
+            _bad.push ({ nm: _nm, why: 'в базе 0 записей, а в свежей копии ' + _old.rows, old: _old });
             continue;
         }
         let _tail = ' (базы ещё нет)';
         if (_cur.exists)
         {
-            const _res = dbBackupRefresh (_file, _bak, _cur.rows, _old);
+            const _res = dbBackupMake (_srv);
             _tail = ' -- ' + _cur.rows + ' ' + plural (_cur.rows, 'запись', 'записи', 'записей') +
                 (_res.ok
-                    ? ', копия обновлена' + (_old.exists && _old.rows > _cur.rows
-                        ? ' (было ' + _old.rows + ' -- записи уменьшились)' : '')
-                    : ', копия НЕ обновлена: ' + _res.why);
+                    ? ', копия ' + dbTail (_res.path).replace (_srv + '.backup-', '') +
+                      (_res.gone.length ? ' (старых копий убрал ' + _res.gone.length + ')' : '')
+                    : ', копия НЕ сделана: ' + _res.why);
+            if (_f.existsSync (dbBackupOf (_srv)))
+                _tail += ', ' + dbTail (dbBackupOf (_srv)) + ' -- старое имя без даты, можно удалить';
             if (_f.existsSync (_file + '-journal') || _f.existsSync (_file + '-wal'))
                 _tail += ', был аварийный выход (журнал на диске -- SQLite откатит сам)';
         }
@@ -2655,52 +2820,61 @@ function dbStartupGuard ()
             (_b.old.exists ? ' | копия: ' + _b.old.rows + ' ' + plural (_b.old.rows, 'запись', 'записи', 'записей') +
                 ', ' + (_b.old.ok ? 'читается' : 'тоже не читается') : ' | копии нет'));
     }
-    console.log ('[db] что делать: `node . restore` -- вернуть базу из копии (текущую отложит рядом как <имя>.broken.sqlite).');
+    console.log ('[db] что делать: `node . restore` -- вернуть базу из САМОЙ СВЕЖЕЙ копии (текущую отложит рядом как <имя>.broken.sqlite).');
+    console.log ('[db] если база пуста ОСОЗНАННО (чистка, /forget всех), а в свежей копии старые записи: `node . backup` --');
+    console.log ('[db] он сделает новую копию с текущим (пустым) состоянием, а прежние копии с датой останутся -- их бот не трогает.');
     console.log ('[db] если копия не нужна и данные не жалко -- переименуй или удали файл базы и запусти снова.');
     console.log ('='.repeat (72));
     process.exit (1);
 }
 
-// `node . backup` -- сделать и проверить копию вручную.
+// `node . backup` -- сделать и проверить копию вручную (новый файл с датой в имени).
 function dbBackupCli ()
 {
     let _fail = 0;
-    console.log ('[backup] копия базы: <имя>.sqlite -> <имя>.backup.sqlite (одна на сервер, перезаписывается)');
+    console.log ('[backup] копия базы: <имя>.sqlite -> <имя>.backup-<дата>_<время>.sqlite' +
+        (BACKUP_KEEP ? ' (самых свежих держу ' + BACKUP_KEEP + ', самая старая уходит сама; backup_keep)' : ' (старые копии не убираю: backup_keep = 0)'));
     for (const _srv of dbServerListOn ())
     {
-        const _file = dbFileOf (_srv), _bak = dbBackupOf (_srv);
-        const _cur = dbIntegrity (_file);
-        if (!_cur.exists) { console.log ('[backup] ' + _srv + ': базы ещё нет -- копировать нечего'); continue; }
-        if (!_cur.ok) { console.log ('[backup] ' + _srv + ': база ПОВРЕЖДЕНА (' + _cur.why + ') -- копию НЕ делаю, чтобы не затереть целую'); _fail++; continue; }
-        if (_cur.rows === 0) { console.log ('[backup] ' + _srv + ': в базе 0 записей -- копию не трогаю (пустая база не должна затереть прежние данные)'); continue; }
-        const _res = dbBackupRefresh (_file, _bak, _cur.rows, dbIntegrity (_bak));
-        if (_res.ok) console.log ('[backup] ' + _srv + ': готово -- ' + _res.rows + ' ' +
-            plural (_res.rows, 'запись', 'записи', 'записей') + ', копия прочитана (' + _bak + ')');
-        else { console.log ('[backup] ' + _srv + ': не вышло: ' + _res.why + ' (прежняя копия не тронута)'); _fail++; }
+        const _res = dbBackupMake (_srv);
+        if (!_res.ok)
+        {
+            console.log ('[backup] ' + _srv + ': ' + _res.why +
+                (dbIntegrity (dbFileOf (_srv)).exists ? ' -- прежние копии не тронуты' : ''));
+            _fail++;
+            continue;
+        }
+        console.log ('[backup] ' + _srv + ': копия сделана -- ' + dbTail (_res.path) + ' (' + _res.rows + ' ' +
+            plural (_res.rows, 'запись', 'записи', 'записей') + ', файл прочитан)' +
+            (_res.empty ? ' -- база сейчас пуста, так и записано' : '') +
+            (_res.gone.length ? ', старых копий убрал ' + _res.gone.length + ' (backup_keep: ' + BACKUP_KEEP + ')' : ''));
+        if (require ('fs').existsSync (dbBackupOf (_srv)))
+            console.log ('[backup] ' + _srv + ': ' + dbTail (dbBackupOf (_srv)) +
+                ' -- старое имя без даты, больше не нужно (заменено копиями с датой), можно удалить');
     }
     return _fail ? 1 : 0;
 }
 
 // ============================================================================
 // [v2.28] КОНТРОЛЬНЫЕ ТОЧКИ БАЗЫ: отдельные файлы с датой в имени.
-// Штатная копия (<id>.backup.sqlite) одна и перезаписывается -- это защита «от обрыва».
-// Точки -- другое: они остаются, чтобы вернуться к конкретному моменту (перед большой
-// чисткой, перед сменой ключа, просто «на всякий случай»):
+// [v2.93] ЭТО ЛИЧНЫЙ ИНСТРУМЕНТ ВЛАДЕЛЬЦА, И БОТ ИХ НЕ ТРОГАЕТ: точки делаются только
+// командой `node . checkpoint [метка]`, хранятся сколько угодно (никакого backup_keep к
+// ним не применяется) и удаляются вручную, когда владелец сам решит:
 //     node . checkpoint [метка]   -- сделать точку сейчас
 //     node . backups              -- посмотреть, что есть
-//     node . restore [метка]      -- вернуть базу из точки (без метки -- из штатной копии)
-// Больше backup_keep точек на сервер не держим (по умолчанию 10; 0 -- не убирать
-// старые вовсе): когда появляется новая сверх лимита, самая старая удаляется.
-// Автоматически по расписанию точки НЕ делаются -- только по команде: в папке не
-// появляется ничего, чего бы владелец не попросил.
+//     node . restore [метка]      -- вернуть базу из точки или из копии с датой
+// (без метки restore берёт САМУЮ СВЕЖУЮ плановую копию -- см. dbBackupLatest).
 // ВАЖНО про ключ: файл точки зашифрован тем ключом, который действовал в момент её
 // создания. После смены ключа (/rekey) старая точка читается только если прежний ключ
 // остался в config.json (db_key_prev) -- иначе записи в ней не расшифровать.
 // ============================================================================
+// [v2.93] СКОЛЬКО ПЛАНОВЫХ КОПИЙ ДЕРЖАТЬ (файлы <id>.backup-<дата>_<время>.sqlite).
+// Владелец: «у основного бекапа всегда писать время, а в параметре только сколько
+// бекапов, мы договорились 5». 0 -- старые копии не удалять (папка растёт).
 const BACKUP_KEEP = (() =>
 {
     const _v = Number (backup_keep);
-    if (!Number.isFinite (_v) || _v < 0) return 10;
+    if (!Number.isFinite (_v) || _v < 0) return 5;
     return Math.floor (_v);
 }) ();
 const dbTail = _p => String (_p).replace (/^.*[\\/]/, '');
@@ -2710,21 +2884,31 @@ function dbCheckStamp ()
     return _d.getFullYear () + '-' + _p (_d.getMonth () + 1) + '-' + _p (_d.getDate ()) + '_' +
         _p (_d.getHours ()) + '-' + _p (_d.getMinutes ()) + '-' + _p (_d.getSeconds ());
 }
-// Точки сервера, отсортированные по времени создания.
-// ВАЖНО: сортировать по имени целиком НЕЛЬЗЯ -- у точек бывают метки, и тогда
+// Файлы сервера с штампом времени сразу после префикса, отсортированные по времени.
+// ВАЖНО: сортировать по имени целиком НЕЛЬЗЯ -- у файлов бывают метки, и тогда
 // «...-before-restore.sqlite» оказался бы ПЕРЕД «....sqlite» (дефис младше точки),
-// то есть ротация удаляла бы самую новую точку. Поэтому сравниваем штамп времени
-// (первые 19 символов после '.check-'), а внутри одной секунды -- время файла и имя.
-function dbCheckFiles (_srv)
+// то есть ротация удаляла бы самую новую. Поэтому сравниваем штамп времени (первые
+// 19 символов после префикса), потом время файла, а если совпало и оно -- ОБЫЧНЫМ
+// порядком с учётом номера: «..._10-00-00.sqlite» старее, чем «..._10-00-00-2.sqlite»
+// (хвост -N -- номер второго файла в ту же секунду, а не метка), иначе сортировка по
+// строке сочла бы «-2» старше и удалила не самый старый (на этом стенд поймал).
+function dbStampFiles (_prefix)
 {
     const _f = require ('fs');
     let _list = [];
     try { _list = _f.readdirSync (__dirname); } catch (e) { return []; }
-    const _pref = _srv + '.check-';
-    const _stamp = _n => _n.slice (_pref.length, _pref.length + 19); // YYYY-MM-DD_HH-MM-SS
+    const _stamp = _n => _n.slice (_prefix.length, _prefix.length + 19); // YYYY-MM-DD_HH-MM-SS
     const _mtime = _p => { try { return _f.statSync (_p).mtimeMs; } catch (e) { return 0; } };
+    // «Природный» ключ только для последнего разрешения спора: основа имени (метка) и
+    // номер второго файла в ту же секунду (его нет -- 0). Метка при этом не разбирается:
+    // сравнивается строка целиком, а номер лишь отделяет «-2» от файла без номера.
+    const _nat = _n =>
+    {
+        const _m = /^([\s\S]*?)(?:-(\d+))?\.sqlite$/.exec (_n);
+        return { base: _m ? _m[1] : _n, num: _m && _m[2] ? Number (_m[2]) : 0 };
+    };
     return _list
-        .filter (_n => _n.startsWith (_pref) && _n.endsWith ('.sqlite'))
+        .filter (_n => _n.startsWith (_prefix) && _n.endsWith ('.sqlite'))
         .map (_n => ({ name: _n, path: __dirname + '/' + _n }))
         .sort ((a, b) =>
         {
@@ -2732,14 +2916,29 @@ function dbCheckFiles (_srv)
             if (_sa !== _sb) return _sa < _sb ? -1 : 1;
             const _ma = _mtime (a.path), _mb = _mtime (b.path);
             if (_ma !== _mb) return _ma - _mb;
+            const _ka = _nat (a.name), _kb = _nat (b.name);
+            if (_ka.base !== _kb.base) return _ka.base < _kb.base ? -1 : 1;
+            if (_ka.num !== _kb.num) return _ka.num - _kb.num;
             return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0);
         });
 }
-function dbCheckRotate (_srv)
+function dbCheckFiles (_srv)  { return dbStampFiles (_srv + '.check-'); }
+function dbBackupFiles (_srv) { return dbStampFiles (_srv + '.backup-'); }
+// Самая свежая копия сервера: с датой, а если таких ещё нет -- старое имя (до v2.93).
+function dbBackupLatest (_srv)
+{
+    const _f = require ('fs');
+    const _all = dbBackupFiles (_srv);
+    if (_all.length) return { name: dbTail (_all[_all.length - 1].name), path: _all[_all.length - 1].path };
+    const _legacy = dbBackupOf (_srv);
+    return _f.existsSync (_legacy) ? { name: dbTail (_legacy), path: _legacy, legacy: true } : null;
+}
+// Убрать самые старые копии сверх backup_keep. Точки не трогаем -- у них лимита нет.
+function dbBackupRotate (_srv)
 {
     const _f = require ('fs');
     if (!BACKUP_KEEP) return [];
-    const _all = dbCheckFiles (_srv);
+    const _all = dbBackupFiles (_srv);
     const _gone = [];
     while (_all.length > BACKUP_KEEP)
     {
@@ -2747,6 +2946,21 @@ function dbCheckRotate (_srv)
         try { _f.rmSync (_old.path, { force: true }); _gone.push (_old.name); } catch (e) { }
     }
     return _gone;
+}
+// Сделать плановую копию (с датой в имени), проверив её чтением, и убрать лишние старые.
+// Пустая база -- не беда: копия ничего не перезаписывает, прежние файлы остаются на месте.
+function dbBackupMake (_srv)
+{
+    const _file = dbFileOf (_srv), _cur = dbIntegrity (_file);
+    if (!_cur.exists) return { ok: false, why: 'базы ещё нет -- копировать нечего' };
+    if (!_cur.ok) return { ok: false, why: 'база ПОВРЕЖДЕНА (' + _cur.why + ') -- копию не делаю' };
+    const _f = require ('fs');
+    const _base = dbBackupStampOf (_srv);
+    let _dst = _base + '.sqlite', _n = 1;
+    while (_f.existsSync (_dst)) { _n++; _dst = _base + '-' + _n + '.sqlite'; }
+    const _res = dbCopyAndVerify (_file, _dst, _cur.rows);
+    if (!_res.ok) return { ok: false, why: _res.why };
+    return { ok: true, path: _dst, rows: _res.rows, empty: _cur.rows === 0, gone: dbBackupRotate (_srv) };
 }
 function dbCheckpointMake (_srv, _label)
 {
@@ -2766,7 +2980,7 @@ function dbCheckpointMake (_srv, _label)
     while (_f.existsSync (_dst)) { _n++; _dst = _base + '-' + _n + '.sqlite'; }
     const _res = dbCopyAndVerify (_file, _dst, _cur.rows);
     if (!_res.ok) return { ok: false, why: _res.why };
-    return { ok: true, path: _dst, rows: _res.rows, gone: dbCheckRotate (_srv) };
+    return { ok: true, path: _dst, rows: _res.rows };
 }
 
 // `node . checkpoint [метка]` -- сделать точку вручную.
@@ -2779,10 +2993,8 @@ function dbCheckpointCli (_label)
         if (!_r.ok) { console.log ('[checkpoint] ' + _srv + ': ' + _r.why); _fail++; continue; }
         console.log ('[checkpoint] ' + _srv + ': точка создана -- ' + dbTail (_r.path) + ' (' + _r.rows + ' ' +
             plural (_r.rows, 'запись', 'записи', 'записей') + ', файл прочитан)');
-        if (_r.gone.length)
-            console.log ('[checkpoint] ' + _srv + ': старых точек убрал ' + _r.gone.length +
-                ' -- держу не больше ' + BACKUP_KEEP + ' (backup_keep)');
     }
+    console.log ('[checkpoint] точки бот не удаляет сам: когда не нужны -- удаляй вручную (лимит backup_keep к ним не применяется)');
     return _fail ? 1 : 0;
 }
 
@@ -2796,21 +3008,34 @@ function dbBackupsCli ()
         ? _i.rows + ' ' + plural (_i.rows, 'запись', 'записи', 'записей') + ', ' + _size (_p) + ', изменена ' + _when (_p) +
           (_i.ok ? '' : ' -- НЕ ЧИТАЕТСЯ (' + _i.why + ')')
         : 'нет');
+    const _lbl = (_srv, _name) => dbTail (_name).replace (_srv + '.check-', '').replace (_srv + '.backup-', '');
     for (const _srv of dbServerListOn ())
     {
         const _nm = _srv + ((SERVERS[_srv] || {}).name ? ' («' + SERVERS[_srv].name + '»)' : '');
         console.log ('[backups] ' + _nm + ':');
-        const _file = dbFileOf (_srv), _bak = dbBackupOf (_srv);
-        console.log (_line ('база сейчас  ', _file, dbIntegrity (_file)));
-        console.log (_line ('штатная копия', _bak, dbIntegrity (_bak)));
+        const _file = dbFileOf (_srv), _legacy = dbBackupOf (_srv);
+        console.log (_line ('база сейчас', _file, dbIntegrity (_file)));
+        const _bakAll = dbBackupFiles (_srv).reverse ();   // свежие сверху
+        if (!_bakAll.length)
+            console.log ('[backups]   копий с датой нет (сделать: node . backup)');
+        else
+            for (const _c of _bakAll)
+                console.log (_line ('копия ' + _lbl (_srv, _c.name), _c.path, dbIntegrity (_c.path)));
+        if (_bakAll.length)
+            console.log ('[backups]   копий с датой: ' + _bakAll.length +
+                (BACKUP_KEEP ? ' (держу до ' + BACKUP_KEEP + ': backup_keep)' : ' (старые не убираю: backup_keep = 0)'));
+        if (_f.existsSync (_legacy))
+            console.log (_line ('старая копия без даты -- можно удалить', _legacy, dbIntegrity (_legacy)));
         const _ch = dbCheckFiles (_srv);
         if (!_ch.length)
-            console.log ('[backups]   точек нет (сделать: node . checkpoint [метка])');
+            console.log ('[backups]   точек нет (сделать: node . checkpoint [метка]; бот их не удаляет)');
         else
             for (const _c of _ch)
-                console.log (_line ('точка ' + dbTail (_c.name).replace (_srv + '.check-', ''), _c.path, dbIntegrity (_c.path)));
-        console.log ('[backups]   вернуть: node . restore -- из штатной копии' +
-            (_ch.length ? ' | node . restore <метка> -- из точки (метка -- часть имени: ' + dbTail (_ch[_ch.length - 1].name).replace (_srv + '.check-', '').replace (/\.sqlite$/, '') + ' или просто дата)' : ''));
+                console.log (_line ('точка ' + _lbl (_srv, _c.name), _c.path, dbIntegrity (_c.path)));
+        console.log ('[backups]   вернуть: node . restore -- из самой свежей копии (' +
+            (_bakAll.length ? _lbl (_srv, _bakAll[0].name)
+                : (_f.existsSync (_legacy) ? _lbl (_srv, _legacy) : 'копий нет')) +
+            ') | node . restore <метка> -- из копии или точки');
     }
     return 0;
 }
@@ -2824,27 +3049,33 @@ function dbRestoreCli (_sel)
     for (const _srv of dbServerListOn ())
     {
         const _file = dbFileOf (_srv), _broken = dbBrokenOf (_srv);
-        let _src = dbBackupOf (_srv), _what = 'штатной копии';
+        // Без метки -- САМАЯ СВЕЖАЯ плановая копия (с датой), а если датированных ещё
+        // нет -- старое имя без даты (обновление с прежних версий).
+        const _latest = dbBackupLatest (_srv);
+        let _src = _latest ? _latest.path : dbBackupOf (_srv);
+        let _what = _latest ? ((_latest.legacy ? 'старой копии ' : 'копии ') + dbTail (_latest.name))
+                            : 'копии (её нет)';
         if (_want && !/^latest$/i.test (_want) && _want !== '-')
         {
             const _low = _want.toLowerCase ();
-            const _all = dbCheckFiles (_srv);
+            const _lbl = _c => dbTail (_c.name).replace (_srv + '.check-', '').replace (_srv + '.backup-', '');
+            const _all = [...dbCheckFiles (_srv), ...dbBackupFiles (_srv)];
             const _hit = _all.filter (_c => _c.name.toLowerCase ().includes (_low));
             if (!_hit.length)
             {
-                console.log ('[restore] ' + _srv + ': точки по запросу «' + _want + '» не нашёл' +
-                    (_all.length ? '. Есть: ' + _all.map (_c => dbTail (_c.name).replace (_srv + '.check-', '')).join (', ')
-                                 : ' -- точек вообще нет'));
+                console.log ('[restore] ' + _srv + ': по запросу «' + _want + '» ничего не нашёл' +
+                    (_all.length ? '. Есть: ' + _all.map (_lbl).join (', ')
+                                 : ' -- ни копий, ни точек нет'));
                 _fail++; continue;
             }
             if (_hit.length > 1)
             {
-                console.log ('[restore] ' + _srv + ': по запросу «' + _want + '» нашлось несколько точек -- уточни запрос: ' +
-                    _hit.map (_c => dbTail (_c.name).replace (_srv + '.check-', '')).join (', '));
+                console.log ('[restore] ' + _srv + ': по запросу «' + _want + '» нашлось несколько файлов -- уточни запрос: ' +
+                    _hit.map (_lbl).join (', '));
                 _fail++; continue;
             }
             _src = _hit[0].path;
-            _what = 'точки ' + dbTail (_hit[0].name).replace (_srv + '.check-', '');
+            _what = (/\.[\w-]*check-/.test (_hit[0].name) ? 'точки ' : 'копии ') + _lbl (_hit[0]);
         }
         const _b = dbIntegrity (_src);
         if (!_b.exists) { console.log ('[restore] ' + _srv + ': восстанавливать нечего -- нет ' + _what); _fail++; continue; }
@@ -2931,10 +3162,12 @@ const BACKUP_EVERY_MINUTES = (() =>
 }) ();
 
 // [v2.92] Когда был прошлый проход. Это нужно не для работы копий, а чтобы в логе было
-// ВИДНО пропущенное: если таймер простоял (сон ПК, например), на следующем проходе выйдет
-// строка «прошлый проход был 3 ч 20 мин назад». Владелец: «Я НЕ ВЫКЛЮЧАЮ ПК!» -- и верно:
-// молчание в логе ночью означало не «таймер сломался», а «копировать нечего, а строку я
-// тогда не писал». Теперь и это видно прямо.
+// ВИДНО пропущенное: если таймер простоял (процесс начали позже или он был остановлен),
+// на следующем проходе выйдет строка «прошлый проход был 3 ч 20 мин назад». Владелец:
+// «Я НЕ ВЫКЛЮЧАЮ ПК!» -- и верно: молчание в логе ночью означало не «таймер сломался»,
+// а «копировать нечего, а строку я тогда не писал». Теперь и это видно прямо.
+// [v2.93] ПРИЧИНУ в строке НЕ выдумываем («ПК спал» -- догадка, а не факт): пишем только
+// факты -- сколько прошло и что именно делаем.
 let _backupLastAt = Date.now ();
 
 function dbBackupTick ()
@@ -2944,52 +3177,38 @@ function dbBackupTick ()
     _backupLastAt = _now;
     if (BACKUP_EVERY_MINUTES > 0 && _gapMs > BACKUP_EVERY_MINUTES * 60 * 1000 * 1.5)
         console.log ('[' + (d()) + '] [backup] прошлый проход был ' + fmtAgo (_gapMs) +
-            ' назад (таймер стоял -- например, ПК спал): обновляю копию сейчас');
+            ' назад, а расписание -- каждые ' + BACKUP_EVERY_MINUTES + ' мин: делаю копию сейчас');
     for (const _srv of dbServerListOn ())
     {
-        const _file = dbFileOf (_srv), _bak = dbBackupOf (_srv);
         const _name = _srv + ((SERVERS[_srv] || {}).name ? ' («' + SERVERS[_srv].name + '»)' : '');
-        const _cur = dbIntegrity (_file);
+        const _res = dbBackupMake (_srv);
         // [v2.92] Строка про КАЖДЫЙ сервер на КАЖДОМ проходе, включая «копировать нечего»:
-        // раньше эти случаи молчали, и вместе с прежним «пишу только при изменении» лог
-        // выглядел так, будто копии делаются когда попало (а их просто нечего было делать).
-        if (!_cur.exists)
-        {
-            console.log ('[' + (d()) + '] [backup] ' + _name + ': базы ещё нет -- копировать нечего');
-            continue;
-        }
-        if (!_cur.ok)
-        {
-            console.error ('[' + (d()) + '] [backup] ' + _name + ': база ПОВРЕЖДЕНА (' + _cur.why +
-                ') -- копию не трогаю, чтобы не затереть целую');
-            continue;
-        }
-        if (_cur.rows === 0)
-        {
-            console.log ('[' + (d()) + '] [backup] ' + _name + ': в базе 0 записей -- копию не трогаю' +
-                ' (пустая база не должна затереть прежние данные)');
-            continue;
-        }
-        const _old = dbIntegrity (_bak);
-        const _res = dbBackupRefresh (_file, _bak, _cur.rows, _old);
+        // раньше эти случаи молчали, и по логу нельзя было отличить работающий таймер от
+        // сломанного (владелец так и подумал: «строчка появляется НЕ РЕГУЛЯРНО»).
         if (!_res.ok)
-            console.error ('[' + (d()) + '] [backup] ' + _name + ': плановая копия не обновилась: ' + _res.why);
-        else if (!_old.exists || _old.rows !== _res.rows)
-            console.log ('[' + (d()) + '] [backup] ' + _name + ': плановая копия обновлена (' +
-                (_old.exists ? _old.rows : 0) + ' -> ' + _res.rows + ' ' +
-                plural (_res.rows, 'запись', 'записи', 'записей') + ')');
-        else
-            // [v2.91] Копия обновляется и когда ничего не изменилось (просто те же
-            // записи на те же места) -- теперь это ВИДНО в логе, а не угадывается.
-            console.log ('[' + (d()) + '] [backup] ' + _name + ': плановая копия обновлена ' +
-                '(без изменений, ' + _res.rows + ' ' + plural (_res.rows, 'запись', 'записи', 'записей') + ')');
+        {
+            if (/базы ещё нет/.test (_res.why))
+                console.log ('[' + (d()) + '] [backup] ' + _name + ': базы ещё нет -- копировать нечего');
+            else if (/ПОВРЕЖДЕНА/.test (_res.why))
+                console.error ('[' + (d()) + '] [backup] ' + _name + ': ' + _res.why + ' -- прежние копии не трогаю');
+            else
+                console.error ('[' + (d()) + '] [backup] ' + _name + ': копия не сделалась: ' + _res.why);
+            continue;
+        }
+        console.log ('[' + (d()) + '] [backup] ' + _name + ': копия ' + dbTail (_res.path).replace (_srv + '.backup-', '') +
+            ' (' + _res.rows + ' ' + plural (_res.rows, 'запись', 'записи', 'записей') + ', файл прочитан)' +
+            (_res.empty ? ' -- база сейчас пуста, так и записано' : '') +
+            (_res.gone.length ? ', старых копий убрал ' + _res.gone.length + ' (держу ' + BACKUP_KEEP + ')' : ''));
     }
 }
 if (BACKUP_EVERY_MINUTES > 0)
 {
     console.log ('[' + new Date ().toLocaleString () + '] [db] плановые копии базы: каждые ' +
-        BACKUP_EVERY_MINUTES + ' мин, пока бот работает (backup_minutes; 0 -- только при старте), ' +
-        'и каждый проход видно в логе [backup]');
+        BACKUP_EVERY_MINUTES + ' мин, пока бот работает (backup_minutes; 0 -- только при старте и вручную) -- ' +
+        'каждый проход видно в логе [backup]; ' +
+        (BACKUP_KEEP ? 'держу последние ' + BACKUP_KEEP + ' копий с датой в имени (backup_keep; 0 -- не убирать старые)'
+                     : 'старые копии с датой не удаляю (backup_keep: 0)') +
+        ', контрольные точки бот не удаляет');
     setInterval (dbBackupTick, BACKUP_EVERY_MINUTES * 60 * 1000);
 }
 
@@ -3544,11 +3763,19 @@ client.on
     'clientReady', // [v2.4] 'ready' в v15 уйдёт -- без warnings в логе (только события)
     async () =>
     {
+        const _again = $bootOnce;
         console.log
         (
             '[' + (d()) + '] ' +
-            `Logged in as ${client.user.tag}!` // v14: tag === username (discriminator убрали)
+            `Logged in as ${client.user.tag}!` + // v14: tag === username (discriminator убрали)
+            (_again ? ' (вход после переподключения -- отчёты и музыка не дублируются)' : '')
         );
+        // [v2.94] ПОВТОРНЫЙ ВХОД (автопереподключение, см. forceRelogin) не должен заново
+        // проверять ffmpeg, слать инструкцию в ЛС и поднимать музыку/снимки/отчёты --
+        // вся эта работа одноразовая. А профильный статус надо поставить заново: у новой
+        // сессии его нет.
+        if (_again) { schedulePresence (true); return; }
+        $bootOnce = true;
         // [v2.14] Выравнивание громкости проверяем ОДИН раз при старте (умеет ли
         // сборка ffmpeg выбранный фильтр) -- чтобы играть без сюрпризов.
         musicNormalizeReady = await probeNormalize ();
@@ -4010,7 +4237,7 @@ client.on ('messageCreate', async message =>
                     const targetId = id || message.author.id;
                     if (!welcomeLink (server))
                         return message.channel.send
-                        ({ content: '⚠️ Приветствие выключено: в `config.json` не задан `welcome_channel` (или он неверный).' })
+                        ({ content: '⚠️ Приветствие выключено: канал для приветствий не задан (или он неверный).' })
                         .catch (console.error);
                     if (id && !is_admin)
                         return message.channel.send
@@ -6219,7 +6446,7 @@ async function welcomeEmbed (server, user, refresh = false)
 async function welcomeCheckSend (server, user, whoLabel)
 {
     if (!welcomeLink (server))
-        return { ok: false, why: 'Приветствие выключено: в `config.json` не задан `welcome_channel` (или он неверный).' };
+        return { ok: false, why: 'Приветствие выключено: канал для приветствий не задан (или он неверный).' };
     try
     {
         const src = await welcomeSource (server, true);
@@ -7651,6 +7878,16 @@ client.on
     'clientReady', // [v2.4] 'ready' в v15 уйдёт -- без warnings в логе (только события)
     async () =>
     {
+        // [v2.94] Этот обработчик поднимает музыку, снимок участников и отчёты -- работа
+        // одноразовая. После автопереподключения gateway он сработает СНОВА, и без этой
+        // проверки бот заново подключился бы к голосовому, заново разослал отчёты и
+        // сбросил бы очередь к состоянию из базы.
+        if ($pollBooted)
+        {
+            console.log ('[' + (d()) + '] [gw] повторный вход -- музыка, снимок участников и отчёты уже подняты, не дублирую');
+            return;
+        }
+        $pollBooted = true;
         // [v2.18] СКОЛЬКО ЛЮДЕЙ ВИДИТ ПРИЛОЖЕНИЕ. Порог ревью Discord считается по
         // УНИКАЛЬНЫМ ПОЛЬЗОВАТЕЛЯМ всех серверов, а не по числу серверов (и не по
         // числу экземпляров бота). memberCount приходит в событии GUILD_CREATE, поэтому
@@ -8281,6 +8518,26 @@ function isNetworkError (e)
     return /SocksHTTPS|proxy|timed out|timeout|ECONN|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|refused|reset|URLError|getaddrinfo|network/i.test (s);
 }
 
+// [v2.93] ОШИБКА ЯВНО ПРО МАРШРУТ, А НЕ ПРО САМО ВИДЕО (сеть/прокси/проверка YouTube).
+// Владелец: «при падении прокси трек не должен сгорать: держи его и жди сеть, как в
+// netWait, а не тратяй попытки и не пропускай». Раньше проверка «Sign in to confirm
+// you're not a bot» считалась ошибкой ВИДЕО, и на длинном обрыве прокси очередь тихо
+// вычерпывалась по треку за треком (в логе -- пять подряд «не запустился, пропускаю»).
+// На самом деле это ответ YouTube про наш адрес/IP, а видео живое: подождать и попробовать
+// позже -- правильное поведение. Видео, которого правда нет, сюда не попадает (isGoneError).
+function isBotCheckError (e)
+{
+    const s = String ((e && (e.stderr || e.message)) || e);
+    return /sign in to confirm|not a bot|confirm you.{0,4}re not a bot|too many requests|HTTP Error 429|rate.?limit/i.test (s);
+}
+function isRouteError (e)
+{
+    if (isGoneError (e)) return false;   // видео действительно нет -- это не маршрут
+    const s = String ((e && (e.stderr || e.message)) || e);
+    return isNetworkError (e) || isBotCheckError (e) ||
+        /unable to download (?:api page|video data)|giving up after|got error|HTTP Error 403/i.test (s);
+}
+
 // [v2.2.2] yt-dlp для метаданных: сначала прокси (проверка 3 сек), не вышло -- DIRECT:
 // [v2.41] Проверка очереди не должна сыпать в лог «proxy не сработал» на каждый мёртвый
 // трек: она сама пишет итог одной строкой (а строка эта -- про трек, а не про маршрут).
@@ -8310,7 +8567,7 @@ async function ytDlpRun (query, optsBase)
             }
             try
             {
-                let opts = Object.assign ({}, optsBase, addr
+                let opts = Object.assign ({}, ytdlpCookieOpts (), optsBase, addr
                     ? { proxy: addr, socketTimeout: 10 } // не висим вечно в мёртвом прокси
                     : {});
                 let r = await ytdlp (query, opts);
@@ -8322,7 +8579,9 @@ async function ytDlpRun (query, optsBase)
                 lastErr = e;
                 if (!ytDlpQuiet)
                     console.error ('[music] ' + (addr ? 'прокси ' + addr : 'DIRECT') + ' не сработал: ' + ytDlpErr (e, 150));
-                if (!isNetworkError (e)) throw e; // реальная ошибка YouTube -- повторять бессмысленно
+                // [v2.93] Проверка «вы не робот» -- тоже про маршрут: пробуем следующий
+                // адрес (или вторую попытку), а не сдаёмся сразу.
+                if (!isRouteError (e)) throw e; // реальная ошибка YouTube -- повторять бессмысленно
                 // [v2.60] сеть подвела на прокси -- помечаем ИМЕННО ЕГО (а не все сразу)
                 if (addr) proxyMarkBad (addr);
             }
@@ -8636,6 +8895,261 @@ if (MUSIC_CACHE_LONG_SETS)
         (MUSIC_CACHE_SHORT_MAX_SEC ? 'всё, что длиннее ' + Math.round (MUSIC_CACHE_SHORT_MAX_SEC / 60) + ' мин' : 'вообще все') +
         ') -- файл уходит вперёд музыки, поэтому перезапуск и перемотка обходятся без YouTube' +
         '; это второй запрос на такой трек и примерно 57 МБ на час звука');
+// [v2.93] COOKIE-ФАЙЛ ДЛЯ yt-dlp (MUSIC.cookies_file). Владелец: «добавь в MUSIC ключ для
+// файла cookie и передавай его в каждый запуск yt-dlp, чтобы YouTube перестал требовать
+// "подтвердите, что вы не робот"». Cookie от своего аккаунта делает запросы «как из
+// браузера», и на адресах, где анонимного доступа не хватает, проверка перестаёт сыпаться
+// (а вместе с ней -- и пропуски живых треков). Формат -- Netscape, так экспортируют
+// браузеры и расширения; путь можно дать относительным -- тогда он от папки с ботом:
+//     "MUSIC": { "cookies_file": "firefox.txt" }
+// Файла нет -- не выдумываем: строка [config] скажет прямо, и бот пойдёт как раньше.
+const MUSIC_COOKIES_FILE = (() =>
+{
+    const raw = String (MUSIC_CFG.cookies_file === undefined || MUSIC_CFG.cookies_file === null
+        ? '' : MUSIC_CFG.cookies_file).trim ();
+    if (!raw) return '';
+    return pathMod.isAbsolute (raw) ? raw : pathMod.join (__dirname, raw);
+}) ();
+// [v2.94] ИЛИ БРАУЗЕР ВМЕСТО ФАЙЛА (MUSIC.cookies_from_browser). Владелец спросил:
+// «а ты сам не можешь сгенерировать этот файл?». Сам -- нет (это его сессия входа,
+// cookie появляются только после ввода пароля). Но файл и НЕ НУЖЕН: yt-dlp умеет читать
+// cookie прямо из браузера (`--cookies-from-browser`) -- браузер уже знает, кто ты.
+// Значение -- имя браузера, можно с профилем: firefox, chrome, edge, chromium, opera,
+// brave, vivaldi, safari; либо firefox:C:\путь\к\профилю. Файл, если он задан, важнее
+// браузера: тогда про браузер пишем строку [config], чтобы два источника не спорили молча.
+const MUSIC_COOKIES_BROWSER = (() =>
+{
+    const raw = String (MUSIC_CFG.cookies_from_browser === undefined || MUSIC_CFG.cookies_from_browser === null
+        ? '' : MUSIC_CFG.cookies_from_browser).trim ();
+    return raw;
+}) ();
+// Одни и те же ключи для ВСЕХ запусков yt-dlp: метаданные, скачивание на диск и поток.
+function ytdlpCookieOpts ()
+{
+    if (MUSIC_COOKIES_FILE) return { cookies: MUSIC_COOKIES_FILE };
+    if (MUSIC_COOKIES_BROWSER) return { cookiesFromBrowser: MUSIC_COOKIES_BROWSER };
+    return {};
+}
+if (MUSIC_COOKIES_FILE && MUSIC_COOKIES_BROWSER)
+    console.error ('[config] заданы И MUSIC.cookies_file, И MUSIC.cookies_from_browser -- беру файл, cookie из браузера не читаю (убери лишнее)');
+if (MUSIC_COOKIES_FILE)
+{
+    let _ckThere = false;
+    try { _ckThere = fsMod.existsSync (MUSIC_COOKIES_FILE); } catch (e) { }
+    if (_ckThere)
+        console.log ('[' + (d()) + '] [music] cookie-файл (MUSIC.cookies_file): ' + MUSIC_COOKIES_FILE +
+            ' -- передаю в каждый запуск yt-dlp');
+    else
+        console.error ('[config] MUSIC.cookies_file = "' + MUSIC_COOKIES_FILE +
+            '": файла нет -- запускаю без cookie (относительный путь считается от папки с ботом)');
+}
+else if (MUSIC_COOKIES_BROWSER)
+    console.log ('[' + (d()) + '] [music] cookie беру из браузера «' + MUSIC_COOKIES_BROWSER +
+        '» (--cookies-from-browser; файл не нужен) -- проверить: `node . cookies`');
+
+// ============================================================================
+// [v2.94] yt-dlp: ВЕРСИЯ ПРИ СТАРТЕ И САМОВОССТАНОВЛЕНИЕ ОБНОВЛЕНИЕМ.
+// Владелец: «порой yt-dlp надо обновлять, т.к. он перестаёт качать ролики вообще...
+// проверять как-то работоспособность при запуске, или делать тоже попытку обновить
+// (yt-dlp -U); если много и часто ошибки загрузки, то это метод восстановления».
+//   * при старте спрашиваем версию (`--version`) и пишем одной строкой -- видно, ЧТО
+//     стоит и не устарело ли (ytdlp_check_days, по умолчанию 60 дней);
+//   * если за короткое окно набралось много ошибок загрузки (ytdlp_update_after_fails,
+//     по умолчанию 5), бот ОДИН раз пробует `-U` (не чаще раза в час) и говорит, что вышло:
+//     ровно тот случай, когда «перестало качать» лечится обновлением, а не прокси;
+//   * вручную -- `node . ytdlp` (версия и возраст), `node . ytdlp -U` (обновить).
+// Ни одну из этих команд не запускаем во время музыки молча: в лог всегда идёт строка.
+// ============================================================================
+const YTDLP_PATH = (ytdlp && ytdlp.constants && ytdlp.constants.YOUTUBE_DL_PATH) || 'yt-dlp';
+const YTDLP_AUTO_UPDATE = MUSIC_CFG.ytdlp_auto_update !== false;   // нет ключа -> включено (просил владелец)
+const YTDLP_UPDATE_AFTER = (() => { const v = Number (MUSIC_CFG.ytdlp_update_after_fails); return Number.isFinite (v) && v >= 0 ? Math.floor (v) : 5; }) ();
+const YTDLP_CHECK_DAYS = (() => { const v = Number (MUSIC_CFG.ytdlp_check_days); return Number.isFinite (v) && v >= 0 ? Math.floor (v) : 60; }) ();
+const YTDLP_FAIL_WINDOW_MS = 15 * 60 * 1000;   // окно, в котором считаем ошибки
+const YTDLP_UPDATE_COOLDOWN_MS = 60 * 60 * 1000;   // чаще раза в час сами не обновляемся
+let ytdlpVersion = '';        // что стоит (узнаём при старте)
+let ytdlpUpdating = false;
+let ytdlpLastUpdateAt = 0;
+let ytdlpFails = [];          // метки времени ошибок загрузки
+
+// Разовый запуск yt-dlp «в стороне» от музыки (версия, обновление, проверка cookie):
+// с таймаутом и без обёртки youtube-dl-exec -- эти дела не про видео.
+function ytdlpRunOnce (argsArr, timeoutMs = 20000)
+{
+    return new Promise (resolve =>
+    {
+        let out = '', err = '', done = false;
+        const fin = code => { if (done) return; done = true; resolve ({ code, out, err }); };
+        let p = null;
+        try { p = spawn (YTDLP_PATH, argsArr, { windowsHide: true }); }
+        catch (e) { resolve ({ code: -2, out: '', err: String ((e && e.message) || e) }); return; }
+        const t = setTimeout (() => { try { p.kill (); } catch (e) { } fin (-1); }, timeoutMs);
+        p.stdout.on ('data', b => { out += String (b); });
+        p.stderr.on ('data', b => { err += String (b); });
+        p.on ('error', e => { clearTimeout (t); err += ' ' + String ((e && e.message) || e); fin (-2); });
+        p.on ('close', c => { clearTimeout (t); fin (c); });
+    });
+}
+// Возраст выпуска из версии вида 2026.09.17 (yt-dlp нумерует датой). null -- если формат другой.
+function ytdlpAgeDays ()
+{
+    const m = /^(\d{4})\.(\d{2})\.(\d{2})/.exec (String (ytdlpVersion || ''));
+    if (!m) return null;
+    const t = Date.UTC (Number (m[1]), Number (m[2]) - 1, Number (m[3]));
+    return Math.max (0, Math.floor ((Date.now () - t) / 86400000));
+}
+async function ytdlpVersionRead ()
+{
+    const r = await ytdlpRunOnce (['--version'], 15000);
+    ytdlpVersion = String (r.out || '').trim ().split ('\n')[0];
+    return ytdlpVersion;
+}
+async function ytdlpStartupReport ()
+{
+    const v = await ytdlpVersionRead ();
+    if (!v)
+    {
+        console.error ('[' + (d()) + '] [music] yt-dlp: не смог узнать версию -- проверь бинарник: ' + YTDLP_PATH);
+        return;
+    }
+    const age = ytdlpAgeDays ();
+    console.log ('[' + (d()) + '] [music] yt-dlp ' + v +
+        (age === null ? '' : ' (выпуск ' + age + ' ' + plural (age, 'день', 'дня', 'дней') + ' назад)') +
+        (YTDLP_AUTO_UPDATE
+            ? '; при частых ошибках загрузки обновлю сам (вручную: node . ytdlp -U)'
+            : '; автообновление выключено (MUSIC.ytdlp_auto_update: false)'));
+    if (age !== null && YTDLP_CHECK_DAYS && age > YTDLP_CHECK_DAYS)
+        console.log ('[' + (d()) + '] [music] yt-dlp давно не обновлялся (' + age + ' ' +
+            plural (age, 'день', 'дня', 'дней') + ') -- если YouTube начнёт ругаться на всех роликах, обнови: `node . ytdlp -U`');
+}
+// Ошибка загрузки: много таких за короткое окно -- повод заподозрить сам yt-dlp.
+function ytdlpNoteFail (why)
+{
+    const now = Date.now ();
+    ytdlpFails = ytdlpFails.filter (t => now - t < YTDLP_FAIL_WINDOW_MS);
+    ytdlpFails.push (now);
+    if (!YTDLP_AUTO_UPDATE || YTDLP_UPDATE_AFTER <= 0) return;
+    if (ytdlpFails.length < YTDLP_UPDATE_AFTER) return;
+    if (ytdlpUpdating || (now - ytdlpLastUpdateAt) < YTDLP_UPDATE_COOLDOWN_MS) return;
+    ytdlpFails = [];
+    ytdlpTryUpdate ('за ' + Math.round (YTDLP_FAIL_WINDOW_MS / 60000) + ' мин не заиграло ' + YTDLP_UPDATE_AFTER +
+        ' треков, последняя причина: ' + why).catch (() => { });
+}
+async function ytdlpTryUpdate (reason)
+{
+    if (ytdlpUpdating) return false;
+    ytdlpUpdating = true;
+    ytdlpLastUpdateAt = Date.now ();
+    const before = ytdlpVersion;
+    console.log ('[' + (d()) + '] [music] yt-dlp: похоже на устаревшую версию (' + reason +
+        ') -- пробую обновить (yt-dlp -U), это может занять минуту');
+    const r = await ytdlpRunOnce (['-U'], 180000);
+    const after = await ytdlpVersionRead ();
+    ytdlpUpdating = false;
+    const txt = oneLine ((String (r.out || '') + ' ' + String (r.err || '')).replace (/\s+/g, ' ').trim (), 160);
+    if (after && after !== before)
+        console.log ('[' + (d()) + '] [music] yt-dlp обновлён: ' + (before || '?') + ' -> ' + after + ' -- беру треки дальше');
+    else if (r.code === 0)
+        console.log ('[' + (d()) + '] [music] yt-dlp уже свежий (' + (after || before || '?') + ') -- значит дело не в нём: смотри маршрут/прокси и сами видео');
+    else
+        console.error ('[' + (d()) + '] [music] yt-dlp обновить не вышло (код ' + r.code + (txt ? ': ' + txt : '') + ') -- обнови вручную: `node . ytdlp -U`');
+    return true;
+}
+// `node . ytdlp [--update|-U]` -- версия и (по желанию) обновление.
+async function ytdlpCli (args)
+{
+    const upd = args.some (a => /^(-u|--update)$/i.test (a));
+    console.log ('[ytdlp] бинарник: ' + YTDLP_PATH);
+    const v = await ytdlpVersionRead ();
+    if (!v) { console.error ('[ytdlp] версию узнать не вышло -- бинарник не отвечает (проверь путь и права)'); return 1; }
+    const age = ytdlpAgeDays ();
+    console.log ('[ytdlp] версия: ' + v +
+        (age === null ? '' : ' (выпуск ' + age + ' ' + plural (age, 'день', 'дня', 'дней') + ' назад)') +
+        (YTDLP_CHECK_DAYS && age !== null && age > YTDLP_CHECK_DAYS ? ' -- СТАРАЯ, советую обновить' : ''));
+    if (!upd) { console.log ('[ytdlp] обновить:  node . ytdlp -U'); return 0; }
+    console.log ('[ytdlp] обновляю (yt-dlp -U)...');
+    const r = await ytdlpRunOnce (['-U'], 300000);
+    const txt = oneLine ((String (r.out || '') + ' ' + String (r.err || '')).replace (/\s+/g, ' ').trim (), 200);
+    const v2 = await ytdlpVersionRead ();
+    if (v2 && v2 !== v) console.log ('[ytdlp] готово: ' + v + ' -> ' + v2);
+    else if (r.code === 0) console.log ('[ytdlp] версия не изменилась (' + v + ') -- уже самая свежая');
+    else console.error ('[ytdlp] обновление не удалось (код ' + r.code + (txt ? ': ' + txt : '') +
+        ') -- можно скачать yt-dlp.exe вручную и положить поверх старого');
+    return 0;
+}
+
+// `node . cookies` -- что задано и читается ли оно. Файл проверяем по формату Netscape,
+// а браузерные cookie -- живым запросом yt-dlp (он читает их ПЕРЕД любым разбором адреса,
+// поэтому проверка идёт по несуществующему адресу: в сеть за видео не ходим вовсе).
+function cookiesFileReport ()
+{
+    let t = '';
+    try { t = fsMod.readFileSync (MUSIC_COOKIES_FILE, 'utf8'); }
+    catch (e) { return { ok: false, why: 'файл не читается: ' + oneLine ((e && e.message) || e) }; }
+    const lines = t.split (/\r?\n/).filter (l => l.trim () && !l.trim ().startsWith ('#'));
+    const dom = new Map ();
+    for (const l of lines)
+    {
+        const c = l.split ('\t');
+        if (c.length < 7) continue;
+        const d0 = String (c[0]).replace (/^\./, '').toLowerCase ();
+        dom.set (d0, (dom.get (d0) || 0) + 1);
+    }
+    const yt = [...dom.keys ()].filter (d0 => /(^|\.)youtube\.com$|(^|\.)google\.com$|(^|\.)googlevideo\.com$/.test (d0));
+    return { ok: lines.length > 0, lines: lines.length, domains: dom.size, yt,
+        top: [...dom.entries ()].sort ((a, b) => b[1] - a[1]).slice (0, 6) };
+}
+async function cookiesCli ()
+{
+    console.log ('[cookies] источник cookie для yt-dlp: ' + (MUSIC_COOKIES_FILE ? 'файл'
+        : (MUSIC_COOKIES_BROWSER ? 'браузер' : 'не задан (запросы идут анонимно)')));
+    if (MUSIC_COOKIES_FILE)
+    {
+        const there = fsMod.existsSync (MUSIC_COOKIES_FILE);
+        console.log ('[cookies] файл: ' + MUSIC_COOKIES_FILE + (there ? '' : ' -- ФАЙЛА НЕТ'));
+        if (!there) return 1;
+        const r = cookiesFileReport ();
+        if (!r.ok) { console.error ('[cookies] ' + r.why); return 1; }
+        console.log ('[cookies] строк с cookie: ' + r.lines + ', доменов: ' + r.domains +
+            ' -- ' + r.top.map (d0 => d0[0] + ' (' + d0[1] + ')').join (', '));
+        if (!r.yt.length)
+        {
+            console.error ('[cookies] в файле нет строк для youtube.com/google.com/googlevideo.com -- похоже, это не cookie YouTube (или выгрузка неполная): yt-dlp такой помощи не заметит');
+            return 1;
+        }
+        console.log ('[cookies] cookie для YouTube на месте (' + r.yt.slice (0, 4).join (', ') + ') -- формат Netscape, годится');
+        return 0;
+    }
+    if (MUSIC_COOKIES_BROWSER)
+    {
+        console.log ('[cookies] браузер: ' + MUSIC_COOKIES_BROWSER + ' (yt-dlp --cookies-from-browser)');
+        const r = await ytdlpRunOnce (['--cookies-from-browser', MUSIC_COOKIES_BROWSER, '--simulate', '--verbose',
+            'https://example.invalid/cookie-check'], 30000);
+        const all = String (r.out || '') + '\n' + String (r.err || '');
+        const ext = /Extracted (\d+) cookies from ([^\n]+)/i.exec (all);
+        const dbg = /Extracting cookies from ([^\n]+)/i.exec (all);
+        const bad = /(could not find|could not copy|failed to (?:decrypt|read|extract)|decryption failed|no cookies|unsupported (?:platform|browser))/i.exec (all);
+        if (ext) { console.log ('[cookies] OK: yt-dlp прочитал ' + ext[1] + ' cookie из ' + String (ext[2]).trim ()); return 0; }
+        if (dbg) { console.log ('[cookies] OK: yt-dlp читает cookie из ' + String (dbg[1]).trim () + ' (количество не назвал)'); return 0; }
+        if (bad)
+        {
+            console.error ('[cookies] браузерные cookie не прочитались: ' + oneLine (bad[0], 160) +
+                ' -- закрой браузер и повтори (Chrome/Edge держат файл cookie открытым), или укажи профиль (firefox:C:\\путь\\к\\профилю), или возьми доступный здесь браузер');
+            return 1;
+        }
+        console.error ('[cookies] не понял ответ yt-dlp -- вот что он сказал: ' + oneLine (String (r.err || r.out || 'без вывода'), 300));
+        return 1;
+    }
+    console.log ('[cookies] ничего не задано -- запросы идут анонимно. Два способа это исправить (любой один):');
+    console.log ('[cookies]   1) БРАУЗЕР (ничего не экспортировать): в блок MUSIC добавь  "cookies_from_browser": "firefox"  (или chrome, edge, brave)');
+    console.log ('[cookies]   2) ФАЙЛ: расширение "Get cookies.txt" выгружает файл в формате Netscape; положи его рядом с ботом и укажи  "cookies_file": "cookies.txt"');
+    console.log ('[cookies] сам файл сгенерировать не могу -- это ВАША сессия входа; но с браузером файл и не нужен (вариант 1).');
+    return 0;
+}
+
+// Отчёт о версии -- сразу при старте (кроме случая, когда это и есть команда `node . ytdlp`).
+if (!process.argv.slice (2).some (_a => /^ytdlp$/i.test (_a)))
+    ytdlpStartupReport ().catch (() => { });
+
 let cacheDirOk = false;
 function cacheDirReady ()
 {
@@ -8815,6 +9329,7 @@ async function cacheDownload (track, holder = {})
             quiet: true,
             noWarnings: true,
             noPlaylist: true,
+            ...ytdlpCookieOpts (),             // [v2.93] MUSIC.cookies_file -- если задан
             ...(viaProxy ? { proxy: viaProxy, socketTimeout: 10 } : {}),
             f: 'bestaudio[acodec!=none][ext=m4a]/bestaudio[acodec!=none]/bestaudio/best',
             retries: 3,
@@ -9240,16 +9755,21 @@ function configCli ()
     row ('db_key_prev', Array.isArray (db_key_prev) ? db_key_prev.length + ' шт' : '0', hasTop ('db_key_prev') ? 'config.json' : 'по умолчанию (0)');
     row ('privacy_url', PRIVACY_URL ? 'задан' : 'пусто (ссылки не будет)', hasTop ('privacy_url') ? 'config.json' : '-- (в файле нет)');
     row ('show_privacy_url', YN (SHOW_PRIVACY_URL), hasTop ('show_privacy_url') ? 'config.json' : 'по умолчанию (показывать)');
-    row ('backup_minutes', BACKUP_EVERY_MINUTES + (BACKUP_EVERY_MINUTES ? ' мин' : ' (только при старте)'), hasTop ('backup_minutes') ? 'config.json' : 'по умолчанию (60)');
-    row ('backup_keep', BACKUP_KEEP, hasTop ('backup_keep') ? 'config.json' : 'по умолчанию (10)');
+    row ('backup_minutes', BACKUP_EVERY_MINUTES + (BACKUP_EVERY_MINUTES ? ' мин' : ' (только при старте и вручную)'), hasTop ('backup_minutes') ? 'config.json' : 'по умолчанию (60)');
+    row ('backup_keep (копий с датой)', BACKUP_KEEP + (BACKUP_KEEP ? '' : ' (старые не убираю)'), hasTop ('backup_keep') ? 'config.json' : 'по умолчанию (5)');
     row ('log_dir', LOG_DIR, hasTop ('log_dir') ? 'config.json' : 'по умолчанию (logs)');
     row ('log_keep_months', LOG_KEEP_MONTHS || '0 (не удалять)', hasTop ('log_keep_months') ? 'config.json' : 'по умолчанию (0)');
 
     sec ('музыка (MUSIC)');
     row ('proxy', MUSIC_PROXIES.length ? MUSIC_PROXIES.join (', ') : 'нет -- напрямую (DIRECT)', hasM ('proxy') ? 'config.json' : (process.env.MUSIC_PROXY ? 'переменная окружения MUSIC_PROXY' : '-- (в файле нет)'));
+    row ('cookies_file', MUSIC_COOKIES_FILE || '-- (не задан)', hasM ('cookies_file') ? 'config.json' : '-- (в файле нет)');
+    row ('cookies_from_browser', MUSIC_COOKIES_BROWSER || '-- (не задан)', hasM ('cookies_from_browser') ? 'config.json' : '-- (в файле нет)');
     row ('normalize (громкость)', YN (MUSIC_NORMALIZE), hasM ('normalize') ? 'config.json' : 'по умолчанию (вкл)');
     row ('filter', MUSIC_NORMALIZE_FILTER, hasM ('filter') ? 'config.json' : 'по умолчанию');
     row ('channel_status (шапка)', YN (MUSIC_CHANNEL_STATUS), hasM ('channel_status') ? 'config.json' : 'по умолчанию (не трогаю)');
+    row ('ytdlp_auto_update', YN (YTDLP_AUTO_UPDATE), hasM ('ytdlp_auto_update') ? 'config.json' : 'по умолчанию (вкл)');
+    row ('ytdlp_update_after_fails', YTDLP_UPDATE_AFTER, hasM ('ytdlp_update_after_fails') ? 'config.json' : 'по умолчанию (5)');
+    row ('ytdlp_check_days', YTDLP_CHECK_DAYS, hasM ('ytdlp_check_days') ? 'config.json' : 'по умолчанию (60)');
     row ('skip_absent_author', YN (MUSIC_SKIP_ABSENT), hasM ('skip_absent_author') ? 'config.json' : 'по умолчанию (да)');
     row ('cache (диск)', YN (MUSIC_CACHE), hasM ('cache') ? 'config.json' : 'по умолчанию (вкл)');
     row ('cache_dir', MUSIC_CACHE_DIR, hasM ('cache_dir') ? 'config.json' : 'по умолчанию (music_cache)');
@@ -9363,6 +9883,27 @@ if (process.argv.slice (2).some (_a => /^cache$/i.test (_a)))
     process.exit (_code);
 }
 
+// [v2.94] `node . cookies` и `node . ytdlp`: оба работают асинхронно (реально запускают
+// yt-dlp), поэтому -- в async-обёртке с process.exit по завершении; вход в Discord на это
+// время придержан ($cliHold), чтобы бот не успел залогиниться и не мешался.
+if (process.argv.slice (2).some (_a => /^cookies$/i.test (_a)))
+    (async () =>
+    {
+        let _code = 1;
+        try { _code = await cookiesCli (); }
+        catch (e) { console.log ('[cookies] ошибка: ' + ((e && e.message) || e)); }
+        process.exit (_code);
+    }) ();
+
+if (process.argv.slice (2).some (_a => /^ytdlp$/i.test (_a)))
+    (async () =>
+    {
+        let _code = 1;
+        try { _code = await ytdlpCli (process.argv.slice (2)); }
+        catch (e) { console.log ('[ytdlp] ошибка: ' + ((e && e.message) || e)); }
+        process.exit (_code);
+    }) ();
+
 // Аудио-ресурс: yt-dlp стримит в stdout -> ffmpeg ресемплирует в Opus для Discord:
 // [v2.2.2] стрим по той же стратегии, что и метаданные: прокси -> DIRECT:
 // [v2.25] seekMode -- КАК продолжать с места:
@@ -9421,6 +9962,7 @@ async function createTrackStream (track, seekSec = 0, seekMode = 'sections')
             quiet: true,
             noWarnings: true,
             noPlaylist: true,
+            ...ytdlpCookieOpts (),         // [v2.93] MUSIC.cookies_file -- если задан
             // [v2.2.2] через прокси, если жив; иначе DIRECT (v2.60: адрес -- из маршрута,
             // а не из «главного» прокси: их может быть несколько):
             ...(viaProxy ? { proxy: viaProxy, socketTimeout: 10 } : {}),
@@ -10016,12 +10558,16 @@ async function playNext (guildId)
         // [v2.70] СБОЙ СЕТИ/ПРОКСИ -- НЕ ПОВОД ТЕРЯТЬ ТРЕК (см. musicNetStall). Позиция, с
         // которой пытались продолжить, ещё не сброшена -- берём её как есть.
         const _at = (m.seekTrack === track) ? (m.seekSec || 0) : (track.seek || 0);
-        if (isNetworkError (e) && !isGoneError (e) && musicNetStall (guildId, track, _at, e))
+        if (isRouteError (e) && musicNetStall (guildId, track, _at, e))
             return;
         // [v2.30] Сказать и ЧТО не заиграло, и что дальше: раньше строка молчала об
         // обоих, и в логе были только «непонятные» ошибки от yt-dlp/ffmpeg.
         console.error ('[' + (d()) + '] [music] трек не заиграл: ' + (track.title || track.url || 'трек') +
             ' -- ' + oneLine (e.message) + ' (беру следующий)');
+        // [v2.94] Много таких ошибок подряд -- повод заподозрить сам yt-dlp: владелец
+        // справедливо заметил, что устаревший yt-dlp лечится обновлением (yt-dlp -U),
+        // а не прокси. Счёт и решение -- в ytdlpNoteFail (всегда со строкой в лог).
+        ytdlpNoteFail (oneLine (ytDlpErr (e, 120)));
         m.current = null;
         // [v2.43] ТРЕК ДОШЁЛ ДО ОЧЕРЕДИ И НЕ ЗАПУСТИЛСЯ -- вот теперь это ФАКТ, а не догадка.
         // Ровно этого и ждёт проверка заранее: из очереди она ничего не убирает (ответ
@@ -10191,7 +10737,8 @@ function startPreload (guildId)
                     await sleep (PRELOAD_RETRY_MS);
                 }
             }
-            console.error ('[music] предзагрузка не удалась (' + (next.title || 'трек') + '): ' + ytDlpErr (lastErr));
+            console.error ('[music] предзагрузка не удалась (' + (next.title || 'трек') + '): ' + ytDlpErr (lastErr) +
+                (isRouteError (lastErr) ? ' -- сеть/прокси, трек не потерян: подключусь к нему заново, когда маршрут оживёт' : ''));
             return null;
         })();
         return;
@@ -10257,7 +10804,8 @@ function startPreload (guildId)
                     'уберу из очереди, когда дойдёт. Поставь другой трек, если он нужен.');
                 return null;
             }
-            console.error ('[music] предзагрузка не удалась (' + (next.title || 'трек') + '): ' + ytDlpErr (e));
+            console.error ('[music] предзагрузка не удалась (' + (next.title || 'трек') + '): ' + ytDlpErr (e) +
+                (isRouteError (e) ? ' -- сеть/прокси, трек не потерян: подключусь к нему заново, когда маршрут оживёт' : ''));
             return null;
         }
     );
@@ -10300,6 +10848,14 @@ function wireStreamErrors (m, track, resource, viaProxy, guildId)
             m.playingSince = null;
             m.streamRetries = 0;
             try { m.player.stop (true); } catch {}
+            return;
+        }
+        // [v2.93] ОШИБКА МАРШРУТА (сеть/прокси/проверка YouTube) -- ПОПЫТКИ НЕ ЖЖЁМ и трек
+        // не пропускаем: место и секунда держатся, музыка пойдёт сама, когда маршрут
+        // оживёт (musicNetStall). Так падение прокси больше не вычерпывает очередь.
+        if (isRouteError (e) && musicNetStall (guildId, track, Math.round (playedMsOf (m) / 1000), e))
+        {
+            m.player.stop (true); // Idle: следующий запуск -- уже по возвращении сети
             return;
         }
         // [v2.12] ОБРЫВ ПОТОКА у играющего трека: трек НЕ выбрасываем -- пробуем
@@ -11307,20 +11863,23 @@ function historyText (guildId)
     const two = n => String (n).padStart (2, '0');
     const stamp = t => { const x = new Date (t); return two (x.getDate ()) + '.' + two (x.getMonth () + 1) +
         ' ' + two (x.getHours ()) + ':' + two (x.getMinutes ()); };
+    // [v2.93] НИКАКИХ КОНФИГ-КЛЮЧЕЙ В ОТВЕТАХ КОМАНД (владелец: «не надо таких
+    // подробностей, это техническая информация по конфигу и коду»): человеку важно,
+    // что история помнит и сколько, а не имя ключа в файле.
     if (!MUSIC_HISTORY_LEN)
-        return '🕘 История добавлений выключена (`MUSIC.history_len`: 0).\n_' +
-            'Поставь число (например 25) -- и снова буду помнить, кто что ставил._';
+        return '🕘 История добавлений сейчас выключена -- веду только очередь.\n_' +
+            'Включить её может владелец бота._';
     if (!list.length)
         return '🕘 Истории добавлений пока нет -- её начнут писать новые `/play`.\n_' +
             'Помню последние ' + MUSIC_HISTORY_LEN + ' ' + plural (MUSIC_HISTORY_LEN, 'пачку', 'пачки', 'пачек') +
-            ' (`MUSIC.history_len`); очередь -- отдельно: `/queue`._';
+            '; очередь -- отдельно: `/queue`._';
     const sum = historyTotalTracks (list);
     const head = '🕘 **История добавлений** -- ' + plural (list.length, 'последняя', 'последние', 'последние') +
         ' ' + list.length + ' ' + plural (list.length, 'пачка', 'пачки', 'пачек') + ', ' + sum + ' ' +
         plural (sum, 'трек', 'трека', 'треков') + (list.length >= MUSIC_HISTORY_LEN ||
             (MUSIC_HISTORY_TRACKS && sum >= MUSIC_HISTORY_TRACKS)
-            ? ' (_MUSIC.history_len_: ' + MUSIC_HISTORY_LEN +
-              (MUSIC_HISTORY_TRACKS ? ', _history_tracks_: ' + MUSIC_HISTORY_TRACKS : '') + ')' : '') + ':\n' + QSEP;
+            ? ' (_лимит: до ' + MUSIC_HISTORY_LEN + ' ' + plural (MUSIC_HISTORY_LEN, 'пачки', 'пачек', 'пачек') +
+              (MUSIC_HISTORY_TRACKS ? ' и до ' + MUSIC_HISTORY_TRACKS + ' треков' : '') + ')' : '') + ':\n' + QSEP;
     // [v2.87] ХВОСТ СЧИТАЕТСЯ В БЮДЖЕТЕ. Раньше он добавлялся ПОСЛЕ подсчёта длины, и при
     // длинной истории текст уходил за лимит Discord («Must be 2000 or fewer in length») --
     // команда перестала отвечать совсем. Теперь бюджет = лимит минус шапка и минус хвост,
@@ -11332,8 +11891,7 @@ function historyText (guildId)
         'Состав пачки целиком -- кнопкой «📜 Все треки» ниже.\n' +
         (hid ? 'Раньше -- ещё ' + hid + ' ' + plural (hid, 'пачка', 'пачки', 'пачек') + '.\n' : '') +
         'Старое уходит само: помню ' + MUSIC_HISTORY_LEN + ' ' + plural (MUSIC_HISTORY_LEN, 'пачку', 'пачки', 'пачек') +
-        (MUSIC_HISTORY_TRACKS ? ' и до ' + MUSIC_HISTORY_TRACKS + ' треков суммарно (пачка уходит целиком)' : '') +
-        ' -- ключи `MUSIC.history_len`' + (MUSIC_HISTORY_TRACKS ? ' и `MUSIC.history_tracks`' : '') + '._';
+        (MUSIC_HISTORY_TRACKS ? ' и до ' + MUSIC_HISTORY_TRACKS + ' треков суммарно (пачка уходит целиком)' : '') + '._';
     const budget = HISTORY_MSG_LIMIT - head.length - 2 -
         Math.max (tailOf (0).length, tailOf (list.length).length);
     const shown = [];
@@ -14878,7 +15436,7 @@ function joinVoiceNow (guildId, voiceChannel, guild, reason = '')
                     }
                     // [v2.70] Причина обрыва -- сеть/прокси? Не пропускаем трек: держим место
                     // и ждём (см. musicNetStall) -- очередь пойдёт сама, когда связь вернётся.
-                    if ((_deadErr && isNetworkError (_deadErr) && !isGoneError (_deadErr)) &&
+                    if ((_deadErr && isRouteError (_deadErr)) &&
                         musicNetStall (guildId, playing, at, _deadErr))
                         return;
                     console.error ('[' + (d()) + '] [music] поток обрывается снова (' + attempt +
