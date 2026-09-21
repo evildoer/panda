@@ -10,6 +10,22 @@
 // номером просто не было -- номер мог быть пропущен, когда правки шли вперемешку. История
 // читается по блокам, а не по номерам: у одной партии может быть много коммитов, а блок
 // пишется только на то, что видно владельцу.
+// CHANGELOG v2.98 (плановое обновление yt-dlp по календарю; путь лога -- одним видом слэшей):
+//   * ПЛАНОВОЕ ОБНОВЛЕНИЕ yt-dlp ПО КАЛЕНДАРЮ (MUSIC.ytdlp_update_days, по умолчанию 30 дней;
+//     0 -- выключено). Владелец: «научи бота обновлять yt-dlp не только после серии ошибок
+//     загрузки, но и по расписанию раз в N дней, с ключом в конфиге и строкой в логе».
+//     Раз в сутки бот смотрит возраст выпущенной версии и обновляет сам -- не дожидаясь,
+//     пока загрузки посыпятся. Каждая суточная проверка -- строка в логе («обновляю сам» /
+//     «пока свежая, не трогаю»), результат обновления -- теми же строками, что и по ошибкам
+//     («обновлён: ... -> ...», «уже свежий», «обновить не вышло (код ...)»). Строка о том,
+//     что расписание включено, выходит при старте рядом с версией yt-dlp, а порог виден в
+//     `node . config`. Ключа нет -- работает как включённый (30 дней): устаревший yt-dlp
+//     перестаёт качать вообще, и ждать этого неделями незачем.
+//   * ПУТЬ ЛОГА -- ОДНИМ ВИДОМ РАЗДЕЛИТЕЛЕЙ. В живом логе было
+//     `C:\nodejs_work\panda/logs/panda-2026-09.log` (владелец: «там у тебя слэши сначала
+//     виндовые, потом линуксовые!!»): папка собиралась конкатенацией с '/'. Теперь всё
+//     строится path.join, а АБСОЛЮТНЫЙ log_dir (README обещал «можно полный путь», а
+//     прежняя конкатенация делала из него кашу) наконец работает как обещано.
 // CHANGELOG v2.97 (в /queue между «Сейчас» и «Очередь» больше нет двух линий подряд):
 //   * Владелец: «В /queue МЕЖДУ „Сейчас:“ и „Очередь:“ !??». Средний блок между шапкой и
 //     очередью («почему тишина», пачки, перенос, подсказка) в обычном виде ПУСТ: подсказка
@@ -1246,7 +1262,19 @@ const space = ' ';
 const BOT_RUN = process.argv.slice (2).length === 0;
 const utilMod = require ('util');
 const fsLog = require ('fs');
-const LOG_DIR = __dirname + '/' + (String (log_dir === undefined || log_dir === null ? '' : log_dir).trim () || 'logs');
+const pathMod = require ('path');   // один модуль на весь файл (пути лога и кэша)
+// [v2.98] ПУТЬ ЛОГА -- ОДНИМ ВИДОМ РАЗДЕЛИТЕЛЕЙ. В живом логе было
+// `C:\nodejs_work\panda/logs/panda-2026-09.log` (владелец: «там у тебя слэши сначала
+// виндовые, потом линуксовые!!»): папка собиралась конкатенацией с '/', и на Windows
+// в одной строке встречались оба вида. Теперь путь строится path.join, а АБСОЛЮТНЫЙ
+// log_dir (README обещал «можно полный путь», а прежняя конкатенация делала из него
+// кашу) наконец работает как обещано.
+const LOG_DIR = (() =>
+{
+    const cfg = String (log_dir === undefined || log_dir === null ? '' : log_dir).trim ();
+    if (!cfg) return pathMod.join (__dirname, 'logs');
+    return pathMod.isAbsolute (cfg) ? pathMod.normalize (cfg) : pathMod.join (__dirname, cfg);
+}) ();
 // [v2.86] ИМЯ ФАЙЛА ЛОГА -- ИЗ ПРЕФИКСА КОМАНД (владелец: «пускай для имени файла берёт
 // префикс… связать явно эти два использования одной переменной»). Так имя файла не надо
 // помнить отдельно: вписал свой префикс -- и лог называется так же (`panda ` ->
@@ -1284,7 +1312,7 @@ function logPruneMonths (keep, now)
             const mm = /^(?:.+)-(\d{4})-(\d{2})\.log$/.exec (name);
             if (!mm) continue;
             const age = (now.getFullYear () - Number (mm[1])) * 12 + (now.getMonth () + 1 - Number (mm[2]));
-            if (age >= keep) { try { fsLog.unlinkSync (LOG_DIR + '/' + name); gone++; } catch (e) {} }
+            if (age >= keep) { try { fsLog.unlinkSync (pathMod.join (LOG_DIR, name)); gone++; } catch (e) {} }
         }
     }
     catch (e) {}
@@ -1301,7 +1329,7 @@ function logFileWrite (line)
         {
             fsLog.mkdirSync (LOG_DIR, {recursive: true});
             const gone = logPruneMonths (LOG_KEEP_MONTHS, now);
-            $logMonthPath = LOG_DIR + '/' + LOG_BASE + '-' + key + '.log';
+            $logMonthPath = pathMod.join (LOG_DIR, LOG_BASE + '-' + key + '.log');
             $logKey = key;
             if (gone)
                 fsLog.appendFileSync ($logMonthPath, '[' + d () + '] [log] убрал старых файлов лога: ' + gone +
@@ -1511,7 +1539,7 @@ function logTailLines (n)
 {
     try
     {
-        const p = logFilePath () || (LOG_DIR + '/' + LOG_BASE + '-' + logMonthKey (new Date ()) + '.log');
+        const p = logFilePath () || pathMod.join (LOG_DIR, LOG_BASE + '-' + logMonthKey (new Date ()) + '.log');
         const arr = fsLog.readFileSync (p, 'utf8').split ('\n').filter (l => l !== '');
         return arr.slice (Math.max (0, arr.length - n));
     }
@@ -1543,8 +1571,8 @@ function crashReport (kind, e, note)
     if (!BOT_RUN || $crashWritten) return '';
     const now = new Date ();
     const two = n => String (n).padStart (2, '0');
-    const path = LOG_DIR + '/crash-' + now.getFullYear () + '-' + two (now.getMonth () + 1) + '-' + two (now.getDate ()) +
-        '_' + two (now.getHours ()) + '-' + two (now.getMinutes ()) + '-' + two (now.getSeconds ()) + '.txt';
+    const path = pathMod.join (LOG_DIR, 'crash-' + now.getFullYear () + '-' + two (now.getMonth () + 1) + '-' + two (now.getDate ()) +
+        '_' + two (now.getHours ()) + '-' + two (now.getMinutes ()) + '-' + two (now.getSeconds ()) + '.txt');
     const reason = e ? String ((e && e.message) || e) : '(без исключения -- выход с ненулевым кодом)';
     const stack = (e && e.stack) ? String (e.stack) : '(стека нет)';
     const tail = logTailLines (CRASH_TAIL_LINES);
@@ -9076,7 +9104,8 @@ function probeNormalize ()
 // Файлы: music_cache/<sha1 адреса>.m4a (готовый), <sha1>.dl.stream (запись живого потока)
 // и <sha1>.dl.<ext> (скачивание в фоне) -- всё с пометкой '.dl.' готовым не считается.
 // ============================================================================
-const pathMod = require ('path');
+// [v2.98] pathMod объявлен ВЫШЕ, рядом с fsLog: теперь пути лога (LOG_DIR) тоже строятся
+// через него -- на Windows в одной строке больше нет смеси `C:\папка/logs`.
 const MUSIC_CACHE = MUSIC_CFG.cache !== false;
 const MUSIC_CACHE_DIR = pathMod.isAbsolute (String (MUSIC_CFG.cache_dir || 'music_cache'))
     ? String (MUSIC_CFG.cache_dir)
@@ -9223,12 +9252,24 @@ const YTDLP_PATH = (ytdlp && ytdlp.constants && ytdlp.constants.YOUTUBE_DL_PATH)
 const YTDLP_AUTO_UPDATE = MUSIC_CFG.ytdlp_auto_update !== false;   // нет ключа -> включено (просил владелец)
 const YTDLP_UPDATE_AFTER = (() => { const v = Number (MUSIC_CFG.ytdlp_update_after_fails); return Number.isFinite (v) && v >= 0 ? Math.floor (v) : 5; }) ();
 const YTDLP_CHECK_DAYS = (() => { const v = Number (MUSIC_CFG.ytdlp_check_days); return Number.isFinite (v) && v >= 0 ? Math.floor (v) : 60; }) ();
+// [v2.98] ПЛАНОВОЕ ОБНОВЛЕНИЕ ПО КАЛЕНДАРЮ (MUSIC.ytdlp_update_days, по умолчанию 30 дней).
+// Владелец: «научи бота обновлять yt-dlp не только после серии ошибок загрузки, но и по
+// расписанию раз в N дней, с ключом в конфиге и строкой в логе». Раз в сутки бот смотрит
+// возраст версии и обновляет сам, когда он перевалит этот порог (тем же путём, что и по
+// ошибкам: `yt-dlp -U`, одна попытка, результат -- строкой). 0 -- календарь выключен.
+const YTDLP_UPDATE_DAYS = (() =>
+{
+    const v = Number (MUSIC_CFG.ytdlp_update_days);
+    if (v === 0) return 0;                                      // явный ноль -- только по ошибкам
+    return Number.isFinite (v) && v > 0 ? Math.floor (v) : 30;  // нет ключа/мусор -- по умолчанию 30
+}) ();
 const YTDLP_FAIL_WINDOW_MS = 15 * 60 * 1000;   // окно, в котором считаем ошибки
 const YTDLP_UPDATE_COOLDOWN_MS = 60 * 60 * 1000;   // чаще раза в час сами не обновляемся
 let ytdlpVersion = '';        // что стоит (узнаём при старте)
 let ytdlpUpdating = false;
 let ytdlpLastUpdateAt = 0;
 let ytdlpFails = [];          // метки времени ошибок загрузки
+let ytdlpPlanAt = 0;         // когда следующая плановая проверка (ms); 0 -- сразу после отчёта о версии
 
 // Разовый запуск yt-dlp «в стороне» от музыки (версия, обновление, проверка cookie):
 // с таймаутом и без обёртки youtube-dl-exec -- эти дела не про видео.
@@ -9309,6 +9350,12 @@ async function ytdlpStartupReport ()
     if (age !== null && YTDLP_CHECK_DAYS && age > YTDLP_CHECK_DAYS)
         console.log ('[' + (d()) + '] [music] yt-dlp давно не обновлялся (' + age + ' ' +
             plural (age, 'день', 'дня', 'дней') + ') -- если YouTube начнёт ругаться на всех роликах, обнови: `node . ytdlp -U`');
+    // [v2.98] Плановое обновление по календарю: при старте видно, ВКЛЮЧЕНО ли оно, а сразу
+    // за строкой идёт первая проверка возраста (дальше -- раз в сутки, см. ytdlpPlannedCheck).
+    if (YTDLP_UPDATE_DAYS)
+        console.log ('[' + (d()) + '] [music] yt-dlp: плановое обновление ВКЛЮЧЕНО -- раз в сутки обновляю сам, если версии больше ' +
+            YTDLP_UPDATE_DAYS + ' ' + plural (YTDLP_UPDATE_DAYS, 'день', 'дня', 'дней') + ' (MUSIC.ytdlp_update_days; 0 -- только по ошибкам загрузки)');
+    await ytdlpPlannedCheck ('при старте').catch (() => { });
 }
 // Ошибка загрузки: много таких за короткое окно -- повод заподозрить сам yt-dlp.
 function ytdlpNoteFail (why)
@@ -9338,11 +9385,53 @@ async function ytdlpTryUpdate (reason)
     if (after && after !== before)
         console.log ('[' + (d()) + '] [music] yt-dlp обновлён: ' + (before || '?') + ' -> ' + after + ' -- беру треки дальше');
     else if (r.code === 0)
-        console.log ('[' + (d()) + '] [music] yt-dlp уже свежий (' + (after || before || '?') + ') -- значит дело не в нём: смотри маршрут/прокси и сами видео');
+    {
+        // [v2.98] Текст зависит от повода: при плановой проверке «смотри маршрут/прокси»
+        // было бы неправдой (никто ничего не ломал -- просто пришло время посмотреть).
+        const _planned = /^планово/.test (String (reason || ''));
+        console.log ('[' + (d()) + '] [music] yt-dlp уже свежий (' + (after || before || '?') + ')' +
+            (_planned ? ' -- обновлять нечего, это была плановая проверка'
+                      : ' -- значит дело не в нём: смотри маршрут/прокси и сами видео'));
+    }
     else
         console.error ('[' + (d()) + '] [music] yt-dlp обновить не вышло (код ' + r.code + (txt ? ': ' + txt : '') + ') -- обнови вручную: `node . ytdlp -U`');
     return true;
 }
+// [v2.98] ПЛАНОВАЯ (КАЛЕНДАРНАЯ) ПРОВЕРКА ВОЗРАСТА -- отдельно от «много ошибок загрузки»:
+// тут повод не сбой, а время. Владелец: «научи бота обновлять yt-dlp не только после серии
+// ошибок загрузки, но и по расписанию раз в N дней, с ключом в конфиге и строкой в логе».
+// Проверка зовётся при старте и потом раз в час (решение «пора или нет» -- внутри, по
+// ytdlpPlanAt: раз в сутки), и КАЖДЫЙ раз пишет строку в лог: по ней видно, что расписание
+// живое, -- ровно то, чего владелец просил и для копий базы («по логу нельзя было отличить
+// работающий таймер от сломанного»). Само обновление -- тем же ytdlpTryUpdate, поэтому и
+// результат в логе такой же («обновлён: ... -> ...», «уже свежий», «обновить не вышло (код ...)»).
+async function ytdlpPlannedCheck (why)
+{
+    if (!YTDLP_UPDATE_DAYS || ytdlpUpdating) return;
+    const now = Date.now ();
+    if (now < ytdlpPlanAt) return;
+    ytdlpPlanAt = now + 24 * 60 * 60 * 1000;   // следующая -- через сутки
+    const age = ytdlpAgeDays ();
+    const ver = ytdlpVersion || 'версия неизвестна';
+    const aged = (age === null ? '' : ' (' + age + ' ' + plural (age, 'день', 'дня', 'дней') + ')');
+    // Строго больше (как и сказано в строке при старте: «если версии БОЛЬШЕ N дней»):
+    // возраст ровно в порог ждёт ещё сутки -- спешить некуда, а формулировка не врёт.
+    if (age !== null && age > YTDLP_UPDATE_DAYS)
+    {
+        console.log ('[' + (d()) + '] [music] yt-dlp: плановая проверка (' + why + ') -- ' + ver + aged +
+            ', а порог ' + YTDLP_UPDATE_DAYS + ' ' + plural (YTDLP_UPDATE_DAYS, 'день', 'дня', 'дней') + ': версия старше -- обновляю сам');
+        await ytdlpTryUpdate ('планово: версия старше ' + YTDLP_UPDATE_DAYS + ' ' + plural (YTDLP_UPDATE_DAYS, 'день', 'дня', 'дней') +
+            ' (календарь)' + (ytdlpVersion ? ': ' + ytdlpVersion : ''));
+        return;
+    }
+    console.log ('[' + (d()) + '] [music] yt-dlp: плановая проверка (' + why + ') -- ' + ver + aged +
+        ', порог ' + YTDLP_UPDATE_DAYS + ': пока свежая, не трогаю (следующая через сутки)');
+}
+// Плановая проверка -- раз в час (решение «пора или нет» внутри, раз в сутки). unref: этот
+// таймер не должен держать процесс живым сам по себе -- как и остальные наши таймеры.
+if (YTDLP_UPDATE_DAYS)
+    setInterval (() => { ytdlpPlannedCheck ('по таймеру').catch (() => { }); }, 60 * 60 * 1000).unref ();
+
 // `node . ytdlp [--update|-U]` -- версия и (по желанию) обновление.
 async function ytdlpCli (args)
 {
@@ -10059,6 +10148,10 @@ function configCli ()
     row ('ytdlp_auto_update', YN (YTDLP_AUTO_UPDATE), hasM ('ytdlp_auto_update') ? 'config.json' : 'по умолчанию (вкл)');
     row ('ytdlp_update_after_fails', YTDLP_UPDATE_AFTER, hasM ('ytdlp_update_after_fails') ? 'config.json' : 'по умолчанию (5)');
     row ('ytdlp_check_days', YTDLP_CHECK_DAYS, hasM ('ytdlp_check_days') ? 'config.json' : 'по умолчанию (60)');
+    // [v2.98] Плановое обновление по календарю -- в отчёте видно, включено ли оно и какой порог.
+    row ('ytdlp_update_days', YTDLP_UPDATE_DAYS
+        ? YTDLP_UPDATE_DAYS + ' ' + plural (YTDLP_UPDATE_DAYS, 'день', 'дня', 'дней') + ' (обновляю сам)'
+        : '0 (только по ошибкам загрузки)', hasM ('ytdlp_update_days') ? 'config.json' : 'по умолчанию (30)');
     row ('skip_absent_author', YN (MUSIC_SKIP_ABSENT), hasM ('skip_absent_author') ? 'config.json' : 'по умолчанию (да)');
     row ('cache (диск)', YN (MUSIC_CACHE), hasM ('cache') ? 'config.json' : 'по умолчанию (вкл)');
     row ('cache_dir', MUSIC_CACHE_DIR, hasM ('cache_dir') ? 'config.json' : 'по умолчанию (music_cache)');
