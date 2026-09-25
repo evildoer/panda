@@ -10,6 +10,20 @@
 // номером просто не было -- номер мог быть пропущен, когда правки шли вперемешку. История
 // читается по блокам, а не по номерам: у одной партии может быть много коммитов, а блок
 // пишется только на то, что видно владельцу.
+// CHANGELOG v2.106 (прежний ответ на ту же команду убирается -- у ВСЕХ команд, не только /queue):
+//   * Владелец: «старый ответ должен исчезнуть, когда зовёшь команду заново -- и не только
+//     /queue». До этого последнее сообщение человека помнила одна /queue (v2.105 -- только
+//     самообновление), поэтому пять /play подряд оставляли в канале пять ответов бота.
+//   * Теперь помнится id ПОСЛЕДНЕГО публичного ответа на каждую команду (запись cmdAnswers,
+//     ключ «канал/человек/команда»): когда тот же человек зовёт ту же команду в том же канале,
+//     прежнее сообщение удаляется, а его место занимает новое.
+//   * Эфемерные ответы («видно только тебе») не запоминаются и прежний публичный ответ НЕ
+//     стирают: отказ «музыка только для DJ» -- не повод убирать то, что человек читал.
+//   * Удаляет бот только СВОЁ сообщение (id из записи), и в момент ответа, а не до команды.
+//     Нет права «Управлять сообщениями», сообщение уже удалили руками, канала больше нет --
+//     команда отвечает как обычно, в логе одна строка [ans] (про уже удалённое -- молчим).
+//   * Правило надевается на ответы само, в одном месте (как страховка лимитов v2.87): ни одна
+//     из десятков команд про него не знает и не может его «забыть».
 // CHANGELOG v2.105 (/queue: у каждого человека живёт только ПОСЛЕДНЕЕ его сообщение):
 //   * Владелец: «всегда обновлять только последнее от каждого пользователя».
 //   * Раньше пять вызовов /queue подряд давали пять ОБНОВЛЯЮЩИХСЯ сообщений и своими же
@@ -2034,6 +2048,14 @@ function dbDumpFmt (_ns, _key, _value)
         return _head + ' -- до ' + dbDumpDate (_until) + ' (' +
             (_until > Date.now () ? 'осталось ' + dbDumpLeft (_until) : 'срок истёк') + ')';
     }
+    // [v2.106] id ПРЕЖНЕГО публичного ответа человека на команду: по нему видно, что
+    // именно бот сотрёт, когда этот человек позовёт ту же команду в том же канале.
+    if (_ns === 'cmdAnswers')
+        return _head + ' -- ответ на /' + (_value.cmd || '?') + ' в канале ' + (_value.ch || '--') +
+            ', сообщение ' + (_value.id || '--') +
+            (_value.by ? ', кто: ' + clipText (String (_value.by), 40) : '') +
+            (_value.at ? ', ' + dbDumpDate (_value.at) : '') +
+            ' | сотрётся при повторном вызове /' + (_value.cmd || '?');
     if (_ns === 'musicState')
     {
         // [v2.57] ИСТОРИЯ ДОБАВЛЕНИЙ -- это тоже musicState, но в другой записи (history),
@@ -2172,7 +2194,7 @@ function dbDumpCli ()
         }
         console.log ('[dump] записей ' + _rows.length + ': открытых ' + _plain + ', зашифрованных ' + _enc +
             ', нечитаемых ' + _bad + (_only ? ' | по фильтру: ' + _shown + ' из ' + _rows.length : ''));
-        const _order = ['memberRoles', 'banHistory', 'membersBanTimeout', 'musicState', 'channelsBusy'];
+        const _order = ['memberRoles', 'banHistory', 'membersBanTimeout', 'musicState', 'cmdAnswers', 'channelsBusy'];
         const _nsKeys = [..._byNs.keys ()].sort ((a, b) =>
         {
             const _ia = _order.indexOf (a), _ib = _order.indexOf (b);
@@ -3667,6 +3689,12 @@ for (let _server in SERVERS)
     // [v2.15] история наказаний -- для отчёта «кто сколько раз выходил и попадал»
     // (ключ -- id участника, значение -- {at, events:[{at, kind}]}):
     $db[_server]['banHistory']        = dbMake (_server, 'banHistory');
+    // [v2.106] id ПОСЛЕДНЕГО публичного ответа человека на команду (канал/человек/команда):
+    // когда тот же человек зовёт ту же команду в том же канале -- прежний ответ удаляется,
+    // а на его место встаёт новый (см. блок «ПРЕЖНИЙ ОТВЕТ НА ТУ ЖЕ КОМАНДУ» ниже).
+    // Отдельным неймспейсом, а не полем musicState: команды -- не только музыка, а запись
+    // эта про ответы, и в дампе её хочется видеть своей строкой.
+    $db[_server]['cmdAnswers']        = dbMake (_server, 'cmdAnswers');
 }
 
 // ============================================================================
@@ -16875,6 +16903,170 @@ async function registerMusicCommands ()
     }
 }
 
+// ============================================================================
+// [v2.106] ПРЕЖНИЙ ОТВЕТ НА ТУ ЖЕ КОМАНДУ УБИРАЕТСЯ.
+// Владелец: «когда зовёшь команду заново, старый ответ должен исчезнуть» -- и не
+// только у /queue, а у ВСЕХ команд и везде. До этого одна только /queue вела лишь
+// последнее сообщение человека (v2.105, самообновление), поэтому пять /play подряд
+// оставляли в канале пять ответов, а пять /history -- пять простыней.
+//
+// Как это работает:
+//   * запись cmdAnswers (ключ «канал/человек/команда») помнит id ПОСЛЕДНЕГО публичного
+//     ответа этого человека на эту команду в этом канале;
+//   * когда он зовёт команду снова и она ГОТОВИТ публичный ответ, прежнее сообщение
+//     удаляется, а id нового занимает его место;
+//   * эфемерные ответы («видно только тебе») бот не запоминает и не удаляет -- их всё
+//     равно видит один вызвавший, и старый публичный ответ при них не трогается (важно:
+//     отказ «музыка только для DJ» -- не повод стирать то, что человек читал);
+//   * удаляем ТОЛЬКО своё: id берётся из записи, чужое сообщение удалить бот не может и
+//     не пытается. Сообщение уже удалили руками, у бота нет права «Управлять
+//     сообщениями», канал пропал -- команда работает как обычно, в логе одна строка;
+//   * помним только последний ответ (в этом и смысл), старые записи не копятся: ключ
+//     один на человека и команду, лишние записи не растут от повторных вызовов.
+// ============================================================================
+
+// Ключ записи -- канал, человек, команда. Разделитель «/»: в дампе (`node . dump <id>`)
+// такой ключ читается глазом и фильтруется по id участника.
+function answerKeyOf (chId, byId, cmd) { return String (chId) + '/' + String (byId) + '/' + String (cmd); }
+
+// Просит ли вызов «видно только мне» (flags ответа). У reply/followUp/deferReply
+// эфемерность задаётся ТОЛЬКО этим флагом.
+function answerFlagsEphemeral (options)
+{
+    const flags = (options && typeof options === 'object') ? Number (options.flags) : NaN;
+    return Number.isFinite (flags) && (flags & MessageFlags.Ephemeral) !== 0;
+}
+
+// Достать сообщение из того, что вернул reply/editReply/followUp. У discord.js это или
+// само сообщение (editReply, followUp), или ОБЁРТКА ответа: с withResponse --
+// InteractionCallbackResponse (сообщение внутри resource.message), без него --
+// InteractionResponse. У InteractionResponse поле id -- это id ВЗАИМОДЕЙСТВИЯ, а не
+// сообщения, и на этом легко было бы запомнить мусор. Отличаем просто: у обёртки нет
+// КАНАЛА, а у сообщения есть и id, и канал. (По полю interaction отличать нельзя: оно
+// есть и у настоящего Message -- Discord присылает его в ответах на взаимодействия.)
+function answerMessageOf (res)
+{
+    if (!res || typeof res !== 'object') return null;
+    if (res.resource && res.resource.message) return answerMessageOf (res.resource.message);
+    if (!res.id || !res.channelId) return null;
+    return res;
+}
+
+// Отправить на удаление сообщение, которое бот раньше прислал как ответ на эту команду.
+// Не ждём и не падаем: ответ человеку важнее уборки.
+async function answerDrop (guildId, chId, msgId, cmd)
+{
+    let ch = client.channels.cache.get (chId);
+    if (!ch) ch = await client.channels.fetch (chId).catch (() => null);
+    if (!ch || !ch.messages || typeof ch.messages.delete !== 'function') return;
+    try
+    {
+        await ch.messages.delete (msgId);
+        console.log ('[' + (d()) + '] [ans] убрал прежний ответ на /' + cmd + ' (' +
+            (ch.name ? '#' + ch.name : chId) + ', сообщение ' + msgId + ')');
+    }
+    catch (e)
+    {
+        const code = Number (e && e.code) || 0;
+        // 10008 «Unknown Message» и 10003 «Unknown Channel» -- сообщения уже нет, это не
+        // сбой, и писать про него в лог незачем.
+        if (code !== 10008 && code !== 10003)
+            console.log ('[' + (d()) + '] [ans] не смог убрать прежний ответ на /' + cmd + ': ' +
+                oneLine ((e && e.message) || e));
+    }
+}
+
+// Убрать прежний ответ (если он записан) -- ровно один раз на интеракцию.
+async function answerForget (interaction, cmd)
+{
+    const chId = interaction.channelId;
+    const byId = interaction.user ? interaction.user.id : '';
+    if (!chId || !byId) return;
+    let rec = null;
+    try { rec = await db (interaction.guildId, 'cmdAnswers', answerKeyOf (chId, byId, cmd)); }
+    catch (e) { return; }
+    const id = (rec && rec.id) ? String (rec.id) : '';
+    if (!id) return;
+    // Удаление не ждём, но ошибку ловим: брошенный промис в этом боте -- это отчёт о сбое.
+    answerDrop (interaction.guildId, (rec.ch || chId), id, cmd).catch (() => {});
+}
+
+// Запомнить id нового публичного ответа -- именно его уберём в следующий раз.
+async function answerRemember (interaction, cmd, msgId)
+{
+    const chId = interaction.channelId;
+    const byId = interaction.user ? interaction.user.id : '';
+    if (!chId || !byId || !msgId) return;
+    try
+    {
+        await db (interaction.guildId, 'cmdAnswers', answerKeyOf (chId, byId, cmd),
+        {
+            id: String (msgId), ch: String (chId), cmd: String (cmd),
+            by: interaction.member ? uuu (interaction.member) : (interaction.user ? interaction.user.username : ''),
+            at: Date.now (),
+        });
+    }
+    catch (e) { console.error ('[ans] не смог запомнить ответ на /' + cmd + ': ' + oneLine ((e && e.message) || e)); }
+}
+
+// Один публичный ответ команды: прежний убираем, новый запоминаем. Делается РОВНО один
+// раз (дальше добавочные сообщения команды -- уже не «ответ», и запоминать последнее
+// значило бы удалять в следующий раз именно его, оставив первый ответ висеть).
+async function answerNote (interaction, cmd, res)
+{
+    if (!interaction.__answerGone)
+    {
+        interaction.__answerGone = true;
+        await answerForget (interaction, cmd);
+    }
+    if (interaction.__answerMsg) return;
+    // Сообщение берём из результата; если Discord его не вернул (обычный reply без
+    // withResponse), один раз спрашиваем сами -- иначе запись осталась бы со старым id.
+    const msg = answerMessageOf (res) || await interaction.fetchReply ().catch (() => null);
+    if (!msg || !msg.id) return;
+    interaction.__answerMsg = String (msg.id);
+    await answerRemember (interaction, cmd, msg.id);
+}
+
+// Надеть это на интеракцию. Методы подменяются у КОНКРЕТНОЙ интеракции -- как и у
+// страховки лимитов (shieldOutgoing), ни один из десятков ответов не может «забыть» про
+// правило. Решение об эфемерности принимается ПОСЛЕ ответа: у reply/editReply discord.js
+// сам выставляет interaction.ephemeral (флаг в вызове ничего не добавит), а у followUp
+// эфемерность своя -- её задают только его flags, и interaction.ephemeral про исходящий
+// ответ тут не говорит.
+function answerWatch (interaction)
+{
+    if (!interaction || interaction.__answerSafe) return interaction;
+    if (typeof interaction.isChatInputCommand !== 'function' || !interaction.isChatInputCommand ()) return interaction;
+    const cmd = String (interaction.commandName || '');
+    if (!cmd || !interaction.guildId || !interaction.channelId) return interaction;
+    // Сервер не из config.json -- базы у него нет (и команды в нём не работают).
+    if (!$db[interaction.guildId] || !$db[interaction.guildId]['cmdAnswers']) return interaction;
+    interaction.__answerSafe = true;
+    for (const m of ['reply', 'editReply', 'followUp'])
+    {
+        const orig = interaction[m];
+        if (typeof orig !== 'function') continue;
+        interaction[m] = function (options, ...rest)
+        {
+            const p = orig.call (this, options, ...rest);
+            if (!p || typeof p.then !== 'function') return p;
+            return p.then (async res =>
+            {
+                try
+                {
+                    const eph = answerFlagsEphemeral (options) ||
+                        (m !== 'followUp' && interaction.ephemeral === true);
+                    if (!eph) await answerNote (interaction, cmd, res);
+                }
+                catch (e) { console.log ('[' + (d()) + '] [ans] ' + oneLine ((e && e.message) || e)); }
+                return res;
+            });
+        };
+    }
+    return interaction;
+}
+
 // Обработка слэш-команд:
 client.on ('interactionCreate', async (interaction) =>
 {
@@ -16884,6 +17076,9 @@ client.on ('interactionCreate', async (interaction) =>
     // закрывает все десятки ответов этой интеракции: reply/editReply/followUp/update
     // и правку сообщения, под которым нажали кнопку.
     shieldOutgoing (interaction);
+    // [v2.106] И ПРЕЖНИЙ ОТВЕТ НА ТУ ЖЕ КОМАНДУ -- тоже до всего остального: правило
+    // работает и для команд, которые ни строчки об этом не знают (см. блок выше).
+    answerWatch (interaction);
     // [v2.14] Кнопки и меню под ответом /queue:
     //   ◀/▶ -- листание (номер страницы зашит в customId, состояние между нажатиями
     //           не нужно, содержимое берётся из ЖИВОЙ очереди);
