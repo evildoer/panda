@@ -29,6 +29,19 @@
 //     выяснено и сделано по-настоящему, см. блок ниже.
 //   * Владелец просил не выдумывать за него: ключ `cookies_from_browser` в конфиге больше не
 //     нужен ВООБЩЕ -- браузер называется прямо в команде.
+// CHANGELOG v2.111 (cookie Chrome-like браузеров: пока браузер работает, читать нечего):
+//   * ВЛАДЕЛЕЦ: «при работающем браузере ты не получишь cookie у chro_melike браузера». Проверил
+//     живьём 25.09.2026 -- прав, и теперь команда говорит это сама, а не строкой «resource busy
+//     or locked», по которой ничего не понятно:
+//       1) Chrome запущен -- база cookie не читается ВООБЩЕ: EBUSY и на чтении, и на копировании
+//          (не права, а защита браузера). До чтения бот пишет, что запущено и с каким pid, а при
+//          отказе объясняет причину и говорит закрыть браузер и повторить;
+//       2) Edge (и Chrome тех же версий) может писать `v20` -- cookie, привязанные к приложению:
+//          закрывать браузер тут бессмысленно, дело в самих cookie, о чём теперь сказано прямо;
+//       3) Firefox берётся при работающем браузере (до этого момента бот так и делал: 2247 строк,
+//          пока Firefox открыт) -- поэтому если файл нужен сразу, то это Firefox.
+//     `cookies_from_browser` (штатный режим yt-dlp) упирается в ту же защиту: у Chrome-like
+//     браузеров он работает только с закрытым браузером -- сказано и в подсказке ключа.
 // CHANGELOG v2.110 (сервисная команда возвращает консоль и говорит об этом):
 //   * ВЛАДЕЛЕЦ: «любой не `node .` должен завершать скрипт, возвращая управление в консоль,
 //     которая его вызвала!». Завершение было и раньше, но его НЕ БЫЛО ВИДНО: последняя строка
@@ -10177,6 +10190,10 @@ async function cookieTextVerdict (_text)
 //     даже сам Windows-API вне браузера, поэтому про них говорим честно, а не делаем вид;
 //   * Chrome, пока он запущен, не отдаёт базу cookie вообще (Windows держит файл намертво:
 //     не только копирование, но и чтение даёт EBUSY) -- об этом тоже сказано прямо.
+// [v2.111] А кто именно запущен и держит базу -- бот теперь смотрит сам (CHROMIUM_PROCS и
+// chromiumProcsOf ниже) и называет процесс с pid: раньше при работающем Chrome человек видел
+// лишь «resource busy or locked». Закрывать браузер нужно именно Chrome-like: Firefox отдаёт
+// свой cookies.sqlite при работающем окне (проверено живым прогоном -- 2247 строк).
 // Дальше всё общее с Firefox: те же три набора и та же живая проверка у YouTube.
 // ============================================================================
 const CHROMIUM_BROWSERS = {
@@ -10290,6 +10307,53 @@ function chromiumKeyRead (_dataDir)
         return { why: 'Windows не отдал ключ cookie через DPAPI' + (_key && _key.length ? ' (длина ' + _key.length + ')' : '') };
     return { key: _key };
 }
+// [v2.111] Кто из браузеров сейчас запущен. Нужно ровно одно: не свалить на «нет прав» то, что
+// делает сам браузер. Проверено живьём 25.09.2026 (Chrome запущен): база cookie не читается
+// ВООБЩЕ -- EBUSY и на чтении, и на копировании; это защита браузера от кражи cookie, а не
+// поломка на нашей стороне. Раньше отказ выглядел загадкой («resource busy or locked»), теперь
+// человеку сказано, ЧТО закрыть и почему. Firefox то же самое не мешает: он разрешает читать
+// свой cookies.sqlite при работающем браузере (проверено живым прогоном -- 2247 строк).
+const CHROMIUM_PROCS = {
+    chrome:   ['chrome.exe'],
+    edge:     ['msedge.exe'],
+    chromium: ['chromium.exe'],
+    brave:    ['brave.exe'],
+    vivaldi:  ['vivaldi.exe'],
+    opera:    ['opera.exe'],
+    helium:   ['helium.exe'],
+};
+let _chromiumProcsCache = null;
+function chromiumProcsRunning ()
+{
+    if (_chromiumProcsCache) return _chromiumProcsCache;
+    const _found = {};
+    try
+    {
+        const _out = String (require ('child_process').execSync ('tasklist /FO CSV /NH',
+            { encoding: 'utf8', timeout: 15000, windowsHide: true }));
+        for (const _line of _out.split (/\r?\n/))
+        {
+            const _m = /^"([^"]+)","(\d+)"/.exec (_line);
+            if (!_m) continue;
+            const _n = _m[1].toLowerCase ();
+            if (!_found[_n]) _found[_n] = _m[2];
+        }
+    }
+    catch (e) { }
+    _chromiumProcsCache = _found;
+    return _found;
+}
+function chromiumProcsOf (_browser)
+{
+    const _all = chromiumProcsRunning ();
+    let _key = String (_browser === undefined || _browser === null ? '' : _browser).trim ().toLowerCase ();
+    const _colon = _key.indexOf (':');
+    if (_colon > 0) _key = _key.slice (0, _colon);
+    const _names = CHROMIUM_PROCS[_key] || Object.keys (CHROMIUM_PROCS).map (_k => CHROMIUM_PROCS[_k][0]);
+    const _out = [];
+    for (const _n of _names) if (_all[_n]) _out.push (_n + ' (pid ' + _all[_n] + ')');
+    return _out;
+}
 function chromiumCookieRowsRead (_dataDir, _profileDir, _label)
 {
     const _fs = require ('fs');
@@ -10299,9 +10363,13 @@ function chromiumCookieRowsRead (_dataDir, _profileDir, _label)
     try { _bytes = _fs.readFileSync (_file); }
     catch (e)
     {
+        const _run = chromiumProcsOf (_label);
         return { why: 'браузер ' + (_label ? '«' + _label + '» ' : '') + 'держит базу cookie открытой (' +
-            oneLine ((e && e.message) || e, 70) + '). Закрой его и повтори: Chrome и Edge не отдают эту базу, пока работают' +
-            ' (Helium и Firefox отдают).' };
+            oneLine ((e && e.message) || e, 70) + '). ' + (_run.length
+                ? _run.join (', ') + ' запущен, а Chrome-like браузеры не отдают эту базу, пока работают' +
+                  ' (не только копирование, но и чтение -- так задумано браузером). Закрой его и повтори.'
+                : 'сам браузер не запущен -- файл занял кто-то другой; проверь, нет ли второго экземпляра,' +
+                  ' и права на папку профиля.') };
     }
     let DatabaseSync = null;
     try { ({ DatabaseSync } = require ('node:sqlite')); } catch (e) { }
@@ -10420,6 +10488,13 @@ async function cookiesSaveCli (_args)
         const _cp = chromiumProfilePick (_cd.dir, _profileWant);
         if (!_cp.dir) { console.error ('[cookies] профиль не найден: ' + _cp.why); return 1; }
         console.log ('[cookies] профиль: ' + _cp.dir + ' (' + _cp.why + ')');
+        // [v2.111] Сказать о запущенном браузере ДО чтения: у Chrome-like браузеров работающий
+        // браузер держит базу cookie намертво, и человек узнаёт об этом не из «resource busy».
+        const _run = chromiumProcsOf (_cd.name);
+        if (_run.length)
+            console.log ('[cookies] браузер запущен: ' + _run.join (', ') +
+                ' -- Chrome и Edge не отдают базу cookie, пока работают (Firefox отдаёт всегда, Helium -- как повезёт).' +
+                ' Если чтение сейчас не выйдет, закрой браузер и повтори.');
         const _cr = chromiumCookieRowsRead (_cd.dir, _cp.dir, _browser);
         if (_cr.why) { console.error ('[cookies] ' + _cr.why); return 1; }
         console.log ('[cookies] строк в базе про музыку: ' + _cr.total + ', из них расшифровано ' + _cr.decrypted +
@@ -10437,7 +10512,8 @@ async function cookiesSaveCli (_args)
         if (!_cr.decrypted)
         {
             console.error ('[cookies] ни одну строку расшифровать не вышло: Windows привязал cookie к приложению' +
-                ' (v20) -- такие cookie достаёт только сам браузер, и в файл их не выложить.');
+                ' (v20) -- такие cookie достаёт только сам браузер, и в файл их не выложить.' +
+                ' Закрывать браузер тут бессмысленно: дело в самих cookie, а не в занятом файле.');
             console.error ('[cookies] что делать: либо браузер, где cookie не привязаны (у владельца так было с Helium),' +
                 ' либо профиль Firefox, либо готовый файл.');
             return 1;
