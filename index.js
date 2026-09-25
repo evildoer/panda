@@ -10,6 +10,25 @@
 // номером просто не было -- номер мог быть пропущен, когда правки шли вперемешку. История
 // читается по блокам, а не по номерам: у одной партии может быть много коммитов, а блок
 // пишется только на то, что видно владельцу.
+// CHANGELOG v2.108 (`node . cookies --save`: файл cookie бот собирает САМ и проверяет у YouTube):
+//   * ВЛАДЕЛЕЦ: «я всё за тебя сделал -- файл положил, а ты сам сгенерить его из имени браузера
+//     не можешь? надо лишь удалить всё, что не касается ютуба и других провайдеров аудио».
+//     И прав: это не его работа. Теперь есть `node . cookies --save [firefox[:профиль]]`: бот
+//     берёт профиль Firefox, оставляет только домены музыки (youtube.com, googlevideo.com,
+//     soundcloud.com, bandcamp.com), собирает Netscape-файл и -- главное -- спрашивает у
+//     YouTube, принял ли он набор, ТЕМ ЖЕ путём, что и музыка (маршруты/прокси бота).
+//   * ПОЧЕМУ НЕ ПРОСТО «ОТФИЛЬТРОВАТЬ»: проверено живыми запросами 25.09.2026 -- набор из
+//     профиля с ПРОТУХШИМ входом в YouTube отбрасывается («The page needs to be reloaded»),
+//     а тот же набор без cookie ВХОДА (аккаунт Google) -- принимается. Поэтому команда
+//     собирает три набора (как есть / без cookie входа / только гостевые) и записывает тот,
+//     который YouTube РЕАЛЬНО принял, а если ни один -- ничего не трогает и говорит, что вход
+//     надо обновить. Что принято, видно строкой на экране, догадок здесь больше нет.
+//   * Ничего не пишется молча: файл меняется только по `--save` (есть `--dry`), прежний файл
+//     уходит в logs/ (cookie -- это доступ к аккаунту, копии в репозитории не место).
+//     Chromium-браузеры (chrome, edge, helium...) честно отказываются: Windows шифрует их
+//     cookie так, что в файл их вытащить нельзя -- читать такой профиль умеет только сам yt-dlp.
+//   * Владелец просил не выдумывать за него: ключ `cookies_from_browser` в конфиге больше не
+//     нужен ВООБЩЕ -- браузер называется прямо в команде.
 // CHANGELOG v2.107 (cookie из браузера ловятся, экран консольных команд -- только про них):
 //   * ВЛАДЕЛЕЦ: «похоже "cookies_from_browser": "firefox" не срабатывал, просто пропускал
 //     все треки». Так и было, и виноват не bot: yt-dlp честно читал 2093 cookie из Firefox,
@@ -1787,7 +1806,7 @@ const CONSOLE_HELP =
     ['node . config',             'чем бот РЕАЛЬНО работает: все ключи, их значения и откуда взяты (бот не запускается)'],
     ['node . files',              'что за каждый файл в папке и что можно удалять'],
     ['node . cache [--clear]',    'кэш музыки: что скачано, сколько занимает, что удалять (--clear -- стереть всё)'],
-    ['node . cookies',            'cookie для YouTube: что задано и читается ли оно (файл или cookies браузера)'],
+    ['node . cookies [--save]',   'cookie для YouTube: что задано и принял ли их YouTube (--save -- собрать файл из браузера самому)'],
     ['node . ytdlp [--update]',   'версия yt-dlp и её возраст (--update -- обновить: yt-dlp -U)'],
     ['node . privacy [--check]',  'пересобрать PRIVACY.md из шаблона (--check -- только проверить)'],
     ['node . privacy --offline',  'то же, но без обращения к Discord за именами'],
@@ -9656,7 +9675,8 @@ async function cookieStartupCheck ()
     if (r.verdict === 'stale' || r.verdict === 'anon')
         console.error ('[' + (d()) + '] [music] ВНИМАНИЕ: YouTube эти cookie НЕ принимает (' + src + '): ' + r.why +
             ' -- каждый трек будет спотыкаться. Проверь `node . cookies`: возьми ФАЙЛ cookie (MUSIC.cookies_file,' +
-            ' так делает сам владелец -- этот путь работает) или убери cookie вовсе (анонимный путь работает).');
+            ' так делает сам владелец -- этот путь работает) или убери cookie вовсе (анонимный путь работает).' +
+            ' Файл можно собрать самому: `node . cookies --save firefox` (только домены музыки, с проверкой у YouTube).');
     else if (r.verdict === 'ok')
         console.log ('[' + (d()) + '] [music] cookie приняты YouTube (' + src + ') -- контрольный запрос прошёл');
 }
@@ -9907,6 +9927,277 @@ function cookiesFileReport ()
     return { ok: lines.length > 0, lines: lines.length, domains: dom.size, yt,
         top: [...dom.entries ()].sort ((a, b) => b[1] - a[1]).slice (0, 6) };
 }
+// ============================================================================
+// [v2.108] `node . cookies --save` -- ФАЙЛ COOKIE СОБИРАЕТ САМ БОТ.
+// Владелец: «я файл положил, а ты сам сгенерить его из имени браузера не можешь? надо лишь
+// удалить всё, что не касается ютуба и других провайдеров аудио». Прав -- и вот что из
+// этого следует по-настоящему:
+//   * в браузере cookie лежат ПО ДОМЕНУ, и для запросов yt-dlp нужен только домен
+//     youtube.com: всё остальное (аккаунт Google, метрика, чужие сайты) к музыке не
+//     относится и только мешает;
+//   * но одного фильтра МАЛО. Проверено 25.09.2026 живыми запросами: набор из профиля
+//     Firefox, где вход в YouTube уже протух, YouTube НЕ принимает («The page needs to be
+//     reloaded»), а тот же набор БЕЗ cookie входа -- принимает;
+//   * поэтому команда собирает не один файл, а ТРИ набора (как есть / без cookie входа /
+//     только гостевые) и оставляет ТОТ, КОТОРЫЙ YOUTUBE РЕАЛЬНО ПРИНЯЛ. Здесь догадка
+//     ничего не стоит, а живой запрос -- стоит: именно на ней владелец и потерял сутки.
+// Файл пишется только по явной команде, старый не затирается молча (уходит в logs/).
+// ============================================================================
+// Домены, нужные запросам yt-dlp (музыкальные провайдеры). Всё остальное в браузере -- мимо.
+const COOKIE_PROVIDER_HOSTS = ['youtube.com', 'youtu.be', 'googlevideo.com', 'soundcloud.com', 'bandcamp.com'];
+// Cookie ВХОДА (аккаунт Google). Протухший вход -- это «The page needs to be reloaded» на
+// КАЖДОМ треке, поэтому набор без них проверяется отдельно, а не выбрасывается молча.
+const COOKIE_LOGIN_NAME = /^(SID|HSID|SSID|APISID|SAPISID|SIDCC|LOGIN_INFO|ST-|__Secure-\dP?(SID|APISID)|__Secure-YEC$|__Secure-YENID$)/i;
+// Гостевые cookie: этот набор YouTube принимает и без входа (проверено живыми запросами).
+const COOKIE_GUEST_NAME = /^(GPS|PREF|SOCS|YSC|wide|VISITOR_INFO1_LIVE|VISITOR_PRIVACY_METADATA|__Secure-BUCKET|__Secure-ROLLOUT_TOKEN|__Secure-YNID)$/;
+
+function cookieHostWanted (_host)
+{
+    const _h = String (_host === undefined || _host === null ? '' : _host).replace (/^\./, '').toLowerCase ();
+    return COOKIE_PROVIDER_HOSTS.some (_d => _h === _d || _h.endsWith ('.' + _d));
+}
+// Одно имя может лежать несколькими строками (разные пути/срок): оставляем самую свежую.
+function cookiesRowsDedup (_rows)
+{
+    const _m = new Map ();
+    for (const _r of _rows)
+    {
+        const _k = _r.host + '|' + (_r.path || '/') + '|' + _r.name;
+        const _old = _m.get (_k);
+        if (!_old || Number (_r.expiry || 0) > Number (_old.expiry || 0)) _m.set (_k, _r);
+    }
+    return [..._m.values ()];
+}
+// Формат Netscape -- тот же, что у расширений-экспортёров и у самого yt-dlp.
+function cookiesNetscapeText (_rows, _source)
+{
+    const _out = ['# Netscape HTTP Cookie File',
+        '# Собрано ботом PANDAMIA из браузера (' + _source + '), ' + new Date ().toLocaleString (), ''
+    ];
+    let _skipped = 0;
+    for (const _r of _rows)
+    {
+        const _val = String (_r.value === undefined || _r.value === null ? '' : _r.value);
+        // Табуляция/перевод строки формат не переживут: такую строку пропускаем, а не портим файл.
+        if (/[\t\r\n]/.test (_val) || /[\t\r\n]/.test (String (_r.name))) { _skipped++; continue; }
+        _out.push ([(_r.isHttpOnly ? '#HttpOnly_' : '') + _r.host,
+            String (_r.host).startsWith ('.') ? 'TRUE' : 'FALSE',
+            _r.path || '/', _r.isSecure ? 'TRUE' : 'FALSE',
+            Math.max (0, Math.floor (Number (_r.expiry || 0))), _r.name, _val].join ('\t'));
+    }
+    return { text: _out.join ('\n') + '\n', skipped: _skipped };
+}
+// Профиль Firefox: 'firefox' (по умолчанию из profiles.ini), 'firefox:C:\путь' или просто путь.
+function firefoxProfileResolve (_spec)
+{
+    const _root = pathMod.join (process.env.APPDATA || '', 'Mozilla', 'Firefox');
+    let _s = String (_spec === undefined || _spec === null ? '' : _spec).trim ();
+    const _m = /^([a-z0-9]+)\s*:\s*(.+)$/i.exec (_s);
+    if (_m)
+    {
+        if (!/^firefox$/i.test (_m[1])) return { why: _m[1] };
+        _s = _m[2].trim ();
+    }
+    // Голое слово -- это ИМЯ БРАУЗЕРА (firefox, chrome, helium...), а не профиль: чужой браузер
+    // сюда не подставляем молча.
+    if (_s && !/[\\\/]/.test (_s) && !/^firefox$/i.test (_s)) return { why: _s };
+    if (/[\\\/]/.test (_s))
+        return fsMod.existsSync (pathMod.join (_s, 'cookies.sqlite')) ? { dir: _s }
+            : { why: 'в папке нет cookies.sqlite: ' + _s };
+    let _ini = '';
+    try { _ini = fsMod.readFileSync (pathMod.join (_root, 'profiles.ini'), 'utf8'); }
+    catch (e) { return { why: 'profiles.ini не читается: ' + pathMod.join (_root, 'profiles.ini') }; }
+    const _sections = [];
+    let _cur = null;
+    for (const _raw of _ini.split (/\r?\n/))
+    {
+        const _line = _raw.trim ();
+        const _sec = /^\[(.+)\]$/.exec (_line);
+        if (_sec) { _cur = { name: _sec[1], keys: {} }; _sections.push (_cur); continue; }
+        if (!_cur || !_line || _line.startsWith (';') || _line.startsWith ('#')) continue;
+        const _eq = _line.indexOf ('=');
+        if (_eq > 0) _cur.keys[_line.slice (0, _eq).trim ()] = _line.slice (_eq + 1).trim ();
+    }
+    // Порядок выбора -- не выдуманный, а из самих настроек Firefox: у блока установки
+    // [Install...] лежит пароль Default, который Firefox считает своим рабочим профилем
+    // (именно его берёт и yt-dlp). Если файла там нет -- смотрим Profile* с Default=1, а
+    // потом любой профиль, у которого cookie вообще есть. Владелец живой случай: один
+    // профиль в profiles.ini помечен Default=1, а cookie живут в другом -- раньше команда
+    // на этом спотыкалась и говорила «не найден».
+    const _dirOf = (_x) => { const _d = _x.keys.IsRelative === '0' ? _x.keys.Path : pathMod.join (_root, _x.keys.Path);
+        return fsMod.existsSync (pathMod.join (_d, 'cookies.sqlite')) ? _d : ''; };
+    const _cands = [];
+    for (const _x of _sections)
+    {
+        if (/^Install/i.test (_x.name) && _x.keys.Default)
+            _cands.push ({ why: 'рабочий профиль Firefox', name: _x.keys.Default, dir: _dirOf ({ keys: { IsRelative: '1', Path: _x.keys.Default } }) });
+    }
+    for (const _x of _sections.filter (_y => /^Profile/i.test (_y.name) && _y.keys.Path))
+        _cands.push ({ why: _x.keys.Default === '1' ? 'помечен Default=1' : 'есть cookie', name: _x.name, dir: _dirOf (_x) });
+    const _hit = _cands.find (_x => _x.dir);
+    if (!_hit)
+        return { why: 'ни в одном профиле Firefox нет cookies.sqlite (' + (_cands.map (_x => _x.name).join (', ') || 'профилей нет') + ')' };
+    return { dir: _hit.dir, profile: _hit.name, why: _hit.why };
+}
+// Чтение cookie из профиля Firefox. Базу обязательно копируем: Firefox держит её открытой,
+// и живой файл читать нельзя (SQLite-лок), а нам нужен только снимок.
+function firefoxCookieRows (_dir)
+{
+    const _fs = require ('fs'), _os = require ('os');
+    let _tmp = '';
+    try
+    {
+        _tmp = _fs.mkdtempSync (pathMod.join (_os.tmpdir (), 'panda-cookie-'));
+        for (const _f of ['cookies.sqlite', 'cookies.sqlite-wal', 'cookies.sqlite-shm'])
+            try { _fs.copyFileSync (pathMod.join (_dir, _f), pathMod.join (_tmp, _f)); } catch (e) { }
+        if (!_fs.existsSync (pathMod.join (_tmp, 'cookies.sqlite')))
+            return { why: 'в папке нет cookies.sqlite: ' + _dir };
+        let DatabaseSync = null;
+        try { ({ DatabaseSync } = require ('node:sqlite')); } catch (e) { }
+        if (!DatabaseSync) return { why: 'этот Node не умеет читать SQLite (node:sqlite) -- нужен Node 22+' };
+        const _db = new DatabaseSync (pathMod.join (_tmp, 'cookies.sqlite'), { readOnly: true });
+        try { return { rows: _db.prepare ('SELECT host, name, value, path, expiry, isSecure, isHttpOnly FROM moz_cookies').all () }; }
+        finally { _db.close (); }
+    }
+    catch (e) { return { why: oneLine ((e && e.message) || e, 200) }; }
+    finally { try { if (_tmp) _fs.rmSync (_tmp, { recursive: true, force: true }); } catch (e) { } }
+}
+// Проверка ОДНОГО набора: пишем во временный файл и спрашиваем метаданные у YouTube тем же
+// путём, что и музыка (маршруты/прокси бота). Возврат -- принял / не принял и почему.
+async function cookieTextVerdict (_text)
+{
+    const _fs = require ('fs'), _os = require ('os');
+    const _dir = _fs.mkdtempSync (pathMod.join (_os.tmpdir (), 'panda-ck-'));
+    const _file = pathMod.join (_dir, 'cookies.txt');
+    _fs.writeFileSync (_file, _text);
+    ytDlpQuiet++;
+    try
+    {
+        // cookiesFromBrowser: undefined -- иначе рядом с файлом ушёл бы и ключ конфига
+        // (yt-dlp такие два источника вместе не принимает).
+        await ytDlpRun (COOKIE_CHECK_URL, { simulate: true, quiet: true, noWarnings: true, noPlaylist: true,
+            cookies: _file, cookiesFromBrowser: undefined });
+        return { ok: true };
+    }
+    catch (e) { return { ok: false, verdict: cookieVerdict (e), why: ytDlpErr (e, 160) }; }
+    finally
+    {
+        ytDlpQuiet--;
+        try { _fs.rmSync (_dir, { recursive: true, force: true }); } catch (e) { }
+    }
+}
+
+async function cookiesSaveCli (_args)
+{
+    $cliOwnScreen ();
+    const _flag = (_n) => { const _i = _args.findIndex (_a => new RegExp ('^' + _n + '$', 'i').test (_a)); return _i >= 0 ? String (_args[_i + 1] || '').trim () : ''; };
+    // Разбор аргументов без выдумок: значение ключа (--to файл, --browser имя) -- это НЕ
+    // браузер. Забыть об этом легко, и тогда путь к файлу бот примет за имя браузера
+    // (поймано живым запуском: `--save --to standtmp/x.txt` -> «это не Firefox»).
+    const _pos = [];
+    for (let _i = 0; _i < _args.length; _i++)
+    {
+        const _a = _args[_i];
+        if (/^(--to|--browser)$/i.test (_a)) { _i++; continue; }
+        if (/^-/.test (_a) || /^(cookies|node|\.)$/i.test (_a)) continue;
+        _pos.push (_a);
+    }
+    // Без подсказок берём Firefox: только из него cookie можно вытащить в файл (у Chromium
+    // их шифрует Windows) -- и это тот браузер, откуда владелец и брал свой рабочий файл.
+    const _browser = _flag ('--browser') || _pos[0] || MUSIC_COOKIES_BROWSER || 'firefox';
+    const _dry = _args.some (_a => /^--dry$/i.test (_a));
+    const _to = _flag ('--to');
+    console.log ('[cookies] собираю файл сам: ' + (_browser ? 'браузер «' + _browser + '»' : 'браузер не назван'));
+    if (!_browser || !/^firefox/i.test (_browser))
+    {
+        // Честно: на Chromium (chrome, edge, helium, brave...) cookie в Windows зашифрованы
+        // (DPAPI + привязка к приложению), и в файл я их вытащить не могу -- их умеет читать
+        // только сам yt-dlp ключом cookies_from_browser, а оттуда набор cookie не отфильтровать.
+        console.error ('[cookies] это не Firefox, а браузер на Chromium (' + (_browser || 'не назван') + ').' +
+            ' Его cookie Windows шифрует так, что вытащить их в файл нельзя: читать такой профиль умеет только сам yt-dlp' +
+            ' (MUSIC.cookies_from_browser), но отфильтровать набор там нечем.');
+        console.error ('[cookies] что делать: возьми профиль Firefox с входом в YouTube --  node . cookies --save firefox  -- или готовый файл.');
+        return 1;
+    }
+    const _prof = firefoxProfileResolve (_browser);
+    if (!_prof.dir)
+    {
+        console.error ('[cookies] профиль Firefox не найден: ' + _prof.why);
+        console.error ('[cookies] можно указать путь вручную:  node . cookies --save firefox:C:\\путь\\к\\профилю');
+        return 1;
+    }
+    console.log ('[cookies] профиль Firefox: ' + _prof.dir +
+        (_prof.profile ? ' (' + _prof.profile + (  _prof.why ? ', ' + _prof.why : '') + ')' : ''));
+    const _got = firefoxCookieRows (_prof.dir);
+    if (_got.why)
+    {
+        console.error ('[cookies] прочитать профиль не вышло: ' + _got.why);
+        return 1;
+    }
+    const _rows = cookiesRowsDedup (_got.rows.filter (_r => cookieHostWanted (_r.host)));
+    if (!_rows.length)
+    {
+        console.error ('[cookies] в профиле нет cookie музыкальных доменов (' + COOKIE_PROVIDER_HOSTS.join (', ') + ')' +
+            ' -- войди в YouTube ЭТИМ браузером и повтори, иначе собирать нечего.');
+        return 1;
+    }
+    const _byHost = {};
+    for (const _r of _rows) _byHost[_r.host] = (_byHost[_r.host] || 0) + 1;
+    console.log ('[cookies] в профиле ' + _got.rows.length + ' строк, из них про музыку -- ' + _rows.length + ': ' +
+        Object.entries (_byHost).map (([_h, _n]) => _h + ' (' + _n + ')').join (', '));
+    const _variants = [
+        ['как есть', _rows],
+        ['без cookie входа (аккаунт Google)', _rows.filter (_r => !COOKIE_LOGIN_NAME.test (String (_r.name)))],
+        ['только гостевые (без входа вовсе)', _rows.filter (_r => COOKIE_GUEST_NAME.test (String (_r.name)))],
+    ];
+    let _win = '', _winText = '', _winN = 0;
+    for (const [_name, _list] of _variants)
+    {
+        if (!_list.length) { console.log ('[cookies] набор «' + _name + '»: пусто -- пропускаю'); continue; }
+        const _made = cookiesNetscapeText (_list, _browser);
+        const _ver = await cookieTextVerdict (_made.text);
+        if (_ver.ok)
+        {
+            console.log ('[cookies] набор «' + _name + '» (' + _list.length + ' строк): YouTube ПРИНЯЛ');
+            _win = _name; _winText = _made.text; _winN = _list.length;
+            break;
+        }
+        console.log ('[cookies] набор «' + _name + '» (' + _list.length + ' строк): YouTube не принял -- ' + _ver.why);
+    }
+    if (!_win)
+    {
+        console.error ('[cookies] ни один набор не подошёл: YouTube не принимает cookie этого профиля.');
+        console.error ('[cookies] это значит, что вход в YouTube в этом браузере протух: зайди на youtube.com ИМ ЖЕ,' +
+            ' убедись, что ты вошёл, и повтори команду.');
+        console.error ('[cookies] ничего не менял -- файл на месте, музыка играет как играла.');
+        return 1;
+    }
+    const _target = _to ? (pathMod.isAbsolute (_to) ? _to : pathMod.join (__dirname, _to))
+        : (MUSIC_COOKIES_FILE || pathMod.join (__dirname, 'cookies.txt'));
+    if (_dry)
+    {
+        console.log ('[cookies] --dry: файл не трогаю. Собрал бы ' + _winN + ' строк (набор «' + _win + '») в ' + _target);
+        return 0;
+    }
+    // Прежний файл -- в logs/ (он в .gitignore целиком): cookie это доступ к аккаунту, и
+    // оставлять копию в репозитории нельзя ни при каких обстоятельствах.
+    if (fsMod.existsSync (_target))
+    {
+        const _stamp = d ().replace (/[:. ]/g, '-');
+        const _bak = pathMod.join (LOG_DIR, 'cookies-backup-' + _stamp + '.txt');
+        try { fsMod.copyFileSync (_target, _bak); console.log ('[cookies] прежний файл сохранён: ' + _bak); }
+        catch (e) { console.log ('[cookies] прежний файл сохранить не вышло (' + oneLine ((e && e.message) || e, 80) + ') -- перезаписываю'); }
+    }
+    try { fsMod.writeFileSync (_target, _winText); }
+    catch (e) { console.error ('[cookies] записать файл не вышло: ' + oneLine ((e && e.message) || e, 160)); return 1; }
+    console.log ('[cookies] файл записан: ' + _target + ' -- ' + _winN + ' строк, набор «' + _win + '»' +
+        (MUSIC_COOKIES_FILE === _target ? '' : ' (впиши его в MUSIC: "cookies_file": "' + pathMod.basename (_target) + '")'));
+    if (_win !== 'как есть')
+        console.log ('[cookies] почему не «как есть»: cookie входа (аккаунт Google) в этом профиле YouTube не принимает;' +
+            ' зайдёшь в YouTube заново -- команда соберёт полный набор.');
+    console.log ('[cookies] проверка:  node . cookies');
+    return 0;
+}
 // [v2.107] ПОСЛЕДНЕЕ СЛОВО -- ЗА YOUTUBE. Прочитать cookie и проверить формат -- это
 // только половина дела: бывает, что cookie читаются, а YouTube их не принимает (живой
 // случай 22-23.09: 1040 строк «The page needs to be reloaded», а команда говорила «ОК»).
@@ -9942,8 +10233,11 @@ async function cookieCliVerdict ()
     return 0;
 }
 
-async function cookiesCli ()
+async function cookiesCli (_args)
 {
+    // [v2.108] `node . cookies --save` -- не отчёт, а сборка файла из браузера (см. выше).
+    if ((_args || process.argv.slice (2)).some (_a => /^--save$/i.test (_a)))
+        return await cookiesSaveCli (_args || process.argv.slice (2));
     $cliOwnScreen ();
     console.log ('[cookies] источник cookie для yt-dlp: ' + (MUSIC_COOKIES_FILE ? 'файл'
         : (MUSIC_COOKIES_BROWSER ? 'браузер' : 'не задан (запросы идут анонимно)')));
@@ -9997,7 +10291,7 @@ async function cookiesCli ()
     console.log ('[cookies] ничего не задано -- запросы идут анонимно. Два способа это исправить (любой один):');
     console.log ('[cookies]   1) БРАУЗЕР (ничего не экспортировать): в блок MUSIC добавь  "cookies_from_browser": "firefox"  (или chrome, edge, brave)');
     console.log ('[cookies]   2) ФАЙЛ: расширение "Get cookies.txt" выгружает файл в формате Netscape; положи его рядом с ботом и укажи  "cookies_file": "cookies.txt"');
-    console.log ('[cookies] сам файл сгенерировать не могу -- это ВАША сессия входа; но с браузером файл и не нужен (вариант 1).');
+    console.log ('[cookies]   3) САМ:  node . cookies --save firefox  -- соберу файл из профиля Firefox (только домены музыки),' + ' сам проверю набор у YouTube и запишу тот, который он принял.');
     return 0;
 }
 
@@ -10753,7 +11047,7 @@ if (process.argv.slice (2).some (_a => /^cookies$/i.test (_a)))
     (async () =>
     {
         let _code = 1;
-        try { _code = await cookiesCli (); }
+        try { _code = await cookiesCli (process.argv.slice (2)); }
         catch (e) { console.log ('[cookies] ошибка: ' + ((e && e.message) || e)); }
         process.exit (_code);
     }) ();
