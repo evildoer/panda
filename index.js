@@ -25,10 +25,27 @@
 //     надо обновить. Что принято, видно строкой на экране, догадок здесь больше нет.
 //   * Ничего не пишется молча: файл меняется только по `--save` (есть `--dry`), прежний файл
 //     уходит в logs/ (cookie -- это доступ к аккаунту, копии в репозитории не место).
-//     Chromium-браузеры (chrome, edge, helium...) честно отказываются: Windows шифрует их
-//     cookie так, что в файл их вытащить нельзя -- читать такой профиль умеет только сам yt-dlp.
+//     Chromium-браузеры сначала отказывались (Windows шифрует их cookie) -- в v2.109 это
+//     выяснено и сделано по-настоящему, см. блок ниже.
 //   * Владелец просил не выдумывать за него: ключ `cookies_from_browser` в конфиге больше не
 //     нужен ВООБЩЕ -- браузер называется прямо в команде.
+// CHANGELOG v2.109 (Chromium тоже можно: helium/chrome/edge в сборке файла):
+//   * ВЛАДЕЛЕЦ: «helium, chrome, edge -- не включены!». Справедливо: в v2.108 я сказал «нельзя»,
+//     не проверив по-настоящему. Проверил -- и оказалось, что можно, если разобрать формат:
+//     ключ cookie лежит в `Local State` (os_crypt.encrypted_key) и защищён DPAPI (это часть
+//     Windows), значение -- `v10` + nonce(12) + AES-256-GCM + тег(16), а ПЕРЕД значением стоит
+//     ОДИНАКОВЫЙ для всей базы заголовок (у Helium -- 32 байта). Без его отбрасывания в файл
+//     уезжает мусор и YouTube cookie не принимает (проверено: с заголовком -- «The page needs
+//     to be reloaded», без него -- трек берётся). Теперь `node . cookies --save helium`
+//     (и chrome, edge, chromium, brave, vivaldi, opera) собирает файл так же, как Firefox,
+//     и так же проверяет набор у YouTube.
+//   * ЧЕСТНО И О ГРАНИЦАХ, а не «всё могу»: Edge на этой машине пишет `v20` -- cookie,
+//     ПРИВЯЗАННЫЕ к приложению: их не достаёт даже Windows-API, и об этом сказано прямо;
+//     Chrome, пока он запущен, не отдаёт базу вообще (EBUSY не только на копировании, но и на
+//     чтении) -- тоже сказано прямо, с советом закрыть его; а браузер без ключа в Local State
+//     назван своим именем. Живые проверки 25.09.2026: Helium -- 29 строк расшифрованы, набор
+//     «как есть» YouTube отбросил, «без cookie входа» (6 строк) принял и файл записан; Firefox
+//     -- 29 строк, принято 6; Edge -- 10 строк, все v20, отказ с объяснением; Chrome -- файл занят.
 // CHANGELOG v2.107 (cookie из браузера ловятся, экран консольных команд -- только про них):
 //   * ВЛАДЕЛЕЦ: «похоже "cookies_from_browser": "firefox" не срабатывал, просто пропускал
 //     все треки». Так и было, и виноват не bot: yt-dlp честно читал 2093 cookie из Firefox,
@@ -1806,7 +1823,7 @@ const CONSOLE_HELP =
     ['node . config',             'чем бот РЕАЛЬНО работает: все ключи, их значения и откуда взяты (бот не запускается)'],
     ['node . files',              'что за каждый файл в папке и что можно удалять'],
     ['node . cache [--clear]',    'кэш музыки: что скачано, сколько занимает, что удалять (--clear -- стереть всё)'],
-    ['node . cookies [--save]',   'cookie для YouTube: что задано и принял ли их YouTube (--save -- собрать файл из браузера самому)'],
+    ['node . cookies [--save [бр]]', 'cookie для YouTube: что задано и принял ли их YouTube (--save -- собрать файл из браузера: firefox, helium, chrome, edge...)'],
     ['node . ytdlp [--update]',   'версия yt-dlp и её возраст (--update -- обновить: yt-dlp -U)'],
     ['node . privacy [--check]',  'пересобрать PRIVACY.md из шаблона (--check -- только проверить)'],
     ['node . privacy --offline',  'то же, но без обращения к Discord за именами'],
@@ -10087,6 +10104,205 @@ async function cookieTextVerdict (_text)
     }
 }
 
+// ============================================================================
+// [v2.109] CHROMIUM-БРАУЗЕРЫ -- ТОЖЕ МОЖНО (вопрос владельца: «helium, chrome, edge -- не
+// включены»). Проверено живьём 25.09.2026:
+//   * cookie в них лежат в SQLite и зашифрованы ключом, который Windows защищает через DPAPI
+//     (`Local State` -> os_crypt.encrypted_key, префикс DPAPI);
+//   * у Helium (Chromium 153) значения формата `v10` = nonce(12) + AES-256-GCM + тег(16),
+//     и ПЕРЕД значением идёт одинаковый для всей базы заголовок в 32 байта -- без его
+//     отбрасывания в файл уезжает мусор и YouTube cookie не принимает (проверено: набор с
+//     заголовком -- «The page needs to be reloaded», без него -- трек берётся);
+//   * Edge на этой же машине пишет `v20` -- cookie, ПРИВЯЗАННЫЕ к приложению: их не достаёт
+//     даже сам Windows-API вне браузера, поэтому про них говорим честно, а не делаем вид;
+//   * Chrome, пока он запущен, не отдаёт базу cookie вообще (Windows держит файл намертво:
+//     не только копирование, но и чтение даёт EBUSY) -- об этом тоже сказано прямо.
+// Дальше всё общее с Firefox: те же три набора и та же живая проверка у YouTube.
+// ============================================================================
+const CHROMIUM_BROWSERS = {
+    chrome:   ['Google/Chrome/User Data', 'Google/Chrome Beta/User Data', 'Google/Chrome Dev/User Data'],
+    edge:     ['Microsoft/Edge/User Data'],
+    chromium: ['Chromium/User Data'],
+    brave:    ['BraveSoftware/Brave-Browser/User Data'],
+    vivaldi:  ['Vivaldi/User Data'],
+    opera:    ['Opera Software/Opera Stable', 'Opera Software/Opera GX Stable'],
+    helium:   ['imput/Helium/User Data', 'Helium/User Data', 'NetImput/Helium/User Data'],
+};
+function chromiumDataDirFind (_spec)
+{
+    const _s = String (_spec === undefined || _spec === null ? '' : _spec).trim ();
+    const _colon = _s.indexOf (':');
+    const _name = (_colon > 0 ? _s.slice (0, _colon) : _s).trim ().toLowerCase ();
+    const _given = _colon > 0 ? _s.slice (_colon + 1).trim () : '';
+    if (_given)
+    {
+        const _dir = pathMod.isAbsolute (_given) ? _given : pathMod.join (process.env.LOCALAPPDATA || '', _given);
+        return fsMod.existsSync (_dir) ? { dir: _dir, name: _name } : { why: 'папки нет: ' + _dir };
+    }
+    const _bases = [process.env.LOCALAPPDATA || '', process.env.APPDATA || ''].filter (_b => _b);
+    const _cands = CHROMIUM_BROWSERS[_name] || [];
+    for (const _rel of _cands)
+        for (const _base of _bases)
+        {
+            const _dir = pathMod.join (_base, _rel);
+            if (fsMod.existsSync (_dir)) return { dir: _dir, name: _name };
+        }
+    return { why: _cands.length ? '(искал: ' + _cands.join (', ') + ')' : 'такого браузера не знаю' };
+}
+function chromiumCookieFileOf (_profileDir)
+{
+    for (const _rel of ['Network/Cookies', 'Cookies'])
+    {
+        const _p = pathMod.join (_profileDir, _rel);
+        if (fsMod.existsSync (_p)) return _p;
+    }
+    return '';
+}
+function chromiumProfilePick (_dataDir, _want)
+{
+    const _dirOf = (_name) => pathMod.join (_dataDir, _name);
+    if (_want)
+    {
+        const _dir = pathMod.isAbsolute (_want) ? _want : _dirOf (_want);
+        return fsMod.existsSync (_dir) ? { dir: _dir, why: 'назван вручную (--profile)' }
+            : { why: 'профиля «' + _want + '» нет: ' + _dir };
+    }
+    // Бывает и так, что профиля нет вовсе (Opera и подобные): cookie лежат в самой папке.
+    if (chromiumCookieFileOf (_dataDir)) return { dir: _dataDir, why: 'cookie лежат в самой папке браузера' };
+    let _last = 'Default';
+    try
+    {
+        const _ls = JSON.parse (fsMod.readFileSync (pathMod.join (_dataDir, 'Local State'), 'utf8'));
+        if (_ls && _ls.profile && typeof _ls.profile.last_used === 'string' && _ls.profile.last_used)
+            _last = _ls.profile.last_used;
+    }
+    catch (e) { }
+    if (fsMod.existsSync (_dirOf (_last))) return { dir: _dirOf (_last), why: 'последний использованный профиль (' + _last + ')' };
+    try
+    {
+        for (const _name of fsMod.readdirSync (_dataDir))
+            if (/^Profile \d+$/.test (_name) && chromiumCookieFileOf (_dirOf (_name)))
+                return { dir: _dirOf (_name), why: 'первый профиль с cookie (' + _name + ')' };
+    }
+    catch (e) { }
+    return { why: 'в папке браузера нет профиля с cookie: ' + _dataDir };
+}
+// Ключ cookie Chromium защищён DPAPI -- это часть Windows, а не браузера. В Node такого API
+// нет, поэтому зовём PowerShell. Скрипт передаётся в base64 (UTF-16LE, -EncodedCommand), а
+// ключ -- внутри скрипта: так не мешают ни кавычки, ни политика запуска (обычный .ps1 эта
+// машина запускать отказывается -- проверено), ни посторонний шум в выводе.
+function dpapiUnprotect (_buf)
+{
+    // Пробел перед скобками PowerShell не принимает -- это ошибка разбора, и ключ молча не
+    // достаётся (поймано живым запуском: «У вас отсутствует оператор между именем метода и
+    // открывающей скобкой»). Поэтому вызовы записаны БЕЗ пробелов, хотя в остальном файле
+    // стиль другой -- здесь это требование чужого языка, а не наш вкус.
+    const _ps = 'Add-Type -AssemblyName System.Security; $ProgressPreference = "SilentlyContinue"; ' +
+        '[Convert]::ToBase64String([System.Security.Cryptography.ProtectedData]::Unprotect(' +
+        '[Convert]::FromBase64String(\'' + _buf.toString ('base64') + '\'), $null, \'CurrentUser\'))';
+    let _r = null;
+    try
+    {
+        _r = require ('child_process').spawnSync ('powershell',
+            ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from (_ps, 'utf16le').toString ('base64')],
+            { encoding: 'utf8', timeout: 30000, windowsHide: true });
+    }
+    catch (e) { return null; }
+    if (!_r || _r.status !== 0 || !_r.stdout) return null;
+    const _lines = String (_r.stdout).split (/\r?\n/).map (_s => _s.trim ())
+        .filter (_s => _s && !_s.startsWith ('#<') && !_s.startsWith ('<'));
+    const _b64 = _lines.length ? _lines[_lines.length - 1] : '';
+    if (!_b64 || !/^[A-Za-z0-9+/=]+$/.test (_b64)) return null;
+    try { return Buffer.from (_b64, 'base64'); } catch (e) { return null; }
+}
+function chromiumKeyRead (_dataDir)
+{
+    let _ls = null;
+    try { _ls = JSON.parse (fsMod.readFileSync (pathMod.join (_dataDir, 'Local State'), 'utf8')); }
+    catch (e) { return { why: 'Local State не читается (без него ключа cookie не достать): ' + oneLine ((e && e.message) || e, 80) }; }
+    const _enc = _ls && _ls.os_crypt && _ls.os_crypt.encrypted_key;
+    if (!_enc || typeof _enc !== 'string') return { why: 'в Local State нет ключа os_crypt.encrypted_key' };
+    const _raw = Buffer.from (_enc, 'base64');
+    if (_raw.subarray (0, 5).toString () !== 'DPAPI')
+        return { why: 'ключ cookie не от Windows (префикс «' + _raw.subarray (0, 5).toString ('latin1') + '») -- разбирать такой не умею' };
+    const _key = dpapiUnprotect (_raw.subarray (5));
+    if (!_key || _key.length !== 32)
+        return { why: 'Windows не отдал ключ cookie через DPAPI' + (_key && _key.length ? ' (длина ' + _key.length + ')' : '') };
+    return { key: _key };
+}
+function chromiumCookieRowsRead (_dataDir, _profileDir, _label)
+{
+    const _fs = require ('fs');
+    const _file = chromiumCookieFileOf (_profileDir);
+    if (!_file) return { why: 'в профиле нет базы cookie (ни Network/Cookies, ни Cookies): ' + _profileDir };
+    let _bytes = null;
+    try { _bytes = _fs.readFileSync (_file); }
+    catch (e)
+    {
+        return { why: 'браузер ' + (_label ? '«' + _label + '» ' : '') + 'держит базу cookie открытой (' +
+            oneLine ((e && e.message) || e, 70) + '). Закрой его и повтори: Chrome и Edge не отдают эту базу, пока работают' +
+            ' (Helium и Firefox отдают).' };
+    }
+    let DatabaseSync = null;
+    try { ({ DatabaseSync } = require ('node:sqlite')); } catch (e) { }
+    if (!DatabaseSync) return { why: 'этот Node не умеет читать SQLite (node:sqlite) -- нужен Node 22+' };
+    let _tmp = '';
+    try
+    {
+        _tmp = _fs.mkdtempSync (pathMod.join (require ('os').tmpdir (), 'panda-cr-'));
+        _fs.writeFileSync (pathMod.join (_tmp, 'Cookies'), _bytes);
+        const _db = new DatabaseSync (pathMod.join (_tmp, 'Cookies'));
+        let _all = [];
+        try
+        {
+            // expires_utc -- микросекунды от 1601 года: в число JS не влезают, поэтому секунды
+            // Unix считаем прямо в SQL (иначе node:sqlite роняет чтение на большом числе).
+            _all = _db.prepare ('SELECT host_key AS host, name, encrypted_value, path, ' +
+                'CAST (expires_utc / 1000000 - 11644473600 AS INTEGER) AS expiry, is_secure, is_httponly FROM cookies').all ();
+        }
+        finally { _db.close (); }
+        const _mine = _all.filter (_r => cookieHostWanted (_r.host));
+        const _key = chromiumKeyRead (_dataDir);
+        if (_key.why) return { why: _key.why, total: _mine.length };
+        let _v20 = 0, _pre = 0, _fail = 0;
+        const _plain = [];
+        for (const _r of _mine)
+        {
+            const _b = Buffer.from (_r.encrypted_value);
+            const _p3 = _b.subarray (0, 3).toString ('latin1');
+            if (_p3 === 'v20') { _v20++; continue; }
+            if (_p3 !== 'v10' && _p3 !== 'v11') { _pre++; continue; }
+            try
+            {
+                const _dec = require ('crypto').createDecipheriv ('aes-256-gcm', _key.key, _b.subarray (3, 15));
+                _dec.setAuthTag (_b.subarray (_b.length - 16));
+                _plain.push ({ row: _r, pt: Buffer.concat ([_dec.update (_b.subarray (15, _b.length - 16)), _dec.final ()]) });
+            }
+            catch (e) { _fail++; }
+        }
+        // Общий заголовок (Chromium 127+ пишет его перед значением у ВСЕЙ базы). Отрезаем,
+        // только если он явно похож на служебный: иначе можно срезать настоящие данные.
+        let _cut = 0;
+        if (_plain.length)
+        {
+            const _first = _plain[0].pt;
+            while (_cut < _first.length && _plain.every (_x => _x.pt.length > _cut && _x.pt[_cut] === _first[_cut])) _cut++;
+            if (_cut < 24 || _cut > 64) _cut = 0;
+        }
+        const _rows = [];
+        for (const _x of _plain)
+        {
+            const _val = _x.pt.subarray (_cut).toString ('utf8');
+            if (!_val) { _fail++; continue; }
+            _rows.push ({ host: _x.row.host, name: _x.row.name, value: _val, path: _x.row.path,
+                expiry: _x.row.expiry, isSecure: _x.row.is_secure, isHttpOnly: _x.row.is_httponly });
+        }
+        return { rows: _rows, total: _mine.length, decrypted: _plain.length - _fail, v20: _v20, pre: _pre, fail: _fail, cut: _cut };
+    }
+    catch (e) { return { why: 'разобрать базу cookie не вышло: ' + oneLine ((e && e.message) || e, 160) }; }
+    finally { try { if (_tmp) _fs.rmSync (_tmp, { recursive: true, force: true }); } catch (e) { } }
+}
+
 async function cookiesSaveCli (_args)
 {
     $cliOwnScreen ();
@@ -10102,49 +10318,85 @@ async function cookiesSaveCli (_args)
         if (/^-/.test (_a) || /^(cookies|node|\.)$/i.test (_a)) continue;
         _pos.push (_a);
     }
-    // Без подсказок берём Firefox: только из него cookie можно вытащить в файл (у Chromium
-    // их шифрует Windows) -- и это тот браузер, откуда владелец и брал свой рабочий файл.
+    // Без подсказок берём Firefox: это тот браузер, откуда владелец и брал свой рабочий файл.
     const _browser = _flag ('--browser') || _pos[0] || MUSIC_COOKIES_BROWSER || 'firefox';
     const _dry = _args.some (_a => /^--dry$/i.test (_a));
     const _to = _flag ('--to');
+    const _profileWant = _flag ('--profile');
     console.log ('[cookies] собираю файл сам: ' + (_browser ? 'браузер «' + _browser + '»' : 'браузер не назван'));
-    if (!_browser || !/^firefox/i.test (_browser))
+    let _rows = [], _src = '';
+    if (/^firefox/i.test (_browser))
     {
-        // Честно: на Chromium (chrome, edge, helium, brave...) cookie в Windows зашифрованы
-        // (DPAPI + привязка к приложению), и в файл я их вытащить не могу -- их умеет читать
-        // только сам yt-dlp ключом cookies_from_browser, а оттуда набор cookie не отфильтровать.
-        console.error ('[cookies] это не Firefox, а браузер на Chromium (' + (_browser || 'не назван') + ').' +
-            ' Его cookie Windows шифрует так, что вытащить их в файл нельзя: читать такой профиль умеет только сам yt-dlp' +
-            ' (MUSIC.cookies_from_browser), но отфильтровать набор там нечем.');
-        console.error ('[cookies] что делать: возьми профиль Firefox с входом в YouTube --  node . cookies --save firefox  -- или готовый файл.');
-        return 1;
+        const _prof = firefoxProfileResolve (_browser);
+        if (!_prof.dir)
+        {
+            console.error ('[cookies] профиль Firefox не найден: ' + _prof.why);
+            console.error ('[cookies] можно указать путь вручную:  node . cookies --save firefox:C:\\путь\\к\\профилю');
+            return 1;
+        }
+        console.log ('[cookies] профиль Firefox: ' + _prof.dir +
+            (_prof.profile ? ' (' + _prof.profile + (_prof.why ? ', ' + _prof.why : '') + ')' : ''));
+        const _got = firefoxCookieRows (_prof.dir);
+        if (_got.why)
+        {
+            console.error ('[cookies] прочитать профиль не вышло: ' + _got.why);
+            return 1;
+        }
+        _rows = cookiesRowsDedup (_got.rows.filter (_r => cookieHostWanted (_r.host)));
+        _src = 'firefox';
+        console.log ('[cookies] в профиле ' + _got.rows.length + ' строк, из них про музыку -- ' + _rows.length);
     }
-    const _prof = firefoxProfileResolve (_browser);
-    if (!_prof.dir)
+    else
     {
-        console.error ('[cookies] профиль Firefox не найден: ' + _prof.why);
-        console.error ('[cookies] можно указать путь вручную:  node . cookies --save firefox:C:\\путь\\к\\профилю');
-        return 1;
+        const _cd = chromiumDataDirFind (_browser);
+        if (!_cd.dir)
+        {
+            console.error ('[cookies] браузер «' + _browser + '» не нашёл: ' + _cd.why);
+            console.error ('[cookies] знаю: firefox, chrome, edge, chromium, brave, opera, vivaldi, helium --' +
+                ' или путь вручную:  node . cookies --save chrome:C:\\путь\\к\\User Data');
+            return 1;
+        }
+        console.log ('[cookies] браузер «' + _cd.name + '»: ' + _cd.dir);
+        const _cp = chromiumProfilePick (_cd.dir, _profileWant);
+        if (!_cp.dir) { console.error ('[cookies] профиль не найден: ' + _cp.why); return 1; }
+        console.log ('[cookies] профиль: ' + _cp.dir + ' (' + _cp.why + ')');
+        const _cr = chromiumCookieRowsRead (_cd.dir, _cp.dir, _browser);
+        if (_cr.why) { console.error ('[cookies] ' + _cr.why); return 1; }
+        console.log ('[cookies] строк в базе про музыку: ' + _cr.total + ', из них расшифровано ' + _cr.decrypted +
+            (_cr.v20 ? ', привязанных к приложению (v20, не достать) -- ' + _cr.v20 : ''));
+        if (_cr.cut)
+            console.log ('[cookies] у расшифрованных значений был общий заголовок ' + _cr.cut +
+                ' байт (так их пишет Windows) -- отброшен, значения в порядке');
+        _rows = cookiesRowsDedup (_cr.rows.filter (_r => cookieHostWanted (_r.host)));
+        _src = _cd.name;
+        if (!_cr.total)
+        {
+            console.error ('[cookies] в базе нет строк про музыку -- войди в YouTube ЭТИМ браузером и повтори.');
+            return 1;
+        }
+        if (!_cr.decrypted)
+        {
+            console.error ('[cookies] ни одну строку расшифровать не вышло: Windows привязал cookie к приложению' +
+                ' (v20) -- такие cookie достаёт только сам браузер, и в файл их не выложить.');
+            console.error ('[cookies] что делать: либо браузер, где cookie не привязаны (у владельца так было с Helium),' +
+                ' либо профиль Firefox, либо готовый файл.');
+            return 1;
+        }
+        console.log ('[cookies] из них про музыку -- ' + _rows.length);
     }
-    console.log ('[cookies] профиль Firefox: ' + _prof.dir +
-        (_prof.profile ? ' (' + _prof.profile + (  _prof.why ? ', ' + _prof.why : '') + ')' : ''));
-    const _got = firefoxCookieRows (_prof.dir);
-    if (_got.why)
-    {
-        console.error ('[cookies] прочитать профиль не вышло: ' + _got.why);
-        return 1;
-    }
-    const _rows = cookiesRowsDedup (_got.rows.filter (_r => cookieHostWanted (_r.host)));
     if (!_rows.length)
     {
-        console.error ('[cookies] в профиле нет cookie музыкальных доменов (' + COOKIE_PROVIDER_HOSTS.join (', ') + ')' +
+        console.error ('[cookies] нет cookie музыкальных доменов (' + COOKIE_PROVIDER_HOSTS.join (', ') + ')' +
             ' -- войди в YouTube ЭТИМ браузером и повтори, иначе собирать нечего.');
         return 1;
     }
-    const _byHost = {};
-    for (const _r of _rows) _byHost[_r.host] = (_byHost[_r.host] || 0) + 1;
-    console.log ('[cookies] в профиле ' + _got.rows.length + ' строк, из них про музыку -- ' + _rows.length + ': ' +
-        Object.entries (_byHost).map (([_h, _n]) => _h + ' (' + _n + ')').join (', '));
+    return await cookieSaveRowsCli (_rows, _src, { to: _to, dry: _dry });
+}
+// Общая часть для любого браузера: три набора -> живая проверка -> запись принятого.
+// Здесь только то, что одинаково у Firefox и у Chromium: разница -- лишь в том, откуда
+// взялись строки, а что считается пригодным, решает ОДИН И ТОТ ЖЕ контрольный запрос.
+async function cookieSaveRowsCli (_rows, _src, _opt)
+{
     const _variants = [
         ['как есть', _rows],
         ['без cookie входа (аккаунт Google)', _rows.filter (_r => !COOKIE_LOGIN_NAME.test (String (_r.name)))],
@@ -10154,7 +10406,7 @@ async function cookiesSaveCli (_args)
     for (const [_name, _list] of _variants)
     {
         if (!_list.length) { console.log ('[cookies] набор «' + _name + '»: пусто -- пропускаю'); continue; }
-        const _made = cookiesNetscapeText (_list, _browser);
+        const _made = cookiesNetscapeText (_list, _src);
         const _ver = await cookieTextVerdict (_made.text);
         if (_ver.ok)
         {
@@ -10172,9 +10424,10 @@ async function cookiesSaveCli (_args)
         console.error ('[cookies] ничего не менял -- файл на месте, музыка играет как играла.');
         return 1;
     }
+    const _to = _opt && _opt.to ? String (_opt.to) : '';
     const _target = _to ? (pathMod.isAbsolute (_to) ? _to : pathMod.join (__dirname, _to))
         : (MUSIC_COOKIES_FILE || pathMod.join (__dirname, 'cookies.txt'));
-    if (_dry)
+    if (_opt && _opt.dry)
     {
         console.log ('[cookies] --dry: файл не трогаю. Собрал бы ' + _winN + ' строк (набор «' + _win + '») в ' + _target);
         return 0;
@@ -10183,15 +10436,16 @@ async function cookiesSaveCli (_args)
     // оставлять копию в репозитории нельзя ни при каких обстоятельствах.
     if (fsMod.existsSync (_target))
     {
-        const _stamp = d ().replace (/[:. ]/g, '-');
+        const _stamp = d ().replace (/[^0-9а-яёa-z]+/gi, '-');
         const _bak = pathMod.join (LOG_DIR, 'cookies-backup-' + _stamp + '.txt');
         try { fsMod.copyFileSync (_target, _bak); console.log ('[cookies] прежний файл сохранён: ' + _bak); }
         catch (e) { console.log ('[cookies] прежний файл сохранить не вышло (' + oneLine ((e && e.message) || e, 80) + ') -- перезаписываю'); }
     }
     try { fsMod.writeFileSync (_target, _winText); }
     catch (e) { console.error ('[cookies] записать файл не вышло: ' + oneLine ((e && e.message) || e, 160)); return 1; }
-    console.log ('[cookies] файл записан: ' + _target + ' -- ' + _winN + ' строк, набор «' + _win + '»' +
-        (MUSIC_COOKIES_FILE === _target ? '' : ' (впиши его в MUSIC: "cookies_file": "' + pathMod.basename (_target) + '")'));
+    console.log ('[cookies] файл записан: ' + _target + ' -- ' + _winN + ' строк, набор «' + _win + '», источник: ' + _src);
+    if (MUSIC_COOKIES_FILE !== _target)
+        console.log ('[cookies] впиши его в MUSIC: "cookies_file": "' + pathMod.basename (_target) + '"');
     if (_win !== 'как есть')
         console.log ('[cookies] почему не «как есть»: cookie входа (аккаунт Google) в этом профиле YouTube не принимает;' +
             ' зайдёшь в YouTube заново -- команда соберёт полный набор.');
@@ -10291,7 +10545,8 @@ async function cookiesCli (_args)
     console.log ('[cookies] ничего не задано -- запросы идут анонимно. Два способа это исправить (любой один):');
     console.log ('[cookies]   1) БРАУЗЕР (ничего не экспортировать): в блок MUSIC добавь  "cookies_from_browser": "firefox"  (или chrome, edge, brave)');
     console.log ('[cookies]   2) ФАЙЛ: расширение "Get cookies.txt" выгружает файл в формате Netscape; положи его рядом с ботом и укажи  "cookies_file": "cookies.txt"');
-    console.log ('[cookies]   3) САМ:  node . cookies --save firefox  -- соберу файл из профиля Firefox (только домены музыки),' + ' сам проверю набор у YouTube и запишу тот, который он принял.');
+    console.log ('[cookies]   3) САМ:  node . cookies --save firefox  -- соберу файл из браузера (firefox, helium, chrome, edge...),' +
+        ' оставлю только домены музыки, сам проверю набор у YouTube и запишу тот, который он принял.');
     return 0;
 }
 
