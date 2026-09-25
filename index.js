@@ -10,6 +10,19 @@
 // номером просто не было -- номер мог быть пропущен, когда правки шли вперемешку. История
 // читается по блокам, а не по номерам: у одной партии может быть много коммитов, а блок
 // пишется только на то, что видно владельцу.
+// CHANGELOG v2.102 (/history: страницы по 5 рядов с перемоткой, состав пачки длиннее):
+//   * Владелец: «хотя бы трека 3, или сколько влезет по длине... вообще там страницы
+//     сделать, по 5, с перемоткой».
+//   * В сообщении теперь ОДНА СТРАНИЦА из HISTORY_PAGE_BLOCKS (5) рядов, а остальное --
+//     кнопками «⏮ В начало / ◀ Влево / Вправо ▶ / В конец ⏭»; перлистывает тот же, кто
+//     историю открыл (как у /queue -- чужие нажатия получают понятный отказ), а смотреть
+//     её по-прежнему может любой. Шаг -- ровно одна страница: страницы одинаковые, поэтому
+//     ни одна строка не может остаться невидимой всем страницам сразу.
+//   * Под каждой пачкой -- до HISTORY_PACK_TITLES (5) названий, причём места под них стало
+//     больше именно потому, что строк на экране меньше: на живой истории в строку влезают
+//     все пять названий вместо обрезанного одного.
+//   * Хвоста «Раньше -- ещё N пачек» больше нет -- за границу истории отвечают кнопки, -- а
+//     пояснение про «×N» показывается только когда такой счётчик есть на этой странице.
 // CHANGELOG v2.101 (/history: повторы -- одной строкой, а состав пачки -- на виду):
 //   * Живой сервер показал другое: в /history пришли десять строк подряд с ОДНОЙ И ТОЙ
 //     ЖЕ ссылкой (тот же плейлист ставили 14 раз) -- остальные пачки в сообщение не
@@ -12094,16 +12107,23 @@ async function clearMusicState (guildId)
 // история -- своё: /stop и /clear очередь стирают, а историю не трогают.
 // ============================================================================
 const HISTORY_MSG_LIMIT = 1800; // сколько символов отдаём под список -- с запасом до лимита Discord
-const HISTORY_SHOW_PACKS = 10;  // [v2.100] сколько блоков видно в самом сообщении (блок -- пачка
-                                // или [v2.101] несколько подряд идущих с той же ссылкой)
+// [v2.102] СТРАНИЦЫ. В одном сообщении -- HISTORY_PAGE_BLOCKS рядов (блок -- это пачка
+// или несколько подряд идущих с той же ссылкой, см. «×N»), а остальное листается
+// кнопками «⏮ В начало / ◀ Влево / Вправо ▶ / В конец ⏭» (владелец: «вообще там
+// страницы сделать, по 5, с перемоткой»). Пять -- потому что с таким числом строк
+// под каждой пачкой влезает НЕСКОЛЬКО названий, а не одно обрезанное: до v2.102
+// в сообщение набивалось десять рядов без состава, и пачку по одной ссылке было
+// не узнать. Больше страниц -- дешевле, чем меньше состава.
+const HISTORY_PAGE_BLOCKS = 5;
 // [v2.101] СОСТАВ ПАЧКИ В САМОМ СООБЩЕНИИ. Под строкой пачки показываем первые
 // HISTORY_PACK_TITLES названий -- этого хватает, чтобы понять, «та ли это пачка»,
 // не открывая кнопку (владелец: «просто группируй и давай инфу по трекам, хотя бы
 // 3-5 первым»). Длину строки названий выбираем сами: сначала пробуем самую щедрую,
-// и если с ней в бюджет влезают не все пачки -- укорачиваем ПРЕВЬЮ, а не число строк
-// (10 коротких строк полезнее пяти длинных). 0 -- превью не показываем совсем.
+// и если с ней в бюджет не влезают все строки страницы -- укорачиваем ПРЕВЬЮ, а не
+// число строк (строку пачки терять нельзя: её закрывает только перелистывание).
+// 0 -- превью не показываем совсем.
 const HISTORY_PACK_TITLES = 5;
-const HISTORY_PACK_CLIPS = [120, 90, 70, 50, 0];
+const HISTORY_PACK_CLIPS = [240, 200, 170, 140, 110, 80, 0];
 // [v2.69] СКОЛЬКО НАЗВАНИЙ ПАЧКИ ХРАНИМ. В самом сообщении /history видно первые три
 // (иначе один плейлист съел бы весь текст) -- а остальное лежит в базе, и состав пачки
 // целиком можно ПОСМОТРЕТЬ ПО КНОПКЕ «📜 Все треки» (просьба владельца: «вижу список
@@ -12389,18 +12409,39 @@ function ytKey (url)
     return s.slice (0, 60);
 }
 
-// Текст /history. Ограничен по числу пачек (history_len), по числу треков
-// (history_tracks) и по длине сообщения: Discord в 2000 символов не влезет двадцатью
-// пятью пачками плейлистов, поэтому строки идут от свежих к старым, а остаток честно
-// называется. [v2.101] Каждая пачка -- блок из одной-двух строк: время, текст /play
-// («×N», если ту же ссылку ставили подряд несколько раз) и первые названия треков;
-// блоки разделены пустой строкой, а пачка, которая не влезла, уходит в «Раньше -- ещё N»
-// целиком.
+// [v2.102] БЛОКИ ИСТОРИИ: одна пачка или несколько ПОДРЯД идущих с тем же текстом /play.
+// Живой случай: один плейлист поставили 14 раз подряд, и /history показывал десять
+// ОДИНАКОВЫХ строк -- другие пачки в сообщение не попадали, хотя лежали в базе
+// (владелец: «просто группируй»). Пустой текст /play группировать нельзя: «без ссылки» --
+// это не повод объединять разные пачки из старой базы в одну.
+function historyBlocksOf (list)
+{
+    const blocks = [];
+    for (const e of (Array.isArray (list) ? list : []))
+    {
+        const key = String (e.q || (Array.isArray (e.urls) ? e.urls[0] : '') || '').trim ();
+        const last = blocks[blocks.length - 1];
+        if (last && key && last.key === key) { last.times++; last.to = Number (e.at) || 0; continue; }
+        blocks.push ({ key: key, at: Number (e.at) || 0, times: 1, e: e });
+    }
+    return blocks;
+}
+function historyPagesOf (list)
+{
+    return Math.max (1, Math.ceil (historyBlocksOf (list).length / HISTORY_PAGE_BLOCKS));
+}
+
+// Текст /history ОДНОЙ СТРАНИЦЫ. Ограничен по числу пачек (history_len), по числу треков
+// (history_tracks) и по длине сообщения: Discord в 2000 символов не влезет и десять
+// плейлистов, поэтому от свежих к старым идёт одна страница из HISTORY_PAGE_BLOCKS строк,
+// а остальное -- кнопками листания (номер страницы приходит из customId).
+// [v2.101] Каждая строка -- блок из одной-двух строк: время, текст /play (и «×N», если
+// ту же ссылку ставили подряд несколько раз) и первые названия треков.
 // [v2.87] В БЮДЖЕТЕ УЧТЁН И ХВОСТ: раньше он добавлялся уже после подсчёта длины, и на
 // длинной истории текст уходил за лимит Discord -- сообщение отбивалось целиком
 // ('Must be 2000 or fewer in length'), а /history перестал отвечать. См. fitPayload
 // (общая страховка лимитов для ВСЕХ исходящих сообщений).
-function historyText (guildId)
+function historyText (guildId, page = 1)
 {
     const m = musicOf (guildId);
     const list = Array.isArray (m.history) ? m.history : [];
@@ -12417,35 +12458,27 @@ function historyText (guildId)
         return '🕘 Истории добавлений пока нет -- её начнут писать новые `/play`.\n_' +
             'Помню последние ' + MUSIC_HISTORY_LEN + ' ' + plural (MUSIC_HISTORY_LEN, 'пачку', 'пачки', 'пачек') +
             '; очередь -- отдельно: `/queue`._';
+    const blocks = historyBlocksOf (list);
+    const pages = Math.max (1, Math.ceil (blocks.length / HISTORY_PAGE_BLOCKS));
+    const cur = Math.min (Math.max (1, Math.floor (Number (page) || 1)), pages);
+    const slice = blocks.slice ((cur - 1) * HISTORY_PAGE_BLOCKS, cur * HISTORY_PAGE_BLOCKS);
     const sum = historyTotalTracks (list);
     const head = '🕘 **История добавлений** -- ' + list.length + ' ' +
         plural (list.length, 'пачка', 'пачки', 'пачек') + ', ' + sum + ' ' +
-        plural (sum, 'трек', 'трека', 'треков') + ':\n' + QSEP;
+        plural (sum, 'трек', 'трека', 'треков') +
+        (pages > 1 ? ' -- страница ' + cur + ' из ' + pages : '') + ':\n' + QSEP;
     // [v2.87] ХВОСТ СЧИТАЕТСЯ В БЮДЖЕТЕ. Раньше он добавлялся ПОСЛЕ подсчёта длины, и при
     // длинной истории текст уходил за лимит Discord («Must be 2000 or fewer in length») --
-    // команда перестала отвечать совсем. Теперь бюджет = лимит минус шапка и минус хвост,
-    // причём берём ХУДШУЮ из двух длин: со строкой «Раньше -- ещё N пачек» (самый длинный
-    // вариант, когда не влезло ничего) или без неё.
-    const tailOf = hid => '\n' + QSEP + '\n_Строка -- одна пачка (время и ссылка) и первые треки; ' +
-        '«×N» -- столько раз подряд ставили одну и ту же ссылку. Состав целиком -- «📜 Все треки»._' +
-        (hid ? '\n_Раньше -- ещё ' + hid + ' ' + plural (hid, 'пачка', 'пачки', 'пачек') + '._' : '');
-    const budget = HISTORY_MSG_LIMIT - head.length - 2 -
-        Math.max (tailOf (0).length, tailOf (list.length).length);
-    // [v2.101] ПОДРЯД ОДНА И ТА ЖЕ ССЫЛКА -- ОДИН БЛОК. Живой случай: один плейлист
-    // поставили 14 раз подряд, и /history показывал десять ОДИНАКОВЫХ строк -- другие
-    // пачки в сообщение просто не попадали, хотя лежали в базе (владелец: «просто
-    // группируй»). Соседние пачки с тем же текстом /play схлопываем в один блок со
-    // счётчиком «×N»: счётчик честно говорит, сколько заходов было, а строка -- одна.
-    const blocks = [];
-    for (const e of list)
-    {
-        const key = String (e.q || (Array.isArray (e.urls) ? e.urls[0] : '') || '').trim ();
-        const last = blocks[blocks.length - 1];
-        // Пустой текст /play группировать нельзя: «без ссылки» -- это не повод
-        // объединять разные пачки из старой базы в одну.
-        if (last && key && last.key === key) { last.times++; continue; }
-        blocks.push ({ key: key, at: Number (e.at) || 0, times: 1, e: e });
-    }
+    // команда перестала отвечать совсем. Теперь бюджет = лимит минус шапка и минус хвост.
+    // [v2.102] Строки «Раньше -- ещё N пачек» тут больше нет: в одно сообщение влезает
+    // страница, а остальное листается кнопками -- считать «сколько не влезло» нечего.
+    // Пояснение про «×N» выходит только когда такой счётчик на СТРАНИЦЕ есть.
+    const withX = slice.some (b => b.times > 1);
+    const tail = '\n' + QSEP + '\n_Строка -- одна пачка (время и ссылка) и первые треки.' +
+        (withX ? ' «×N» -- столько раз подряд ставили одну и ту же ссылку.' : '') +
+        ' Весь состав -- кнопкой «📜 Все треки»._' +
+        (pages > 1 ? '\n_Дальше -- кнопками листания под сообщением._' : '');
+    const budget = HISTORY_MSG_LIMIT - head.length - 2 - tail.length;
     // Строка блока: время, «×N» (если заходов больше одного) и ссылка, введённая в /play.
     // [v2.100] Ни автора, ни «судьбы»: состав -- в превью ниже и кнопкой «📜 Все треки».
     // Ссылку не подрезаем по смыслу: адрес без «https://» бот в /play за ссылку
@@ -12465,45 +12498,77 @@ function historyText (guildId)
         else if (t.length > HISTORY_PACK_TITLES) s += ' · …';
         return s;
     };
-    // Прикидка: сколько блоков влезет с превью такой длины. Считаем ровно так же, как
-    // раньше считала одна строка на пачку -- вместе с пустой строкой между блоками.
-    const build = clip =>
+    // Вся страница с превью такой длины: строки идут по порядку, пустая строка между ними.
+    // Считаем ровно так же, как считала одна строка на пачку (см. v2.87).
+    const rowsOf = clip =>
     {
-        const shown = [];
-        let len = 0, packs = 0, hidden = 0;
-        for (const b of blocks)
+        const out = [];
+        let len = 0;
+        for (const b of slice)
         {
             const prev = previewOf (b, clip);
             const part = linkLine (b) + (prev ? '\n' + prev : '');
-            if (len + part.length + 2 > budget || shown.length >= HISTORY_SHOW_PACKS)
-            {
-                hidden = list.length - packs;
-                break;
-            }
-            shown.push (part);
+            // Страховка (на живых данных недостижима -- ссылка обрезана до 90 символов):
+            // лучше показать меньше строк, чем отдать Discord текст за лимитом.
+            if (len + part.length + 2 > budget) break;
+            out.push (part);
             len += part.length + 2;
-            packs += b.times;
         }
-        return { shown: shown, hidden: hidden };
+        return out;
     };
-    // [v2.101] ПРЕВЬЮ ДЛИННЕЕ -- СТРОК МЕНЬШЕ, и наоборот. Идём от самого щедрого превью
-    // к самому скупому и берём ПЕРВОЕ, с которым влезают все пачки (или HISTORY_SHOW_PACKS
-    // блоков): состав пачки -- то, зачем сюда вообще смотрят, а лишние строки внизу всё
-    // равно закрыты кнопкой «📜 Все треки». Если ни одно превью не дало всех строк, берём
-    // то, что дало их больше всего (ничья -- в пользу более щедрого превью).
-    const want = Math.min (blocks.length, HISTORY_SHOW_PACKS);
-    let view = null;
+    // [v2.101] ПРЕВЬЮ ДЛИННЕЕ -- МЕСТА МЕНЬШЕ, и наоборот. Идём от самого щедрого превью
+    // к самому скупому и берём ПЕРВОЕ, с которым в бюджет влезают ВСЕ строки страницы:
+    // состав пачки -- то, зачем сюда вообще смотрят, а лишние строки всё равно закрыты
+    // кнопками листания. Если ни одно превью не дало всей страницы, берём то, что дало
+    // больше всего строк (ничья -- в пользу более щедрого превью).
+    let rows = null;
     for (const clip of HISTORY_PACK_CLIPS)
     {
-        const r = build (clip);
-        if (!view || r.shown.length > view.shown.length) view = r;
-        if (r.shown.length >= want) break;
+        const r = rowsOf (clip);
+        if (!rows || r.length > rows.length) rows = r;
+        if (r.length >= slice.length) break;
     }
-    const text = head + '\n' + view.shown.join ('\n\n') + tailOf (view.hidden);
+    const text = head + '\n' + rows.join ('\n\n') + tail;
     // Последняя страховка: если шапка/хвост сами по себе не влезли (длинные настройки,
     // гигантские имена), текст всё равно уходит не длиннее лимита. Без неё молчаливая
     // надежда на арифметику -- а живой случай показал, чем это кончается.
     return text.length <= HISTORY_MSG_LIMIT ? text : fitMsgText (text, HISTORY_MSG_LIMIT);
+}
+
+// [v2.102] КНОПКИ /history. Ряд листания собирается ТОЛЬКО когда страниц больше одной, а
+// в customId -- сама кнопка и ЦЕЛЕВАЯ страница (q:hg:first / q:hg:prev / q:hg:next /
+// q:hg:last): ровно как в /queue, где без имени кнопки «В начало» и «Влево» давали один
+// id, и Discord отбивал сообщение целиком (COMPONENT_CUSTOM_ID_DUPLICATED). Шаг -- ровно
+// одна страница: страницы здесь одинаковые (HISTORY_PAGE_BLOCKS строк), поэтому кнопка не
+// может перепрыгнуть строки так, чтобы их не увидела ни одна страница. Страницы считаются
+// по ЖИВОЙ истории, а не по переданному из сообщения числу: пока сообщение лежит в канале,
+// в историю добавляются новые пачки, и жёсткое число строк «поехало» бы.
+function historyComponents (guildId, page = 1)
+{
+    const m = musicOf (guildId);
+    const list = Array.isArray (m.history) ? m.history : [];
+    const pages = historyPagesOf (list);
+    const cur = Math.min (Math.max (1, Math.floor (Number (page) || 1)), pages);
+    const rows = [];
+    if (pages > 1)
+        rows.push (new ActionRowBuilder ().addComponents (
+            new ButtonBuilder ().setCustomId ('q:hg:first:1').setLabel ('⏮ В начало')
+                .setStyle (ButtonStyle.Secondary).setDisabled (cur <= 1),
+            new ButtonBuilder ().setCustomId ('q:hg:prev:' + Math.max (1, cur - 1)).setLabel ('◀ Влево')
+                .setStyle (ButtonStyle.Secondary).setDisabled (cur <= 1),
+            new ButtonBuilder ().setCustomId ('q:hg:next:' + Math.min (pages, cur + 1)).setLabel ('Вправо ▶')
+                .setStyle (ButtonStyle.Secondary).setDisabled (cur >= pages),
+            new ButtonBuilder ().setCustomId ('q:hg:last:' + pages).setLabel ('В конец ⏭')
+                .setStyle (ButtonStyle.Secondary).setDisabled (cur >= pages)
+        ));
+    // [v2.69] «📜 Все треки» -- состав пачки целиком (до HISTORY_TITLES_STORE названий).
+    // Кнопка нужна только когда раскрывать есть что: в тексте видно первые названия пачки.
+    if (list.some (e => historyTitlesOf (e).length > 3))
+        rows.push (new ActionRowBuilder ().addComponents (
+            new ButtonBuilder ().setCustomId ('q:hi').setLabel ('📜 Все треки')
+                .setStyle (ButtonStyle.Secondary)
+        ));
+    return rows;
 }
 
 // ============================================================================
@@ -16848,6 +16913,25 @@ client.on ('interactionCreate', async (interaction) =>
         // «только DJ»: смотреть историю может каждый (как /queue и /nowplaying), а всё
         // это эфемерно -- чужой человек увидит только свой выбор, публичное сообщение
         // истории останется на месте.
+        // [v2.102] ЛИСТАНИЕ /history: в customId -- кнопка и ЦЕЛЕВАЯ страница, а содержимое
+        // берётся из живой истории (как у /queue). Ветка стоит ДО гейта «только DJ»: историю
+        // смотрит кто угодно, а перлистывать может только тот, кто её открыл.
+        const mHg = /^q:hg:(?:first|prev|next|last):(\d+)$/.exec (cid);
+        if (mHg)
+        {
+            const opener = interaction.message && interaction.message.interaction && interaction.message.interaction.user
+                ? interaction.message.interaction.user.id
+                : null;
+            if (opener && opener !== interaction.user.id)
+                return interaction.reply
+                (
+                    { content: '🕘 Эту историю открыл другой человек -- вызови `/history` сам.', flags: MessageFlags.Ephemeral }
+                );
+            await historyLoad (guildId);
+            const at = parseInt (mHg[1], 10) || 1;
+            return interaction.update
+            ({ content: historyText (guildId, at), components: historyComponents (guildId, at) });
+        }
         if (cid === 'q:hi')
         {
             await historyLoad (guildId);   // с прошлого запуска могла остаться в базе
@@ -18193,17 +18277,13 @@ client.on ('interactionCreate', async (interaction) =>
             // История живёт ОТДЕЛЬНО от очереди (musicState/history) и переживает и
             // доигранное, и /stop, и перезапуск (см. historyLoad/historyAdd).
             await historyLoad (guildId);   // с прошлого запуска могло остаться в базе
-            // [v2.69] В САМОМ тексте у пачки видно только первые три названия (иначе один
-            // плейлист съел бы весь текст). Всё остальное (до HISTORY_TITLES_STORE) -- по
-            // кнопке «📜 Все треки»: она даёт выбрать пачку и листает её состав.
-            const hiRows = m.history.some (e => historyTitlesOf (e).length > 3)
-                ? [new ActionRowBuilder ().addComponents (
-                    new ButtonBuilder ().setCustomId ('q:hi').setLabel ('📜 Все треки')
-                        .setStyle (ButtonStyle.Secondary))]
-                : [];
-            const hText = historyText (guildId);
-            return interaction.reply (hiRows.length
-                ? { content: hText, components: hiRows }
+            // [v2.102] Открываем ПЕРВУЮ страницу, а текст и кнопки собираются вместе из
+            // одной и той же живой истории (historyComponents/historyText) -- иначе текст
+            // был бы с одной страницы, а кнопки с другой (и в /queue на этом уже спотыкались).
+            const hRows = historyComponents (guildId, 1);
+            const hText = historyText (guildId, 1);
+            return interaction.reply (hRows.length
+                ? { content: hText, components: hRows }
                 : hText);
         }
         else if (name === 'repeat')
