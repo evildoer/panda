@@ -9655,8 +9655,8 @@ async function cookieStartupCheck ()
     const r = await cookieRealCheck ();
     if (r.verdict === 'stale' || r.verdict === 'anon')
         console.error ('[' + (d()) + '] [music] ВНИМАНИЕ: YouTube эти cookie НЕ принимает (' + src + '): ' + r.why +
-            ' -- каждый трек будет спотыкаться. Проверь `node . cookies`: возьми профиль, где ты вошёл в YouTube' +
-            ' (firefox:C:\\путь\\к\\профилю), либо убери cookie вовсе (анонимный путь работает).');
+            ' -- каждый трек будет спотыкаться. Проверь `node . cookies`: возьми ФАЙЛ cookie (MUSIC.cookies_file,' +
+            ' так делает сам владелец -- этот путь работает) или убери cookie вовсе (анонимный путь работает).');
     else if (r.verdict === 'ok')
         console.log ('[' + (d()) + '] [music] cookie приняты YouTube (' + src + ') -- контрольный запрос прошёл');
 }
@@ -9924,8 +9924,12 @@ async function cookieCliVerdict ()
     {
         console.error ('[cookies] НЕ ГОДЯТСЯ: YouTube эти cookie не принимает -- ' + r.why);
         console.error ('[cookies] с ними КАЖДЫЙ трек будет падать («The page needs to be reloaded»), а музыка -- рваться');
-        console.error ('[cookies] что делать: взять профиль, где ты вошёл в YouTube (firefox:C:\\путь\\к\\профилю) -- или');
-        console.error ('[cookies] вовсе убрать cookie: анонимный путь на этой машине работает (см. `node . cookies` без них)');
+        // Проверено живым опытом 25.09.2026: у владельца профиль Firefox С ВХОДОМ в YouTube, и всё равно
+        // «The page needs to be reloaded» (и то же самое, если выгрузить этот профиль в файл),
+        // а его собственный файл cookie из 15 строк работает. Так что совет -- не «войди в браузере»,
+        // а «возьми файл» (или убери cookie).
+        console.error ('[cookies] что делать: браузерный режим на этой машине YouTube не принимает -- возьми ФАЙЛ cookie');
+        console.error ('[cookies] (MUSIC.cookies_file: так делает сам владелец, этот путь работает) или убери cookie вовсе');
         return 1;
     }
     if (r.verdict === 'video')
