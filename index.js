@@ -29,6 +29,17 @@
 //     выяснено и сделано по-настоящему, см. блок ниже.
 //   * Владелец просил не выдумывать за него: ключ `cookies_from_browser` в конфиге больше не
 //     нужен ВООБЩЕ -- браузер называется прямо в команде.
+// CHANGELOG v2.110 (сервисная команда возвращает консоль и говорит об этом):
+//   * ВЛАДЕЛЕЦ: «любой не `node .` должен завершать скрипт, возвращая управление в консоль,
+//     которая его вызвала!». Завершение было и раньше, но его НЕ БЫЛО ВИДНО: последняя строка
+//     отчёта и тишина -- а если проверка упёрлась в сеть, прокси или браузер, команда шла
+//     минутами и снаружи выглядела зависшей. Теперь:
+//       1) каждая сервисная команда печатает последнюю строку «команда закончена (код N) --
+//          управление возвращается в консоль» (и в окно, и в лог) -- видно, что процесс кончился;
+//       2) на каждую команду поставлен СТОРОЖ со своим бюджетом (cookies 120 с, ytdlp 300 с,
+//          backup/restore/checkpoint/privacy/cache 300 с, fixauthors 600 с, остальные 120 с):
+//          не уложилась -- процесс завершается сам, с причиной в окне и в логе.
+//     Запуск бота (`node .`) сторож не трогает: бот и должен жить, пока его не остановят.
 // CHANGELOG v2.109 (Chromium тоже можно: helium/chrome/edge в сборке файла):
 //   * ВЛАДЕЛЕЦ: «helium, chrome, edge -- не включены!». Справедливо: в v2.108 я сказал «нельзя»,
 //     не проверив по-настоящему. Проверил -- и оказалось, что можно, если разобрать формат:
@@ -1927,6 +1938,55 @@ if (!BOT_RUN)
     // молчаливый отказ был бы хуже лишних строк.
     process.on ('exit', () => { if (!_own) for (const [_fn, _a] of _held) try { _fn (..._a); } catch (e) { } });
 }
+// ============================================================================
+// [v2.110] СЕРВИСНАЯ КОМАНДА ЗАВЕРШАЕТСЯ САМА -- И ГОВОРИТ ОБ ЭТОМ.
+// Владелец: «любой не `node .` должен завершать скрипт, возвращая управление в консоль,
+// которая его вызвала». Завершение было и раньше, но его не было ВИДНО: последняя строка
+// отчёта и тишина -- а если проверка упёрлась в сеть, прокси или браузер, команда шла
+// минутами и снаружи выглядела зависшей. Поэтому здесь две вещи:
+//   1) у каждой сервисной команды появилась последняя строка «команда закончена (код N)» --
+//      по ней видно, что управление вернулось в консоль, а не что бот думает дальше;
+//   2) на каждую команду поставлен сторож со своим бюджетом времени: не уложилась -- процесс
+//      завершается сам, с понятной причиной. Консоль получает управление ВСЕГДА.
+// Обычный запуск бота (`node .`) сторож не трогает: бот и должен жить, пока его не остановят.
+// ============================================================================
+let cliCmdName = '';
+if (!BOT_RUN)
+{
+    const _argv = process.argv.slice (2).map (_a => String (_a).toLowerCase ());
+    cliCmdName = CONSOLE_CMDS.find (_c => _argv.includes (_c)) || _argv[0] || '';
+}
+// Бюджеты с запасом: сторож нужен не чтобы «уложиться в секунды», а чтобы команда не висела
+// НАВСЕГДА. Больше всего времени честно требуют база, обход файлов и обновление yt-dlp.
+const CLI_BUDGET_S = { fixauthors: 600, backup: 300, restore: 300, checkpoint: 300, privacy: 300,
+    cache: 300, ytdlp: 300, cookies: 120 };
+const CLI_BUDGET_DEFAULT_S = 120;
+// Последняя строка сервисной команды и выход. Пишем САМИ (в файл и в stdout), а не console.log:
+// обычный вывод при сервисном запуске идёт через придержку «экран -- только про команду», и
+// последняя строка могла бы в ней застрять -- ровно поэтому так же пишет и отказ замка.
+function $cliDone (_code)
+{
+    const _line = '[' + (cliCmdName || 'bot') + '] команда закончена (код ' + _code + ') -- управление возвращается в консоль';
+    try { logFileWrite ('[' + (d()) + '] ' + _line + '\n'); } catch (e) { }
+    try { process.stdout.write (_line + '\n'); } catch (e) { }
+    // Именно exit, а не $cliDone: это и есть выход (иначе -- рекурсия, и её поймал стенд).
+    process.exit (_code);
+}
+if (!BOT_RUN && cliCmdName)
+{
+    const _sec = CLI_BUDGET_S[cliCmdName] || CLI_BUDGET_DEFAULT_S;
+    const _watch = setTimeout (() =>
+    {
+        const _why = 'сторож: команда идёт дольше ' + _sec + ' с (сеть, прокси или браузер не отвечают?)' +
+            ' -- завершаю процесс, чтобы управление вернулось в консоль';
+        try { logFileWrite ('[' + (d()) + '] [' + cliCmdName + '] ' + _why + '\n'); } catch (e) { }
+        try { process.stderr.write ('[' + cliCmdName + '] ' + _why + '\n'); } catch (e) { }
+        process.exit (1);
+    }, _sec * 1000);
+    // Сторож сам процесс НЕ держит: быстрая команда завершается мгновенно вместе с таймером,
+    // а зависшая -- не висит дольше своего бюджета.
+    if (_watch.unref) _watch.unref ();
+}
 
 function dbKeyMake (_raw)
 {
@@ -2408,7 +2468,7 @@ if (process.argv.slice (2).some (_a => /^files$/i.test (_a)))
 {
     let _code = 1;
     try { _code = filesCli (); } catch (e) { console.log ('[files] ошибка: ' + ((e && e.message) || e)); }
-    process.exit (_code);
+    $cliDone (_code);
 }
 
 // ============================================================================
@@ -2607,7 +2667,7 @@ if (process.argv.slice (2).some (_a => /^privacy$/i.test (_a)))
     let _code = 1;
     try { _code = privacyCli (process.argv.includes ('--check'), process.argv.includes ('--offline')); }
     catch (e) { console.log ('[privacy] ошибка: ' + ((e && e.message) || e)); }
-    process.exit (_code);
+    $cliDone (_code);
 }
 
 // ============================================================================
@@ -2749,7 +2809,7 @@ if (process.argv.slice (2).some (_a => /^unkey$/i.test (_a)))
     let _code = 1;
     try { _code = dbUnkeyCli (dbArgAfter ('unkey')); }
     catch (e) { console.log ('[unkey] ошибка: ' + ((e && e.message) || e)); }
-    process.exit (_code);
+    $cliDone (_code);
 }
 
 // [v2.5] Привилегированный интент Message Content (в портале приложения включён).
@@ -3607,25 +3667,25 @@ if (process.argv.slice (2).some (_a => /^backup$/i.test (_a)))
 {
     let _code = 1;
     try { _code = dbBackupCli (); } catch (e) { console.log ('[backup] ошибка: ' + ((e && e.message) || e)); }
-    process.exit (_code);
+    $cliDone (_code);
 }
 if (process.argv.slice (2).some (_a => /^checkpoint$/i.test (_a)))
 {
     let _code = 1;
     try { _code = dbCheckpointCli (dbArgAfter ('checkpoint')); } catch (e) { console.log ('[checkpoint] ошибка: ' + ((e && e.message) || e)); }
-    process.exit (_code);
+    $cliDone (_code);
 }
 if (process.argv.slice (2).some (_a => /^backups$/i.test (_a)))
 {
     let _code = 1;
     try { _code = dbBackupsCli (); } catch (e) { console.log ('[backups] ошибка: ' + ((e && e.message) || e)); }
-    process.exit (_code);
+    $cliDone (_code);
 }
 if (process.argv.slice (2).some (_a => /^restore$/i.test (_a)))
 {
     let _code = 1;
     try { _code = dbRestoreCli (dbArgAfter ('restore')); } catch (e) { console.log ('[restore] ошибка: ' + ((e && e.message) || e)); }
-    process.exit (_code);
+    $cliDone (_code);
 }
 // Проверка целостности и обновление копии -- ПЕРЕД тем, как бот откроет базы на запись.
 dbStartupGuard ();
@@ -3853,8 +3913,8 @@ async function dbFixAuthorsCli ()
 if (process.argv.slice (2).some (_a => /^fixauthors$/i.test (_a)))
 {
     dbFixAuthorsCli ()
-        .then (_code => process.exit (_code || 0))
-        .catch (e => { console.log ('[fixauthors] ошибка: ' + oneLine ((e && e.message) || e)); process.exit (1); });
+        .then (_code => $cliDone (_code || 0))
+        .catch (e => { console.log ('[fixauthors] ошибка: ' + oneLine ((e && e.message) || e)); $cliDone (1); });
 }
 
 
@@ -11284,7 +11344,7 @@ if (process.argv.slice (2).some (_a => /^config$/i.test (_a)))
     let _code = 0;
     try { _code = configCli (); }
     catch (e) { console.log ('[config] ошибка: ' + ((e && e.message) || e)); _code = 1; }
-    process.exit (_code);
+    $cliDone (_code);
 }
 
 if (process.argv.slice (2).some (_a => /^cache$/i.test (_a)))
@@ -11292,7 +11352,7 @@ if (process.argv.slice (2).some (_a => /^cache$/i.test (_a)))
     let _code = 0;
     try { _code = cacheCli (process.argv.slice (2)); }
     catch (e) { console.log ('[cache] ошибка: ' + ((e && e.message) || e)); _code = 1; }
-    process.exit (_code);
+    $cliDone (_code);
 }
 
 // [v2.94] `node . cookies` и `node . ytdlp`: оба работают асинхронно (реально запускают
@@ -11304,7 +11364,7 @@ if (process.argv.slice (2).some (_a => /^cookies$/i.test (_a)))
         let _code = 1;
         try { _code = await cookiesCli (process.argv.slice (2)); }
         catch (e) { console.log ('[cookies] ошибка: ' + ((e && e.message) || e)); }
-        process.exit (_code);
+        $cliDone (_code);
     }) ();
 
 if (process.argv.slice (2).some (_a => /^ytdlp$/i.test (_a)))
@@ -11313,7 +11373,7 @@ if (process.argv.slice (2).some (_a => /^ytdlp$/i.test (_a)))
         let _code = 1;
         try { _code = await ytdlpCli (process.argv.slice (2)); }
         catch (e) { console.log ('[ytdlp] ошибка: ' + ((e && e.message) || e)); }
-        process.exit (_code);
+        $cliDone (_code);
     }) ();
 
 // Аудио-ресурс: yt-dlp стримит в stdout -> ffmpeg ресемплирует в Opus для Discord:
@@ -12543,8 +12603,8 @@ if (/^clearstatus$/i.test (String (process.argv[2] || '')))
         process.exit (1);
     }
     voiceStatusPush (_ch, null)
-        .then (() => { console.log ('[clearstatus] статус (шапка) канала ' + _ch + ' снят'); process.exit (0); })
-        .catch (e => { console.error ('[clearstatus] не получилось: ' + oneLine (e && e.message || e)); process.exit (1); });
+        .then (() => { console.log ('[clearstatus] статус (шапка) канала ' + _ch + ' снят'); $cliDone (0); })
+        .catch (e => { console.error ('[clearstatus] не получилось: ' + oneLine (e && e.message || e)); $cliDone (1); });
 }
 
 // Раз в минуту обновляем счётчик «бот тут N мин» (в лог не пишется -- там только события):
@@ -12684,7 +12744,7 @@ for (let sig of ['SIGINT', 'SIGTERM'])
                 if ($conHalt && drained === false) $conHalt ();
             })
             .catch (() => {})
-            .finally (() => { consoleRestoreCodePage (); process.exit (0); });
+            .finally (() => { consoleRestoreCodePage (); $cliDone (0); });
     });
 
 // ============================================================================
