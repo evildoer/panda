@@ -10,6 +10,27 @@
 // номером просто не было -- номер мог быть пропущен, когда правки шли вперемешку. История
 // читается по блокам, а не по номерам: у одной партии может быть много коммитов, а блок
 // пишется только на то, что видно владельцу.
+// CHANGELOG v2.107 (cookie из браузера ловятся, экран консольных команд -- только про них):
+//   * ВЛАДЕЛЕЦ: «похоже "cookies_from_browser": "firefox" не срабатывал, просто пропускал
+//     все треки». Так и было, и виноват не bot: yt-dlp честно читал 2093 cookie из Firefox,
+//     но YouTube отвечал на них «The page needs to be reloaded» -- и КАЖДЫЙ трек падал
+//     (в логе 1040 таких строк 22-23.09, музыка шла «потоком» и рвалась на третьей секунде).
+//     А `node . cookies` при этом говорил «всё хорошо»: он проверял только ЧТЕНИЕ cookie.
+//     Теперь проверка НАСТОЯЩАЯ -- контрольный запрос метаданных к YouTube по маршрутам бота:
+//     при старте одной строкой («cookie приняты YouTube» / «ВНИМАНИЕ: YouTube эти cookie НЕ
+//     принимает -- каждый трек будет спотыкаться»), а `node . cookies` -- тем же запросом,
+//     с кодом 1 и прямым советом; без cookie он ещё и проверит, нужны ли они тут вообще.
+//   * ЭКРАН КОНСОЛЬНОЙ КОМАНДЫ -- ТОЛЬКО ПРО НЕЁ. Владелец: «node . cookies сначала выдаёт
+//     сверху какую-то лишнюю информацию, похоже так ведут себя и другие команды». Стартовые
+//     строки (копии базы, шифрование, прокси, кэш, версия yt-dlp, маршруты) при сервисном
+//     запуске теперь придерживаются и выбрасываются, как только команда начинает свой отчёт;
+//     упадёт процесс до команды -- придержанное печатается как есть. Заодно в сервисном
+//     запуске НЕ делается лишняя работа бота: не идёт проверка/обновление yt-dlp, не
+//     проверяются маршруты, не печатается сводка по конфигу.
+//   * «ТОЛЬКО СВОИ ЗАПИСИ» БЕЗ ЛИШНЕГО. Владелец: «Так очередь остаётся общей, а
+//     распоряжается каждый своим. Админы и модеры могут всё.» -- ненужная тут фраза, и
+//     странный символ в конце». Фраза убрана из отказа (/skip, /remove, /move, снятие с
+//     эфира, /seek), остался сам отказ и кто добавил трек.
 // CHANGELOG v2.105 (/queue: у каждого человека живёт только ПОСЛЕДНЕЕ его сообщение):
 //   * Владелец: «всегда обновлять только последнее от каждого пользователя».
 //   * Раньше пять вызовов /queue подряд давали пять ОБНОВЛЯЮЩИХСЯ сообщений и своими же
@@ -1841,6 +1862,36 @@ if (process.argv.slice (2).some (_a => /^keygen$/i.test (_a)))
     process.exit (0);
 }
 
+// ============================================================================
+// [v2.107] СЕРВИСНАЯ КОМАНДА -- ЭКРАН ПРО НЕЁ, А НЕ ПРО СТАРТ БОТА.
+// Владелец: «`node . cookies` сначала выдаёт сверху какую-то лишнюю информацию, похоже
+// так ведут себя и другие команды». Так и было: dump/files/privacy выходят РАНО, до
+// стартовой трещотки, а config/cache/cookies/ytdlp стоят дальше по файлу (им нужны
+// значения из конфига и музыкальные функции) -- и перед их отчётом успевали напечататься
+// строки про копии базы, шифрование, прокси и кэш.
+// Теперь при сервисном запуске стартовые строки ПРИДЕРЖИВАЮТСЯ и выбрасываются, как
+// только команда начинает свой отчёт (каждая зовёт $cliOwnScreen первой строкой): экран
+// показывает только то, ради чего её позвали. Если процесс упадёт ДО команды (битый
+// config.json и прочее), придержанное печатается как есть -- иначе владелец не увидел бы
+// причины. Обычный запуск бота (`node .`) не меняется вовсе.
+// ============================================================================
+// Каждая консольная команда зовёт это первой строкой: «говорю я, трещотку -- в мусор».
+// При обычном запуске бота это пустышка (ничего не придержано).
+let $cliOwnScreen = () => { };
+if (!BOT_RUN)
+{
+    const _realLog = console.log.bind (console), _realErr = console.error.bind (console);
+    const _held = [];
+    let _own = false;
+    const _push = (_fn, a) => { if (_own) _fn (...a); else _held.push ([_fn, a]); };
+    console.log = (...a) => _push (_realLog, a);
+    console.error = (...a) => _push (_realErr, a);
+    $cliOwnScreen = () => { _own = true; _held.length = 0; };
+    // Процесс кончился, а команда так и не началась (сбой на старте) -- показываем всё:
+    // молчаливый отказ был бы хуже лишних строк.
+    process.on ('exit', () => { if (!_own) for (const [_fn, _a] of _held) try { _fn (..._a); } catch (e) { } });
+}
+
 function dbKeyMake (_raw)
 {
     const _s = String (_raw === undefined || _raw === null ? '' : _raw).trim ();
@@ -2088,6 +2139,7 @@ function dbDumpFmt (_ns, _key, _value)
 
 function dbDumpCli ()
 {
+    $cliOwnScreen ();
     let DatabaseSync = null;
     try { ({ DatabaseSync } = require ('node:sqlite')); } catch (e) { /* старый Node */ }
     if (!DatabaseSync)
@@ -2210,6 +2262,7 @@ if (process.argv.slice (2).some (_a => /^dump$/i.test (_a)))
 // ============================================================================
 function filesCli ()
 {
+    $cliOwnScreen ();
     const _fs = require ('fs'), _path = require ('path');
     const _dir = __dirname;
     const _d = stamp => (stamp ? new Date (stamp).toLocaleString () : '?');
@@ -2382,6 +2435,7 @@ function privacyDiscordNames ()
 }
 function privacyCli (_check, _offline)
 {
+    $cliOwnScreen ();
     const _fs = require ('fs'), _path = require ('path');
     const _tplFile = _path.join (__dirname, 'privacy.template.md');
     const _outFile = _path.join (__dirname, 'PRIVACY.md');
@@ -2549,6 +2603,7 @@ if (process.argv.slice (2).some (_a => /^privacy$/i.test (_a)))
 // ============================================================================
 function dbUnkeyCli (_arg)
 {
+    $cliOwnScreen ();
     let DatabaseSync = null;
     try { ({ DatabaseSync } = require ('node:sqlite')); } catch (e) { /* старый Node */ }
     if (!DatabaseSync)
@@ -3229,6 +3284,7 @@ function dbStartupGuard ()
 // `node . backup` -- сделать и проверить копию вручную (новый файл с датой в имени).
 function dbBackupCli ()
 {
+    $cliOwnScreen ();
     let _fail = 0;
     console.log ('[backup] копия базы: <имя>.sqlite -> <имя>.backup-<дата>_<время>.sqlite' +
         (BACKUP_KEEP ? ' (самых свежих держу ' + BACKUP_KEEP + ', самая старая уходит сама; backup_keep)' : ' (старые копии не убираю: backup_keep = 0)'));
@@ -3384,6 +3440,7 @@ function dbCheckpointMake (_srv, _label)
 // `node . checkpoint [метка]` -- сделать точку вручную.
 function dbCheckpointCli (_label)
 {
+    $cliOwnScreen ();
     let _fail = 0;
     for (const _srv of dbServerListOn ())
     {
@@ -3399,6 +3456,7 @@ function dbCheckpointCli (_label)
 // `node . backups` -- что вообще есть в папке (и что можно вернуть).
 function dbBackupsCli ()
 {
+    $cliOwnScreen ();
     const _f = require ('fs');
     const _size = _p => { try { return Math.max (1, Math.round (_f.statSync (_p).size / 1024)) + ' КБ'; } catch (e) { return '?'; } };
     const _when = _p => { try { return _f.statSync (_p).mtime.toLocaleString (); } catch (e) { return '?'; } };
@@ -3441,6 +3499,7 @@ function dbBackupsCli ()
 // `node . restore [метка]` -- положить на место базы штатную копию (без метки) или точку.
 function dbRestoreCli (_sel)
 {
+    $cliOwnScreen ();
     const _f = require ('fs');
     const _want = String (_sel === undefined || _sel === null ? '' : _sel).trim ();
     let _fail = 0;
@@ -3682,6 +3741,7 @@ for (let _server in SERVERS)
 // ============================================================================
 async function dbFixAuthorsCli ()
 {
+    $cliOwnScreen ();
     const _args = process.argv.slice (2).filter (_x => !/^fixauthors$/i.test (_x));
     const _dry = _args.some (_x => /^--dry$/i.test (_x));
     const _id = _args.find (_x => /^\d{17,20}$/.test (_x)) || '';
@@ -8836,6 +8896,10 @@ let routeSig = '';
 function routeSigLog (sig, text)
 {
     if (sig === routeSig) return;
+    // [v2.107] При сервисном запуске (node . cookies и прочие) молчим: это строки о жизни
+    // БОТА, а на экране -- только отчёт команды. Состояние маршрута там видно по самому
+    // отчёту («запрос прошёл» / «проверить не вышло»).
+    if (!BOT_RUN) { routeSig = sig; return; }
     const first = !routeSig;      // первый набор уже описан строкой при старте -- не повторяем
     routeSig = sig;
     if (first) return;
@@ -8936,7 +9000,9 @@ function sectionProxyWhy (sectionProxy)
 // [v2.99] Проверка запасного пути -- по ФАКТУ (DNS + прямой запрос), а не только по имени:
 // при выключенном обходе блокировки (zapret/VPN) имя резолвится, а запрос не проходит --
 // раньше эта строка вводила в заблуждение («есть»).
-if (MUSIC_PROXY)
+// [v2.107] Только у бота: при сервисном запуске (`node . cookies` и прочие) это строка о
+// жизни бота, а не о команде; её состояние и так видно по отчёту команды.
+if (MUSIC_PROXY && BOT_RUN)
     (async () =>
     {
         const ok = await directWorks ();
@@ -9544,6 +9610,62 @@ else if (MUSIC_COOKIES_BROWSER)
         '» (--cookies-from-browser; файл не нужен) -- проверить: `node . cookies`');
 
 // ============================================================================
+// [v2.107] COOKIE ПРОВЕРЯЮТСЯ У САМОГО YOUTUBE, А НЕ ТОЛЬКО «ПРОЧИТАЛИСЬ ЛИ ОНИ».
+// Живой случай (22-23.09.2026): владелец поставил "cookies_from_browser": "firefox", yt-dlp
+// честно прочитал 2093 cookie -- и КАЖДЫЙ трек стал падать с «ERROR: [youtube] <id>: The page
+// needs to be reloaded.» Таких строк в логе 1040 за двое суток, музыка шла «потоком» и
+// рвалась на третьей секунде, а `node . cookies` говорил, что всё хорошо: он проверял
+// только ЧТЕНИЕ cookie и формат файла. Теперь проверка настоящая -- бот спрашивает у
+// YouTube метаданные (самый дешёвый запрос, `--simulate`) по СВОИМ маршрутам и смотрит
+// ОТВЕТ. Про сеть/прокси/недоступное видео молчим: это не новость про cookie.
+// ============================================================================
+const COOKIE_CHECK_URL = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';  // короткая и вечная
+function cookieVerdict (e)
+{
+    const s = String ((e && (e.stderr || e.message)) || e);
+    // Сперва то, что к cookie не относится: адрес/IP и сам маршрут.
+    if (/too many requests|HTTP Error 429|rate.?limit/i.test (s)) return 'net';
+    if (/the page needs to be reloaded/i.test (s)) return 'stale';   // cookie чужие или протухшие
+    if (isBotCheckError (e)) return 'anon';                          // cookie не пускают/их нет
+    if (/video unavailable|private video|not available in your country|premieres in/i.test (s)) return 'video';
+    if (isRouteError (e) || isNetworkError (e) ||
+        /timed out|proxy|ECONN|socket|EOF|reset|HTTP Error 4\d\d|HTTP Error 5\d\d/i.test (s)) return 'net';
+    return 'other';
+}
+async function cookieRealCheck ()
+{
+    // Счётчик, а не флаг: проверок может идти несколько подряд (при старте и в команде),
+    // и тишина одной не должна включать болтовню другой.
+    ytDlpQuiet++;
+    try
+    {
+        await ytDlpRun (COOKIE_CHECK_URL, { simulate: true, quiet: true, noWarnings: true, noPlaylist: true });
+        return { ok: true, verdict: 'ok' };
+    }
+    catch (e) { return { ok: false, verdict: cookieVerdict (e), why: ytDlpErr (e, 200) }; }
+    finally { ytDlpQuiet--; }
+}
+// Одна проверка при старте -- но зато правда: бывает, что cookie читаются, а YouTube их не
+// принимает, и без этого тревожного случая не видно ниоткуда: со стороны это выглядит как
+// «все треки поломались», а причина в одной строке конфига.
+async function cookieStartupCheck ()
+{
+    const src = MUSIC_COOKIES_FILE ? ('файл: ' + MUSIC_COOKIES_FILE)
+                                   : ('браузер: «' + MUSIC_COOKIES_BROWSER + '»');
+    const r = await cookieRealCheck ();
+    if (r.verdict === 'stale' || r.verdict === 'anon')
+        console.error ('[' + (d()) + '] [music] ВНИМАНИЕ: YouTube эти cookie НЕ принимает (' + src + '): ' + r.why +
+            ' -- каждый трек будет спотыкаться. Проверь `node . cookies`: возьми профиль, где ты вошёл в YouTube' +
+            ' (firefox:C:\\путь\\к\\профилю), либо убери cookie вовсе (анонимный путь работает).');
+    else if (r.verdict === 'ok')
+        console.log ('[' + (d()) + '] [music] cookie приняты YouTube (' + src + ') -- контрольный запрос прошёл');
+}
+// Проверка при старте -- только у бота: сервисная команда проверяет сама (и иначе две
+// проверки шли бы разом, а `node . cookies` показал бы вдвое больше запросов к YouTube).
+if (BOT_RUN && (MUSIC_COOKIES_FILE || MUSIC_COOKIES_BROWSER))
+    cookieStartupCheck ().catch (() => { });
+
+// ============================================================================
 // [v2.94] yt-dlp: ВЕРСИЯ ПРИ СТАРТЕ И САМОВОССТАНОВЛЕНИЕ ОБНОВЛЕНИЕМ.
 // Владелец: «порой yt-dlp надо обновлять, т.к. он перестаёт качать ролики вообще...
 // проверять как-то работоспособность при запуске, или делать тоже попытку обновить
@@ -9743,6 +9865,7 @@ if (YTDLP_UPDATE_DAYS)
 // `node . ytdlp [--update|-U]` -- версия и (по желанию) обновление.
 async function ytdlpCli (args)
 {
+    $cliOwnScreen ();
     const upd = args.some (a => /^(-u|--update)$/i.test (a));
     console.log ('[ytdlp] бинарник: ' + YTDLP_PATH);
     const v = await ytdlpVersionRead ();
@@ -9784,8 +9907,40 @@ function cookiesFileReport ()
     return { ok: lines.length > 0, lines: lines.length, domains: dom.size, yt,
         top: [...dom.entries ()].sort ((a, b) => b[1] - a[1]).slice (0, 6) };
 }
+// [v2.107] ПОСЛЕДНЕЕ СЛОВО -- ЗА YOUTUBE. Прочитать cookie и проверить формат -- это
+// только половина дела: бывает, что cookie читаются, а YouTube их не принимает (живой
+// случай 22-23.09: 1040 строк «The page needs to be reloaded», а команда говорила «ОК»).
+// Здесь же делается настоящий контрольный запрос -- и о результате говорится прямо.
+async function cookieCliVerdict ()
+{
+    console.log ('[cookies] проверяю по-настоящему: спрашиваю у YouTube метаданные контрольного видео...');
+    const r = await cookieRealCheck ();
+    if (r.verdict === 'ok')
+    {
+        console.log ('[cookies] YouTube ПРИНЯЛ cookie -- контрольный запрос прошёл, музыка заиграет');
+        return 0;
+    }
+    if (r.verdict === 'stale' || r.verdict === 'anon')
+    {
+        console.error ('[cookies] НЕ ГОДЯТСЯ: YouTube эти cookie не принимает -- ' + r.why);
+        console.error ('[cookies] с ними КАЖДЫЙ трек будет падать («The page needs to be reloaded»), а музыка -- рваться');
+        console.error ('[cookies] что делать: взять профиль, где ты вошёл в YouTube (firefox:C:\\путь\\к\\профилю) -- или');
+        console.error ('[cookies] вовсе убрать cookie: анонимный путь на этой машине работает (см. `node . cookies` без них)');
+        return 1;
+    }
+    if (r.verdict === 'video')
+    {
+        console.error ('[cookies] не уверен: контрольное видео недоступно (' + r.why + ') -- это не про cookie, проверь его в браузере');
+        return 1;
+    }
+    console.log ('[cookies] проверить не вышло (маршрут/сеть): ' + r.why);
+    console.log ('[cookies] это НЕ про cookie -- сами cookie прочитались нормально, попробуй команду позже');
+    return 0;
+}
+
 async function cookiesCli ()
 {
+    $cliOwnScreen ();
     console.log ('[cookies] источник cookie для yt-dlp: ' + (MUSIC_COOKIES_FILE ? 'файл'
         : (MUSIC_COOKIES_BROWSER ? 'браузер' : 'не задан (запросы идут анонимно)')));
     if (MUSIC_COOKIES_FILE)
@@ -9803,7 +9958,7 @@ async function cookiesCli ()
             return 1;
         }
         console.log ('[cookies] cookie для YouTube на месте (' + r.yt.slice (0, 4).join (', ') + ') -- формат Netscape, годится');
-        return 0;
+        return await cookieCliVerdict ();
     }
     if (MUSIC_COOKIES_BROWSER)
     {
@@ -9814,8 +9969,8 @@ async function cookiesCli ()
         const ext = /Extracted (\d+) cookies from ([^\n]+)/i.exec (all);
         const dbg = /Extracting cookies from ([^\n]+)/i.exec (all);
         const bad = /(could not find|could not copy|failed to (?:decrypt|read|extract)|decryption failed|no cookies|unsupported (?:platform|browser))/i.exec (all);
-        if (ext) { console.log ('[cookies] OK: yt-dlp прочитал ' + ext[1] + ' cookie из ' + String (ext[2]).trim ()); return 0; }
-        if (dbg) { console.log ('[cookies] OK: yt-dlp читает cookie из ' + String (dbg[1]).trim () + ' (количество не назвал)'); return 0; }
+        if (ext) { console.log ('[cookies] yt-dlp прочитал ' + ext[1] + ' cookie из ' + String (ext[2]).trim ()); return await cookieCliVerdict (); }
+        if (dbg) { console.log ('[cookies] yt-dlp читает cookie из ' + String (dbg[1]).trim () + ' (количество не назвал)'); return await cookieCliVerdict (); }
         if (bad)
         {
             console.error ('[cookies] браузерные cookie не прочитались: ' + oneLine (bad[0], 160) +
@@ -9825,6 +9980,16 @@ async function cookiesCli ()
         console.error ('[cookies] не понял ответ yt-dlp -- вот что он сказал: ' + oneLine (String (r.err || r.out || 'без вывода'), 300));
         return 1;
     }
+    // [v2.107] И без cookie полезно знать главное: НУЖНЫ ли они тут вообще. Раньше команда
+    // молча отправляла владельца за cookie, даже когда анонимный путь прекрасно работает
+    // (на этой машине -- именно так: с файлом, без cookie и без ничего -- музыка играет).
+    const _anon = await cookieRealCheck ();
+    if (_anon.verdict === 'ok')
+        console.log ('[cookies] проверено: и БЕЗ cookie YouTube отвечает (контрольный запрос прошёл) -- если музыка играет, возиться с cookie не обязательно');
+    else if (_anon.verdict === 'anon' || _anon.verdict === 'stale')
+        console.log ('[cookies] проверено: без cookie YouTube отвечает «' + _anon.why + '» -- вот от этого cookie и спасают');
+    else
+        console.log ('[cookies] проверить анонимный путь не вышло (' + _anon.why + ') -- это про сеть/маршрут, не про cookie');
     console.log ('[cookies] ничего не задано -- запросы идут анонимно. Два способа это исправить (любой один):');
     console.log ('[cookies]   1) БРАУЗЕР (ничего не экспортировать): в блок MUSIC добавь  "cookies_from_browser": "firefox"  (или chrome, edge, brave)');
     console.log ('[cookies]   2) ФАЙЛ: расширение "Get cookies.txt" выгружает файл в формате Netscape; положи его рядом с ботом и укажи  "cookies_file": "cookies.txt"');
@@ -9833,7 +9998,9 @@ async function cookiesCli ()
 }
 
 // Отчёт о версии -- сразу при старте (кроме случая, когда это и есть команда `node . ytdlp`).
-if (!process.argv.slice (2).some (_a => /^ytdlp$/i.test (_a)))
+// [v2.107] И только у БОТА: при сервисном запуске этот отчёт (а с ним и проверка версии,
+// и плановое обновление yt-dlp) -- лишняя работа и лишние строки перед отчётом команды.
+if (BOT_RUN && !process.argv.slice (2).some (_a => /^ytdlp$/i.test (_a)))
     ytdlpStartupReport ().catch (() => { });
 
 let cacheDirOk = false;
@@ -10315,6 +10482,7 @@ function openCachedTrack (track, file, seekSec = 0)
 // ============================================================================
 function cacheCli (args = [])
 {
+    $cliOwnScreen ();
     const _mb = n => (Number (n || 0) / 1048576).toFixed (1) + ' МБ';
     const _when = t => new Date (t).toLocaleString ();
     if (!MUSIC_CACHE)
@@ -10407,6 +10575,7 @@ function cacheCli (args = [])
 // ============================================================================
 function configCli ()
 {
+    $cliOwnScreen ();
     const hasTop = _k => Object.prototype.hasOwnProperty.call (CONFIG_RAW || {}, _k);
     // hasM -- «есть ли ключ в блоке MUSIC файла» (значения бот берёт из кода: ключа нет -- работает
     // значение по умолчанию, и в отчёте это должно быть видно именно так).
@@ -13697,9 +13866,11 @@ function queuePurge (guildId, keep)
 // [v2.31] Один и тот же понятный отказ там, где DJ пытается тронуть чужую запись.
 function ownOnlyText (action, track)
 {
+    // [v2.107] Владелец: «Так очередь остаётся общей, а распоряжается каждый своим. Админы и
+    // модеры могут всё.» -- ненужная тут фраза, и странный символ в конце (это были кавычки
+    // курсива, которыми она была обёрнута). Оставляем только сам отказ и факт про автора.
     return '🚫 ' + action + ' -- только свои записи: этот трек добавил ' +
-        (byIdOf (track) ? byNameOf (track) : 'неизвестный автор (трек из старой базы)') + '.\n' +
-        '_Так очередь остаётся общей, а распоряжается каждый своим. Админы и модеры могут всё._';
+        (byIdOf (track) ? byNameOf (track) : 'неизвестный автор (трек из старой базы)') + '.';
 }
 
 // [v2.31] ЧТО ИМЕННО УЙДЁТ при чистке -- и для подтверждения, и для ответа, и для лога.
@@ -18561,5 +18732,7 @@ for (const _cfgIssue of configSanityIssues ())
 
 // [v2.29] И там же -- не отстал ли боевой config.json от config.example.json (подсказки
 // и новые ключи). Тоже молчит, когда расхождения нет.
-for (const _cfgDrift of configDriftIssues ())
+// [v2.107] Сводка о конфиге -- только у бота: сервисной команде её печатает её же отчёт
+// (configCli зовёт ту же configDriftIssues), а остальным эта строка -- чужой шум на экране.
+for (const _cfgDrift of (BOT_RUN ? configDriftIssues () : []))
     console.log ('[' + (d()) + '] [config] ' + _cfgDrift);
