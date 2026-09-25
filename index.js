@@ -10,6 +10,21 @@
 // номером просто не было -- номер мог быть пропущен, когда правки шли вперемешку. История
 // читается по блокам, а не по номерам: у одной партии может быть много коммитов, а блок
 // пишется только на то, что видно владельцу.
+// CHANGELOG v2.112 (вопрос про `cookies_from_browser` решён: ключ не нужен, первым его не советуют):
+//   * ВЛАДЕЛЕЦ: «Тогда решить надо вопрос с параметром --cookies-from-browser; я вижу, ты его удалил --
+//     это нормально». Решение такое: в боевом config.json ключа нет и там он не нужен, потому что cookie
+//     берутся из ФАЙЛА, а файл бот собирает САМ по имени браузера (`node . cookies --save firefox`, v2.108)
+//     и проверяет набор у самого YouTube. Это единственный путь, который на этой машине работает: профиль
+//     Firefox с ЖИВЫМ входом YouTube всё равно отбрасывает (проверено 25.09.2026), а Chrome, пока запущен,
+//     базу cookie не отдаёт вовсе -- то есть браузерный режим тут не «надо настроить», а «не работает».
+//   * ПОДДЕРЖКА НЕ УДАЛЕНА, УБРАНО ПЕРВОЕ МЕСТО В СОВЕТАХ. Если ключ задан, yt-dlp по-прежнему читает
+//     cookie из браузера -- для сайтов вне YouTube (SoundCloud, Bandcamp) это рабочий вариант. Но
+//     в `node . cookies` порядок теперь такой: (1) собери файл сам, (2) выгрузи файл руками,
+//     (3) браузерный режим -- и у третьего честно сказано, чего он не умеет. Так же и в примере конфига,
+//     и в отчёте `node . config` (там у ключа стоит пометка, что он не нужен, если файл уже есть).
+//   * И ОТКАЗ СТАЛ ТОЧНЕЕ. Раньше при протухшем наборе команда всегда говорила «возьми ФАЙЛ cookie» --
+//     даже когда виноват был сам файл. Теперь источник назван: для файла -- «пересобери
+//     (`node . cookies --save firefox`)», для браузера -- «возьми файл».
 // CHANGELOG v2.108 (`node . cookies --save`: файл cookie бот собирает САМ и проверяет у YouTube):
 //   * ВЛАДЕЛЕЦ: «я всё за тебя сделал -- файл положил, а ты сам сгенерить его из имени браузера
 //     не можешь? надо лишь удалить всё, что не касается ютуба и других провайдеров аудио».
@@ -10609,8 +10624,20 @@ async function cookieCliVerdict ()
         // «The page needs to be reloaded» (и то же самое, если выгрузить этот профиль в файл),
         // а его собственный файл cookie из 15 строк работает. Так что совет -- не «войди в браузере»,
         // а «возьми файл» (или убери cookie).
-        console.error ('[cookies] что делать: браузерный режим на этой машине YouTube не принимает -- возьми ФАЙЛ cookie');
-        console.error ('[cookies] (MUSIC.cookies_file: так делает сам владелец, этот путь работает) или убери cookie вовсе');
+        // [v2.112] Совет ЗАВИСИТ ОТ ИСТОЧНИКА. Раньше и на файле, и на браузере команда говорила
+        // «возьми ФАЙЛ cookie» -- на файле это звучало странно (файл как раз и есть).
+        if (MUSIC_COOKIES_FILE)
+        {
+            console.error ('[cookies] что делать: этот набор протух (обычно виноваты cookie ВХОДА в аккаунт Google,' +
+                ' которые попали в файл) -- пересобери его:  node . cookies --save firefox');
+            console.error ('[cookies] команда соберёт наборы заново и запишет тот, который YouTube РЕАЛЬНО принимает');
+        }
+        else
+        {
+            console.error ('[cookies] что делать: возьми ФАЙЛ cookie -- на этой машине работает только он:');
+            console.error ('[cookies]   node . cookies --save firefox  -- соберу файл из браузера и сам проверю его у YouTube');
+        }
+        console.error ('[cookies] или убери cookie вовсе: анонимный путь здесь отвечает, музыка играет и без них');
         return 1;
     }
     if (r.verdict === 'video')
@@ -10678,11 +10705,17 @@ async function cookiesCli (_args)
         console.log ('[cookies] проверено: без cookie YouTube отвечает «' + _anon.why + '» -- вот от этого cookie и спасают');
     else
         console.log ('[cookies] проверить анонимный путь не вышло (' + _anon.why + ') -- это про сеть/маршрут, не про cookie');
-    console.log ('[cookies] ничего не задано -- запросы идут анонимно. Два способа это исправить (любой один):');
-    console.log ('[cookies]   1) БРАУЗЕР (ничего не экспортировать): в блок MUSIC добавь  "cookies_from_browser": "firefox"  (или chrome, edge, brave)');
-    console.log ('[cookies]   2) ФАЙЛ: расширение "Get cookies.txt" выгружает файл в формате Netscape; положи его рядом с ботом и укажи  "cookies_file": "cookies.txt"');
-    console.log ('[cookies]   3) САМ:  node . cookies --save firefox  -- соберу файл из браузера (firefox, helium, chrome, edge...),' +
-        ' оставлю только домены музыки, сам проверю набор у YouTube и запишу тот, который он принял.');
+    // [v2.112] ГЛАВНЫЙ СПОСОБ -- ФАЙЛ, и он идёт ПЕРВЫМ. Браузерный режим ("cookies_from_browser")
+    // никуда не делся и работает, но на этой машине YouTube набор профиля не принимает, поэтому
+    // советовать его первым -- значит отправлять владельца по заведомо нерабочему пути.
+    console.log ('[cookies] ничего не задано -- запросы идут анонимно. Способы это исправить (любой один; тут работает первый):');
+    console.log ('[cookies]   1) САМ:  node . cookies --save firefox  -- соберу файл из браузера (firefox, helium, chrome, edge...),' +
+        ' оставлю только домены музыки, сам проверю набор у YouTube и запишу тот, который он принял;' +
+        ' останется вписать его в MUSIC:  "cookies_file": "cookies.txt"');
+    console.log ('[cookies]   2) ФАЙЛ руками: расширение "Get cookies.txt" выгружает файл в формате Netscape; положи его рядом с ботом и укажи  "cookies_file": "cookies.txt"');
+    console.log ('[cookies]   3) БЕЗ ФАЙЛА (необязательный ключ): в блок MUSIC добавь  "cookies_from_browser": "firefox"  (или chrome, edge, brave) -- yt-dlp прочитает cookie из браузера сам.');
+    console.log ('[cookies]      Для YouTube на этой машине так НЕ работает (набор профиля YouTube не принимает): годится для SoundCloud и Bandcamp,' +
+        ' а у Chrome и Edge требует ЗАКРЫТОГО браузера -- проверено 25.09.2026');
     return 0;
 }
 
@@ -11307,7 +11340,8 @@ function configCli ()
     sec ('музыка (MUSIC)');
     row ('proxy', MUSIC_PROXIES.length ? MUSIC_PROXIES.join (', ') : 'нет -- напрямую (DIRECT)', hasM ('proxy') ? 'config.json' : (process.env.MUSIC_PROXY ? 'переменная окружения MUSIC_PROXY' : '-- (в файле нет)'));
     row ('cookies_file', MUSIC_COOKIES_FILE || '-- (не задан)', hasM ('cookies_file') ? 'config.json' : '-- (в файле нет)');
-    row ('cookies_from_browser', MUSIC_COOKIES_BROWSER || '-- (не задан)', hasM ('cookies_from_browser') ? 'config.json' : '-- (в файле нет)');
+    // [v2.112] Ключ необязательный, и в этом отчёте это сказано прямо: рабочий путь -- файл.
+    row ('cookies_from_browser (необязательный)', MUSIC_COOKIES_BROWSER || '-- (не задан)', hasM ('cookies_from_browser') ? 'config.json' : 'не нужен, если задан cookies_file');
     row ('normalize (громкость)', YN (MUSIC_NORMALIZE), hasM ('normalize') ? 'config.json' : 'по умолчанию (вкл)');
     row ('filter', MUSIC_NORMALIZE_FILTER, hasM ('filter') ? 'config.json' : 'по умолчанию');
     row ('channel_status (шапка)', YN (MUSIC_CHANNEL_STATUS), hasM ('channel_status') ? 'config.json' : 'по умолчанию (не трогаю)');
