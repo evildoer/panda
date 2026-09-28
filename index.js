@@ -6177,8 +6177,8 @@ async function ytRoutes ()
         directWarnedAt = Date.now ();
         console.log ('[' + (d()) + '] [music] youtube.com не резолвится локально -- иду через прокси (DIRECT на этой машине невозможен)');
     }
-    const { alive, rest } = await liveProxyList ();
-    const pRoutes = [...alive, ...rest].map (p => ({ proxy: p }));
+    const { alive } = await liveProxyList ();
+    const liveRoutes = alive.map (p => ({ proxy: p }));
     const dp = dnsOk ? await directProbe () : { ok: false, why: 'youtube.com локально не резолвится' };
     if (!alive.length && !dp.ok)
         routeSigLog ('p:|d:0', 'рабочих маршрутов нет: прокси молчат (' + MUSIC_PROXIES.join (', ') +
@@ -6193,8 +6193,8 @@ async function ytRoutes ()
     else
         routeSigLog ('p:' + alive.join ('|') + '|d:1', 'отвечают оба пути: прокси ' + alive.join (', ') +
             ' и DIRECT -- основной прокси, прямой остаётся запасным');
-    if (!dnsOk) return pRoutes;
-    return [...alive.map (p => ({ proxy: p })), { proxy: '' }, ...rest.map (p => ({ proxy: p }))];
+    if (!dnsOk) return liveRoutes.length ? liveRoutes : [{ proxy: '' }];
+    return [...liveRoutes, { proxy: '' }];
 }
 
 function sectionProxyFor (viaProxy)
