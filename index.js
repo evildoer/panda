@@ -345,7 +345,7 @@ const DB_ENC_PREFIX = 'enc1:';
 const DB_ENC_SALT = 'pandamia-db-v1';
 const DB_ENC_HEX = /^[0-9a-fA-F]{64}$/;
 
-const CONSOLE_CMDS = ['help', 'config', 'keygen', 'dump', 'files', 'cache', 'privacy', 'backup', 'checkpoint', 'backups', 'restore', 'clearstatus', 'unkey', 'fixauthors', 'cookies', 'ytdlp'];
+const CONSOLE_CMDS = ['help', 'config', 'keygen', 'dump', 'files', 'cache', 'privacy', 'backup', 'checkpoint', 'backups', 'restore', 'clearstatus', 'unkey', 'fixauthors', 'cookies', 'ytdlp', 'voice'];
 const CONSOLE_HELP =
 [
     ['node .',                    'запустить бота и смотреть живой лог (Ctrl+C -- выйти)'],
@@ -364,6 +364,7 @@ const CONSOLE_HELP =
     ['node . backups',            'что есть: база, копии с датой и контрольные точки'],
     ['node . restore [метка]',    'вернуть базу из самой свежей копии (без метки) или из копии/точки по метке'],
     ['node . clearstatus <id>',   'разово снять свою строку из статуса голосового канала'],
+    ['node . voice [id канала]',  'проверить вход в голосовой канал по-настоящему (музыка играет именно там)'],
     ['node . fixauthors <id> [имя] [--dry]', 'проставить автора трекам в очереди, где его нет'],
 ];
 function printConsoleHelp ()
@@ -373,7 +374,7 @@ function printConsoleHelp ()
     for (const _c of CONSOLE_HELP) console.log ('  ' + _c[0].padEnd (_w) + ' -- ' + _c[1]);
     console.log ('Всё, что открывает ключи и базу, делается ТОЛЬКО здесь, в консоли, а не в Discord.');
 }
-const $cliHold = ['fixauthors', 'cookies', 'ytdlp'].some (_c =>
+const $cliHold = ['fixauthors', 'cookies', 'ytdlp', 'voice'].some (_c =>
     CONSOLE_CMDS.includes (_c) && process.argv.slice (2).some (_a => new RegExp ('^' + _c + '$', 'i').test (_a)));
 if (BOT_RUN && !$cliHold)
 {
@@ -429,7 +430,7 @@ if (!BOT_RUN)
     cliCmdName = CONSOLE_CMDS.find (_c => _argv.includes (_c)) || _argv[0] || '';
 }
 const CLI_BUDGET_S = { fixauthors: 600, backup: 300, restore: 300, checkpoint: 300, privacy: 300,
-    cache: 300, ytdlp: 300, cookies: 120 };
+    cache: 300, ytdlp: 300, cookies: 120, voice: 120 };
 const CLI_BUDGET_DEFAULT_S = 120;
 function $cliDone (_code)
 {
@@ -1851,6 +1852,8 @@ for (let _server in SERVERS)
     $db[_server]['membersBanTimeout'] = dbMake (_server, 'membersBanTimeout');
     $db[_server]['channelsBusy']      = dbMake (_server, 'channelsBusy');
     $db[_server]['musicState']        = dbMake (_server, 'musicState');
+    $db[_server]['netState']          = dbMake (_server, 'netState');
+    $db[_server]['dnsbook']           = dbMake (_server, 'dnsbook');   // своя книга имён и адресов (DNS -- только справочная)
     $db[_server]['memberRoles']       = dbMake (_server, 'memberRoles');
     $db[_server]['banHistory']        = dbMake (_server, 'banHistory');
 }
@@ -5420,7 +5423,7 @@ const CONFIG_ORDER = {
         ['SERVERS'],
     ],
     MUSIC: [
-        ['proxy', 'cookies_file', 'cookies_from_browser'],
+        ['proxy', 'doh', 'cookies_file', 'cookies_from_browser'],
         ['ytdlp_auto_update', 'ytdlp_update_after_fails', 'ytdlp_check_days', 'ytdlp_update_days'],
         ['normalize', 'filter'],
         ['channel_status', 'skip_absent_author'],
@@ -6146,6 +6149,729 @@ async function directWhy ()
     return d.ok ? '' : 'прямой запрос не проходит (' + (d.why || 'нет ответа') + ')';
 }
 
+async function reportRoutes ()
+{
+    try
+    {
+        const dnsOk = await directUsable ();
+        const dp = dnsOk ? await directProbe () : { ok: false, why: 'youtube.com локально не резолвится' };
+        const parts = [
+            'DNS: ' + (dnsOk ? 'youtube.com резолвится' : 'youtube.com НЕ резолвится'),
+            'прямой путь: ' + (dp.ok ? 'отвечает (' + dp.why + ')' : 'не отвечает -- ' + (dp.why || 'нет ответа')),
+            'прокси: ' + (MUSIC_PROXIES.length ? MUSIC_PROXIES.join (', ') : 'нет'),
+            'свой DoH-маршрут: ' + (MUSIC_DOH ? 'включён' : 'выключен (MUSIC.doh)'),
+        ];
+        let advice;
+        if (dp.ok) advice = '-- музыка пойдёт напрямую, менять ничего не надо';
+        else if (dnsOk) advice = '-- имена в порядке, а запрос не проходит: это блокировка провайдера (DPI) -- включи свой обход (запрет/winws) или VPN-прокси';
+        else if (MUSIC_DOH) advice = '-- имя не резолвится, но это лечит сам: иду своим DoH-маршрутом (имена спрашиваю по https, системный DNS не нужен)';
+        else advice = '-- имя не резолвится: включи MUSIC.doh либо поставь DNS 9.9.9.9 / 94.140.14.14, либо прописывай hosts' ;
+        console.log ('[' + (d()) + '] [music] пути к YouTube: ' + parts.join ('; ') + ' ' + advice);
+    }
+    catch (e) { }
+}
+if (BOT_RUN) setImmediate (() => reportRoutes ());   // после загрузки модуля: не торопит старт и не трогает ещё не объявленные настройки
+if (BOT_RUN)
+{
+    setTimeout (async () =>                                       // собрал адреса из ЖИВЫХ соединений системы
+    {
+        await poolHarvest ();
+        try
+        {
+            const i = await dnsBookInfo ();
+            const pools = Object.keys (ipMem || {}).filter (k => k.indexOf ('pool:') === 0)
+                .map (k => k.slice (5) + ': ' + Object.keys ((ipMem[k] || {}).ips || {}).length).join (', ');
+            console.log ('[' + (d()) + '] [music] книга адресов: имён ' + i.names + ', адресов ' + i.ips +
+                ', свежих записей ' + i.fresh + (pools ? '; копилки -- ' + pools : ''));
+        }
+        catch (e) { }
+    }, 5000);
+    const poolTimer = setInterval (() =>
+    {
+        poolHarvest ();
+        dnsBookLoad ().then (() => { dnsTrim (); dnsBookSave (true); }).catch (() => { });
+    }, 5 * 60 * 1000);
+    try { poolTimer.unref (); } catch (e) { }
+}
+
+
+const MUSIC_DOH = MUSIC_CFG.doh !== false;
+const DOH_RESOLVERS =
+[
+    { name: 'Cloudflare', ip: '1.1.1.1',   host: 'cloudflare-dns.com',        path: '/dns-query' },
+    { name: 'Google',     ip: '8.8.8.8',   host: 'dns.google',                path: '/resolve' },
+    { name: 'Quad9',      ip: '9.9.9.9',   host: 'dns.quad9.net',             path: '/dns-query' },
+    { name: 'Яндекс',     ip: '77.88.8.8', host: 'common.dot.dns.yandex.net', path: '/dns-query' }
+];
+let dohGoodIdx = 0;
+let dohLastOkAt = 0;
+let dohProxyPort = 0;
+let dohCalls = 0, dohOops = 0;
+const dohCache = new Map ();
+const DOH_TTL = 120000;
+
+function dohBadIp (ip)
+{
+    const s = String (ip || '');
+    if (!/^\d{1,3}(\.\d{1,3}){3}$/.test (s)) return true;
+    return /^(0\.|127\.|10\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test (s);
+}
+
+function dohAsk (resolver, name)
+{
+    return new Promise (res =>
+    {
+        let done = false;
+        const fin = v => { if (!done) { done = true; res (v); } };
+        const req = require ('https').request ({
+            host: resolver.ip, servername: resolver.host, port: 443, method: 'GET',
+            path: resolver.path + '?name=' + encodeURIComponent (name) + '&type=A',
+            headers: { host: resolver.host, accept: 'application/dns-json' }, timeout: 5000
+        }, r =>
+        {
+            if (r.statusCode !== 200) { try { r.resume (); } catch (e) { } return fin (null); }
+            let b = '';
+            r.on ('data', d => { if (b.length < 20000) b += d; });
+            r.on ('end', () =>
+            {
+                try
+                {
+                    const j = JSON.parse (b);
+                    const ans = (j.Answer || []).filter (a => a.type === 1);
+                    const ips = ans.map (a => a.data).filter (x => !dohBadIp (x));
+                    const ttl = Math.min.apply (null, ans.map (a => Number (a.TTL) || 0).filter (t => t > 0).concat ([0]));
+                    fin (ips.length ? { ip: ips[0], ips: ips, ttl: ttl } : null);
+                }
+                catch (e) { fin (null); }
+            });
+        });
+        req.on ('timeout', () => { try { req.destroy (); } catch (e) { } fin (null); });
+        req.on ('error', () => fin (null));
+        req.end ();
+    });
+}
+
+
+const KNOWN_DNS = ['77.88.8.8', '77.88.8.1', '9.9.9.9', '94.140.14.14', '1.1.1.1', '8.8.8.8', '208.67.222.222'];
+let plainDnsList = null;
+function plainDnsServers ()
+{
+    if (plainDnsList) return plainDnsList;
+    const out = [];
+    const is4 = s => /^(\d{1,3}\.){3}\d{1,3}$/.test (String (s || ''));
+    try { for (const s of require ('dns').getServers ()) if (is4 (s) && out.indexOf (s) === -1) out.push (s); } catch (e) { }
+    for (const s of KNOWN_DNS) if (out.indexOf (s) === -1) out.push (s);   // знакомые: если системный не ответит -- спрошу их
+    plainDnsList = out.slice (0, 8);
+    return plainDnsList;
+}
+
+function dnsEncodeName (name)
+{
+    const out = [];
+    for (const p of String (name).split ('.')) { out.push (p.length); for (let i = 0; i < p.length; i++) out.push (p.charCodeAt (i) & 0xff); }
+    out.push (0);
+    return Buffer.from (out);
+}
+
+function dnsParseA (buf, id)
+{
+    if (!buf || buf.length < 12 || buf.readUInt16BE (0) !== id) return null;
+    const ancount = buf.readUInt16BE (6);
+    if (!ancount) return null;
+    let off = 12;
+    const skipName = () =>
+    {
+        while (off < buf.length)
+        {
+            const len = buf[off];
+            if (len === 0) { off++; return; }
+            if ((len & 0xc0) === 0xc0) { off += 2; return; }
+            off += 1 + len;
+        }
+    };
+    const qd = buf.readUInt16BE (4);
+    for (let i = 0; i < qd; i++) { skipName (); off += 4; }
+    const ips = [];
+    for (let i = 0; i < ancount; i++)
+    {
+        skipName ();
+        if (off + 10 > buf.length) break;
+        const type = buf.readUInt16BE (off); off += 8;
+        const rdlen = buf.readUInt16BE (off); off += 2;
+        if (type === 1 && rdlen === 4) ips.push (buf[off] + '.' + buf[off + 1] + '.' + buf[off + 2] + '.' + buf[off + 3]);
+        off += rdlen;
+    }
+    return ips;
+}
+
+function plainDnsAsk (server, name, timeoutMs = 1500)
+{
+    return new Promise (res =>
+    {
+        let done = false;
+        const fin = v => { if (!done) { done = true; res (v); } };
+        try
+        {
+            const dgram = require ('dgram');
+            const sock = dgram.createSocket ('udp4');
+            const id = 1 + ((Math.random () * 65000) | 0);
+            const head = Buffer.alloc (12);
+            head.writeUInt16BE (id, 0);
+            head.writeUInt16BE (0x0100, 2);
+            head.writeUInt16BE (1, 4);
+            const body = Buffer.concat ([head, dnsEncodeName (name), Buffer.from ([0, 1, 0, 1])]);
+            const t = setTimeout (() => { try { sock.close (); } catch (e) { } fin (null); }, timeoutMs);
+            sock.on ('message', m =>
+            {
+                clearTimeout (t);
+                const ips = dnsParseA (m, id);
+                try { sock.close (); } catch (e) { }
+                const good = ips ? ips.filter (x => !dohBadIp (x)) : [];   // подмена (127./10./192.168. и т.п.) -- не беру
+                fin (good.length ? { ip: good[0], ips: good, ttl: 0 } : null);
+            });
+            sock.on ('error', () => { clearTimeout (t); try { sock.close (); } catch (e) { } fin (null); });
+            sock.send (body, 53, server, e => { if (e) { clearTimeout (t); try { sock.close (); } catch (e2) { } fin (null); } });
+        }
+        catch (e) { fin (null); }
+    });
+}
+
+let ipViaLogged = '';
+function ipViaLog (via, extra)
+{
+    if (!BOT_RUN || (via + extra) === ipViaLogged) return;
+    ipViaLogged = via + extra;
+    console.log ('[' + (d()) + '] [music] ' + via + (extra ? ' (' + extra + ')' : '') +
+        ' -- IP отдаю загрузчику (yt-dlp) через свой локальный маршрут, системный DNS и hosts не нужны');
+}
+
+const DNS_BOOK_MAX = 5000;
+const DNS_IPS_MAX = 64;
+const DNS_TTL_DEF = 10 * 60 * 1000;
+const DNS_TTL_MIN = 60 * 1000;
+const DNS_TTL_MAX = 24 * 60 * 60 * 1000;
+const DNS_FAIL_ASLEEP = 120000;   // столько не предлагаю адрес после сбоя по нему
+const IP_MEM_MAX = 500;
+let ipMem = null;                 // только копилки сервисов (pool:youtube, pool:discord)
+let ipMemLoading = null;
+let dnsBook = null;               // имя -> запись
+let dnsBookLoading = null;
+let dnsStats = null;              // источник -> { ok, fail, ms, at }
+let dnsSaveTimer = null;
+let dnsSaveBusy = false;
+
+function ipMemTrim ()
+{
+    const keys = Object.keys (ipMem);
+    if (keys.length <= IP_MEM_MAX) return;
+    keys.sort ((a, b) => (ipMem[a].at || 0) - (ipMem[b].at || 0));
+    for (let i = 0; i < keys.length - IP_MEM_MAX; i++) delete ipMem[keys[i]];
+}
+async function ipMemLoad ()
+{
+    if (ipMem) return ipMem;
+    if (ipMemLoading) return ipMemLoading;
+    ipMemLoading = (async () =>
+    {
+        let val = null;
+        try
+        {
+            const srv = dbServerList ()[0];
+            if (srv) val = await db (srv, 'netState', 'ip_map');
+        }
+        catch (e) { }
+        ipMem = (val && typeof val === 'object' && !Array.isArray (val)) ? val : {};
+        ipMemLoading = null;
+        return ipMem;
+    }) ();
+    return ipMemLoading;
+}
+async function ipMemSave ()
+{
+    try
+    {
+        const srv = dbServerList ()[0];
+        if (srv) await db (srv, 'netState', 'ip_map', ipMem);
+    }
+    catch (e) { }
+}
+
+async function dnsBookLoad ()
+{
+    if (dnsBook) return dnsBook;
+    if (dnsBookLoading) return dnsBookLoading;
+    dnsBookLoading = (async () =>
+    {
+        let map = null, st = null;
+        try
+        {
+            const srv = dbServerList ()[0];
+            if (srv) { map = await db (srv, 'dnsbook', 'map'); st = await db (srv, 'dnsbook', 'stats'); }
+        }
+        catch (e) { }
+        dnsBook = (map && typeof map === 'object' && !Array.isArray (map)) ? map : {};
+        dnsStats = (st && typeof st === 'object' && !Array.isArray (st)) ? st : {};
+        try
+        {
+            const old = await ipMemLoad ();
+            let moved = 0;
+            for (const k of Object.keys (old))
+            {
+                const r = old[k];
+                if (!r || !r.ip || !/^\d{1,3}(\.\d{1,3}){3}$/.test (String (r.ip))) continue;
+                const rec = dnsBook[k] || (dnsBook[k] = dnsRecMake (k));
+                if (!rec.ips.some (x => x.ip === r.ip)) rec.ips.push ({ ip: r.ip, at: r.at || Date.now (), ms: 0, src: 'прежняя книга', ok: 0, fail: 0, lastUsed: 0 });
+                rec.at = Math.max (rec.at || 0, r.at || 0);
+                delete old[k];
+                moved++;
+            }
+            if (moved)
+            {
+                await ipMemSave ();
+                dnsSaveTimer = null;
+                await dnsBookSave (true);
+                console.log ('[' + (d()) + '] [music] книгу адресов перенёс в отдельную таблицу: ' + moved + ' имён');
+            }
+        }
+        catch (e) { }
+        dnsBookLoading = null;
+        return dnsBook;
+    }) ();
+    return dnsBookLoading;
+}
+
+async function dnsBookSave (now)
+{
+    if (!now)
+    {
+        if (dnsSaveTimer) return;
+        dnsSaveTimer = setTimeout (() => { dnsSaveTimer = null; dnsBookSave (true); }, 2000);
+        try { dnsSaveTimer.unref (); } catch (e) { }
+        return;
+    }
+    if (dnsSaveBusy || !dnsBook) return;
+    dnsSaveBusy = true;
+    try
+    {
+        const srv = dbServerList ()[0];
+        if (srv) { await db (srv, 'dnsbook', 'map', dnsBook); await db (srv, 'dnsbook', 'stats', dnsStats || {}); }
+    }
+    catch (e) { }
+    dnsSaveBusy = false;
+}
+
+function dnsRecMake (name)
+{
+    return { name: name, ips: [], ttl: DNS_TTL_DEF, at: 0, src: '', hits: 0, fails: 0, lastUsed: 0 };
+}
+async function dnsRec (name)
+{
+    const book = await dnsBookLoad ();
+    if (!book[name]) book[name] = dnsRecMake (name);
+    return book[name];
+}
+function dnsIpSlot (rec, ip)
+{
+    let r = rec.ips.find (x => x.ip === ip);
+    if (!r) { r = { ip: ip, at: 0, ms: 0, src: '', ok: 0, fail: 0, lastUsed: 0 }; rec.ips.push (r); }
+    return r;
+}
+function dnsTrim ()
+{
+    const keys = Object.keys (dnsBook);
+    if (keys.length <= DNS_BOOK_MAX) return;
+    keys.sort ((a, b) => (dnsBook[a].lastUsed || dnsBook[a].at || 0) - (dnsBook[b].lastUsed || dnsBook[b].at || 0));
+    for (let i = 0; i < keys.length - DNS_BOOK_MAX; i++) delete dnsBook[keys[i]];
+}
+async function dnsNote (name, ips, ms, src, ttlSec)
+{
+    const book = await dnsBookLoad ();
+    const rec = book[name] || (book[name] = dnsRecMake (name));
+    const now = Date.now ();
+    const list = Array.isArray (ips) ? ips : [ips];
+    for (const ip of list)
+    {
+        if (!ip || dohBadIp (ip)) continue;
+        const r = dnsIpSlot (rec, ip);
+        r.at = now;
+        r.src = src;
+        r.ms = r.ms ? Math.round (r.ms * 0.6 + ms * 0.4) : ms;
+    }
+    rec.at = now;
+    rec.src = src;
+    if (rec.ips.length > DNS_IPS_MAX)
+    {
+        rec.ips.sort ((a, b) => (b.at || 0) - (a.at || 0));
+        rec.ips.length = DNS_IPS_MAX;
+    }
+    rec.ttl = Math.max (DNS_TTL_MIN, Math.min (DNS_TTL_MAX, ttlSec ? ttlSec * 1000 : (rec.ttl || DNS_TTL_DEF)));
+    dnsTrim ();
+    dnsBookSave ();
+    return rec;
+}
+function dnsBestIp (rec)
+{
+    if (!rec || !rec.ips || !rec.ips.length) return null;
+    const now = Date.now ();
+    const awake = rec.ips.filter (x => !(x.fail > 0 && (now - x.fail) < DNS_FAIL_ASLEEP));
+    const pool = awake.length ? awake : rec.ips.slice ();
+    pool.sort ((a, b) =>
+    {
+        const da = (a.fail > 0 && (now - a.fail) < 600000) ? 1 : 0;      // кто не сбоил -- вперёд
+        const db = (b.fail > 0 && (now - b.fail) < 600000) ? 1 : 0;
+        if (da !== db) return da - db;
+        if ((b.at || 0) !== (a.at || 0)) return (b.at || 0) - (a.at || 0);   // потом самые свежие
+        return (a.ms || 0) - (b.ms || 0);                                  // потом самые быстрые
+    });
+    return pool[0].ip;
+}
+async function ipRemember (name, ip)
+{
+    const rec = await dnsRec (name);
+    const was = rec.ips.length ? rec.ips[0].ip : '';
+    await dnsNote (name, [ip], 0, rec.src || 'свой ответ', 0);
+    if (was !== ip)
+        console.log ('[' + (d()) + '] [music] записал адрес: ' + name + ' -> ' + ip + (was ? ' (было ' + was + ')' : ''));
+}
+function dnsSrcStat (src)
+{
+    if (!dnsStats) dnsStats = {};
+    if (!dnsStats[src]) dnsStats[src] = { ok: 0, fail: 0, ms: 0, at: 0 };
+    return dnsStats[src];
+}
+function dnsNoteSrc (src, ok, ms)
+{
+    const s = dnsSrcStat (src);
+    if (ok) { s.ok++; s.ms = s.ms ? Math.round (s.ms * 0.7 + ms * 0.3) : ms; s.at = Date.now (); }
+    else s.fail++;
+    dnsBookSave ();
+}
+function dnsSourcesOrdered ()
+{
+    const list = [];
+    for (const r of DOH_RESOLVERS) list.push ({ kind: 'doh', src: 'DoH ' + r.name, name: r.name, ip: r.ip, host: r.host, path: r.path });
+    for (const s of plainDnsServers ()) list.push ({ kind: 'plain', src: 'DNS ' + s, ip: s });
+    list.push ({ kind: 'system', src: 'системный резолвер', ip: '' });
+    const score = q =>
+    {
+        const s = dnsStats && dnsStats[q.src];
+        if (!s || !s.ok) return Number.MAX_SAFE_INTEGER - 1;      // нет данных -- в конец, но перед системным
+        return Math.round (s.ms * (1 + s.fail / Math.max (1, s.ok)));
+    };
+    list.sort ((a, b) => score (a) - score (b));
+    return list;
+}
+async function dnsBookInfo ()
+{
+    const book = await dnsBookLoad ();
+    const names = Object.keys (book);
+    let ips = 0, fresh = 0;
+    const now = Date.now ();
+    for (const n of names)
+    {
+        const rec = book[n];
+        ips += (rec.ips || []).length;
+        if (rec.ips && rec.ips.length && (now - (rec.at || 0)) < (rec.ttl || DNS_TTL_DEF)) fresh++;
+    }
+    return { names: names.length, ips: ips, fresh: fresh, stats: dnsStats || {} };
+}
+const POOL_NETS = [
+    { svc: 'youtube', pre: ['142.250.', '142.251.', '142.252.', '142.253.', '172.217.', '216.58.', '173.194.',
+                             '209.85.', '74.125.', '64.233.', '108.177.', '216.239.'] },
+    { svc: 'discord', pre: ['162.159.', '104.16.', '104.17.', '104.18.', '104.24.', '103.86.', '188.114.', '5.254.'] },
+];
+const POOL_MAX = 64;
+const poolBad = new Map ();
+function poolNetFor (ip)
+{
+    for (const n of POOL_NETS) for (const p of n.pre) if (String (ip).startsWith (p)) return n.svc;
+    return null;
+}
+function poolSvcForHost (host)
+{
+    const h = String (host || '').toLowerCase ();
+    if (/youtube|googlevideo|ytimg|ggpht|youtu\.be|googleusercontent/.test (h)) return 'youtube';
+    if (/discord/.test (h)) return 'discord';
+    return null;
+}
+function poolKeyOf (svc) { return 'pool:' + svc; }
+async function poolAdd (svc, ips)
+{
+    if (!svc || !ips || !ips.length) return;
+    await ipMemLoad ();
+    const key = poolKeyOf (svc);
+    const cur = (ipMem[key] && ipMem[key].ips) ? ipMem[key].ips : {};
+    let added = 0;
+    for (const ip of ips)
+    {
+        if (!/^\d{1,3}(\.\d{1,3}){3}$/.test (String (ip)) || dohBadIp (ip)) continue;
+        if (cur[ip] === undefined) { cur[ip] = Date.now (); added++; }
+    }
+    const keys = Object.keys (cur);
+    if (keys.length > POOL_MAX)
+    {
+        keys.sort ((a, b) => cur[a] - cur[b]);
+        for (let i = 0; i < keys.length - POOL_MAX; i++) delete cur[keys[i]];
+    }
+    ipMem[key] = { ips: cur, at: Date.now () };
+    if (added)
+    {
+        console.log ('[' + (d()) + '] [music] копилка адресов ' + svc + ': +' + added +
+            ' (всего ' + Object.keys (cur).length + ')');
+        await ipMemSave ();
+    }
+}
+function poolHarvest ()
+{
+    return new Promise (res =>
+    {
+        try
+        {
+            require ('child_process').execFile ('netstat', ['-ano', '-p', 'TCP'], { windowsHide: true, timeout: 8000 },
+                async (e, out) =>
+                {
+                    if (e || !out) return res ();
+                    const bySvc = {};
+                    for (const line of String (out).split ('\n'))
+                    {
+                        const m = line.trim ().match (/^TCP\s+\S+\s+(\S+):(\d+)\s+ESTABLISHED/);
+                        if (!m) continue;
+                        const ip = m[1];
+                        if (!/^\d{1,3}(\.\d{1,3}){3}$/.test (ip)) continue;
+                        const svc = poolNetFor (ip);
+                        if (svc) (bySvc[svc] = bySvc[svc] || []).push (ip);
+                    }
+                    for (const svc of Object.keys (bySvc)) await poolAdd (svc, bySvc[svc]);
+                    res ();
+                });
+        }
+        catch (e) { res (); }
+    });
+}
+async function poolPick (host)
+{
+    const svc = poolSvcForHost (host);
+    if (!svc) return null;
+    await ipMemLoad ();
+    const bag = ipMem[poolKeyOf (svc)];
+    const cur = (bag && bag.ips) ? bag.ips : {};
+    const now = Date.now ();
+    const list = Object.keys (cur).filter (ip =>
+    {
+        const bad = poolBad.get (ip);
+        return !(bad && (now - bad) < 60000);
+    });
+    if (!list.length) return null;
+    list.sort ((a, b) => (cur[a] || 0) - (cur[b] || 0));   // кого давно не брали -- того и беру (ходит по кругу)
+    return { ip: list[0], svc: svc };
+}
+async function poolTouch (ip, fail)
+{
+    const svc = poolNetFor (ip);
+    if (!svc) return;
+    await ipMemLoad ();
+    const bag = ipMem[poolKeyOf (svc)];
+    if (!bag || !bag.ips || bag.ips[ip] === undefined) return;
+    if (fail) poolBad.set (ip, Date.now ());
+    else bag.ips[ip] = Date.now ();
+    await ipMemSave ();
+}
+
+async function ipRecalled (name, ttl)
+{
+    const book = await dnsBookLoad ();
+    const rec = book[name];
+    if (!rec) return null;
+    if (ttl !== Number.MAX_SAFE_INTEGER && (Date.now () - (rec.at || 0)) >= ttl) return null;
+    return dnsBestIp (rec);
+}
+async function ipFailNote (name, ip)
+{
+    const book = await dnsBookLoad ();
+    const rec = book[name];
+    if (!rec) return;
+    rec.fails = (rec.fails || 0) + 1;
+    rec.fail = Date.now ();
+    if (ip) { const r = dnsIpSlot (rec, ip); r.fail = Date.now (); }
+    else for (const r of rec.ips) r.fail = Date.now ();
+    dnsBookSave ();
+    dohCache.delete (name);
+}
+async function ipOkNote (name, ip)
+{
+    const book = await dnsBookLoad ();
+    const rec = book[name];
+    if (!rec) return;
+    rec.hits = (rec.hits || 0) + 1;
+    rec.fail = 0;
+    rec.lastUsed = Date.now ();
+    if (ip)
+    {
+        const r = dnsIpSlot (rec, ip);
+        r.fail = 0;
+        r.ok = (r.ok || 0) + 1;
+        r.lastUsed = Date.now ();
+    }
+    else for (const r of rec.ips) r.fail = 0;
+    dnsBookSave ();
+}
+
+async function ipResolve (name)
+{
+    const book = await dnsBookLoad ();
+    const rec = book[name] || null;
+    const now = Date.now ();
+    const healthy = !!(rec && rec.ips && rec.ips.length
+        && (now - (rec.at || 0)) < (rec.ttl || DNS_TTL_DEF)
+        && !(rec.fail && (now - rec.fail) < DNS_FAIL_ASLEEP));
+    const c = dohCache.get (name);
+    if (c && (now - c.at) < DOH_TTL && healthy) return c.ip;
+    if (healthy)
+    {
+        const ip = dnsBestIp (rec);
+        if (ip)
+        {
+            ipViaLog ('играю по своей записи (' + (rec.src || 'своя книга') + (rec.hits ? ', пригодилась ' + rec.hits + ' раз' : '') + ')',
+                name + ' -> ' + ip + ', запись ' + Math.round ((now - (rec.at || 0)) / 1000) + ' с назад, ttl ' + Math.round ((rec.ttl || DNS_TTL_DEF) / 1000) + ' с');
+            dohCache.set (name, { ip: ip, at: now });
+            return ip;
+        }
+    }
+    for (const q of dnsSourcesOrdered ())
+    {
+        const t0 = Date.now ();
+        let got = null;
+        if (q.kind === 'doh') got = await dohAsk (q, name);
+        else if (q.kind === 'plain') got = await plainDnsAsk (q.ip, name);
+        else
+            try
+            {
+                const r = await require ('dns').promises.lookup (name);
+                if (r && r.address && !dohBadIp (r.address)) got = { ip: r.address, ips: [r.address], ttl: 0 };
+            }
+            catch (e) { }
+        const ms = Date.now () - t0;
+        if (got && got.ip)
+        {
+            dnsNoteSrc (q.src, true, ms);
+            if (q.kind === 'doh') dohGoodIdx = Math.max (0, DOH_RESOLVERS.findIndex (r => r.name === q.name));
+            dohLastOkAt = Date.now ();
+            const nrec = await dnsNote (name, got.ips || [got.ip], ms, q.src, got.ttl);
+            dohCache.set (name, { ip: got.ip, at: Date.now () });
+            ipViaLog (q.src, name + ' -> ' + got.ip + ' за ' + ms + ' мс' +
+                (got.ips && got.ips.length > 1 ? ' (всего адресов: ' + got.ips.length + ')' : ''));
+            const svc = poolSvcForHost (name);
+            if (svc) poolAdd (svc, [got.ip]);   // и в копилку сервиса -- на случай, когда имя взять будет неоткуда
+            if (nrec && !nrec.hits) nrec.hits = 0;
+            return got.ip;
+        }
+        dnsNoteSrc (q.src, false, 0);
+    }
+    const old = rec ? dnsBestIp (rec) : null;
+    if (old)
+    {
+        ipViaLog ('справочная молчит -- беру свою запись', name + ' -> ' + old);
+        dohCache.set (name, { ip: old, at: Date.now () });
+        return old;
+    }
+    return null;
+}
+
+function dohProxyStart ()
+{
+    return new Promise (res =>
+    {
+        if (dohProxyPort) return res (dohProxyPort);
+        const http = require ('http'), net = require ('net');
+        const srv = http.createServer ((req, r) => { r.writeHead (400); r.end (); });
+        srv.on ('connect', async (req, cSock, head) =>
+        {
+            const parts = String (req.url || '').split (':');
+            const host = parts[0], port = Number (parts[1] || 443);
+            let ip = await ipResolve (host);
+            let fromPool = '';
+            if (!ip)
+            {
+                const p = await poolPick (host);
+                if (p) { ip = p.ip; fromPool = p.svc; ipViaLog ('беру адрес из копилки ' + p.svc, host + ' -> ' + p.ip); }
+            }
+            if (!ip)
+            {
+                dohOops++;
+                try { cSock.end ('HTTP/1.1 502 Bad Gateway\r\n\r\n'); } catch (e) { }
+                return;
+            }
+            const up = net.connect (port, ip, () =>
+            {
+                dohCalls++;
+                ipOkNote (host, ip);   // по этому адресу ответило -- сверка не нужна
+                if (fromPool) poolTouch (ip, false);
+                try { cSock.write ('HTTP/1.1 200 Connection Established\r\n\r\n'); } catch (e) { }
+                if (head && head.length) up.write (head);
+                up.pipe (cSock); cSock.pipe (up);
+            });
+            up.on ('error', () => { dohOops++; ipFailNote (host, ip); if (fromPool) poolTouch (ip, true);
+                try { cSock.end ('HTTP/1.1 502 Bad Gateway\r\n\r\n'); } catch (e) { } });
+            cSock.on ('error', () => { try { up.destroy (); } catch (e) { } });
+        });
+        srv.on ('error', () => res (0));
+        srv.once ('listening', () =>
+        {
+            try { srv.unref (); } catch (e) { }
+            dohProxyPort = srv.address ().port;
+            res (dohProxyPort);
+        });
+        try { srv.listen (0, '127.0.0.1'); } catch (e) { res (0); }
+    });
+}
+
+function netFingerprint ()
+{
+    try
+    {
+        const nets = require ('os').networkInterfaces ();
+        for (const k of Object.keys (nets))
+            for (const a of (nets[k] || []))
+                if (a && a.family === 'IPv4' && !a.internal) return k + '/' + String (a.mac || '') + '/' + String (a.address || '');
+    }
+    catch (e) { }
+    return '';
+}
+let netMemCache = { at: 0, val: null };
+async function netMem ()
+{
+    if (netMemCache.val !== null && (Date.now () - netMemCache.at) < 30000) return netMemCache.val;
+    let val = null;
+    try
+    {
+        const srv = dbServerList ()[0];
+        if (srv) val = await db (srv, 'netState', 'route_memory');
+    }
+    catch (e) { }
+    netMemCache = { at: Date.now (), val: val };
+    return val;
+}
+async function netMemNote (kind, proxy)
+{
+    try
+    {
+        const srv = dbServerList ()[0];
+        if (!srv || !kind) return;
+        const val = { fingerprint: netFingerprint (), kind: String (kind), proxy: String (proxy || ''), at: Date.now () };
+        await db (srv, 'netState', 'route_memory', val);
+        netMemCache = { at: Date.now (), val: val };
+    }
+    catch (e) { }
+}
+async function routeMemoryOrder (list)
+{
+    const m = await netMem ();
+    if (!m || !m.kind || !m.fingerprint || m.fingerprint !== netFingerprint ()) return list;
+    const i = list.findIndex (r => r && r.kind === m.kind);
+    if (i <= 0) return list;
+    return [list[i], ...list.slice (0, i), ...list.slice (i + 1)];
+}
+
 let routeSig = '';
 function routeSigLog (sig, text)
 {
@@ -6162,14 +6888,28 @@ async function ytRoutes ()
 {
     if (!MUSIC_PROXIES.length)
     {
-        const dp = await directProbe ();
-        if (!dp.ok)
-            routeSigLog ('direct-bad', 'рабочих маршрутов нет: прокси не задан, а прямой путь не отвечает (' +
-                (dp.why || 'нет ответа') + ') -- держу очередь и место в треке, пробую каждые ' +
-                Math.round (NET_PING_STEP_MS / 1000) + ' с');
+        const dnsOk = await directUsable ();
+        const dp = dnsOk ? await directProbe () : { ok: false, why: 'youtube.com локально не резолвится' };
+        const dohPort = MUSIC_DOH ? await dohProxyStart () : 0;
+        const dohRoute = dohPort ? { proxy: 'http://127.0.0.1:' + dohPort, kind: 'doh' } : null;
+        const dohSig = dohPort ? '|doh:1' : '|doh:0';
+        const out = [];
+        if (dp.ok) out.push ({ proxy: '', kind: 'direct' });
+        if (dohRoute) out.push (dohRoute);
+        if (!dp.ok) out.push ({ proxy: '', kind: 'direct' });
+        if (!dp.ok && dnsOk)
+            routeSigLog ('direct-bad' + dohSig, 'прокси не задан, а прямой путь не отвечает (' + (dp.why || 'нет ответа') + ') -- ' +
+                (dohRoute ? 'пробую свой DoH-маршрут' : 'похоже на блокировку провайдера: включи обход DPI (запрет/winws) или подними VPN-прокси') +
+                '; очередь и место в треке держу, пробую каждые ' + Math.round (NET_PING_STEP_MS / 1000) + ' с');
+        else if (!dp.ok)
+            routeSigLog ('dns-bad' + dohSig, 'твой DNS не резолвит youtube.com -- ' + (dohRoute
+                ? 'иду своим DoH-маршрутом: имена разрешает сам бот через DNS-over-HTTPS, системный DNS тут не нужен'
+                : 'включи прокси (MUSIC.proxy) или смени DNS: 1.1.1.1 и 8.8.8.8 часто не резолвят youtube.com, а 9.9.9.9 и 94.140.14.14 -- резолвят'));
+        else if (dohRoute)
+            routeSigLog ('direct-ok' + dohSig, 'играю напрямую (прокси не задан), DoH-маршрут лежит запасным');
         else
-            routeSigLog ('direct-ok', 'прямой путь снова отвечает -- играю напрямую');
-        return [{ proxy: '' }];
+            routeSigLog ('direct-ok' + dohSig, 'прямой путь снова отвечает -- играю напрямую');
+        return await routeMemoryOrder (out);
     }
     const dnsOk = await directUsable ();
     if (!dnsOk && (Date.now () - directWarnedAt) > 600000)
@@ -6178,14 +6918,20 @@ async function ytRoutes ()
         console.log ('[' + (d()) + '] [music] youtube.com не резолвится локально -- иду через прокси (DIRECT на этой машине невозможен)');
     }
     const { alive } = await liveProxyList ();
-    const liveRoutes = alive.map (p => ({ proxy: p }));
+    const liveRoutes = alive.map (p => ({ proxy: p, kind: 'proxy' }));
+    const directRoute = { proxy: '', kind: 'direct' };
+    const dohPort = MUSIC_DOH ? await dohProxyStart () : 0;
+    const dohRoute = dohPort ? { proxy: 'http://127.0.0.1:' + dohPort, kind: 'doh' } : null;
+    const dohSig = dohPort ? '|doh:1' : '|doh:0';
     const dp = dnsOk ? await directProbe () : { ok: false, why: 'youtube.com локально не резолвится' };
     if (!alive.length && !dp.ok)
-        routeSigLog ('p:|d:0', 'рабочих маршрутов нет: прокси молчат (' + MUSIC_PROXIES.join (', ') +
-            '), прямой путь не отвечает (' + (dp.why || 'нет ответа') + ') -- очередь и место в треке держу, пробую каждые ' +
+        routeSigLog ('p:|d:0' + dohSig, 'рабочих маршрутов нет: прокси молчат (' + MUSIC_PROXIES.join (', ') +
+            '), прямой путь не отвечает (' + (dp.why || 'нет ответа') + ') -- похоже на блокировку провайдера: включи свой обход DPI (запрет/winws) или подними VPN-прокси. ' +
+            (dohRoute ? 'Свой DoH-маршрут у меня есть -- пробую и его. ' : 'Свой DoH-маршрут выключен (MUSIC.doh). ') +
+            'очередь и место в треке держу, пробую каждые ' +
             Math.round (NET_PING_STEP_MS / 1000) + ' с');
     else if (!alive.length)
-        routeSigLog ('p:|d:1', 'иду напрямую, прокси молчат (' + MUSIC_PROXIES.join (', ') +
+        routeSigLog ('p:|d:1' + dohSig, 'иду напрямую, прокси молчат (' + MUSIC_PROXIES.join (', ') +
             ') -- прямой путь отвечает; если и он даст сбой, музыка подождёт сеть, очередь не пострадает');
     else if (!dp.ok)
         routeSigLog ('p:' + alive.join ('|') + '|d:0', 'иду через прокси ' + alive.join (', ') +
@@ -6193,8 +6939,21 @@ async function ytRoutes ()
     else
         routeSigLog ('p:' + alive.join ('|') + '|d:1', 'отвечают оба пути: прокси ' + alive.join (', ') +
             ' и DIRECT -- основной прокси, прямой остаётся запасным');
-    if (!dnsOk) return liveRoutes.length ? liveRoutes : [{ proxy: '' }];
-    return [...liveRoutes, { proxy: '' }];
+    if (!dnsOk)
+    {
+        routeSigLog ('dns-bad' + dohSig, 'твой DNS не резолвит youtube.com -- ' + (dohRoute
+            ? 'иду своим DoH-маршрутом: имена разрешает сам бот через DNS-over-HTTPS, системный DNS тут не нужен'
+            : 'включи прокси (MUSIC.proxy) или смени DNS: 1.1.1.1 и 8.8.8.8 часто не резолвят youtube.com, а 9.9.9.9 и 94.140.14.14 -- резолвят'));
+        const bad = [...liveRoutes];
+        if (dohRoute) bad.push (dohRoute);
+        if (!bad.length) bad.push (directRoute);
+        return await routeMemoryOrder (bad);
+    }
+    const out = [...liveRoutes];
+    if (dp.ok) out.push (directRoute);
+    if (dohRoute) out.push (dohRoute);
+    if (!dp.ok) out.push (directRoute);
+    return await routeMemoryOrder (out);
 }
 
 function sectionProxyFor (viaProxy)
@@ -6344,10 +7103,21 @@ function isRouteError (e)
 }
 
 let ytDlpQuiet = 0;
+function ytRouteLabel (route, addr)
+{
+    const kind = route && route.kind ? String (route.kind) : (addr ? 'proxy' : 'direct');
+    if (kind === 'doh') return 'сам: имена спросил по адресу в шифрованном виде (системный справочник имён не участвовал)';
+    if (kind === 'proxy') return 'через прокси ' + addr + ' (это твой VPN)';
+    return 'напрямую, без прокси';
+}
+
 async function ytDlpRun (query, optsBase)
 {
+    const startedAt = Date.now ();
     let routes = await ytRoutes ();
     let lastErr;
+    let failedRoutes = 0;
+    let triedList = [];
     for (let route of routes)
     {
         const addr = route && route.proxy ? String (route.proxy) : '';
@@ -6362,23 +7132,34 @@ async function ytDlpRun (query, optsBase)
             }
             try
             {
-                let opts = Object.assign ({}, ytdlpCookieOpts (), optsBase, addr
+                let opts = Object.assign ({ retries: 1, extractorRetries: 1 }, ytdlpCookieOpts (), optsBase, addr
                     ? { proxy: addr, socketTimeout: 10 }
                     : {});
                 let r = await ytdlp (query, opts);
                 if (addr) proxyMarkGood (addr);
+                if (route && route.kind) netMemNote (route.kind, addr);   // запомнил, что сработало в этой сети
+                if (!ytDlpQuiet)
+                    console.log ('[' + (d()) + '] [music] взял трек ' + ytRouteLabel (route, addr) +
+                        ' за ' + ((Date.now () - startedAt) / 1000).toFixed (1) + ' с' +
+                        (failedRoutes ? ', до этого не сработало маршрутов: ' + failedRoutes : ''));
                 return r;
             }
             catch (e)
             {
                 lastErr = e;
+                failedRoutes++;
+                triedList.push (addr ? 'через прокси ' + addr : 'напрямую');
                 if (!ytDlpQuiet)
-                    console.error ('[music] ' + (addr ? 'прокси ' + addr : 'DIRECT') + ' не сработал: ' + ytDlpErr (e, 150));
+                    console.error ('[music] ' + (addr ? 'через прокси ' + addr : 'напрямую') + ' не вышло: ' + ytDlpErr (e, 150));
                 if (!isRouteError (e)) throw e;
                 if (addr) proxyMarkBad (addr);
             }
         }
     }
+    if (!ytDlpQuiet)
+        console.error ('[' + (d()) + '] [music] трек взять не удалось: попробовал путей ' + routes.length +
+            (triedList.length ? ' (' + [...new Set (triedList)].join ('; ') + ')' : '') +
+            ' -- очередь и место в треке держу, беру заново, когда сеть оживёт');
     throw lastErr;
 }
 
@@ -8929,6 +9710,123 @@ if (/^clearstatus$/i.test (String (process.argv[2] || '')))
     voiceStatusPush (_ch, null)
         .then (() => { console.log ('[clearstatus] статус (шапка) канала ' + _ch + ' снят'); $cliDone (0); })
         .catch (e => { console.error ('[clearstatus] не получилось: ' + oneLine (e && e.message || e)); $cliDone (1); });
+}
+
+async function loginWithIntentFallback ()
+{
+    if (USE_MESSAGE_CONTENT && client.options.intents.has (GatewayIntentBits.MessageContent) && !(await messageContentAllowed ()))
+        dropIntent (GatewayIntentBits.MessageContent);
+    if (USE_GUILD_MEMBERS && client.options.intents.has (GatewayIntentBits.GuildMembers) && !(await guildMembersAllowed ()))
+        dropIntent (GatewayIntentBits.GuildMembers);
+    const PRIV = [GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMembers];
+    for (let attempt = 0; attempt <= PRIV.length; attempt++)
+    {
+        try { await client.login (TOKEN); return ''; }
+        catch (e)
+        {
+            const msg = String ((e && e.message) || e);
+            const drop = /disallowed intent/i.test (msg) ? PRIV.find (i => client.options.intents.has (i)) : null;
+            if (!drop) return msg;
+            dropIntent (drop);
+            console.error ('[' + (d()) + '] [voice] Discord не даёт разрешение «' + (INTENT_NAMES.get (drop) || 'привилегированное') +
+                '» -- вхожу без него (на голосовой канал это не влияет)');
+        }
+    }
+    return 'не смог войти в Discord даже без привилегированных разрешений';
+}
+
+const VOICE_CHECK_LOGIN_S = 30;
+const VOICE_CHECK_MS = 25000;
+if (/^voice$/i.test (String (process.argv[2] || '')))
+{
+    const _want = String (process.argv[3] || '').trim ();
+    const _fin = (_code, _msg) =>
+    {
+        if (_msg) console.log ('[voice] ' + _msg);
+        try { botLockRelease (); } catch (e) { }
+        $cliDone (_code);
+    };
+    const _busy = botAlreadyRunning ();
+    if (_busy && /уже запущен/.test (_busy)) _fin (1, _busy);
+    else (async () =>
+    {
+        let _chId = _want;
+        if (!_chId)
+        {
+            for (const _when of ['заходил', 'любой'])
+            {
+                for (const _g of Object.keys (SERVERS))
+                {
+                    const _v = await readVoiceState (_g);
+                    if (!_v || !_v.channelId) continue;
+                    if (_when === 'заходил' && _v.leftByUser) continue;
+                    _chId = String (_v.channelId);
+                    break;
+                }
+                if (_chId) break;
+            }
+        }
+        if (!/^\d{17,20}$/.test (_chId))
+        {
+            return _fin (1, 'укажи голосовой канал:  node . voice <id канала>\n' +
+                '[voice] id виден при включённом режиме разработчика (ПКМ по каналу -> «Копировать ID»),\n' +
+                '[voice] либо он уже записан в базе (музыка туда заходила) -- тогда просто:  node . voice');
+        }
+        const _t0 = Date.now ();
+        let _why = '';
+        const _ready = new Promise (res =>
+        {
+            const _gr = () => { clearTimeout (_tm); clearInterval (_iv); res (''); };
+            const _tm = setTimeout (() => { clearInterval (_iv); res ('не дождался входа в Discord за ' + VOICE_CHECK_LOGIN_S + ' с'); },
+                VOICE_CHECK_LOGIN_S * 1000);
+            const _iv = setInterval (() => { if (client.isReady && client.isReady ()) _gr (); }, 300);
+            client.once ('clientReady', _gr);
+            client.once ('ready', _gr);
+        });
+        _why = await loginWithIntentFallback ();
+        const _r = await _ready;
+        if (_why || _r)
+            return _fin (1, 'не смог войти в Discord: ' + (_why || _r) + ' -- команды до бота не дойдут');
+        console.log ('[voice] вошёл как ' + ((client.user && client.user.tag) ? client.user.tag : 'бот'));
+        let _ch = null;
+        try { _ch = await client.channels.fetch (_chId); }
+        catch (e) { return _fin (1, 'канал ' + _chId + ' не нашёл: ' + oneLine ((e && e.message) || e)); }
+        const _guild = (_ch && _ch.guild) ? _ch.guild : null;
+        if (!_guild) return _fin (1, 'канал ' + _chId + ' не на сервере -- подключиться туда не могу');
+        const _isVoice = (typeof _ch.isVoiceBased === 'function') ? _ch.isVoiceBased () : (_ch.type === 2 || _ch.type === 13);
+        if (!_isVoice) return _fin (1, 'канал «' + _ch.name + '» не голосовой -- проверять нечего');
+        console.log ('[voice] пробую войти в «' + _ch.name + '» (сервер «' + (_guild.name || _guild.id) + '»)...');
+        let _conn = null;
+        try
+        {
+            _conn = joinVoiceChannel
+            (
+                {
+                    channelId: _ch.id,
+                    guildId: _guild.id,
+                    adapterCreator: _guild.voiceAdapterCreator,
+                    selfDeaf: false,
+                }
+            );
+        }
+        catch (e) { return _fin (1, 'не смог начать подключение: ' + oneLine ((e && e.message) || e)); }
+        const _onErr = e => { if (!_why) _why = oneLine ((e && e.message) || e); };
+        _conn.on ('error', _onErr);
+        _conn.on ('stateChange', (o, n) =>
+        {
+            if (!_why && n && n.status === VoiceConnectionStatus.Disconnected) _why = 'связь оборвалась сразу после подключения';
+        });
+        let _ok = false;
+        try { await entersState (_conn, VoiceConnectionStatus.Ready, VOICE_CHECK_MS); _ok = true; }
+        catch (e) { if (!_why) _why = oneLine ((e && e.message) || e); }
+        const _sec = ((Date.now () - _t0) / 1000).toFixed (1);
+        try { _conn.destroy (); } catch (e) { }
+        if (_ok)
+            return _fin (0, 'голос работает: канал «' + _ch.name + '» поднялся за ' + _sec +
+                ' с (медиа-адрес ответил) -- музыка заиграет');
+        return _fin (1, 'голос НЕ работает: канал «' + _ch.name + '» не поднялся за ' + (VOICE_CHECK_MS / 1000) +
+            ' с' + (_why ? ' (' + _why + ')' : '') + ' -- пока это не наладится, музыка играть не сможет');
+    }) ();
 }
 
 const voiceStatusTick = setInterval
