@@ -19,6 +19,7 @@
 // v2.123 -- голос: после обрыва бот сам возвращается к слушателям и продолжает с того же места; лог сети молчит без перемен
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
+// v2.130 -- обход под присмотром и видно, кто за ним следит: сторож (он же хранитель -- пункт 6 в tools/obhod.cmd) сам переподбирает стратегию, автозапуск (пункт 7) только поднимает сторожа при входе, и это решает человек; при старте, если ни один путь к YouTube не работает, владельцу уходит короткое «что сделать сейчас» с готовой командой; дальше бот следит за службой zapret, движком и сторожем -- встал обход или сторожа нет, напишет и скажет, что поставить, а когда поднимется -- сообщит отдельно; состояние сторожа видно в /health и `node . obhod`
 // v2.129 -- обход замечает собственную смерть: если движок работает, а ютуб или дискорд (шлюз, api, голос) не отвечают -- бот говорит владельцу, что стратегия устарела и нужен подбор, а когда отпустит -- сообщает; `node . obhod --start` и кнопка «Поднять обход» возвращают сохранённую стратегию после перезагрузки за пару секунд (один запрос прав, в автозапуск ничего не пишется)
 // v2.128 -- обход можно вести из консоли: `node . obhod` показывает, что с движком, службой и драйвером (и ничего не меняет), `--engine` приносит движок без прав, `--pick` подбирает и оставляет стратегию, `--stop` возвращает как было; подбор идёт с одним запросом прав Windows, в автозапуск бот ничего не ставит, а кнопка у владельца в /health делает то же
 // v2.127 -- связь видно и лечится сама: /health говорит, сколько было обрывов голоса и сети, вернулся ли бот сам и каким путём идёт звук; когда ни один путь не работает, бот сам приносит движок обхода и запускает хранителя из планировщика, а если прав не хватило -- честно пишет владельцу, чего именно (ключ MUSIC.dpi_heal)
@@ -6342,6 +6343,47 @@ async function directWhy ()
     return d.ok ? '' : 'прямой запрос не проходит (' + (d.why || 'нет ответа') + ')';
 }
 
+const DOH_PROBE_TIMEOUT = 6000;          // свой маршрут поднимается и разрешает имя не сразу, поэтому жду дольше прямого
+const DOH_PROBE_FAIL_TTL = 10000;        // «не ответил» помню недолго: со второй попытки он обычно уже работает
+let dohProbeCache = { ok: false, why: '', at: 0 };
+function probeDohOnce (port)             // отвечает ли YouTube через наш маршрут по адресам (свой http-прокси на 127.0.0.1)
+{
+    return new Promise (resolve =>
+    {
+        let done = false;
+        const fin = (ok, why) => { if (done) return; done = true; resolve ({ ok: !!ok, why: String (why || '') }); };
+        let req = null;
+        try
+        {
+            const A = proxyAgentFor ('http://127.0.0.1:' + port);
+            if (!A) return fin (false, 'агент для своего маршрута не собрался');
+            req = require ('https').request ({ host: 'www.youtube.com', path: '/robots.txt',
+                method: 'GET', timeout: DOH_PROBE_TIMEOUT, agent: A }, res =>
+            {
+                res.resume ();
+                fin (res.statusCode >= 200 && res.statusCode < 400, 'HTTP ' + res.statusCode);
+            });
+            req.on ('timeout', () => { try { req.destroy (); } catch { }
+                fin (false, 'нет ответа за ' + Math.round (DOH_PROBE_TIMEOUT / 1000) + ' с'); });
+            req.on ('error', e => fin (false, (e && (e.code || e.message)) || 'ошибка соединения'));
+            req.end ();
+        }
+        catch (e) { fin (false, (e && e.message) || 'ошибка'); }
+    });
+}
+async function dohRouteProbe ()          // свой маршрут: удачу помню минуту, «не ответил» -- секунды, чтобы не пугать зря
+{
+    if (!MUSIC_DOH) return { ok: false, why: 'свой маршрут выключен (MUSIC.doh)' };
+    const port = await dohProxyStart ();
+    if (!port) return { ok: false, why: 'свой маршрут не поднялся' };
+    const now = Date.now ();
+    if (dohProbeCache.at && (now - dohProbeCache.at) < (dohProbeCache.ok ? DIRECT_PROBE_TTL : DOH_PROBE_FAIL_TTL))
+        return dohProbeCache;
+    const r = await probeDohOnce (port);
+    dohProbeCache = { ok: r.ok, why: r.why, at: now };
+    return dohProbeCache;
+}
+
 function dpiBypassProbe ()          // запущен ли обход DPI (winws.exe -- движок zapret/обхода)
 {
     return new Promise (res =>
@@ -6425,6 +6467,7 @@ async function routeStatus ()       // проверка путей: её чит�
     for (const p of MUSIC_PROXIES) if (await pingProxy (p, 1500)) alive.push (p);
     const dead = MUSIC_PROXIES.filter (p => alive.indexOf (p) < 0);
     const dohPort = MUSIC_DOH ? await dohProxyStart () : 0;      // свой маршрут по адресам: поднимаю сразу
+    const dohOk = dohPort ? (await dohRouteProbe ()).ok : false; // и сразу вижу, отвечает ли через него YouTube
     let bookN = 0;
     try { const b = await dnsBookLoad (); bookN = Object.keys (b || {}).length; } catch (e) { }
     const parts = [
@@ -6438,15 +6481,16 @@ async function routeStatus ()       // проверка путей: её чит�
                 : 'задан, но НЕ отвечает: ' + MUSIC_PROXIES.join (', '))
             : 'не задан'),
         'свой DoH-маршрут (имя разрешаю сам, системный DNS не нужен): ' + (dohPort
-            ? 'включён' + (bookN ? ', в книге адресов ' + bookN + ' имён' : ', книга пока пустая -- наполнится сама')
+            ? 'включён' + (dohOk ? ', моя проверка через него проходит' : ', но моя проверка через него не прошла') +
+                (bookN ? ', в книге адресов ' + bookN + ' имён' : ', книга пока пустая -- наполнится сама')
             : 'выключен (MUSIC.doh)'),
     ];
     let advice;
     if (dp.ok) advice = '-- музыку беру напрямую, включать ничего не надо';
     else if (alive.length) advice = '-- прямой путь не проходит, музыку беру через прокси ' + alive.join (', ');
-    else if (dohPort) advice = '-- прямого пути нет: пробую свой DoH-маршрут (имя разрешаю сам, иду по адресу)';
+    else if (dohPort) advice = '-- прямого пути нет: пробую свой DoH-маршрут (имя разрешаю сам, иду по адресу)' + (dohOk ? ', проверка через него проходит' : '');
     else advice = '-- рабочего пути НЕТ: включи обход DPI (tools\\obhod.cmd -- подбирает стратегию сам) или впиши рабочий прокси в MUSIC.proxy, либо включи MUSIC.doh';
-    return { dnsOk, dp, dpi, svc, drv, alive, dead, dohPort, bookN, parts, advice, noPath: (!dp.ok && !alive.length) };
+    return { dnsOk, dp, dpi, svc, drv, alive, dead, dohPort, dohOk, bookN, parts, advice, noPath: (!dp.ok && !alive.length) };
 }
 
 async function notifyHoster (text)              // письмо хозяину: в личные сообщения и в журнал сервера
@@ -6534,6 +6578,7 @@ async function dpiSelfHeal (reason)             // ни один путь не �
     if (fixed)
     {
         console.log ('[' + (d()) + '] [music] обход DPI поднял сам -- путь к YouTube снова есть');
+        dpiStat.healToldAt = Date.now ();
         await notifyHoster ('🛠 **Музыка снова может идти.** Ни один путь к YouTube не работал (' + reason + '), и обход блокировки я поднял сам.' +
             (did.length ? '\n_Что делал: ' + did.join ('; ') + '._' : ''));
         return true;
@@ -6542,6 +6587,7 @@ async function dpiSelfHeal (reason)             // ни один путь не �
     if ((Date.now () - dpiHealToldAt) > DPI_HEAL_TELL_MS)
     {
         dpiHealToldAt = Date.now ();
+        dpiStat.healToldAt = Date.now ();
         console.error ('[' + (d()) + '] [music] обход DPI поднять сам не смог: ' + what +
             ' -- музыке нужен рабочий путь, скажи хозяину запустить tools\\obhod.cmd');
         await notifyHoster ('🚨 **Музыке некуда идти.** Ни один путь к YouTube не работает (' + reason + '), а обход сам поднять не смог: ' + what + '.' +
@@ -6568,13 +6614,15 @@ async function reportRoutes ()
             setTimeout (() => dpiSelfHeal ('при старте ни один путь не отвечает'), 30000);   // не тороплю старт: сеть может подниматься сама
         if (rs.noPath && fsMod.existsSync (DPI_CHOSEN))
             console.error ('[' + (d()) + '] [music] сохранённая стратегия обхода есть -- поднять её можно быстро: `node . obhod --start` (или кнопкой в /health)');
+        if (rs.noPath)
+            setTimeout (() => startupPathNotice ().catch (() => { }), 45000);   // даю системе догрузиться и проверяю ещё раз
     }
     catch (e) { }
 }
 
-if (BOT_RUN)                                             // обход работает, а пути мертвы? замечаю сам
+if (BOT_RUN)                                             // обход и его сторож -- под присмотром
 {
-    const _dpiStatTick = () => dpiStrategyHealth ('плановая проверка').catch (() => { });
+    const _dpiStatTick = () => dpiWatchTick ('плановая проверка').catch (() => { });
     setTimeout (_dpiStatTick, 3 * 60000);                // первый раз через три минуты после старта
     const _dpiStatTimer = setInterval (_dpiStatTick, DPI_STAT_EVERY_MS);
     try { _dpiStatTimer.unref (); } catch (e) { }
@@ -6583,10 +6631,22 @@ if (BOT_RUN)                                             // обход рабо�
 const DPI_WORK = pathMod.join (__dirname, 'tools', 'zapret-work');
 const DPI_LOG = pathMod.join (DPI_WORK, 'zapret-pick.log');
 const DPI_CHOSEN = pathMod.join (DPI_WORK, 'zapret-chosen.bat');
+const DPI_KEEPER_LOCK = pathMod.join (DPI_WORK, 'keeper.lock');
 const DPI_PICK_TIMEOUT_MS = 45 * 60000;          // подбор ждёт своей очереди долго: пресетов много
 const DPI_STAT_EVERY_MS = 10 * 60000;            // раз в 10 минут смотрю: обход работает, а пути живы?
-const DPI_STAT_TELL_MS = 60 * 60000;             // про умершую стратегию напоминаю не чаще раза в час
-let dpiStat = { verdict: '', toldAt: 0 };
+const DPI_STAT_TELL_MS = 60 * 60000;            // про умершую стратегию и вставший обход напоминаю не чаще раза в час
+const DPI_KEEPER_TELL_MS = 12 * 3600000;        // про «за обходом никто не следит» -- не чаще раза в 12 часов
+let dpiStat = { verdict: '', toldAt: 0, engine: null, keeper: null, goneTold: false, healToldAt: 0 };
+
+async function netFlagGet (key)                  // мелкие отметки в базе: чтобы перезапуск бота не повторял уже сказанное
+{
+    try { const srv = dbServerList ()[0]; if (srv) return await db (srv, 'netState', key); } catch (e) { }
+    return null;
+}
+async function netFlagSet (key, val)
+{
+    try { const srv = dbServerList ()[0]; if (srv) await db (srv, 'netState', key, val); } catch (e) { }
+}
 
 function dpiEnginePids ()                        // что за winws.exe сейчас работает (только чтение)
 {
@@ -6655,6 +6715,31 @@ async function dpiPickSwitches (only, seconds, test, voice)
     if (test) sw.push ('-TestOnly');
     return sw;
 }
+async function dpiKeeperState ()                 // сторожит ли обход: живой сторож (по keeper.lock) и задача в планировщике
+{
+    const out = { pid: 0, proc: false, task: false };
+    try
+    {
+        const pid = parseInt (String (fsMod.readFileSync (DPI_KEEPER_LOCK, 'utf8') || '').split (/\r?\n/)[0].replace (/\D/g, ''), 10) || 0;
+        if (pid > 0)
+        {
+            const r = await runCapture ('tasklist.exe', ['/FI', 'PID eq ' + pid, '/FO', 'CSV', '/NH'], 8000);
+            if (String (r.out || '').indexOf ('"' + pid + '"') >= 0) { out.pid = pid; out.proc = true; }
+        }
+    }
+    catch (e) { }
+    const q = await runCapture ('schtasks.exe', ['/Query', '/TN', DPI_TASK, '/FO', 'LIST'], 15000);
+    out.task = (q.code === 0);
+    return out;
+}
+function keeperWords (k)
+{
+    if (!k) return 'не смотрел';
+    if (k.proc) return 'работает (pid ' + k.pid + ')';
+    if (k.task) return 'есть в планировщике, сейчас не запущен (поднимется при входе в систему)';
+    return 'нет -- обход никто не сторожит';
+}
+
 async function dpiDiscordState ()                // что с дискордом с нашей стороны: шлюз (по себе), api (лёгкий запрос), голос (если сижу в канале)
 {
     let api = false;
@@ -6677,7 +6762,7 @@ async function dpiStrategyHealth (why)           // обход работает,
     const dnsOk = await directUsable ();
     const dp = dnsOk ? await directProbe () : { ok: false, why: 'youtube.com локально не резолвится' };
     const disc = await dpiDiscordState ();
-    const ytOk = !!dp.ok;
+    const ytOk = !!dp.ok;                                  // свой маршрут проверкои не засчитываю: он не обязан везти музыку (см. /health и строку путей)
     const discOk = (disc.gw !== false) && disc.api;
     const verdict = (ytOk && discOk) ? 'ok' : (discOk ? 'yt' : (ytOk ? 'disc' : 'both'));
     const was = dpiStat.verdict;
@@ -6699,13 +6784,86 @@ async function dpiStrategyHealth (why)           // обход работает,
         await notifyHoster ('⚠️ **Похоже, обход перестал помогать.** Движок обхода работает, а ' + what + '.' +
             '\n_Сейчас: ютуб -- ' + (ytOk ? 'отвечает' : 'не отвечает') + '; шлюз discord -- ' +
             (disc.gw === false ? 'мёртв' : (disc.gw ? 'держится' : 'не смотрел')) + '; api discord -- ' + (disc.api ? 'отвечает' : 'НЕ отвечает') +
-            '; голос -- ' + (!disc.voiceKnown ? 'не проверен (в канале не сижу)' : (disc.voice ? 'связь держится' : 'связи нет')) + '._' +
+            '; голос -- ' + (!disc.voiceKnown ? 'не проверен (в канале не сижу)' : (disc.voice ? 'связь держится' : 'связи нет')) +
+            '; сторож -- ' + keeperWords (await dpiKeeperState ()) + '._' +
             '\n_Скорее всего провайдер сменил приём, и текущая стратегия больше не подходит._' +
             '\nЧто сделать: в консоли бота `node . obhod --pick` -- он переберёт пресеты (ютуб + шлюз Discord), оставит рабочую и один раз спросит разрешение Windows; то же самое -- кнопка в /health.' +
             '\nГолос проверяется отдельно, для замера бота надо выключить: `node . obhod --pick --voice`.' +
             '\nКак отпустит -- напишу.');
     }
     return verdict;
+}
+
+async function startupPathNotice ()              // при старте: если путей нет, сказать владельцу КОРОТКО и с готовой командой
+{
+    if (!MUSIC_DPI_HEAL || !BOT_RUN) return;
+    const before = await netFlagGet ('pathNotice');
+    if (before && (Date.now () - (Number (before.at) || 0)) < 60 * 60000) return;      // за последний час уже сказали
+    await new Promise (r => setTimeout (r, 45000));                                     // сеть часто поднимается вместе с системой
+    const rs = await routeStatus ();
+    if (!rs.noPath) return;
+    await netFlagSet ('pathNotice', { at: Date.now () });
+    const k = await dpiKeeperState ();
+    const hasChosen = fsMod.existsSync (DPI_CHOSEN);
+    const step = hasChosen ? '`node . obhod --start`' : '`node . obhod --pick`';
+    const head = rs.dohOk
+        ? '📡 **Прямого пути и прокси нет -- остаётся только мой маршрут по адресам.**'
+        : '📡 **Музыка пока не сможет играть: к YouTube нет ни одного пути.**';
+    const stepWhat = hasChosen ? 'поднять сохранённую стратегию обхода (пара секунд)' : 'подобрать рабочую стратегию обхода (перебор пресетов, это дольше)';
+    const healTold = (Date.now () - (Number (dpiStat.healToldAt) || 0)) < 10 * 60000;  // про это же я только что писал -- второй раз не повторяюсь
+    console.error ('[' + (d()) + '] [music] путей к YouTube нет вообще: сказал владельцу, что делать (сторож: ' + keeperWords (k) + ')');
+    await notifyHoster (head +
+        (healTold ? '' : '\n_Сейчас: ' + rs.parts.join ('; ') + '._') +
+        '\n**Что сделать сейчас:** ' + step + ' -- ' + stepWhat + ', одно окно подтверждения Windows.' +
+        (healTold ? '' : '\nИли мышкой: `tools\\obhod.cmd`, пункт 4 («подобрать и запустить»).' +
+            (MUSIC_PROXIES.length ? '\nЕсли поднят VPN-прокси -- бот сам попробует его первым.' : '') +
+            (rs.dohPort ? (rs.dohOk ? '\nСвой маршрут по адресам включён и моя проверка через него проходит -- но это проверка только маршрута: поедет ли музыка, не обещаю.'
+                : '\nСвой маршрут по адресам включён, но и моя проверка через него пока не прошла.') : '')) +
+        '\n_Сторож обхода: ' + keeperWords (k) + '. Очередь и место в треке целы: музыка ждёт, а не теряется._');
+}
+async function dpiWatchTick (why)                // раз в 10 минут: жив ли обход, помогает ли стратегия, есть ли сторож
+{
+    if (!MUSIC_DPI_HEAL || !BOT_RUN) return;
+    const engine = (await dpiBypassProbe ()) === true;
+    const hadEngine = (dpiStat.engine === true);
+    dpiStat.engine = engine;
+    if (engine)
+    {
+        if (dpiStat.goneTold)
+        {
+            dpiStat.goneTold = false;
+            dpiStat.verdict = '';                    // про стратегию отдельно писать не надо: только что сказали про сам обход
+            await notifyHoster ('✅ **Обход снова работает:** движок `winws.exe` поднялся.');
+        }
+        const v = await dpiStrategyHealth (why);
+        const k = await dpiKeeperState ();
+        dpiStat.keeper = k;
+        if (k.proc) return;
+        const told = await netFlagGet ('keeperTold');
+        if (told && (Date.now () - (Number (told.at) || 0)) < DPI_KEEPER_TELL_MS) return;
+        await netFlagSet ('keeperTold', { at: Date.now () });
+        console.log ('[' + (d()) + '] [music] сторож обхода: ' + keeperWords (k) +
+            ' -- если обход встанет, я это замечу и напишу, но чинить придётся тебе (сам я прав не спрашиваю)');
+        await notifyHoster ('ℹ️ **За обходом сейчас никто не следит.** Обход работает' +
+            (v === 'ok' ? ' -- ютуб и дискорд отвечают' : ' (но с путями не всё в порядке)') + '.' +
+            '\n_Сторож: ' + keeperWords (k) + '._' +
+            '\nЧто это значит: если обход встанет, я это замечу и напишу, но чинить придётся тебе -- сам я прав администратора не спрашиваю.' +
+            '\nЧтобы сторожил и сам чинил: `tools\\obhod.cmd` -- пункт 6 («ХРАНИТЕЛЬ»), потом пункт 7 («хранитель в автозапуск»).' +
+            ' Это единственное, что встаёт в автозапуск, -- и только по твоему решению.');
+        return;
+    }
+    if (!hadEngine) return;                          // обход и раньше не работал -- этим занимаются самопомощь и стартовая проверка
+    if ((Date.now () - dpiStat.toldAt) < DPI_STAT_TELL_MS) return;
+    dpiStat.toldAt = Date.now ();
+    dpiStat.goneTold = true;
+    const k = await dpiKeeperState ();
+    const svc = await serviceState ('zapret');
+    console.error ('[' + (d()) + '] [music] обход встал: движка winws.exe больше нет (служба zapret: ' + svcWords (svc) + '; сторож: ' + keeperWords (k) + ')');
+    await notifyHoster ('⚠️ **Обход встал** -- движка `winws.exe` больше нет.' +
+        '\n_Служба zapret: ' + svcWords (svc) + '; сторож: ' + keeperWords (k) + '._' +
+        '\nЧто сделать: `node . obhod --start` -- поднять сохранённую стратегию (пара секунд), или `tools\\obhod.cmd`.' +
+        (k.proc ? '\n_Сторож работает, но обход не поднял -- значит и ему не хватило прав: запусти пункт 6 в `tools\\obhod.cmd` от администратора._' : '') +
+        '\nКак поднимется -- напишу.');
 }
 
 async function obhodCli (args)                   // node . obhod: что с обходом и что можно сделать (права -- только на запуск/смену)
@@ -6801,8 +6959,11 @@ async function obhodCli (args)                   // node . obhod: что с об
         if (t && !/^=====/.test (t)) say (t);
     }
     const pids = await dpiEnginePids ();
+    const keeper = await dpiKeeperState ();
     say ('движок winws.exe: ' + (pids.length ? 'работает (pid ' + pids.join (', ') + ')' : 'не запущен') +
         '; последняя удачная стратегия: ' + dpiChosenInfo ());
+    say ('сторож обхода (кто следит и чинит сам): ' + keeperWords (keeper) + ' -- это запуск `obhod.cmd` с пунктом 6;');
+    say ('  автозапуск -- это только то, кто поднимает сторожа при входе в систему (тот же обход.cmd, пункт 7), и это решаешь ты.');
     say ('права администратора нужны только на запуск, остановку и смену стратегии обхода; проверка и «принести движок» -- без прав.');
     say ('что можно сделать:');
     say ('  node . obhod --engine            принести движок zapret (без прав)');
@@ -15040,8 +15201,16 @@ async function netHealthText (m, guildId, viewerId)      // ответ на /hea
             : 'не задан'),
         'свой маршрут по адресам: ' + (rs.dohPort ? 'включён' + (rs.bookN ? ', в книге ' + rs.bookN + ' имён' : '') : 'выключен'),
     ].join ('; '));
+    const keep = await dpiKeeperState ();
+    lines.push ('👁 Сторож обхода (хранитель): ' + keeperWords (keep) +
+        (keep.proc ? ' -- значит обход чинится сам, каждые пару минут.'
+            : keep.task ? ' -- поднимется сам при входе в систему; если обход встанет, замечу и напишу.'
+            : ' -- если обход встанет, я это замечу и напишу, но чинить придётся вручную: в `tools\\obhod.cmd` пункт 6 ставит сторожа, пункт 7 -- он же в автозапуске.'));
     lines.push (rs.advice.replace (/^-- /, ''));
     const fix = !!(owner && rs.noPath && rs.dpi !== true && MUSIC_DPI_HEAL);
+    if (!rs.noPath && rs.dpi === true && !keep.proc && !keep.task)
+        lines.push ((owner ? '👁 Обход никто не сторожит: он работает' : '👁 Обход работает, но его никто не сторожит') +
+            ' -- если он встанет, я это замечу и напишу, а чинить придётся вручную (`tools\\obhod.cmd`, пункт 6).');
     const canStart = !!(fix && fsMod.existsSync (DPI_CHOSEN));
     if (fix)
         lines.push ('🛠 Поднять обход я попробую сам: движок и хранителя из планировщика -- без прав; если не хватит прав -- напишу, каких именно.' +
