@@ -19,6 +19,7 @@
 // v2.123 -- голос: после обрыва бот сам возвращается к слушателям и продолжает с того же места; лог сети молчит без перемен
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
+// v2.126 -- пути и обрывы: при старте одна строка -- что сейчас работает (прямой путь, обход DPI, прокси, свой DoH-маршрут по адресам) и что включить, если не работает ничего; обрывы голоса и сети считаются (когда, сколько ждал, вернулся ли сам и с какой попытки) и видны в `node . net`; в /queue и /nowplaying видно, каким путём идёт звук; запас на диске по умолчанию 2 ГБ
 
 function earlyConfigCrash (e)
 {
@@ -863,6 +864,9 @@ function netCli ()       // разбор собранного: что знаем
         const pkeys = Object.keys (pools).filter (k => k.indexOf ('pool:') === 0);
         if (pkeys.length)
             console.log ('[net] копилки адресов: ' + pkeys.map (k => k.slice (5) + ' -- ' + Object.keys ((pools[k] || {}).ips || {}).length).join (', '));
+        console.log ('[net] обрывы связи (счёт бота: когда пропало, сколько ждал, вернулся ли сам):');
+        for (const _l of netVoiceLines (_get ('netState:voice')))
+            console.log ('[net]   ' + _l);
         const ipKeys = Object.keys (rev);
         let multi = 0, namesTotal = 0;
         for (const ip of ipKeys)
@@ -6329,24 +6333,59 @@ async function directWhy ()
     return d.ok ? '' : 'прямой запрос не проходит (' + (d.why || 'нет ответа') + ')';
 }
 
+function dpiBypassProbe ()          // запущен ли обход DPI (winws.exe -- движок zapret/обхода)
+{
+    return new Promise (res =>
+    {
+        if (process.platform !== 'win32') return res (null);
+        let p = null;
+        try { p = spawn ('tasklist', ['/FI', 'IMAGENAME eq winws.exe', '/NH'], { windowsHide: true }); }
+        catch (e) { return res (null); }
+        let out = '', done = false;
+        const fin = v => { if (!done) { done = true; res (v); } };
+        try { p.stdout.on ('data', d => { out += String (d); }); } catch (e) { }
+        try { p.on ('error', () => fin (null)); } catch (e) { }
+        try { p.on ('close', () => fin (/winws\.exe/i.test (out))); } catch (e) { }
+        setTimeout (() => fin (null), 2500).unref ();
+    });
+}
+
 async function reportRoutes ()
 {
     try
     {
         const dnsOk = await directUsable ();
         const dp = dnsOk ? await directProbe () : { ok: false, why: 'youtube.com локально не резолвится' };
+        const dpi = await dpiBypassProbe ();
+        const alive = [];
+        for (const p of MUSIC_PROXIES) if (await pingProxy (p, 1500)) alive.push (p);
+        const dead = MUSIC_PROXIES.filter (p => alive.indexOf (p) < 0);
+        const dohPort = MUSIC_DOH ? await dohProxyStart () : 0;      // свой маршрут по адресам: поднимаю сразу
+        let bookN = 0;
+        try { const b = await dnsBookLoad (); bookN = Object.keys (b || {}).length; } catch (e) { }
         const parts = [
-            'DNS: ' + (dnsOk ? 'youtube.com резолвится' : 'youtube.com НЕ резолвится'),
-            'прямой путь: ' + (dp.ok ? 'отвечает (' + dp.why + ')' : 'не отвечает -- ' + (dp.why || 'нет ответа')),
-            'прокси: ' + (MUSIC_PROXIES.length ? MUSIC_PROXIES.join (', ') : 'нет'),
-            'свой DoH-маршрут: ' + (MUSIC_DOH ? 'включён' : 'выключен (MUSIC.doh)'),
+            'прямой путь: ' + (dp.ok ? 'ОТВЕЧАЕТ' : 'не проходит' +
+                (dnsOk ? (dp.why ? ' (' + dp.why + ')' : '') : ' (и имя youtube.com локально не резолвится)')),
+            'обход DPI (zapret/winws): ' + (dpi === true ? 'запущен' : (dpi === false ? 'НЕ запущен' : 'не смог посмотреть')),
+            'прокси: ' + (MUSIC_PROXIES.length
+                ? (alive.length ? 'отвечает ' + alive.join (', ') + (dead.length ? '; молчит ' + dead.join (', ') : '')
+                    : 'задан, но НЕ отвечает: ' + MUSIC_PROXIES.join (', '))
+                : 'не задан'),
+            'свой DoH-маршрут (имя разрешаю сам, системный DNS не нужен): ' + (dohPort
+                ? 'включён' + (bookN ? ', в книге адресов ' + bookN + ' имён' : ', книга пока пустая -- наполнится сама')
+                : 'выключен (MUSIC.doh)'),
         ];
         let advice;
-        if (dp.ok) advice = '-- музыка пойдёт напрямую, менять ничего не надо';
-        else if (dnsOk) advice = '-- имена в порядке, а запрос не проходит: это блокировка провайдера (DPI) -- включи свой обход (запрет/winws) или VPN-прокси';
-        else if (MUSIC_DOH) advice = '-- имя не резолвится, но это лечит сам: иду своим DoH-маршрутом (имена спрашиваю по https, системный DNS не нужен)';
-        else advice = '-- имя не резолвится: включи MUSIC.doh либо поставь DNS 9.9.9.9 / 94.140.14.14, либо прописывай hosts' ;
-        console.log ('[' + (d()) + '] [music] пути к YouTube: ' + parts.join ('; ') + ' ' + advice);
+        if (dp.ok) advice = '-- музыку беру напрямую, включать ничего не надо';
+        else if (alive.length) advice = '-- прямой путь не проходит, музыку беру через прокси ' + alive.join (', ');
+        else if (dohPort) advice = '-- прямого пути нет: пробую свой DoH-маршрут (имя разрешаю сам, иду по адресу)';
+        else advice = '-- рабочего пути НЕТ: включи обход DPI (tools\\obhod.cmd -- подбирает стратегию сам) или впиши рабочий прокси в MUSIC.proxy, либо включи MUSIC.doh';
+        console.log ('[' + (d()) + '] [music] пути к YouTube сейчас: ' + parts.join ('; ') + ' ' + advice);
+        if (!dp.ok && !alive.length)
+            console.error ('[' + (d()) + '] [music] ни одного проверенного пути к YouTube: ' + (dohPort
+                ? 'остаётся только свой DoH-маршрут (по адресам из книги) -- если и он не выручит, включи обход DPI или прокси'
+                : 'включи обход DPI (tools\\obhod.cmd) или впиши рабочий прокси в MUSIC.proxy, либо MUSIC.doh') +
+                '; пока этого нет, музыка будет ждать сеть, а очередь и место в треке целы');
     }
     catch (e) { }
 }
@@ -8738,7 +8777,7 @@ const MUSIC_CACHE_DIR = pathMod.isAbsolute (String (MUSIC_CFG.cache_dir || 'musi
     ? String (MUSIC_CFG.cache_dir)
     : pathMod.join (__dirname, String (MUSIC_CFG.cache_dir || 'music_cache'));
 const MUSIC_CACHE_MAX_MB = MUSIC_CFG.cache_max_mb === undefined || MUSIC_CFG.cache_max_mb === null
-    ? 4096
+    ? 2048
     : Math.max (0, Math.round (Number (MUSIC_CFG.cache_max_mb) || 0));
 const MUSIC_CACHE_SHORT_MAX_MINUTES = (MUSIC_CFG.cache_short_max_minutes !== undefined && MUSIC_CFG.cache_short_max_minutes !== null)
     ? MUSIC_CFG.cache_short_max_minutes
@@ -10443,6 +10482,7 @@ function configCli ()
 
     sec ('музыка (MUSIC)');
     row ('proxy', MUSIC_PROXIES.length ? MUSIC_PROXIES.join (', ') : 'нет -- напрямую (DIRECT)', hasM ('proxy') ? 'config.json' : (process.env.MUSIC_PROXY ? 'переменная окружения MUSIC_PROXY' : '-- (в файле нет)'));
+    row ('doh (свой маршрут по адресам)', YN (MUSIC_DOH), hasM ('doh') ? 'config.json' : 'по умолчанию (вкл: имена разрешаю сам, системный DNS не участвует)');
     row ('cookies_file', MUSIC_COOKIES_FILE || '-- (не задан)', hasM ('cookies_file') ? 'config.json' : '-- (в файле нет)');
     row ('cookies_from_browser (необязательный)', MUSIC_COOKIES_BROWSER || '-- (не задан)', hasM ('cookies_from_browser') ? 'config.json' : 'не нужен, если задан cookies_file');
     row ('normalize (громкость)', YN (MUSIC_NORMALIZE), hasM ('normalize') ? 'config.json' : 'по умолчанию (вкл)');
@@ -10460,7 +10500,7 @@ function configCli ()
     row ('cache_short_max_minutes', Math.round (MUSIC_CACHE_SHORT_MAX_SEC / 60) + ' мин',
         hasM ('cache_short_max_minutes') ? 'config.json' : 'по умолчанию (15)');
     row ('cache_long_sets', YN (MUSIC_CACHE_LONG_SETS), hasM ('cache_long_sets') ? 'config.json' : 'по умолчанию (вкл)');
-    row ('cache_max_mb', MUSIC_CACHE_MAX_MB || '0 (без лимита)', hasM ('cache_max_mb') ? 'config.json' : 'по умолчанию (4096)');
+    row ('cache_max_mb', MUSIC_CACHE_MAX_MB || '0 (без лимита)', hasM ('cache_max_mb') ? 'config.json' : 'по умолчанию (2048)');
     row ('cache_keep_played', YN (MUSIC_CACHE_KEEP_PLAYED), hasM ('cache_keep_played') ? 'config.json' : 'по умолчанию (вкл: копии остаются запасом)');
     row ('cache_fill (запас вперёд)', MUSIC_CACHE
             ? 'да: очередь догружается сама, по одному треку каждые ' + Math.round (CACHE_FILL_EVERY_MS / 1000) + ' с, до ' + CACHE_FILL_DEPTH + ' вперёд'
@@ -10823,6 +10863,8 @@ function musicNetStall (guildId, track, at, e)
     w.tries++;
     w.at = Date.now ();
     w.lastWhy = why;
+    if (w.tries === 1) netOutageStart (guildId);      // счёт обрывов: начало
+    else netOutageAttempt (guildId, w.tries);
     w.nextAt = Date.now () + Math.min (NET_WAIT_MAX_MS,
         NET_WAIT_MS * Math.pow (2, Math.min (3, Math.max (0, w.tries - 1))));
     const chId = m.connection ? m.connection.joinConfig.channelId : m.savedChannelId;
@@ -11031,6 +11073,7 @@ async function playNext (guildId)
         {
             const _w = m.netWait;
             m.netWait = null;
+            netOutageFinish (guildId, playedFromDisk);   // счёт обрывов: музыка поднялась сама
             console.log (playedFromDisk
                 ? '[' + (d()) + '] [music] связи нет, но музыка идёт ИЗ СВОЕЙ КОПИИ (YouTube для неё не нужен)' +
                   ' -- очередь не стоит' + (startedAt ? '; продолжаю с ' + fmtDur (startedAt) : '')
@@ -11661,6 +11704,7 @@ const musicNetTick = setInterval
                             console.log ('[' + (d()) + '] [music] меня нет в голосовом, а в «' + ch.name +
                                 '» есть слушатели -- возвращаюсь сам');
                         }
+                        voiceOutageAttempt (g);              // счёт обрывов: попытка возврата
                         startRestored (g, ch, guild);
                         if (m.connection) m.netWait = null;
                         continue;
@@ -13810,6 +13854,36 @@ function queueSeekBy (guildId, delta, who, opts = {})
     return { ok: true, text: res.text + '\n_Место, где играло: `' + fmtDur (at) + '`._' };
 }
 
+function playWayShort (m, guildId)
+{
+    // чем именно сейчас играет трек: свои файлы против потока и его маршрута -- словами, без адресов
+    const t = m && (m.current || m.seekTrack);
+    if (!t) return '';
+    if (t.isLive) return 'потоком (эфир)';
+    if (MUSIC_CACHE && cacheFind (t)) return 'с диска (своя копия)';
+    if (m.partFile) return 'со своей записи';
+    const u = routeUseOf (guildId);
+    if (u && u.kind === 'stream' && u.proxy) return 'потоком (прокси)';
+    if (u && u.kind === 'stream') return 'потоком (напрямую)';
+    return 'потоком';
+}
+function playWayText (m, guildId, viewerId)
+{
+    const t = m && (m.current || m.seekTrack);
+    if (!t) return '';
+    const owner = isBotOwner (viewerId);
+    if (t.isLive)
+        return '▶ Путь звука: прямой эфир, играю потоком' + (owner ? ' (у эфира нет ни копии, ни навигации)' : '');
+    if (MUSIC_CACHE && cacheFind (t))
+        return '▶ Путь звука: играю со своей копии на диске -- YouTube в проигрывании не участвует';
+    if (m.partFile)
+        return '▶ Путь звука: начал со своей записи на диске, дальше беру потоком';
+    const u = routeUseOf (guildId);
+    if (u && u.kind === 'stream' && u.proxy)
+        return '▶ Путь звука: потоком от YouTube через прокси' + (owner ? '' : ' -- адрес видит только владелец');
+    return '▶ Путь звука: потоком от YouTube' + ((u && u.kind === 'stream') ? ' напрямую (без прокси)' : '');
+}
+
 function queueHeadText (m)
 {
     if (m.current)
@@ -13821,8 +13895,10 @@ function queueHeadText (m)
             : (m.current.duration > 0
                 ? ' `' + posTxt (Math.min (posSec, m.current.duration)) + ' / ' + fmtDur (m.current.duration) + '`'
                 : '');
+        const way = playWayShort (m, m.guildId);
         return '🎵 **Сейчас (№0):** ' + (m.current.isLive ? '🔴 ' : '') + '**' + (m.current.title || 'трек') + '**' + pos +
             byLabel (m.current) + repeatMark (m, m.current) +
+            (way ? ' · ▶ ' + way : '') +
             (m.pausedByNobody ? ' _(пауза: нет слушателей)_' : '');
     }
     if (m.pending && m.tracks.length)
@@ -13933,6 +14009,8 @@ function nowPlayingText (m, guildId, viewerId)
     lines.push (QSMALL + '🎧 ' + (ch ? 'пою в «' + ch.name + '»' : (chId ? 'пою в <#' + chId + '>' : 'в канале не сижу')) +
         ' · слушателей: ' + (chId ? humansInChannel (guildId, chId) : 0) +
         ' · в очереди: ' + m.tracks.length);
+    const way = playWayText (m, guildId, viewerId);
+    if (way) lines.push (QSMALL + way);
     const net = netWaitText (m);
     if (net) lines.push (net);
     const route = netRouteText (guildId, viewerId);
@@ -14250,6 +14328,7 @@ function startRestored (server, ch, guild)
         (rest ? ' + ещё ' + rest + ' в очереди' : '');
     if (!joinVoice (server, ch, guild) || !m.connection) return;
     m.savedChannelId = ch.id;
+    voiceOutageFinish (server, true);                    // счёт обрывов: вернулся сам
     if (!humansInChannel (server, ch.id))
     {
         m.pending = true;
@@ -14316,6 +14395,161 @@ function outageDown (guildId, track, sec)
     m.netDownToldAt = Date.now ();
     musicNotice (guildId, outageDownText (track, sec));
     return true;
+}
+
+// Счёт обрывов: когда связь пропала, сколько музыка ждала, вернулась ли сама и с какой попытки.
+// Хранится отдельно от очереди (netState/voice в базе): это не данные бота, а наблюдение за связью --
+// его читает `node . net`. Записи не теряются: последние 20 случаев лежат списком, а счётчики -- нарастающим итогом.
+const VOICE_LOG_MAX = 20;
+let voiceLog = null, voiceLogLoading = null, voiceLogTimer = null;
+async function voiceLogLoad ()
+{
+    if (voiceLog) return voiceLog;
+    if (voiceLogLoading) return voiceLogLoading;
+    voiceLogLoading = (async () =>
+    {
+        let val = null;
+        try { const srv = dbServerList ()[0]; if (srv) val = await db (srv, 'netState', 'voice'); }
+        catch (e) { }
+        const base = { n: 0, back: 0, kicked: 0, waitMs: 0, tries: 0, net: 0, netBack: 0, netWaitMs: 0, netFromCopy: 0, list: [] };
+        voiceLog = (val && typeof val === 'object') ? Object.assign (base, val) : base;
+        if (!Array.isArray (voiceLog.list)) voiceLog.list = [];
+        voiceLogLoading = null;
+        return voiceLog;
+    }) ();
+    return voiceLogLoading;
+}
+function voiceLogSave ()
+{
+    if (voiceLogTimer) return;
+    voiceLogTimer = setTimeout (async () =>
+    {
+        voiceLogTimer = null;
+        try
+        {
+            const srv = dbServerList ()[0];
+            if (srv && voiceLog) await db (srv, 'netState', 'voice', voiceLog);
+        }
+        catch (e) { }
+    }, 2000);
+    try { voiceLogTimer.unref (); } catch (e) { }
+}
+async function voiceLogNote (rec)
+{
+    try
+    {
+        const log = await voiceLogLoad ();
+        log.list.unshift (rec);
+        if (log.list.length > VOICE_LOG_MAX) log.list.length = VOICE_LOG_MAX;
+        if (rec.kind === 'net')
+        {
+            log.net++;
+            if (rec.back) log.netBack++;
+            if (rec.copy) log.netFromCopy++;
+            log.netWaitMs += Math.max (0, rec.waitMs || 0);
+        }
+        else
+        {
+            log.n++;
+            if (rec.kicked) log.kicked++;
+            else if (rec.back) log.back++;
+            log.waitMs += Math.max (0, rec.waitMs || 0);
+            log.tries += Math.max (0, rec.tries || 0);
+        }
+        voiceLogSave ();
+    }
+    catch (e) { }
+}
+function voiceOutageStart (guildId, why)
+{
+    const m = $music[guildId];
+    if (!m) return;
+    if (m.voiceOut) voiceOutageFinish (guildId, false, 'связь пропала снова, так и не вернувшись');
+    m.voiceOut = { at: Date.now (), tries: 0, why: String (why || 'связь пропала') };
+}
+function voiceOutageAttempt (guildId)
+{
+    const m = $music[guildId];
+    if (m && m.voiceOut) m.voiceOut.tries = (m.voiceOut.tries || 0) + 1;
+}
+function voiceOutageFinish (guildId, back, why)
+{
+    const m = $music[guildId];
+    if (!m || !m.voiceOut) return;
+    const o = m.voiceOut;
+    m.voiceOut = null;
+    const waitMs = Date.now () - (o.at || Date.now ());
+    voiceLogNote ({ kind: 'voice', at: o.at, waitMs: waitMs, tries: o.tries || 0, back: !!back, why: why || o.why || '' });
+    if (back)
+        console.log ('[' + (d()) + '] [music] счёт обрывов: вернулся сам через ' + fmtAgo (waitMs) +
+            ' (' + (o.tries || 0) + ' ' + plural (o.tries || 0, 'попытка', 'попытки', 'попыток') + ') -- записал в счёт обрывов');
+}
+function voiceOutageKicked (guildId)
+{
+    voiceLogNote ({ kind: 'voice', at: Date.now (), waitMs: 0, tries: 0, back: false, kicked: true,
+        why: 'выкинули из канала (сам не возвращаюсь)' });
+}
+function netOutageStart (guildId)
+{
+    const m = $music[guildId];
+    if (!m || m.netOut) return;
+    m.netOut = { at: Date.now (), tries: 1 };
+}
+function netOutageAttempt (guildId, tries)
+{
+    const m = $music[guildId];
+    if (m && m.netOut) m.netOut.tries = Math.max (m.netOut.tries || 0, Number (tries) || 0);
+}
+function netOutageFinish (guildId, copy)
+{
+    const m = $music[guildId];
+    if (!m || !m.netOut) return;
+    const o = m.netOut;
+    m.netOut = null;
+    const waitMs = Date.now () - (o.at || Date.now ());
+    voiceLogNote ({ kind: 'net', at: o.at, waitMs: waitMs, tries: o.tries || 0, back: true, copy: !!copy });
+    console.log ('[' + (d()) + '] [music] счёт обрывов: музыка стояла ' + fmtAgo (waitMs) +
+        ' (' + (o.tries || 0) + ' ' + plural (o.tries || 0, 'попытка', 'попытки', 'попыток') + ') -- поднялась сама' +
+        (copy ? ' из своей копии' : '') + '; записал в счёт обрывов');
+}
+function netVoiceLines (voice)
+{
+    // строки для `node . net`: обрывы голоса и вставшая из-за сети музыка
+    const out = [];
+    const v = (voice && typeof voice === 'object') ? voice : null;
+    if (!v || (!v.n && !v.net))
+        return ['записей пока нет -- либо всё было ровно, либо бот не работал с этой версией'];
+    if (v.n)
+    {
+        const attempted = Math.max (0, v.n - (v.kicked || 0));
+        out.push ('обрывы голоса: ' + v.n + ', вернулся сам ' + (v.back || 0) +
+            (v.kicked ? ', выкидываний ' + v.kicked + ' (это не обрыв: сам не возвращаюсь)' : '') +
+            ', ждал в сумме ' + fmtAgo (v.waitMs || 0) +
+            ((attempted && v.tries) ? ', попыток на возврат в среднем ' +
+                (Math.round ((v.tries / attempted) * 10) / 10) : ''));
+    }
+    if (v.net)
+        out.push ('музыка вставала из-за сети: ' + v.net + ', поднялась сама ' + (v.netBack || 0) +
+            (v.netFromCopy ? ' (из них с диска ' + v.netFromCopy + ')' : '') +
+            ', ждала в сумме ' + fmtAgo (v.netWaitMs || 0));
+    const list = (v.list || []).slice (0, 5);
+    for (const e of list)
+    {
+        let when = '--';
+        try { when = new Date (e.at).toLocaleString ('ru-RU'); } catch (x) { }
+        if (e.kind === 'net')
+            out.push ('  ' + when + ' -- сеть: стояла ' + fmtAgo (e.waitMs || 0) +
+                (e.tries ? ' (' + e.tries + ' ' + plural (e.tries, 'попытка', 'попытки', 'попыток') + ')' : '') +
+                ', поднялась сама' + (e.copy ? ' из своей копии' : ''));
+        else
+            out.push ('  ' + when + ' -- голос: ' + (e.kicked ? 'выкинули, сам не возвращался'
+                : ((e.back ? 'вернулся сам за ' + fmtAgo (e.waitMs || 0) :
+                    'НЕ вернулся (' + (e.why || 'причина не записана') + ')') +
+                    (e.tries ? ', попыток ' + e.tries : ''))));
+    }
+    if (v.list && v.list.length > list.length)
+        out.push ('  ...и ещё ' + (v.list.length - list.length) + ' в записях');
+    return out;
 }
 
 function musicNotice (guildId, text)
@@ -15131,12 +15365,17 @@ function destroyMusic (guildId, opts = {})
     if (opts.unexpected && !opts.forget && !m.leftByUser)
     {
         m.netWait = { tries: 0, at: Date.now (), lastWhy: 'связь с голосовым каналом пропала', rejoinAt: 0, rejoinLogged: false };
+        voiceOutageStart (guildId, 'связь с голосовым каналом пропала');   // счёт обрывов: начало
         if (!chId || humansInChannel (guildId, chId) > 0)
             outageDown (guildId, m.seekTrack, at);
         if (chId)
             console.log ('[' + (d()) + '] [music] вернусь в «' + (ch ? ch.name : chId) +
                 '» сам, как только связь ответит и там будут слушатели (место в треке помню; передумать -- /leave)');
     }
+    if (opts.unexpected && !opts.forget && m.leftByUser)
+        voiceOutageKicked (guildId);                 // счёт обрывов: выкинули -- сам не возвращаюсь
+    if (!opts.unexpected && m.voiceOut)
+        voiceOutageFinish (guildId, false, 'бот вышел сам, так и не дождавшись связи');
     if (opts.unexpected && !opts.forget) writeVoiceState (guildId, chId, false);
     else writeVoiceState (guildId, null, false);
     clearVoiceStatus (chId);
