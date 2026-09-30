@@ -18,6 +18,7 @@
 // v2.122 -- связки адресов: один адрес на много имён; первым идёт тот, через кого музыка уже шла
 // v2.123 -- голос: после обрыва бот сам возвращается к слушателям и продолжает с того же места; лог сети молчит без перемен
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
+// v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
 // v2.133 -- присмотр говорит и о поломке, которую видит впервые: если служба обхода есть и работает (или сторож есть), а движка winws.exe нет -- это уже не «не поднимали», а поломка, и владельцу уходит то же письмо (раньше оно требовало, чтобы предыдущая проверка видела движок живым); плюс исправлена ошибка запуска: включатель присмотра стоял выше своих настроек и валил старт бота (Cannot access 'DPI_STAT_EVERY_MS' before initialization)
 // v2.132 -- свой маршрут по адресам засчитывается путём для музыки только если проверен делом: бот раз в 10 минут прогоняет через него yt-dlp и, если тот не дошёл, за путь его не считает и говорит об этом прямо (проверка самим ботом, а не «мне кажется, работает»)
@@ -6519,7 +6520,7 @@ async function routeStatus ()       // проверка путей: её чит�
     return { dnsOk, dp, dpi, svc, drv, alive, dead, dohPort, dohOk, bookN, parts, advice, noPath: (!dp.ok && !alive.length) };
 }
 
-async function notifyHoster (text)              // письмо хозяину: в личные сообщения и в журнал сервера
+async function notifyHoster (text, opts = {})   // письмо хозяину: в личные сообщения (opts.dmOnly -- только туда) и в журнал сервера
 {
     let sent = 0;
     const ids = OWNER_HOSTER ? [OWNER_HOSTER] : STARTUP_DMS.slice ();
@@ -6528,9 +6529,10 @@ async function notifyHoster (text)              // письмо хозяину: 
         try { const usr = await client.users.fetch (id); if (usr) { await sendFit (usr, text); sent++; } }
         catch (e) { console.error ('[' + (d()) + '] письмо владельцу не ушло: ' + ((e && e.message) || e)); }
     }
-    for (const srv of Object.keys (SERVERS))
-        if (SERVERS[srv] && SERVERS[srv].log_channel)
-            try { await logTo (SERVERS[srv].log_channel).send (text); sent++; } catch (e) { }
+    if (!opts.dmOnly)
+        for (const srv of Object.keys (SERVERS))
+            if (SERVERS[srv] && SERVERS[srv].log_channel)
+                try { await logTo (SERVERS[srv].log_channel).send (text); sent++; } catch (e) { }
     return sent;
 }
 
@@ -12404,6 +12406,194 @@ const musicNetTick = setInterval
 );
 if (musicNetTick.unref) musicNetTick.unref ();
 
+// Беда до обрыва: пока музыка играет, сам меряю медиа-путь голоса -- шлю медиа-адресу служебный 8-байтовый
+// пинг (такой же, как библиотека, но со своим числом) и жду ответ с тем же числом. Ответа нет или пинг
+// вырос -- владельцу уходит личное письмо, и один раз переподключаюсь сам, помня место в треке. В журнал
+// идут только смены состояния: на каждый замер -- ни строки.
+const MEDIA_PROBE_MS = 5000;
+const MEDIA_PROBE_MISS = 3;                     // столько подряд без ответа -- медиа-путь пропал
+const MEDIA_PING_HIGH_MS = 400;                 // пинг выше -- уже тревожно
+const MEDIA_PING_HIGH_N = 2;                    // столько замеров подряд -- уже тревожно
+const MEDIA_GRACE_MS = 15000;                   // после входа в канал даю связи устояться
+const MEDIA_FRESH_MS = 3 * MEDIA_PROBE_MS;      // сколько мой последний замер считается свежим
+const MEDIA_HEAL_GAP_MS = 10 * 60 * 1000;       // переподключаюсь не чаще раза в 10 минут (дальше -- реже)
+const MEDIA_HEAL_MAX_GAP_MS = 60 * 60 * 1000;   // но и не реже раза в час
+const MEDIA_HEAL_MAX_N = 3;                     // за одну беду переподключаюсь не больше трёх раз
+const MEDIA_WARN_GAP_MS = 30 * 60 * 1000;       // письмо владельцу -- не чаще раза в 30 минут
+const MEDIA_COUNTER_START = 0x80000000;         // свой счётчик: у библиотеки он идёт с нуля -- не пересекутся
+const MEDIA_PROBE_PROOF = 24;                   // столько замеров без единого ответа -- значит, такой пинг тут не отвечает
+let mediaProbeOk = 0, mediaProbeTries = 0, mediaWatchOff = false;   // предохранитель: без доказанного ответа ничего не делаю
+
+function mediaProbe (m, now)                    // один замер: послать пинг медиа-адресу и прочитать ответ
+{
+    const st = m.connection && m.connection.state;
+    const net = (st && st.networking && st.networking.state) || {};
+    const udp = net.udp;
+    if (!udp || !udp.socket || !udp.remote || !udp.remote.ip || !udp.remote.port) return null;
+    let v = m.vprobe;
+    if (!v || v.sock !== udp.socket)            // новое соединение -- слушаю его сокет, счёты переношу
+    {
+        const old = v;
+        v = m.vprobe = { sock: udp.socket, counter: MEDIA_COUNTER_START, at: now, misses: 0, high: 0, sentAt: 0,
+            ping: null, lastOkAt: 0, trouble: false, warned: 0, warnedAt: 0, healAt: 0, heals: 0, gaveUp: 0 };
+        if (old)
+        {
+            v.trouble = old.trouble;
+            v.warned = old.warned;
+            v.warnedAt = old.warnedAt;
+            v.healAt = old.healAt;
+            v.heals = old.heals;
+            v.gaveUp = old.gaveUp;
+        }
+        try
+        {
+            udp.socket.on ('message', msg =>           // ответ на мой пинг: те же 8 байт с моим числом
+            {
+                try
+                {
+                    if (!msg || msg.length !== 8 || msg.readUInt32LE (0) !== v.counter) return;
+                    v.ping = Math.max (0, Date.now () - (v.sentAt || Date.now ()));
+                    v.lastOkAt = Date.now ();
+                    v.sentAt = 0;
+                    v.misses = 0;
+                    v.high = (v.ping >= MEDIA_PING_HIGH_MS) ? (v.high + 1) : 0;
+                    mediaProbeOk++;
+                    if (mediaWatchOff)
+                    {
+                        mediaWatchOff = false;
+                        console.log ('[' + (d()) + '] [music] мой замер медиа-пути снова отвечает -- сторожа включаю');
+                    }
+                }
+                catch (e) { }
+            });
+        }
+        catch (e) { return null; }
+    }
+    if (v.sentAt)                               // ответа не дождался: замер мимо, но долгую паузу не считаю
+    {
+        if ((now - v.sentAt) <= 2 * MEDIA_PROBE_MS) { v.misses++; v.high = 0; }
+        v.sentAt = 0;
+    }
+    v.counter = (v.counter >= 0xFFFFFF00) ? MEDIA_COUNTER_START : (v.counter + 1);
+    const packet = Buffer.alloc (8);
+    packet.writeUInt32LE (v.counter, 0);
+    v.sentAt = now;
+    mediaProbeTries++;
+    try { udp.socket.send (packet, udp.remote.port, udp.remote.ip, () => { }); }
+    catch (e) { v.sentAt = 0; v.misses++; }
+    return v;
+}
+
+function mediaWarnText (m, lost, v)
+{
+    const track = m.seekTrack || m.current || null;
+    const at = (track && !track.isLive) ? ' на ' + fmtDur (Math.max (0, Math.round (playedMsOf (m) / 1000))) : '';
+    return '🕵 **Заметил раньше обрыва:** медиа-пинг голоса ' +
+        (lost ? 'пропал -- медиа-адрес молчит уже ' + Math.round ((MEDIA_PROBE_MISS * MEDIA_PROBE_MS) / 1000) + ' с'
+              : 'вырос до ' + ((v && v.ping) || '?') + ' мс (обычно десятки)') +
+        (track ? ', а сейчас идёт «' + (track.title || 'трек') + '»' + at : '') + '.\n' +
+        ((v && v.heals) ? 'Переподключаюсь сам: ' + v.heals + ' ' +
+            plural (v.heals, 'попытка', 'попытки', 'попыток') + ' уже была -- продолжаю, место в треке помню.'
+         : 'Переподключаюсь сам, место в треке помню: музыка может прерваться на пару секунд.') +
+        '\n_Это замер самого голосового канала (udp), а не YouTube._';
+}
+
+function mediaReconnect (g)
+{
+    const m = $music[g];
+    if (!m || !m.connection) return;
+    const chId = (m.connection.joinConfig && m.connection.joinConfig.channelId) || m.savedChannelId;
+    const ch = chId ? client.channels.cache.get (chId) : null;
+    const guild = (ch && ch.guild) || client.guilds.cache.get (g);
+    try { destroyMusic (g, { unexpected: true, who: 'медиа-пинг' }); }   // как при обрыве: место в треке и счёт целы
+    catch (e) { }
+    if (ch && guild) { try { startRestored (g, ch, guild); } catch (e) { } }   // назад сразу, без 15-секундного ожидания
+    if (m.connection) m.netWait = null;
+}
+
+function mediaWatchRun (now)
+{
+    for (const g of Object.keys ($music))
+    {
+        const m = $music[g];
+        if (!m || !m.connection || !m.current || m.pausedByNobody || m.leaving || voiceRealBusy) continue;
+        const st = m.connection.state;
+        if (!st || st.status !== VoiceConnectionStatus.Ready) continue;
+        const v = mediaProbe (m, now);
+        if (mediaWatchOff) continue;                            // замер здесь не отвечает -- сторожа не держу
+        if (!mediaProbeOk)                                      // пока ни одного ответа: только пробую, ничего не делаю
+        {
+            if (mediaProbeTries >= MEDIA_PROBE_PROOF)
+            {
+                mediaWatchOff = true;
+                console.log ('[' + (d()) + '] [music] мой замер медиа-пути не получил ни одного ответа за ' + mediaProbeTries +
+                    ' попыток -- на такой пинг медиа-адрес не отвечает: сторожа медиа-пинга выключаю ' +
+                    '(ни писем, ни переподключений); включится сам, если ответ придёт');
+            }
+            continue;
+        }
+        if (!v || (now - v.at) < MEDIA_GRACE_MS) continue;      // только вошли -- даю связи устояться
+        const lost = v.misses >= MEDIA_PROBE_MISS;
+        const slow = v.high >= MEDIA_PING_HIGH_N;
+        if (!lost && !slow)
+        {
+            if (v.trouble)
+            {
+                v.trouble = false;
+                console.log ('[' + (d()) + '] [music] медиа-пинг снова отвечает (' + v.ping + ' мс)' +
+                    (v.heals ? ', после моего переподключения' : ''));
+                if (v.warned)
+                    notifyHoster ('✅ Медиа-пинг голоса вернулся: ' + v.ping +
+                        ' мс. Место в треке и очередь целы.', { dmOnly: true }).catch (() => { });
+                v.warned = 0;
+                v.heals = 0;
+                v.gaveUp = 0;
+            }
+            continue;
+        }
+        if (!v.trouble)
+        {
+            v.trouble = true;
+            console.log ('[' + (d()) + '] [music] медиа-пинг ' + (lost
+                ? 'пропал (' + v.misses + ' ' + plural (v.misses, 'замер', 'замера', 'замеров') + ' подряд без ответа)'
+                : 'вырос до ' + v.ping + ' мс') +
+                ' -- музыка вот-вот оборвётся, пробую переподключиться сам (место в треке помню)');
+        }
+        if (now - v.warnedAt >= MEDIA_WARN_GAP_MS)
+        {
+            v.warnedAt = now;
+            v.warned = 1;
+            notifyHoster (mediaWarnText (m, lost, v), { dmOnly: true }).catch (() => { });
+        }
+        if (v.gaveUp) continue;
+        if (v.heals >= MEDIA_HEAL_MAX_N)
+        {
+            v.gaveUp = 1;
+            console.log ('[' + (d()) + '] [music] медиа-пинг всё ещё молчит -- переподключаться больше не буду ' +
+                '(ждать нечего); как отпустит, музыка пойдёт дальше сама');
+            continue;
+        }
+        const gap = Math.min (MEDIA_HEAL_GAP_MS * Math.pow (2, Math.max (0, v.heals - 1)), MEDIA_HEAL_MAX_GAP_MS);
+        if (now - v.healAt >= gap)
+        {
+            v.healAt = now;
+            v.heals = (v.heals || 0) + 1;
+            mediaReconnect (g);
+        }
+    }
+}
+
+const mediaWatchTick = setInterval
+(
+    () =>
+    {
+        try { mediaWatchRun (Date.now ()); }
+        catch (e) { console.error ('[music] сторож медиа-пинга: ' + oneLine ((e && e.message) || e)); }
+    },
+    MEDIA_PROBE_MS
+);
+if (mediaWatchTick.unref) mediaWatchTick.unref ();
+
 let $exiting = false;
 async function saveAllMusic ()
 {
@@ -15231,7 +15421,12 @@ function voicePingNow (m)
     {
         const p = c.ping;
         if (!p) return null;
-        return { ws: (typeof p.ws === 'number' ? p.ws : null), udp: (typeof p.udp === 'number' ? p.udp : null) };
+        let udp = (typeof p.udp === 'number' ? p.udp : null);
+        // библиотека в этой версии udp-пинг не считает -- отдаю свой свежий замер (это и есть проверка медиа-пути)
+        const v = m.vprobe;
+        if (typeof udp !== 'number' && v && typeof v.ping === 'number' && (Date.now () - (v.lastOkAt || 0)) < MEDIA_FRESH_MS)
+            udp = v.ping;
+        return { ws: (typeof p.ws === 'number' ? p.ws : null), udp: udp };
     }
     catch (e) { return null; }
 }
@@ -15325,9 +15520,23 @@ async function netHealthText (m, guildId, viewerId)      // ответ на /hea
         if (m.connection)
             lines.push ('🔊 Голос: ' + (m.connection.state && m.connection.state.status === VoiceConnectionStatus.Ready ? 'связь держится' : 'связь не держится') +
                 (vch ? ' (канал «' + (((await voiceChannelFor (vch, false)) || {}).name || vch) + '»)' : '') +
-                (vp && typeof vp.udp === 'number' ? '; к медиа-адресу пакеты ходят (пинг ' + vp.udp + ' мс)' :
-                    '; медиа-адрес сейчас не измерю -- ничего ещё не звучало') +
+                (vp && typeof vp.udp === 'number' ? '; к медиа-адресу пакеты ходят и возвращаются (пинг ' + vp.udp + ' мс)' :
+                    (m.vprobe && m.vprobe.trouble ? '; к медиа-адресу пакеты не ходят (мои замеры без ответа) -- вот-вот может оборваться' :
+                        '; медиа-путь сейчас не измерен (замеряю сам, пока играет музыка)')) +
                 (owner ? ' -- кнопка ниже проверит его по-настоящему' : ''));
+        if (owner && m.vprobe)
+        {
+            const my = m.vprobe;
+            if (typeof my.ping === 'number' && (Date.now () - (my.lastOkAt || 0)) < MEDIA_FRESH_MS)
+                lines.push ('🕵 Мой замер медиа-пути: ' + my.ping + ' мс, последний ответ ' +
+                    fmtAgo (Date.now () - (my.lastOkAt || Date.now ())) + ' назад');
+            else if (my.trouble)
+                lines.push ('🕵 Мой замер медиа-пути: ответа нет уже ' + my.misses + ' ' +
+                    plural (my.misses, 'замер', 'замера', 'замеров') + ' подряд -- ' +
+                    (my.gaveUp ? 'переподключаться больше не пробую, жду сам' : 'переподключался уже ' + my.heals + ' раз'));
+            else if (mediaWatchOff)
+                lines.push ('🕵 Мой замер медиа-пути: медиа-адрес на такой пинг не отвечает -- сторожа не держу (ни писем, ни переподключений)');
+        }
     }
     const rs = await routeStatus ();
     lines.push ('🛣 Пути к YouTube: ' + [
@@ -16408,7 +16617,7 @@ const musicCommands =
         .setDescription ('Что играет сейчас: трек, позиция, кто поставил и что дальше'),
     new SlashCommandBuilder ()
         .setName ('health')
-        .setDescription ('Здорова ли связь: обрывы голоса и сети и каким путём сейчас идёт звук'),
+        .setDescription ('Здорова ли связь: обрывы голоса и сети и каким путём сейчас идёт звук (видит только владелец)'),
     new SlashCommandBuilder ()
         .setName ('history')
         .setDescription ('История добавлений: кто, когда и что поставил (треки, эфиры, плейлисты)'),
@@ -17834,7 +18043,10 @@ client.on ('interactionCreate', async (interaction) =>
         }
         else if (name === 'health')
         {
-            await interaction.deferReply ();            // проверка путей занимает пару секунд
+            if (!isBotOwner (interaction.user.id))      // там адреса прокси и обхода -- их нельзя показывать всем
+                return interaction.reply ({ content: '🚫 `/health` -- личная команда владельца бота.', flags: MessageFlags.Ephemeral });
+            await interaction.deferReply ({ flags: MessageFlags.Ephemeral });   // ответ виден только тому, кто спросил
+
             const hr = await netHealthText (m, guildId, interaction.user.id);
             const rows = [];
             let hText = hr.text;
