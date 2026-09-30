@@ -6378,12 +6378,42 @@ function dpiToolRun (args, timeoutMs)
     return runCapture ('powershell.exe',
         ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', DPI_TOOL].concat (args || []), timeoutMs);
 }
+function dpiHealPause ()            // дать обходу подняться, прежде чем проверять
+{
+    return new Promise (r => { const t = setTimeout (r, DPI_HEAL_WAIT_MS); try { t.unref (); } catch (e) { } });
+}
+
+function serviceState (name)        // служба или драйвер Windows: есть ли и работает ли (sc query -- только чтение; значения там ASCII)
+{
+    if (process.platform !== 'win32') return Promise.resolve ({ exists: false, running: false, state: '' });
+    return runCapture ('sc.exe', ['query', name], 8000).then (r =>
+    {
+        const m = String (r.out || '').match (/\b(RUNNING|STOPPED|START_PENDING|STOP_PENDING|PAUSED|CONTINUE_PENDING|PAUSE_PENDING)\b/);
+        const st = m ? m[1] : '';
+        return { exists: r.code === 0, running: st === 'RUNNING', state: st };
+    }).catch (() => ({ exists: false, running: false, state: '' }));
+}
+async function anyServiceState (names)      // первый из найденных (драйвер WinDivert в разных сборках называется по-разному)
+{
+    for (const n of names)
+    {
+        const s = await serviceState (n);
+        if (s.exists) return s;
+    }
+    return { exists: false, running: false, state: '' };
+}
+function svcWords (s)
+{
+    return !s.exists ? 'нет' : (s.running ? 'работает' : 'стоит');
+}
 
 async function routeStatus ()       // проверка путей: её читают и стартовая строка, и /health
 {
     const dnsOk = await directUsable ();
     const dp = dnsOk ? await directProbe () : { ok: false, why: 'youtube.com локально не резолвится' };
     const dpi = await dpiBypassProbe ();
+    const svc = await serviceState ('zapret');                                    // состояние обхода спрашиваю всегда:
+    const drv = await anyServiceState (['windivert', 'WinDivert', 'WinDivert1.4']);   // видно, что мешает, а что уже есть
     const alive = [];
     for (const p of MUSIC_PROXIES) if (await pingProxy (p, 1500)) alive.push (p);
     const dead = MUSIC_PROXIES.filter (p => alive.indexOf (p) < 0);
@@ -6393,7 +6423,9 @@ async function routeStatus ()       // проверка путей: её чит�
     const parts = [
         'прямой путь: ' + (dp.ok ? 'ОТВЕЧАЕТ' : 'не проходит' +
             (dnsOk ? (dp.why ? ' (' + dp.why + ')' : '') : ' (и имя youtube.com локально не резолвится)')),
-        'обход DPI (zapret/winws): ' + (dpi === true ? 'запущен' : (dpi === false ? 'НЕ запущен' : 'не смог посмотреть')),
+        'обход DPI (zapret/winws): ' + (dpi === true ? 'запущен' : (dpi === false ? 'НЕ запущен' : 'не смог посмотреть')) +
+            ' [служба zapret: ' + svcWords (svc) + '; драйвер WinDivert: ' + (drv.exists ? 'установлен' : 'не видно') +
+            ' -- движок обхода запускается только с правами администратора]',
         'прокси: ' + (MUSIC_PROXIES.length
             ? (alive.length ? 'отвечает ' + alive.join (', ') + (dead.length ? '; молчит ' + dead.join (', ') : '')
                 : 'задан, но НЕ отвечает: ' + MUSIC_PROXIES.join (', '))
@@ -6407,7 +6439,7 @@ async function routeStatus ()       // проверка путей: её чит�
     else if (alive.length) advice = '-- прямой путь не проходит, музыку беру через прокси ' + alive.join (', ');
     else if (dohPort) advice = '-- прямого пути нет: пробую свой DoH-маршрут (имя разрешаю сам, иду по адресу)';
     else advice = '-- рабочего пути НЕТ: включи обход DPI (tools\\obhod.cmd -- подбирает стратегию сам) или впиши рабочий прокси в MUSIC.proxy, либо включи MUSIC.doh';
-    return { dnsOk, dp, dpi, alive, dead, dohPort, bookN, parts, advice, noPath: (!dp.ok && !alive.length) };
+    return { dnsOk, dp, dpi, svc, drv, alive, dead, dohPort, bookN, parts, advice, noPath: (!dp.ok && !alive.length) };
 }
 
 async function notifyHoster (text)              // письмо хозяину: в личные сообщения и в журнал сервера
@@ -6433,6 +6465,7 @@ async function dpiSelfHeal (reason)             // ни один путь не �
     dpiHealBusy = true;
     dpiHealLastAt = Date.now ();
     let fixed = false, missing = '';
+    let svc = { exists: false, running: false }, drv = { exists: false, running: false };
     const did = [];
     try
     {
@@ -6449,6 +6482,25 @@ async function dpiSelfHeal (reason)             // ни один путь не �
             }
             if (!missing)
             {
+                svc = await serviceState ('zapret');
+                drv = await anyServiceState (['windivert', 'WinDivert', 'WinDivert1.4']);
+                if (svc.exists && !svc.running)                 // служба обхода есть, но стоит -- пробую поднять её сам
+                {
+                    const st = await runCapture ('net.exe', ['start', 'zapret'], 30000);
+                    did.push ('поднял службу zapret: ' + (st.code === 0 ? 'получилось' : 'не получилось'));
+                    if (st.code === 0)
+                    {
+                        await dpiHealPause ();
+                        fixed = (await dpiBypassProbe ()) === true;
+                        if (!fixed) missing = 'служба zapret поднялась, но движка winws.exe не видно';
+                    }
+                    else missing = 'служба zapret есть, но стоит -- запустить её из бота не вышло: обычному пользователю разрешено только смотреть службу, а не запускать (нужны права администратора)';
+                }
+                else if (svc.exists && svc.running)
+                    missing = 'служба zapret работает, а движка winws.exe не видно -- нужен запуск от администратора (tools/obhod.cmd, «подобрать и запустить») -- драйвер WinDivert тут не при чём, он может быть уже установлен';
+            }
+            if (!missing && !fixed)
+            {
                 const q = await runCapture ('schtasks.exe', ['/Query', '/TN', DPI_TASK, '/FO', 'LIST'], 15000);
                 if (q.code === 0)                               // хранитель уже стоит: он и запущен с повышенными правами
                 {
@@ -6456,13 +6508,13 @@ async function dpiSelfHeal (reason)             // ни один путь не �
                     did.push ('запустил хранителя из планировщика: ' + (run.code === 0 ? 'получилось' : 'не получилось'));
                     if (run.code === 0)
                     {
-                        await new Promise (r => { const t = setTimeout (r, DPI_HEAL_WAIT_MS); try { t.unref (); } catch (e) { } });
+                        await dpiHealPause ();
                         fixed = (await dpiBypassProbe ()) === true;
                         if (!fixed) missing = 'хранитель запущен, но движок не поднялся';
                     }
                     else missing = 'хранитель в планировщике есть, но запустить его не удалось';
                 }
-                else missing = 'нет задачи хранителя в планировщике, а без прав администратора обход не поднять (драйвер WinDivert ставится только с повышением прав)';
+                else missing = 'нет ни службы zapret, ни задачи хранителя в планировщике, а движок обхода (winws.exe) без прав администратора не запускается -- драйвер WinDivert тут не при чём, он может быть и установлен';
             }
         }
     }
@@ -6483,6 +6535,7 @@ async function dpiSelfHeal (reason)             // ни один путь не �
             ' -- музыке нужен рабочий путь, скажи хозяину запустить tools\\obhod.cmd');
         await notifyHoster ('🚨 **Музыке некуда идти.** Ни один путь к YouTube не работает (' + reason + '), а обход сам поднять не смог: ' + what + '.' +
             (did.length ? '\n_Что пробовал: ' + did.join ('; ') + '._' : '') +
+            '\n_Сейчас у тебя: служба zapret -- ' + svcWords (svc) + ', драйвер WinDivert -- ' + (drv.exists ? 'установлен' : 'не видно') + '._' +
             '\nЧто нужно от тебя: запусти один раз `tools\\obhod.cmd` -- пункт 4 («ПОДОБРАТЬ и запустить»), потом пункт 7 («хранитель в автозапуск»).' +
             ' После этого я смогу поднимать обход сам, и права спрашивать больше не придётся.');
     }
@@ -14691,7 +14744,8 @@ async function netHealthText (m, guildId, viewerId)      // ответ на /hea
     const rs = await routeStatus ();
     lines.push ('🛣 Пути к YouTube: ' + [
         'прямой путь: ' + (rs.dp.ok ? 'работает' : 'не проходит'),
-        'обход DPI (zapret): ' + (rs.dpi === true ? 'запущен' : (rs.dpi === false ? 'не запущен' : 'не видно')),
+        'обход DPI (zapret): ' + (rs.dpi === true ? 'запущен' : (rs.dpi === false ? 'не запущен' : 'не видно')) +
+            ' (служба zapret: ' + svcWords (rs.svc) + ', драйвер WinDivert: ' + (rs.drv.exists ? 'установлен' : 'не видно') + ')',
         'прокси: ' + (MUSIC_PROXIES.length
             ? (rs.alive.length ? 'отвечает' + (owner ? ' (' + rs.alive.join (', ') + ')' : '') : 'задан, но молчит')
             : 'не задан'),
@@ -14699,7 +14753,7 @@ async function netHealthText (m, guildId, viewerId)      // ответ на /hea
     ].join ('; '));
     lines.push (rs.advice.replace (/^-- /, ''));
     if (owner && rs.noPath && rs.dpi !== true && MUSIC_DPI_HEAL)
-        lines.push ('🛠 Поднять обход я попробую сам; если не хватит прав -- напишу, каких именно.');
+        lines.push ('🛠 Поднять обход я попробую сам: движок и хранителя из планировщика -- без прав; если не хватит прав -- напишу, каких именно.');
     return lines.join ('\n');
 }
 
