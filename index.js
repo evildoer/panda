@@ -19,6 +19,7 @@
 // v2.123 -- голос: после обрыва бот сам возвращается к слушателям и продолжает с того же места; лог сети молчит без перемен
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
+// v2.128 -- обход можно вести из консоли: `node . obhod` показывает, что с движком, службой и драйвером (и ничего не меняет), `--engine` приносит движок без прав, `--pick` подбирает и оставляет стратегию, `--stop` возвращает как было; подбор идёт с одним запросом прав Windows, в автозапуск бот ничего не ставит, а кнопка у владельца в /health делает то же
 // v2.127 -- связь видно и лечится сама: /health говорит, сколько было обрывов голоса и сети, вернулся ли бот сам и каким путём идёт звук; когда ни один путь не работает, бот сам приносит движок обхода и запускает хранителя из планировщика, а если прав не хватило -- честно пишет владельцу, чего именно (ключ MUSIC.dpi_heal)
 // v2.126 -- пути и обрывы: при старте одна строка -- что сейчас работает (прямой путь, обход DPI, прокси, свой DoH-маршрут по адресам) и что включить, если не работает ничего; обрывы голоса и сети считаются (когда, сколько ждал, вернулся ли сам и с какой попытки) и видны в `node . net`; в /queue и /nowplaying видно, каким путём идёт звук; запас на диске по умолчанию 2 ГБ
 
@@ -353,7 +354,7 @@ const DB_ENC_PREFIX = 'enc1:';
 const DB_ENC_SALT = 'pandamia-db-v1';
 const DB_ENC_HEX = /^[0-9a-fA-F]{64}$/;
 
-const CONSOLE_CMDS = ['help', 'config', 'keygen', 'dump', 'net', 'files', 'cache', 'privacy', 'backup', 'checkpoint', 'backups', 'restore', 'clearstatus', 'unkey', 'fixauthors', 'cookies', 'ytdlp', 'voice'];
+const CONSOLE_CMDS = ['help', 'config', 'keygen', 'dump', 'net', 'files', 'cache', 'privacy', 'backup', 'checkpoint', 'backups', 'restore', 'clearstatus', 'unkey', 'fixauthors', 'cookies', 'ytdlp', 'voice', 'obhod'];
 const CONSOLE_HELP =
 [
     ['node .',                    'запустить бота и смотреть живой лог (Ctrl+C -- выйти)'],
@@ -374,6 +375,7 @@ const CONSOLE_HELP =
     ['node . restore [метка]',    'вернуть базу из самой свежей копии (без метки) или из копии/точки по метке'],
     ['node . clearstatus <id>',   'разово снять свою строку из статуса голосового канала'],
     ['node . voice [id канала]',  'проверить вход в голосовой канал по-настоящему (музыка играет именно там)'],
+    ['node . obhod',              'обход блокировки: что сейчас, что можно сделать (--engine --pick --stop; смена стратегии -- один запрос прав)'],
     ['node . fixauthors <id> [имя] [--dry]', 'проставить автора трекам в очереди, где его нет'],
 ];
 function printConsoleHelp ()
@@ -439,7 +441,7 @@ if (!BOT_RUN)
     cliCmdName = CONSOLE_CMDS.find (_c => _argv.includes (_c)) || _argv[0] || '';
 }
 const CLI_BUDGET_S = { fixauthors: 600, backup: 300, restore: 300, checkpoint: 300, privacy: 300,
-    cache: 300, ytdlp: 300, cookies: 120, voice: 120 };
+    cache: 300, ytdlp: 300, cookies: 120, voice: 120, obhod: 3600 };
 const CLI_BUDGET_DEFAULT_S = 120;
 function $cliDone (_code)
 {
@@ -950,6 +952,8 @@ function filesCli ()
         if (/\.unkey\.sqlite$/i.test (_name)) return ['копия базы ОТКРЫТЫМ ТЕКСТОМ (красная кнопка `node . unkey`)', 'ДА, и прямо сейчас'];
         if (/\.check-.*\.sqlite$/i.test (_name)) return ['контрольная точка базы (`node . checkpoint`); бот их не удаляет', 'можно, когда сам решишь'];
         if (/\.sqlite-(journal|wal|shm)$/i.test (_name)) return ['хвост незакрытой транзакции SQLite', 'можно, когда бот выключен'];
+        if (_name === 'tools') return ['инструменты рядом с ботом: обход блокировки (`obhod.cmd` и `zapret-pick.ps1`) и его журнал в `zapret-work`',
+            'НЕТ -- без них бот не сможет ни подбирать обход, ни сказать о нём правду (`node . obhod`)'];
         if (_name === 'music_cache') return ['кэш музыки (MUSIC.cache): скачанные треки и запас вперёд -- бот сам догружает сюда очередь, '
             + 'пока играет музыка. Это НЕ данные бота -- просто музыка',
             'можно ВСЁ -- бот скачает заново (отчёт, в том числе чего ещё нет в запасе, и очистка: `node . cache`); ' +
@@ -1025,6 +1029,8 @@ function filesCli ()
     console.log ('  node . cache                  -- кэш музыки: что скачано, сколько занимает и чего ещё не хватает в запасе');
     console.log ('  node . cache --clear          -- стереть кэш целиком (бот скачает заново)');
     console.log ('  node . cache --prune          -- убрать из кэша самое старое по лимиту MUSIC.cache_max_mb');
+    console.log ('  node . obhod                  -- обход блокировки: что сейчас и что можно сделать (--engine, --pick, --stop);');
+    console.log ('                                  смена стратегии -- один запрос прав Windows, в автозапуск ничего не ставится');
     return 0;
 }
 
@@ -6558,6 +6564,165 @@ async function reportRoutes ()
     }
     catch (e) { }
 }
+
+const DPI_WORK = pathMod.join (__dirname, 'tools', 'zapret-work');
+const DPI_LOG = pathMod.join (DPI_WORK, 'zapret-pick.log');
+const DPI_CHOSEN = pathMod.join (DPI_WORK, 'zapret-chosen.bat');
+const DPI_PICK_TIMEOUT_MS = 45 * 60000;          // подбор ждёт своей очереди долго: пресетов много
+
+function dpiEnginePids ()                        // что за winws.exe сейчас работает (только чтение)
+{
+    return runCapture ('tasklist.exe', ['/FI', 'IMAGENAME eq winws.exe', '/FO', 'CSV', '/NH'], 8000).then (r =>
+    {
+        const pids = [];
+        const re = /"winws\.exe","(\d+)"/gi;
+        let m = null;
+        while ((m = re.exec (String (r.out || '')))) pids.push (Number (m[1]));
+        return pids;
+    }).catch (() => []);
+}
+function dpiLogTail (lines)                      // последние строки журнала обхода (скрипт пишет его в UTF-8)
+{
+    try
+    {
+        const all = fsMod.readFileSync (DPI_LOG, 'utf8').replace (/^\uFEFF/, '').split (/\r?\n/)
+            .filter (l => l.trim () !== '');
+        return all.slice (-(lines || 12));
+    }
+    catch (e) { return []; }
+}
+function dpiChosenInfo ()                        // когда записана последняя удачная стратегия
+{
+    try
+    {
+        const st = fsMod.statSync (DPI_CHOSEN);
+        return 'есть, изменена ' + new Date (st.mtimeMs).toLocaleString ('ru-RU');
+    }
+    catch (e) { return 'нет -- её пишет подбор'; }
+}
+function dpiLine (s) { return String (s || '').replace (/^\uFEFF/, '').replace (/^\[\d\d:\d\d:\d\d\]\s*/, '').trim (); }
+async function dpiElevatedRun (switches, timeoutMs)      // запуск подбора с ОДНИМ запросом прав Windows
+{
+    const list = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', DPI_TOOL].concat (switches || [])
+        .map (a => "'" + String (a).replace (/'/g, "''") + "'").join (', ');
+    const cmd = 'Start-Process -FilePath "powershell.exe" -ArgumentList @(' + list + ') -Verb RunAs -Wait';
+    return runCapture ('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', cmd], timeoutMs || DPI_PICK_TIMEOUT_MS);
+}
+async function dpiPickSwitches (only, seconds, test, voice)
+{
+    const sw = [];
+    if (only) sw.push ('-Only', String (only));
+    if (seconds) sw.push ('-Seconds', String (seconds));
+    if (!voice) sw.push ('-SkipVoice');          // голос проверяется только когда бот выключен
+    if (test) sw.push ('-TestOnly');
+    return sw;
+}
+async function obhodCli (args)                   // node . obhod: что с обходом и что можно сделать (права -- только на запуск/смену)
+{
+    $cliOwnScreen ();
+    const cli = (args || []).map (_a => String (_a));
+    const has = _k => cli.some (_a => new RegExp ('^' + _k + '$', 'i').test (_a));
+    const val = _k => { const _i = cli.findIndex (_a => new RegExp ('^' + _k + '$', 'i').test (_a)); return _i >= 0 ? String (cli[_i + 1] || '') : ''; };
+    const say = _s => console.log ('[obhod] ' + _s);
+
+    if (!fsMod.existsSync (DPI_TOOL))
+    {
+        say ('рядом с ботом нет tools/zapret-pick.ps1 -- подбирать обход нечем. Положи набор zapret в tools/ и повтори.');
+        return 1;
+    }
+
+    if (has ('--engine'))
+    {
+        say ('приношу движок zapret (без прав; если папка уже есть -- ничего не качаю, только показываю её)...');
+        const r = await dpiToolRun (['-EngineOnly'], 300000);
+        for (const l of String (r.out || '').split (/\r?\n/)) if (dpiLine (l)) say (dpiLine (l));
+        say (r.code === 0 ? 'движок на месте.' : 'движка нет и скачать не вышло -- положи набор zapret вручную.');
+        return r.code === 0 ? 0 : 1;
+    }
+
+    if (has ('--stop'))
+    {
+        say ('останавливаю обход и возвращаю службу zapret как было...');
+        say ('сейчас Windows спросит разрешение -- подтверди окно, иначе ничего не меняется.');
+        const r = await dpiElevatedRun (['-Restore'], 180000);
+        const pids = await dpiEnginePids ();
+        say (r.code === 0
+            ? 'готово: обход остановлен (winws.exe: ' + (pids.length ? 'ещё работает, pid ' + pids.join (', ') : 'не запущен') + '), служба zapret возвращена как была.'
+            : 'не вышло (код ' + r.code + '): похоже, разрешение не дали -- ничего не менял.');
+        return r.code === 0 ? 0 : 1;
+    }
+
+    if (has ('--pick'))
+    {
+        const only = val ('--only'), seconds = Number (val ('--seconds')) || 0;
+        const test = has ('--test'), voice = has ('--voice');
+        const list = await dpiToolRun (['-List'], 30000);
+        const presets = (String (list.out || '').match (/ :: /g) || []).length;
+        const each = seconds || 6;
+        const mins = presets ? Math.round ((presets * (each + 4) + 30) / 60) : 0;
+        if (presets) say ('к проверке пресетов: ' + presets + ' (по ' + each + ' с на каждый)' + (mins ? ' -- это примерно ' + mins + ' мин' : ''));
+        say ('внимание: на время подбора обход останавливается -- ютуб и дискорд будут недоступны, потом встанет лучшая стратегия');
+        say (voice ? 'голосовой канал проверю (для этого бот должен быть выключен)' : 'голосовой канал не проверяю: для этого бота надо выключить (впиши --voice, если выключен)');
+        say ('сейчас Windows спросит разрешение -- подтверди окно; без него ничего не меняется.');
+        const r = await dpiElevatedRun (await dpiPickSwitches (only, seconds, test, voice));
+        say ('подбор закончен (код ' + r.code + ').');
+        const tail = dpiLogTail (14);
+        if (tail.length) { say ('последнее из журнала (tools/zapret-work/zapret-pick.log):'); for (const l of tail) say ('  ' + dpiLine (l)); }
+        const pids = await dpiEnginePids ();
+        const dnsOk = await directUsable ();
+        const dp = dnsOk ? await directProbe () : { ok: false, why: 'youtube.com локально не резолвится' };
+        say ('сейчас: ютуб ' + (dp.ok ? 'отвечает' : 'не проходит (' + (dp.why || 'нет ответа') + ')') +
+            '; обход ' + (pids.length ? 'работает (winws.exe, pid ' + pids.join (', ') + ')' : 'не запущен'));
+        say ('удачная стратегия записана: tools/zapret-work/zapret-chosen.bat -- ' + dpiChosenInfo () + '.');
+        say ('в автозапуск я ничего не ставлю: захочешь сам -- положи zapret-chosen.bat в автозапуск или поставь службу из набора zapret.');
+        if (r.code !== 0) say ('ненулевой код обычно значит «разрешение не подтвердили» или «ни одна стратегия не подошла»: смотри журнал выше.');
+        return r.code === 0 ? 0 : 1;
+    }
+
+    say ('обход блокировки: что сейчас (только чтение, ничего не меняю)');
+    const chk = await dpiToolRun (['-Check'], 40000);
+    for (const l of String (chk.out || '').split (/\r?\n/))
+    {
+        const t = dpiLine (l);
+        if (t && !/^=====/.test (t)) say (t);
+    }
+    const pids = await dpiEnginePids ();
+    say ('движок winws.exe: ' + (pids.length ? 'работает (pid ' + pids.join (', ') + ')' : 'не запущен') +
+        '; последняя удачная стратегия: ' + dpiChosenInfo ());
+    say ('права администратора нужны только на запуск, остановку и смену стратегии обхода; проверка и «принести движок» -- без прав.');
+    say ('что можно сделать:');
+    say ('  node . obhod --engine            принести движок zapret (без прав)');
+    say ('  node . obhod --pick [--only ALT] [--seconds 8] [--test] [--voice]');
+    say ('                                   подобрать и оставить рабочую стратегию (один запрос прав Windows)');
+    say ('  node . obhod --stop              остановить обход и вернуть службу zapret как было (один запрос прав)');
+    say ('в автозапуск ничего не ставлю и чужую систему не переписываю; то же самое есть меню: tools/obhod.cmd');
+    return 0;
+}
+
+async function dpiPickFromDiscord ()             // кнопка у владельца: подбор из Discord, результат -- письмом
+{
+    if (dpiHealBusy) { await notifyHoster ('🛠 Подбор обхода уже идёт -- дождусь его и напишу.'); return; }
+    dpiHealBusy = true;
+    try
+    {
+        const before = await dpiEnginePids ();
+        const r = await dpiElevatedRun (['-SkipVoice']);
+        const pids = await dpiEnginePids ();
+        const dnsOk = await directUsable ();
+        const dp = dnsOk ? await directProbe () : { ok: false, why: 'youtube.com локально не резолвится' };
+        const head = (r.code === 0)
+            ? '🛠 **Подбор обхода закончен.** Сейчас: ютуб ' + (dp.ok ? 'отвечает' : 'не проходит (' + (dp.why || 'нет ответа') + ')') +
+                '; обход ' + (pids.length ? 'работает (winws.exe, pid ' + pids.join (', ') + ')' : 'не запущен')
+            : '🚨 **Подбор обхода не прошёл** (код ' + r.code + '): похоже, разрешение не подтвердили или ни одна стратегия не подошла.';
+        const tail = dpiLogTail (10).map (dpiLine).map (l => l.length > 160 ? l.slice (0, 160) + '…' : l);
+        await notifyHoster (head +
+            '\n_Было: ' + (before.length ? 'движок работал (pid ' + before.join (', ') + ')' : 'обход не запущен') + '._' +
+            (tail.length ? '\n_Последнее из журнала:_\n```\n' + tail.join ('\n') + '\n```' : '') +
+            (fsMod.existsSync (DPI_CHOSEN) ? '\n_Рабочая стратегия записана: tools/zapret-work/zapret-chosen.bat._' : ''));
+    }
+    catch (e) { await notifyHoster ('🚨 Подбор обхода сорвался: ' + ((e && e.message) || e)); }
+    finally { dpiHealBusy = false; }
+}
 if (BOT_RUN) setImmediate (() => reportRoutes ());   // после загрузки модуля: не торопит старт и не трогает ещё не объявленные настройки
 if (BOT_RUN)
 {
@@ -10782,6 +10947,15 @@ if (process.argv.slice (2).some (_a => /^cookies$/i.test (_a)))
         $cliDone (_code);
     }) ();
 
+if (process.argv.slice (2).some (_a => /^obhod$/i.test (_a)))
+    (async () =>
+    {
+        let _code = 1;
+        try { _code = await obhodCli (process.argv.slice (2)); }
+        catch (e) { console.log ('[obhod] ошибка: ' + ((e && e.message) || e)); }
+        $cliDone (_code);
+    }) ();
+
 if (process.argv.slice (2).some (_a => /^ytdlp$/i.test (_a)))
     (async () =>
     {
@@ -14752,9 +14926,10 @@ async function netHealthText (m, guildId, viewerId)      // ответ на /hea
         'свой маршрут по адресам: ' + (rs.dohPort ? 'включён' + (rs.bookN ? ', в книге ' + rs.bookN + ' имён' : '') : 'выключен'),
     ].join ('; '));
     lines.push (rs.advice.replace (/^-- /, ''));
-    if (owner && rs.noPath && rs.dpi !== true && MUSIC_DPI_HEAL)
+    const fix = !!(owner && rs.noPath && rs.dpi !== true && MUSIC_DPI_HEAL);
+    if (fix)
         lines.push ('🛠 Поднять обход я попробую сам: движок и хранителя из планировщика -- без прав; если не хватит прав -- напишу, каких именно.');
-    return lines.join ('\n');
+    return { text: lines.join ('\n'), fix: fix };
 }
 
 function musicNotice (guildId, text)
@@ -16040,6 +16215,18 @@ client.on ('interactionCreate', async (interaction) =>
         const cid = interaction.customId || '';
         const guildId = interaction.guildId;
         if (!(guildId in SERVERS)) return;
+        if (/^h:dpi:pick$/.test (cid))
+        {
+            if (!isBotOwner (interaction.user.id))
+                return interaction.reply ({ content: '🚫 Подбирать обход может только владелец бота.', flags: MessageFlags.Ephemeral });
+            const _list = await dpiToolRun (['-List'], 30000);
+            const _n = (String (_list.out || '').match (/ :: /g) || []).length;
+            await interaction.reply ({ content: '🛠 Подбираю обход' + (_n ? ': пресетов ' + _n + ', это примерно ' + Math.max (1, Math.round ((_n * 10 + 30) / 60)) + ' мин' : '') + '.\n' +
+                'Сейчас Windows спросит разрешение -- подтверди, иначе ничего не меняется.\n' +
+                'На время подбора обход останавливается: команды и музыка не работают, потом встанет лучшая стратегия. Напишу сюда и в журнал, когда закончу.' });
+            dpiPickFromDiscord ().catch (() => { });
+            return;
+        }
         const m = musicOf (guildId);
         const mOwn = /^(?:q:rm|q:mv|q:mx):(\d+)$/.exec (cid);
         const page = mOwn ? (parseInt (mOwn[1], 10) || 1) : 1;
@@ -17176,7 +17363,12 @@ client.on ('interactionCreate', async (interaction) =>
         else if (name === 'health')
         {
             await interaction.deferReply ();            // проверка путей занимает пару секунд
-            return interaction.editReply (await netHealthText (m, guildId, interaction.user.id));
+            const hr = await netHealthText (m, guildId, interaction.user.id);
+            return interaction.editReply (hr.fix
+                ? { content: hr.text + '\n_Кнопка ниже -- подбор обхода: Windows спросит разрешение, на время подбора обход останавливается._',
+                    components: [ new ActionRowBuilder ().addComponents (
+                        new ButtonBuilder ().setCustomId ('h:dpi:pick').setLabel ('🛠 Подобрать обход').setStyle (ButtonStyle.Danger)) ] }
+                : { content: hr.text });
         }
         else if (name === 'history')
         {
