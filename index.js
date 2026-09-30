@@ -19,6 +19,7 @@
 // v2.123 -- голос: после обрыва бот сам возвращается к слушателям и продолжает с того же места; лог сети молчит без перемен
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
+// v2.127 -- связь видно и лечится сама: /health говорит, сколько было обрывов голоса и сети, вернулся ли бот сам и каким путём идёт звук; когда ни один путь не работает, бот сам приносит движок обхода и запускает хранителя из планировщика, а если прав не хватило -- честно пишет владельцу, чего именно (ключ MUSIC.dpi_heal)
 // v2.126 -- пути и обрывы: при старте одна строка -- что сейчас работает (прямой путь, обход DPI, прокси, свой DoH-маршрут по адресам) и что включить, если не работает ничего; обрывы голоса и сети считаются (когда, сколько ждал, вернулся ли сам и с какой попытки) и видны в `node . net`; в /queue и /nowplaying видно, каким путём идёт звук; запас на диске по умолчанию 2 ГБ
 
 function earlyConfigCrash (e)
@@ -1347,6 +1348,7 @@ const STARTUP_DM_TEXT =
     '`/queue` -- что играет сейчас и что дальше: кто что поставил и сколько ещё ждать (сообщение обновляется само, пока музыка играет)\n' +
     '`/nowplaying` -- коротко про текущий трек: позиция, кто поставил, что дальше\n' +
     '`/history` -- кто и когда ставил музыку: последние добавления (треки, эфиры, плейлисты)\n' +
+    '`/health` -- здорова ли связь: сколько было обрывов голоса и сети, вернулся ли бот сам и каким путём сейчас идёт звук\n' +
     'Если в канале никого, музыка встаёт на паузу и продолжается, когда кто-то зашёл: бот помнит и трек, и место в нём -- перезапуск и обрыв связи их не сбрасывают.\n' +
     '\n' +
     '🔑 **Свой голосовой канал**\n' +
@@ -5598,7 +5600,7 @@ const CONFIG_ORDER = {
         ['SERVERS'],
     ],
     MUSIC: [
-        ['proxy', 'doh', 'cookies_file', 'cookies_from_browser'],
+        ['proxy', 'doh', 'dpi_heal', 'cookies_file', 'cookies_from_browser'],
         ['ytdlp_auto_update', 'ytdlp_update_after_fails', 'ytdlp_check_days', 'ytdlp_update_days'],
         ['normalize', 'filter'],
         ['channel_status', 'skip_absent_author'],
@@ -6350,42 +6352,156 @@ function dpiBypassProbe ()          // запущен ли обход DPI (winws
     });
 }
 
+const DPI_TOOL = pathMod.join (__dirname, 'tools', 'zapret-pick.ps1');   // обход DPI: самоподбор стратегии
+const DPI_TASK = 'obhod-dpi';                                           // задача хранителя в планировщике
+const DPI_HEAL_COOLDOWN_MS = 10 * 60000;      // чаще раза в 10 минут не пробую
+const DPI_HEAL_TELL_MS = 60 * 60000;          // про нехватку прав напоминаю не чаще раза в час
+const DPI_HEAL_WAIT_MS = 25000;               // сколько ждать, пока хранитель поднимет движок
+let dpiHealBusy = false, dpiHealLastAt = 0, dpiHealToldAt = 0;
+
+function runCapture (file, args, timeoutMs)   // запустить чужую программу и забрать код возврата: вывод бывает в чужой кодировке
+{
+    return new Promise (res =>
+    {
+        if (process.platform !== 'win32') return res ({ code: -1 });
+        try
+        {
+            require ('child_process').execFile (file, args,
+                { windowsHide: true, timeout: timeoutMs || 20000, maxBuffer: 4 * 1024 * 1024 },
+                (e, stdout) => res ({ code: e ? (typeof e.code === 'number' ? e.code : -1) : 0, out: String (stdout || '') }));
+        }
+        catch (e) { res ({ code: -1 }); }
+    });
+}
+function dpiToolRun (args, timeoutMs)
+{
+    return runCapture ('powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', DPI_TOOL].concat (args || []), timeoutMs);
+}
+
+async function routeStatus ()       // проверка путей: её читают и стартовая строка, и /health
+{
+    const dnsOk = await directUsable ();
+    const dp = dnsOk ? await directProbe () : { ok: false, why: 'youtube.com локально не резолвится' };
+    const dpi = await dpiBypassProbe ();
+    const alive = [];
+    for (const p of MUSIC_PROXIES) if (await pingProxy (p, 1500)) alive.push (p);
+    const dead = MUSIC_PROXIES.filter (p => alive.indexOf (p) < 0);
+    const dohPort = MUSIC_DOH ? await dohProxyStart () : 0;      // свой маршрут по адресам: поднимаю сразу
+    let bookN = 0;
+    try { const b = await dnsBookLoad (); bookN = Object.keys (b || {}).length; } catch (e) { }
+    const parts = [
+        'прямой путь: ' + (dp.ok ? 'ОТВЕЧАЕТ' : 'не проходит' +
+            (dnsOk ? (dp.why ? ' (' + dp.why + ')' : '') : ' (и имя youtube.com локально не резолвится)')),
+        'обход DPI (zapret/winws): ' + (dpi === true ? 'запущен' : (dpi === false ? 'НЕ запущен' : 'не смог посмотреть')),
+        'прокси: ' + (MUSIC_PROXIES.length
+            ? (alive.length ? 'отвечает ' + alive.join (', ') + (dead.length ? '; молчит ' + dead.join (', ') : '')
+                : 'задан, но НЕ отвечает: ' + MUSIC_PROXIES.join (', '))
+            : 'не задан'),
+        'свой DoH-маршрут (имя разрешаю сам, системный DNS не нужен): ' + (dohPort
+            ? 'включён' + (bookN ? ', в книге адресов ' + bookN + ' имён' : ', книга пока пустая -- наполнится сама')
+            : 'выключен (MUSIC.doh)'),
+    ];
+    let advice;
+    if (dp.ok) advice = '-- музыку беру напрямую, включать ничего не надо';
+    else if (alive.length) advice = '-- прямой путь не проходит, музыку беру через прокси ' + alive.join (', ');
+    else if (dohPort) advice = '-- прямого пути нет: пробую свой DoH-маршрут (имя разрешаю сам, иду по адресу)';
+    else advice = '-- рабочего пути НЕТ: включи обход DPI (tools\\obhod.cmd -- подбирает стратегию сам) или впиши рабочий прокси в MUSIC.proxy, либо включи MUSIC.doh';
+    return { dnsOk, dp, dpi, alive, dead, dohPort, bookN, parts, advice, noPath: (!dp.ok && !alive.length) };
+}
+
+async function notifyHoster (text)              // письмо хозяину: в личные сообщения и в журнал сервера
+{
+    let sent = 0;
+    const ids = OWNER_HOSTER ? [OWNER_HOSTER] : STARTUP_DMS.slice ();
+    for (const id of ids)
+    {
+        try { const usr = await client.users.fetch (id); if (usr) { await sendFit (usr, text); sent++; } }
+        catch (e) { console.error ('[' + (d()) + '] письмо владельцу не ушло: ' + ((e && e.message) || e)); }
+    }
+    for (const srv of Object.keys (SERVERS))
+        if (SERVERS[srv] && SERVERS[srv].log_channel)
+            try { await logTo (SERVERS[srv].log_channel).send (text); sent++; } catch (e) { }
+    return sent;
+}
+
+async function dpiSelfHeal (reason)             // ни один путь не работает -- пробую поднять обход DPI сам
+{
+    if (!MUSIC_DPI_HEAL || !BOT_RUN) return false;
+    if (dpiHealBusy || (Date.now () - dpiHealLastAt) < DPI_HEAL_COOLDOWN_MS) return false;
+    if ((await dpiBypassProbe ()) === true) return false;      // обход уже идёт: чинить нечего
+    dpiHealBusy = true;
+    dpiHealLastAt = Date.now ();
+    let fixed = false, missing = '';
+    const did = [];
+    try
+    {
+        console.log ('[' + (d()) + '] [music] ни один путь не отвечает (' + reason + ') -- пробую поднять обход DPI сам');
+        if (!fsMod.existsSync (DPI_TOOL)) missing = 'рядом с ботом нет tools/zapret-pick.ps1';
+        else
+        {
+            const list = await dpiToolRun (['-List'], 30000);
+            if (list.code === 3)                                // движка нет -- принести его можно и без прав
+            {
+                const eng = await dpiToolRun (['-EngineOnly'], 180000);
+                did.push ('принёс движок zapret: ' + (eng.code === 0 ? 'получилось' : 'не получилось'));
+                if (eng.code !== 0) missing = 'нет движка zapret и скачать его не вышло';
+            }
+            if (!missing)
+            {
+                const q = await runCapture ('schtasks.exe', ['/Query', '/TN', DPI_TASK, '/FO', 'LIST'], 15000);
+                if (q.code === 0)                               // хранитель уже стоит: он и запущен с повышенными правами
+                {
+                    const run = await runCapture ('schtasks.exe', ['/Run', '/TN', DPI_TASK], 20000);
+                    did.push ('запустил хранителя из планировщика: ' + (run.code === 0 ? 'получилось' : 'не получилось'));
+                    if (run.code === 0)
+                    {
+                        await new Promise (r => { const t = setTimeout (r, DPI_HEAL_WAIT_MS); try { t.unref (); } catch (e) { } });
+                        fixed = (await dpiBypassProbe ()) === true;
+                        if (!fixed) missing = 'хранитель запущен, но движок не поднялся';
+                    }
+                    else missing = 'хранитель в планировщике есть, но запустить его не удалось';
+                }
+                else missing = 'нет задачи хранителя в планировщике, а без прав администратора обход не поднять (драйвер WinDivert ставится только с повышением прав)';
+            }
+        }
+    }
+    catch (e) { missing = 'сорвалось с ошибкой: ' + ((e && e.message) || e); }
+    finally { dpiHealBusy = false; }
+    if (fixed)
+    {
+        console.log ('[' + (d()) + '] [music] обход DPI поднял сам -- путь к YouTube снова есть');
+        await notifyHoster ('🛠 **Музыка снова может идти.** Ни один путь к YouTube не работал (' + reason + '), и обход блокировки я поднял сам.' +
+            (did.length ? '\n_Что делал: ' + did.join ('; ') + '._' : ''));
+        return true;
+    }
+    const what = missing || 'рабочей стратегии не нашлось';
+    if ((Date.now () - dpiHealToldAt) > DPI_HEAL_TELL_MS)
+    {
+        dpiHealToldAt = Date.now ();
+        console.error ('[' + (d()) + '] [music] обход DPI поднять сам не смог: ' + what +
+            ' -- музыке нужен рабочий путь, скажи хозяину запустить tools\\obhod.cmd');
+        await notifyHoster ('🚨 **Музыке некуда идти.** Ни один путь к YouTube не работает (' + reason + '), а обход сам поднять не смог: ' + what + '.' +
+            (did.length ? '\n_Что пробовал: ' + did.join ('; ') + '._' : '') +
+            '\nЧто нужно от тебя: запусти один раз `tools\\obhod.cmd` -- пункт 4 («ПОДОБРАТЬ и запустить»), потом пункт 7 («хранитель в автозапуск»).' +
+            ' После этого я смогу поднимать обход сам, и права спрашивать больше не придётся.');
+    }
+    return false;
+}
+
 async function reportRoutes ()
 {
     try
     {
-        const dnsOk = await directUsable ();
-        const dp = dnsOk ? await directProbe () : { ok: false, why: 'youtube.com локально не резолвится' };
-        const dpi = await dpiBypassProbe ();
-        const alive = [];
-        for (const p of MUSIC_PROXIES) if (await pingProxy (p, 1500)) alive.push (p);
-        const dead = MUSIC_PROXIES.filter (p => alive.indexOf (p) < 0);
-        const dohPort = MUSIC_DOH ? await dohProxyStart () : 0;      // свой маршрут по адресам: поднимаю сразу
-        let bookN = 0;
-        try { const b = await dnsBookLoad (); bookN = Object.keys (b || {}).length; } catch (e) { }
-        const parts = [
-            'прямой путь: ' + (dp.ok ? 'ОТВЕЧАЕТ' : 'не проходит' +
-                (dnsOk ? (dp.why ? ' (' + dp.why + ')' : '') : ' (и имя youtube.com локально не резолвится)')),
-            'обход DPI (zapret/winws): ' + (dpi === true ? 'запущен' : (dpi === false ? 'НЕ запущен' : 'не смог посмотреть')),
-            'прокси: ' + (MUSIC_PROXIES.length
-                ? (alive.length ? 'отвечает ' + alive.join (', ') + (dead.length ? '; молчит ' + dead.join (', ') : '')
-                    : 'задан, но НЕ отвечает: ' + MUSIC_PROXIES.join (', '))
-                : 'не задан'),
-            'свой DoH-маршрут (имя разрешаю сам, системный DNS не нужен): ' + (dohPort
-                ? 'включён' + (bookN ? ', в книге адресов ' + bookN + ' имён' : ', книга пока пустая -- наполнится сама')
-                : 'выключен (MUSIC.doh)'),
-        ];
-        let advice;
-        if (dp.ok) advice = '-- музыку беру напрямую, включать ничего не надо';
-        else if (alive.length) advice = '-- прямой путь не проходит, музыку беру через прокси ' + alive.join (', ');
-        else if (dohPort) advice = '-- прямого пути нет: пробую свой DoH-маршрут (имя разрешаю сам, иду по адресу)';
-        else advice = '-- рабочего пути НЕТ: включи обход DPI (tools\\obhod.cmd -- подбирает стратегию сам) или впиши рабочий прокси в MUSIC.proxy, либо включи MUSIC.doh';
-        console.log ('[' + (d()) + '] [music] пути к YouTube сейчас: ' + parts.join ('; ') + ' ' + advice);
-        if (!dp.ok && !alive.length)
-            console.error ('[' + (d()) + '] [music] ни одного проверенного пути к YouTube: ' + (dohPort
+        const rs = await routeStatus ();
+        console.log ('[' + (d()) + '] [music] пути к YouTube сейчас: ' + rs.parts.join ('; ') + ' ' + rs.advice);
+        if (rs.noPath)
+            console.error ('[' + (d()) + '] [music] ни одного проверенного пути к YouTube: ' + (rs.dohPort
                 ? 'остаётся только свой DoH-маршрут (по адресам из книги) -- если и он не выручит, включи обход DPI или прокси'
                 : 'включи обход DPI (tools\\obhod.cmd) или впиши рабочий прокси в MUSIC.proxy, либо MUSIC.doh') +
                 '; пока этого нет, музыка будет ждать сеть, а очередь и место в треке целы');
+        if (rs.noPath && !rs.dohPort)
+            setTimeout (() => dpiSelfHeal ('при старте ни один путь не отвечает'), 30000);   // не тороплю старт: сеть может подниматься сама
     }
     catch (e) { }
 }
@@ -6463,6 +6579,7 @@ if (BOT_RUN)
 
 
 const MUSIC_DOH = MUSIC_CFG.doh !== false;
+const MUSIC_DPI_HEAL = MUSIC_CFG.dpi_heal !== false;   // когда ни один путь не работает -- пробую поднять обход DPI сам
 const DOH_RESOLVERS =
 [
     { name: 'Cloudflare', ip: '1.1.1.1',   host: 'cloudflare-dns.com',        path: '/dns-query' },
@@ -10483,6 +10600,7 @@ function configCli ()
     sec ('музыка (MUSIC)');
     row ('proxy', MUSIC_PROXIES.length ? MUSIC_PROXIES.join (', ') : 'нет -- напрямую (DIRECT)', hasM ('proxy') ? 'config.json' : (process.env.MUSIC_PROXY ? 'переменная окружения MUSIC_PROXY' : '-- (в файле нет)'));
     row ('doh (свой маршрут по адресам)', YN (MUSIC_DOH), hasM ('doh') ? 'config.json' : 'по умолчанию (вкл: имена разрешаю сам, системный DNS не участвует)');
+    row ('dpi_heal (поднимать обход сам)', YN (MUSIC_DPI_HEAL), hasM ('dpi_heal') ? 'config.json' : 'по умолчанию (вкл: пробую поднять обход, когда ни один путь не отвечает)');
     row ('cookies_file', MUSIC_COOKIES_FILE || '-- (не задан)', hasM ('cookies_file') ? 'config.json' : '-- (в файле нет)');
     row ('cookies_from_browser (необязательный)', MUSIC_COOKIES_BROWSER || '-- (не задан)', hasM ('cookies_from_browser') ? 'config.json' : 'не нужен, если задан cookies_file');
     row ('normalize (громкость)', YN (MUSIC_NORMALIZE), hasM ('normalize') ? 'config.json' : 'по умолчанию (вкл)');
@@ -10865,6 +10983,7 @@ function musicNetStall (guildId, track, at, e)
     w.lastWhy = why;
     if (w.tries === 1) netOutageStart (guildId);      // счёт обрывов: начало
     else netOutageAttempt (guildId, w.tries);
+    if (w.tries === 3) dpiSelfHeal ('музыка не может подняться: сеть не отвечает');   // пути не работают на самом деле
     w.nextAt = Date.now () + Math.min (NET_WAIT_MAX_MS,
         NET_WAIT_MS * Math.pow (2, Math.min (3, Math.max (0, w.tries - 1))));
     const chId = m.connection ? m.connection.joinConfig.channelId : m.savedChannelId;
@@ -14552,6 +14671,38 @@ function netVoiceLines (voice)
     return out;
 }
 
+async function netHealthText (m, guildId, viewerId)      // ответ на /health: как живёт связь и чем идёт звук
+{
+    const owner = isBotOwner (viewerId);
+    const lines = ['🩺 **Связь и музыка** -- что бот помнит и что видит сейчас'];
+    for (const l of await netVoiceLines (await voiceLogLoad ()))
+        lines.push (/^  /.test (l) ? l : '• ' + l);
+    if (m)
+    {
+        const way = playWayShort (m, guildId);
+        lines.push ('🎵 Сейчас: ' + (m.current ? '«' + (m.current.title || 'трек') + '»' : 'ничего не играет') +
+            (way ? ' -- играю ' + way : ''));
+        if (m.netWait)
+            lines.push ('⏳ Жду сеть (попытка ' + (m.netWait.tries || 1) + '): ' + (m.netWait.lastWhy || 'нет ответа') +
+                ' -- очередь и место в треке целы');
+        else if (m.pending)
+            lines.push ('⏸ На паузе: в канале нет слушателей -- продолжу, когда кто-нибудь зайдёт');
+    }
+    const rs = await routeStatus ();
+    lines.push ('🛣 Пути к YouTube: ' + [
+        'прямой путь: ' + (rs.dp.ok ? 'работает' : 'не проходит'),
+        'обход DPI (zapret): ' + (rs.dpi === true ? 'запущен' : (rs.dpi === false ? 'не запущен' : 'не видно')),
+        'прокси: ' + (MUSIC_PROXIES.length
+            ? (rs.alive.length ? 'отвечает' + (owner ? ' (' + rs.alive.join (', ') + ')' : '') : 'задан, но молчит')
+            : 'не задан'),
+        'свой маршрут по адресам: ' + (rs.dohPort ? 'включён' + (rs.bookN ? ', в книге ' + rs.bookN + ' имён' : '') : 'выключен'),
+    ].join ('; '));
+    lines.push (rs.advice.replace (/^-- /, ''));
+    if (owner && rs.noPath && rs.dpi !== true && MUSIC_DPI_HEAL)
+        lines.push ('🛠 Поднять обход я попробую сам; если не хватит прав -- напишу, каких именно.');
+    return lines.join ('\n');
+}
+
 function musicNotice (guildId, text)
 {
     const m = $music[guildId];
@@ -15582,6 +15733,9 @@ const musicCommands =
     new SlashCommandBuilder ()
         .setName ('nowplaying')
         .setDescription ('Что играет сейчас: трек, позиция, кто поставил и что дальше'),
+    new SlashCommandBuilder ()
+        .setName ('health')
+        .setDescription ('Здорова ли связь: обрывы голоса и сети и каким путём сейчас идёт звук'),
     new SlashCommandBuilder ()
         .setName ('history')
         .setDescription ('История добавлений: кто, когда и что поставил (треки, эфиры, плейлисты)'),
@@ -16696,14 +16850,14 @@ client.on ('interactionCreate', async (interaction) =>
             '; ключ также напечатан **в консоли бота** (в Discord не отправляю: оттуда он ушёл бы на серверы Discord).' +
             '\nСохрани его отдельно от config.json -- без него записи базы не читаются. Перезапуск не нужен.');
     }
-    if (!['play','join','stop','skip','pause','resume','seek','queue','nowplaying','history','leave','remove','clear','jump','move','push','repeat','repeat-list','filter'].includes (name)) return;
+    if (!['play','join','stop','skip','pause','resume','seek','queue','nowplaying','history','health','leave','remove','clear','jump','move','push','repeat','repeat-list','filter'].includes (name)) return;
     const guildId = interaction.guildId;
     const m = musicOf (guildId);
     const qRedraw = (ms = 300) => queueMsgRedraw (guildId, ms).catch (() => {});
 
     try
     {
-        if (!['queue', 'nowplaying', 'history', 'repeat', 'repeat-list', 'filter'].includes (name) && !isDJ (interaction))
+        if (!['queue', 'nowplaying', 'history', 'health', 'repeat', 'repeat-list', 'filter'].includes (name) && !isDJ (interaction))
         {
             let role_dj = SERVERS[guildId].role_dj || '';
             return interaction.reply ({ content: '🚫 Музыка только для ' + (role_dj ? '<@&' + role_dj + '>' : 'DJ'), flags: MessageFlags.Ephemeral });
@@ -16964,6 +17118,11 @@ client.on ('interactionCreate', async (interaction) =>
         else if (name === 'nowplaying')
         {
             return interaction.reply (nowPlayingText (m, guildId, interaction.user.id));
+        }
+        else if (name === 'health')
+        {
+            await interaction.deferReply ();            // проверка путей занимает пару секунд
+            return interaction.editReply (await netHealthText (m, guildId, interaction.user.id));
         }
         else if (name === 'history')
         {
