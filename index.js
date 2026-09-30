@@ -17,6 +17,7 @@
 // v2.121 -- собранное о сети разбирается: одна таблица, графики по часам и дням, поиск зацепок и прогноз, который сверяется с фактом
 // v2.122 -- связки адресов: один адрес на много имён; первым идёт тот, через кого музыка уже шла
 // v2.123 -- голос: после обрыва бот сам возвращается к слушателям и продолжает с того же места; лог сети молчит без перемен
+// v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 
 function earlyConfigCrash (e)
 {
@@ -8742,7 +8743,7 @@ const MUSIC_CACHE_SHORT_MAX_MINUTES = (MUSIC_CFG.cache_short_max_minutes !== und
 const MUSIC_CACHE_SHORT_MAX_SEC = (MUSIC_CACHE_SHORT_MAX_MINUTES === undefined || MUSIC_CACHE_SHORT_MAX_MINUTES === null
     ? 15
     : Math.max (0, Math.round (Number (MUSIC_CACHE_SHORT_MAX_MINUTES) || 0))) * 60;
-const MUSIC_CACHE_KEEP_PLAYED = MUSIC_CFG.cache_keep_played === true;
+const MUSIC_CACHE_KEEP_PLAYED = MUSIC_CFG.cache_keep_played !== false;
 const MUSIC_CACHE_LONG_SETS = MUSIC_CACHE &&
     ((MUSIC_CFG.cache_long_sets === undefined || MUSIC_CFG.cache_long_sets === null)
         ? true : MUSIC_CFG.cache_long_sets === true);
@@ -8750,14 +8751,17 @@ const CACHE_PART_USEFUL_BYTES  = 65536;
 const CACHE_PART_BYTES_PER_SEC = 16384;
 const CACHE_PART_SAFE_FACTOR   = 0.9;
 const CACHE_PART_AHEAD_SEC     = 20;
+const CACHE_PART_MIN_AHEAD_SEC = 10;
+const DISK_RETRY_MS            = 3000;
 const cachePartSpent = new Set ();
 const cacheLongBusy = new Set ();
 if (MUSIC_CACHE)
     console.log ('[' + (d()) + '] [music] кэш аудио: ВКЛЮЧЁН -- ' + MUSIC_CACHE_DIR + ' (' +
         (MUSIC_CACHE_MAX_MB ? 'лимит ' + MUSIC_CACHE_MAX_MB + ' МБ, старое удаляется само' : 'без лимита места') + ')' +
         (MUSIC_CACHE_KEEP_PLAYED
-            ? '; проигранное остаётся на диске (cache_keep_played: true)'
-            : '; проигранные файлы удаляются сразу -- на диске только играющий и предзагрузка') +
+            ? '; проигранное остаётся НА ДИСКЕ ЗАПАСОМ: сеть или YouTube отвалились -- трек играет со своей копии, '
+                + 'уходит только по лимиту (выключить: cache_keep_played: false)'
+            : '; проигранные файлы удаляются сразу (cache_keep_played: false) -- на диске только играющий и предзагрузка') +
         (MUSIC_CACHE_SHORT_MAX_SEC ? '; треки до ' + Math.round (MUSIC_CACHE_SHORT_MAX_SEC / 60) +
             ' мин качаю на диск до старта, ' + (MUSIC_CACHE_LONG_SETS ? 'длинные сеты -- целиком в фоне'
                 : 'длинные сеты пишу во время игры') : ''));
@@ -9691,7 +9695,7 @@ function cacheDropParts (key)
         if (n.startsWith (key + '.dl.'))
             try { fsMod.unlinkSync (pathMod.join (MUSIC_CACHE_DIR, n)); } catch {}
 }
-function cachePartFind (track, posSec)
+function cachePartFind (track, posSec, loose = false)
 {
     if (!MUSIC_CACHE || !track || track.isLive || !cacheDirReady ()) return null;
     if (!(Number (posSec) >= 1)) return null;
@@ -9710,10 +9714,27 @@ function cachePartFind (track, posSec)
         try { st = fsMod.statSync (p); } catch { continue; }
         if (!st.isFile () || st.size < CACHE_PART_USEFUL_BYTES) continue;
         const sec = cachePartSeconds (st.size) * CACHE_PART_SAFE_FACTOR;
-        if (want + CACHE_PART_AHEAD_SEC > sec) continue;
+        if (want + (loose ? CACHE_PART_MIN_AHEAD_SEC : CACHE_PART_AHEAD_SEC) > sec) continue;
         if (!best || sec > best.sec) best = { file: p, name: n, sec: Math.round (sec) };
     }
     return best;
+}
+function cachePlayFrom (track, posSec = 0)
+{
+    if (!MUSIC_CACHE || !track || track.isLive) return null;
+    const file = cacheFind (track);
+    if (file) return { file: file, kind: 'copy', loose: false, what: 'целая копия этого трека' };
+    const part = cachePartFind (track, posSec, true);
+    if (part) return { file: part.file, kind: 'part', loose: true,
+                       what: 'своя запись этого трека (примерно до ' + fmtDur (part.sec) + ')' };
+    return null;
+}
+function netDiskPick (m)
+{
+    const t = (m && (m.seekTrack || (m.tracks && m.tracks[0]))) || null;
+    if (!t) return null;
+    const sec = (m.seekTrack === t) ? (m.seekSec || 0) : (t.seek || 0);
+    return cachePlayFrom (t, sec);
 }
 function cacheSpendPart (file)
 {
@@ -10049,6 +10070,11 @@ function cacheCli (args = [])
     console.log ('[cache] готовых треков: ' + done.length + ' (' + _mb (total) + ')' +
         (parts.length ? ', недокачанных файлов: ' + parts.length + ' (' + _mb (partSize) + ')' : '') +
         ', лимит: ' + (MUSIC_CACHE_MAX_MB ? MUSIC_CACHE_MAX_MB + ' МБ' : 'без лимита'));
+    if (!MUSIC_CACHE_KEEP_PLAYED)
+        console.log ('[cache] проигранное не хранится (cache_keep_played: false): на диске только играющий трек и предзагрузка');
+    else if (done.length)
+        console.log ('[cache] это ЗАПАС: если YouTube или сеть отвалится, бот возьмёт трек из своей копии и очередь не встанет' +
+            ' (не нужно -- выключить: cache_keep_played: false)');
     if (parts.length)
     {
         console.log ('[cache] недокачанное НЕ выбрасывается (v2.72): если позиция трека внутри записанного куска, ' +
@@ -10142,7 +10168,7 @@ function configCli ()
         hasM ('cache_short_max_minutes') ? 'config.json' : 'по умолчанию (15)');
     row ('cache_long_sets', YN (MUSIC_CACHE_LONG_SETS), hasM ('cache_long_sets') ? 'config.json' : 'по умолчанию (вкл)');
     row ('cache_max_mb', MUSIC_CACHE_MAX_MB || '0 (без лимита)', hasM ('cache_max_mb') ? 'config.json' : 'по умолчанию (4096)');
-    row ('cache_keep_played', YN (MUSIC_CACHE_KEEP_PLAYED), hasM ('cache_keep_played') ? 'config.json' : 'по умолчанию (выкл)');
+    row ('cache_keep_played', YN (MUSIC_CACHE_KEEP_PLAYED), hasM ('cache_keep_played') ? 'config.json' : 'по умолчанию (вкл: копии остаются запасом)');
     row ('queue_check (заранее)', YN (MUSIC_QUEUE_CHECK), hasM ('queue_check') ? 'config.json' : 'по умолчанию (вкл)');
     row ('queue_check_depth', QUEUE_CHECK_DEPTH + ' треков (первые ' + QUEUE_CHECK_STRICT + ' -- yt-dlp)', hasM ('queue_check_depth') ? 'config.json' : 'по умолчанию (20)');
     row ('queue_check_gap_ms', QUEUE_CHECK_GAP_MS + ' мс', hasM ('queue_check_gap_ms') ? 'config.json' : 'по умолчанию (5000)');
@@ -10257,7 +10283,7 @@ if (process.argv.slice (2).some (_a => /^ytdlp$/i.test (_a)))
         $cliDone (_code);
     }) ();
 
-async function createTrackStream (track, seekSec = 0, seekMode = 'sections')
+async function createTrackStream (track, seekSec = 0, seekMode = 'sections', partLoose = false)
 {
     const _cached = MUSIC_CACHE ? cacheFind (track) : null;
     if (_cached)
@@ -10267,7 +10293,7 @@ async function createTrackStream (track, seekSec = 0, seekMode = 'sections')
     }
     if (seekSec >= 1 && !track.isLive)
     {
-        const _part = cachePartFind (track, seekSec);
+        const _part = cachePartFind (track, seekSec, partLoose);
         if (_part)
         {
             const rp = openCachedTrack (track, _part.file, seekSec);
@@ -10515,6 +10541,13 @@ function musicNetStall (guildId, track, at, e)
     else if (w.tries <= 3 || (w.tries % 5) === 0)
         console.error ('[' + (d()) + '] [music] сеть всё ещё не отвечает (попытка ' + w.tries + '): ' + why +
             ' -- музыка пойдёт сама, как только маршрут оживёт');
+    const _copy = track ? cachePlayFrom (track, pos) : null;
+    m.seekLoose = !!(_copy && _copy.loose);
+    if (_copy && w.tries === 1)
+        console.log ('[' + (d()) + '] [music] у меня есть ' + _copy.what +
+            ' -- наружу не прошу: трек продолжу со своей копии, YouTube для этого не нужен');
+    if (heard && w.tries === 1)
+        outageDown (guildId, track, pos);
     if (!heard || !m.connection)
         m.pending = true;
     scheduleVoiceStatus (guildId, true);
@@ -10567,7 +10600,7 @@ async function playNext (guildId)
     const seekFrom = (m.seekTrack === track && (m.seekSec || 0) >= 1) ? Math.round (m.seekSec) : 0;
     console.log ('[' + (d()) + '] [music] играю: ' + (track.title || track.url || 'трек') +
         (seekFrom ? ' (продолжаю с ' + fmtDur (seekFrom) + ')'
-                  : (fromDisk ? ' (с диска)' : (fromPreload ? ' (из предзагрузки, без паузы)' : ''))));
+                  : (fromDisk ? ' (с диска: своя копия)' : (fromPreload ? ' (из предзагрузки, без паузы)' : ''))));
     scheduleVoiceStatus (guildId, true);
     schedulePresence (true);
     try
@@ -10575,6 +10608,8 @@ async function playNext (guildId)
         let resource = null, viaProxy = false, handle = null;
         let startedAt = 0;
         let fromPart = false, partFile = null;
+        let playedFromDisk = false;
+        let _loose = !!m.seekLoose;
         const p = m.preload;
         if (p && p.track === track && !(track.gone && p.proc && p.proc.lastErr))
         {
@@ -10583,6 +10618,7 @@ async function playNext (guildId)
             if (r)
             {
                 resource = r.resource; viaProxy = r.viaProxy;
+                playedFromDisk = !!(r.fromCache || r.fromPart);
                 handle = { resource: r.resource, source: p.source, proc: p.proc, ff: p.ff, tee: p.tee };
                 if (resource) routeUseSet (guildId, r.viaProxy, (r.fromCache || r.fromPart) ? 'disk' : 'stream');
             }
@@ -10593,8 +10629,19 @@ async function playNext (guildId)
         }
         if (!resource)
         {
-            if (MUSIC_CACHE && !track.isLive && Number (track.duration) > 0 &&
-                Number (track.duration) <= MUSIC_CACHE_SHORT_MAX_SEC && !cacheFind (track))
+            let seekSec = (m.seekTrack === track) ? (m.seekSec || 0) : (track.seek || 0);
+            if (track.isLive) seekSec = 0;
+            const _diskNow = (MUSIC_CACHE && !track.isLive) ? cachePlayFrom (track, seekSec) : null;
+            if (_diskNow)
+            {
+                m.seekLoose = !!_diskNow.loose;
+                _loose = !!m.seekLoose;
+                if (_diskNow.loose || m.netWait)
+                    console.log ('[' + (d()) + '] [music] качать не буду: у меня уже есть ' + _diskNow.what +
+                        ' -- играю с диска, YouTube для этого не нужен');
+            }
+            else if (MUSIC_CACHE && !track.isLive && Number (track.duration) > 0 &&
+                Number (track.duration) <= MUSIC_CACHE_SHORT_MAX_SEC)
             {
                 try
                 {
@@ -10611,11 +10658,9 @@ async function playNext (guildId)
                             '): ' + ytDlpErr (e, 150) + ' -- беру потоком');
                 }
             }
-            let seekSec = (m.seekTrack === track) ? (m.seekSec || 0) : (track.seek || 0);
-            if (track.isLive) seekSec = 0;
             const _noSec = (m.seekNoSections || []).includes (track.url);
             const _trySections = seekSec >= 1 && seekSec > SEEK_FFSEEK_MAX && !_noSec;
-            let opened = await createTrackStream (track, seekSec, _trySections ? 'sections' : (seekSec >= 1 ? 'ffseek' : 'none'));
+            let opened = await createTrackStream (track, seekSec, _trySections ? 'sections' : (seekSec >= 1 ? 'ffseek' : 'none'), _loose);
             if (_trySections && !opened.fromCache)
             {
                 const _waitMs = seekSectionWait (opened);
@@ -10631,7 +10676,7 @@ async function playNext (guildId)
                     console.error ('[' + (d()) + '] [music] секция с ' + fmtDur (seekSec) +
                         ' ничего не отдала за ' + Math.round (_waitMs / 1000) + ' с' +
                         sectionProxyWhy (opened.sectionProxy) + ' -- беру тот же трек через ffmpeg');
-                    opened = await createTrackStream (track, seekSec, 'ffseek');
+                    opened = await createTrackStream (track, seekSec, 'ffseek', _loose);
                 }
             }
             if (seekSec >= 1 && (!opened.seeked || await failedFast (opened.proc)))
@@ -10645,7 +10690,7 @@ async function playNext (guildId)
                         '(источник не умеет навигацию) -- продолжаю с ' + fmtDur (back) + ', как и играло');
                     musicNotice (guildId, '⚠️ **' + (track.title || 'Трек') + '** -- источник не умеет навигацию, ' +
                         'перемотка не вышла. Продолжаю с `' + fmtDur (back) + '` (где и играло).');
-                    opened = await createTrackStream (track, back, 'ffseek');
+                    opened = await createTrackStream (track, back, 'ffseek', _loose);
                 }
                 else
                 {
@@ -10656,7 +10701,8 @@ async function playNext (guildId)
             }
             m.seekReturnSec = 0;
             resource = opened.resource;
-            routeUseSet (guildId, opened.viaProxy, (opened.fromCache || opened.fromPart) ? 'disk' : 'stream');
+            playedFromDisk = !!(opened.fromCache || opened.fromPart);
+            routeUseSet (guildId, opened.viaProxy, playedFromDisk ? 'disk' : 'stream');
             viaProxy = opened.viaProxy;
             handle = { resource: opened.resource, source: opened.source, proc: opened.proc, ff: opened.ff };
             startedAt = seekSec;
@@ -10677,12 +10723,21 @@ async function playNext (guildId)
         m.streamHandle = handle;
         m.player.play (resource);
         m.playFailStreak = 0;
+        m.seekLoose = false;
         if (m.netWait)
         {
             const _w = m.netWait;
             m.netWait = null;
-            console.log ('[' + (d()) + '] [music] сеть вернулась (попыток: ' + _w.tries +
-                ') -- музыка снова идёт' + (startedAt ? ' (с ' + fmtDur (startedAt) + ')' : ''));
+            console.log (playedFromDisk
+                ? '[' + (d()) + '] [music] связи нет, но музыка идёт ИЗ СВОЕЙ КОПИИ (YouTube для неё не нужен)' +
+                  ' -- очередь не стоит' + (startedAt ? '; продолжаю с ' + fmtDur (startedAt) : '')
+                : '[' + (d()) + '] [music] сеть вернулась (попыток: ' + _w.tries +
+                  ') -- музыка снова идёт' + (startedAt ? ' (с ' + fmtDur (startedAt) + ')' : ''));
+        }
+        if (m.netDownToldAt)
+        {
+            m.netDownToldAt = 0;
+            musicNotice (guildId, outageUpText (track, startedAt, false, playedFromDisk));
         }
         if (track.warn)
         {
@@ -11307,10 +11362,24 @@ const musicNetTick = setInterval
                 const ready = await netRouteAnswers ();
                 const justCame = ready && !m.netWait.up;
                 m.netWait.up = ready;
-                if (!ready) continue;
-                if (!justCame && now < (m.netWait.nextAt || 0)) continue;
+                const _copy = ready ? null : netDiskPick (m);
+                if (!ready && !_copy) continue;
+                const _fastDisk = !!(_copy && (m.netWait.diskTries || 0) < 5 &&
+                    now - (m.netWait.at || 0) >= DISK_RETRY_MS);
+                if (!justCame && !_fastDisk && now < (m.netWait.nextAt || 0)) continue;
                 if (justCame)
                     console.log ('[' + (d()) + '] [music] маршрут снова отвечает (прокси/сеть) -- сразу пробую играть');
+                if (_copy)
+                {
+                    m.seekLoose = !!_copy.loose;
+                    m.netWait.diskTries = (m.netWait.diskTries || 0) + 1;
+                    if (!m.netWait.diskTold)
+                    {
+                        m.netWait.diskTold = 1;
+                        console.log ('[' + (d()) + '] [music] сети нет, но у меня ' + _copy.what +
+                            ' -- играю С ДИСКА, YouTube для этого не нужен (очередь не стоит, место в треке то же)');
+                    }
+                }
                 m.netWait.nextAt = Date.now () + NET_WAIT_MAX_MS;
                 Promise.resolve (playNext (g)).catch (() => {});
             }
@@ -13877,6 +13946,11 @@ function startRestored (server, ch, guild)
         m.leftByUser = false;
         console.log ('[' + (d()) + '] [music] в «' + ch.name + '» никого -- играть не для кого: ' +
             'стою и жду слушателя (помню: ' + where + '), начну с того же места');
+        if (m.netDownToldAt)
+        {
+            m.netDownToldAt = 0;
+            musicNotice (server, outageUpText (current, seek, true));
+        }
         scheduleVoiceStatus (server, true);
         schedulePresence (true);
         saveMusicState (server);
@@ -13888,6 +13962,50 @@ function startRestored (server, ch, guild)
     schedulePresence (true);
     playNext (server);
     scheduleDeadScan (server);
+}
+
+// Обрыв связи и возвращение бот говорит в тот же текстовый канал, откуда его позвали (не чаще раза в минуту --
+// при частых обрывах канал не засыпается). Это не данные бота: в базу такие записи не идут.
+function netNoticeOnce (m, key, gapMs = 60000)
+{
+    if (!m) return false;
+    m.netTold = m.netTold || {};
+    const t = m.netTold[key] || 0;
+    if (t && (Date.now () - t) < gapMs) return false;
+    m.netTold[key] = Date.now ();
+    return true;
+}
+function outageDownText (track, sec)
+{
+    const _s = Math.max (0, Math.round (Number (sec) || 0));
+    const what = track ? '**' + (track.title || 'трек') + '**' +
+        ((_s >= 1 && !track.isLive) ? ' (' + fmtDur (_s) + ')' : '') : '';
+    return '📡 Связь пропала' + (what ? ': ' + what + ' остановился' : '') +
+        '. Очередь и место помню -- вернусь и продолжу с этой же секунды, как только связь оживёт.';
+}
+function outageUpText (track, sec, waiting, copy = false)
+{
+    const _s = Math.max (0, Math.round (Number (sec) || 0));
+    const what = track ? '**' + (track.title || 'трек') + '**' : 'очередь';
+    const at = (_s >= 1 && (!track || !track.isLive)) ? ' с ' + fmtDur (_s) : '';
+    if (waiting)
+        return '🔄 Связь вернулась -- я снова в канале, но слушателей нет: продолжу ' + what + at +
+            ', как только кто-нибудь зайдёт.';
+    if (copy)
+        return '🔄 Я снова в канале -- играю ' + what +
+            (at ? ' с того же места (' + fmtDur (_s) + ')' : '') +
+            ' из своей копии: YouTube для этого не понадобился.';
+    return '🔄 Связь вернулась -- снова играю ' + what +
+        (at ? ' с того же места (' + fmtDur (_s) + ')' : '') + '.';
+}
+function outageDown (guildId, track, sec)
+{
+    const m = $music[guildId];
+    if (!m) return false;
+    if (!netNoticeOnce (m, 'down')) return false;
+    m.netDownToldAt = Date.now ();
+    musicNotice (guildId, outageDownText (track, sec));
+    return true;
 }
 
 function musicNotice (guildId, text)
@@ -14702,6 +14820,8 @@ function destroyMusic (guildId, opts = {})
     if (opts.unexpected && !opts.forget && !m.leftByUser)
     {
         m.netWait = { tries: 0, at: Date.now (), lastWhy: 'связь с голосовым каналом пропала', rejoinAt: 0, rejoinLogged: false };
+        if (!chId || humansInChannel (guildId, chId) > 0)
+            outageDown (guildId, m.seekTrack, at);
         if (chId)
             console.log ('[' + (d()) + '] [music] вернусь в «' + (ch ? ch.name : chId) +
                 '» сам, как только связь ответит и там будут слушатели (место в треке помню; передумать -- /leave)');
