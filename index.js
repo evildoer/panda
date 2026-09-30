@@ -18,6 +18,7 @@
 // v2.122 -- связки адресов: один адрес на много имён; первым идёт тот, через кого музыка уже шла
 // v2.123 -- голос: после обрыва бот сам возвращается к слушателям и продолжает с того же места; лог сети молчит без перемен
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
+// v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
 
 function earlyConfigCrash (e)
 {
@@ -360,7 +361,7 @@ const CONSOLE_HELP =
     ['node . net',                'разбор сети: сколько знаем имён и адресов, кто отвечает, что подписано, что давно'],
     ['node . config',             'чем бот РЕАЛЬНО работает: все ключи, их значения и откуда взяты (бот не запускается)'],
     ['node . files',              'что за каждый файл в папке и что можно удалять'],
-    ['node . cache [--clear]',    'кэш музыки: что скачано, сколько занимает, что удалять (--clear -- стереть всё)'],
+    ['node . cache [--clear]',    'кэш музыки: что скачано, сколько занимает, чего ещё не хватает в запасе по очереди, что удалять (--clear -- стереть всё)'],
     ['node . cookies [--save [бр]]', 'cookie для YouTube: что задано и принял ли их YouTube (--save -- собрать файл из браузера: firefox, helium, chrome, edge...)'],
     ['node . ytdlp [--update]',   'версия yt-dlp и её возраст (--update -- обновить: yt-dlp -U)'],
     ['node . privacy [--check]',  'пересобрать PRIVACY.md из шаблона (--check -- только проверить)'],
@@ -501,6 +502,21 @@ function dbDec (_text)
         if (_t !== null) return _t;
     }
     return null;
+}
+function dbPeekValue (_rows, _name)   // одна запись из чужой базы: только чтение (консольный разбор)
+{
+    const _r = (_rows || []).find (x => String (x.key) === String (_name));
+    if (!_r) return null;
+    let _raw = dbRawStr (_r.value);
+    if (_raw.startsWith (DB_ENC_PREFIX))
+    {
+        const _t = DB_KEYS.length ? dbDec (_raw) : null;
+        if (_t === null) return null;
+        _raw = _t;
+    }
+    let _val = null;
+    try { _val = JSON.parse (_raw); } catch (e) { return null; }
+    return (_val && typeof _val === 'object' && 'value' in _val) ? _val.value : _val;   // в базе значение лежит в обёртке
 }
 function dbSerialize (_value)
 {
@@ -798,21 +814,7 @@ function netCli ()       // разбор собранного: что знаем
         }
         catch (e) { console.log ('[net] не смог прочитать базу: ' + ((e && e.message) || e)); }
         try { if (_db) _db.close (); } catch (e) { }
-        const _get = name =>
-        {
-            const r = _rows.find (x => String (x.key) === name);
-            if (!r) return null;
-            let raw = dbRawStr (r.value);
-            if (raw.startsWith (DB_ENC_PREFIX))
-            {
-                const t = DB_KEYS.length ? dbDec (raw) : null;
-                if (t === null) return null;
-                raw = t;
-            }
-            let val = null;
-            try { val = JSON.parse (raw); } catch (e) { return null; }
-            return (val && typeof val === 'object' && 'value' in val) ? val.value : val;   // в базе значение лежит в обёртке
-        };
+        const _get = name => dbPeekValue (_rows, name);
         const book = _get ('dnsbook:map') || {};
         const stats = _get ('dnsbook:stats') || {};
         const pools = _get ('netState:ip_map') || {};
@@ -943,9 +945,10 @@ function filesCli ()
         if (/\.unkey\.sqlite$/i.test (_name)) return ['копия базы ОТКРЫТЫМ ТЕКСТОМ (красная кнопка `node . unkey`)', 'ДА, и прямо сейчас'];
         if (/\.check-.*\.sqlite$/i.test (_name)) return ['контрольная точка базы (`node . checkpoint`); бот их не удаляет', 'можно, когда сам решишь'];
         if (/\.sqlite-(journal|wal|shm)$/i.test (_name)) return ['хвост незакрытой транзакции SQLite', 'можно, когда бот выключен'];
-        if (_name === 'music_cache') return ['кэш музыки (MUSIC.cache): скачанные треки. Это НЕ данные бота -- просто музыка',
-            'можно ВСЁ -- бот скачает заново (отчёт и очистка: `node . cache`); но недокачанное ему полезно: ' +
-            'если позиция трека внутри записанного куска, продолжение идёт с диска сразу'];
+        if (_name === 'music_cache') return ['кэш музыки (MUSIC.cache): скачанные треки и запас вперёд -- бот сам догружает сюда очередь, '
+            + 'пока играет музыка. Это НЕ данные бота -- просто музыка',
+            'можно ВСЁ -- бот скачает заново (отчёт, в том числе чего ещё нет в запасе, и очистка: `node . cache`); ' +
+            'но недокачанное ему полезно: если позиция трека внутри записанного куска, продолжение идёт с диска сразу'];
         if (/^intents-.*\.md$/i.test (_name)) return ['заявка/шпаргалка по интентам (данные реального сервера -- в git не попадает)', 'можно (но заявка ещё может пригодиться)'];
         if (/\.log$/i.test (_name)) return ['старый лог', 'можно'];
         if (/^crash-.*\.txt$/i.test (_name)) return ['отчёт о сбое (бот сам кладёт его рядом с логом при падении: причина, стек, последние строки лога)',
@@ -1014,7 +1017,7 @@ function filesCli ()
     console.log ('  node . privacy --offline      -- то же, но без обращения к сети');
     console.log ('  node . config                 -- чем бот РЕАЛЬНО работает: все ключи, значения и откуда взяты');
     console.log ('  node . files                  -- этот отчёт');
-    console.log ('  node . cache                  -- кэш музыки: что скачано, сколько занимает, что удалять');
+    console.log ('  node . cache                  -- кэш музыки: что скачано, сколько занимает и чего ещё не хватает в запасе');
     console.log ('  node . cache --clear          -- стереть кэш целиком (бот скачает заново)');
     console.log ('  node . cache --prune          -- убрать из кэша самое старое по лимиту MUSIC.cache_max_mb');
     return 0;
@@ -8753,8 +8756,14 @@ const CACHE_PART_SAFE_FACTOR   = 0.9;
 const CACHE_PART_AHEAD_SEC     = 20;
 const CACHE_PART_MIN_AHEAD_SEC = 10;
 const DISK_RETRY_MS            = 3000;
+const CACHE_FILL_EVERY_MS      = 15000;      // как часто поглядываю, есть ли что догрузить
+const CACHE_FILL_DEPTH         = 20;         // на сколько треков вперёд смотрю
+const CACHE_FILL_FAIL_MS       = 10 * 60000; // трек, который не лёг, не трогаю 10 минут
 const cachePartSpent = new Set ();
-const cacheLongBusy = new Set ();
+const cacheLongBusy = new Set ();           // ключи, которые качаются прямо сейчас (фоном)
+const cacheFillBusy = new Set ();           // то же для догрузки очереди: один трек -- одна закачка
+function cacheFullName (key) { return pathMod.join (MUSIC_CACHE_DIR, key + '.m4a'); }
+function cachePartName (key) { return pathMod.join (MUSIC_CACHE_DIR, key + '.dl.m4a'); }
 if (MUSIC_CACHE)
     console.log ('[' + (d()) + '] [music] кэш аудио: ВКЛЮЧЁН -- ' + MUSIC_CACHE_DIR + ' (' +
         (MUSIC_CACHE_MAX_MB ? 'лимит ' + MUSIC_CACHE_MAX_MB + ' МБ, старое удаляется само' : 'без лимита места') + ')' +
@@ -8772,6 +8781,11 @@ if (MUSIC_CACHE_LONG_SETS)
         (MUSIC_CACHE_SHORT_MAX_SEC ? 'всё, что длиннее ' + Math.round (MUSIC_CACHE_SHORT_MAX_SEC / 60) + ' мин' : 'вообще все') +
         ') -- файл уходит вперёд музыки, поэтому перезапуск и перемотка обходятся без YouTube' +
         '; это второй запрос на такой трек и примерно 57 МБ на час звука');
+if (MUSIC_CACHE)
+    console.log ('[' + (d()) + '] [music] запас вперёд: пока играет музыка, бот сам догружает на диск треки из очереди, ' +
+        'которых в запасе ещё нет -- по одному, до ' + CACHE_FILL_DEPTH + ' треков вперёд, каждые ' +
+        Math.round (CACHE_FILL_EVERY_MS / 1000) + ' с; один трек -- один файл, дважды одно и то же не качается ' +
+        '(тот же трек в списке повторов -- это тот же файл, а не второй)');
 const MUSIC_COOKIES_FILE = (() =>
 {
     const raw = String (MUSIC_CFG.cookies_file === undefined || MUSIC_CFG.cookies_file === null
@@ -9695,15 +9709,13 @@ function cacheDropParts (key)
         if (n.startsWith (key + '.dl.'))
             try { fsMod.unlinkSync (pathMod.join (MUSIC_CACHE_DIR, n)); } catch {}
 }
-function cachePartFind (track, posSec, loose = false)
+function cachePartAny (track)
 {
+    // самая длинная пригодная запись этого трека на диске (то, с чего можно продолжить)
     if (!MUSIC_CACHE || !track || track.isLive || !cacheDirReady ()) return null;
-    if (!(Number (posSec) >= 1)) return null;
-    if (cacheLongBusy.has (cacheKeyOf (track))) return null;
     const base = cacheKeyOf (track) + '.dl.';
     let names = [];
     try { names = fsMod.readdirSync (MUSIC_CACHE_DIR); } catch { return null; }
-    const want = Math.max (0, Math.round (Number (posSec) || 0));
     let best = null;
     for (const n of names)
     {
@@ -9714,9 +9726,19 @@ function cachePartFind (track, posSec, loose = false)
         try { st = fsMod.statSync (p); } catch { continue; }
         if (!st.isFile () || st.size < CACHE_PART_USEFUL_BYTES) continue;
         const sec = cachePartSeconds (st.size) * CACHE_PART_SAFE_FACTOR;
-        if (want + (loose ? CACHE_PART_MIN_AHEAD_SEC : CACHE_PART_AHEAD_SEC) > sec) continue;
         if (!best || sec > best.sec) best = { file: p, name: n, sec: Math.round (sec) };
     }
+    return best;
+}
+function cachePartFind (track, posSec, loose = false)
+{
+    if (!MUSIC_CACHE || !track || track.isLive || !cacheDirReady ()) return null;
+    if (!(Number (posSec) >= 1)) return null;
+    if (cacheLongBusy.has (cacheKeyOf (track))) return null;
+    const best = cachePartAny (track);
+    if (!best) return null;
+    const want = Math.max (0, Math.round (Number (posSec) || 0));
+    if (want + (loose ? CACHE_PART_MIN_AHEAD_SEC : CACHE_PART_AHEAD_SEC) > best.sec) return null;
     return best;
 }
 function cachePlayFrom (track, posSec = 0)
@@ -9751,26 +9773,35 @@ function cacheSpendPart (file)
 }
 function cachePromoteParts (key, track)
 {
-    let names = [];
-    try { names = fsMod.readdirSync (MUSIC_CACHE_DIR); } catch { return null; }
-    let file = null, size = 0;
-    for (const n of names)
+    // один трек -- один файл (имя всегда <sha1 адреса>.m4a): второй копии того же трека не будет,
+    // а чужие огрызки (например, запись во время игры) тут не трогаю: своё имя -- .dl.stream
+    const dst = cacheFullName (key);
+    const src = cachePartName (key);
+    let size = 0;
+    try
     {
-        if (!n.startsWith (key + '.dl.')) continue;
-        const src = pathMod.join (MUSIC_CACHE_DIR, n);
-        const dst = pathMod.join (MUSIC_CACHE_DIR, n.replace ('.dl.', '.'));
-        try
+        if (fsMod.existsSync (dst))
         {
-            const s = fsMod.statSync (src).size;
-            if (s <= 8192) { fsMod.unlinkSync (src); continue; }
-            fsMod.renameSync (src, dst);
-            if (s > size) { size = s; file = dst; }
+            // копия уже есть -- второй файл того же трека не нужен, но более полный оставляю
+            const a = fsMod.existsSync (src) ? fsMod.statSync (src).size : 0;
+            const b = fsMod.statSync (dst).size;
+            if (a > b)
+            {
+                try { fsMod.renameSync (src, dst); }        // наша копия полнее -- заменяет прежнюю
+                catch { try { fsMod.unlinkSync (src); } catch { } }
+            }
+            else
+                try { fsMod.unlinkSync (src); } catch { }    // наша копия не полнее -- не держу вторую
+            return dst;
         }
-        catch {}
+        if (!fsMod.existsSync (src)) return null;
+        size = fsMod.statSync (src).size;
+        if (size <= 8192) { fsMod.unlinkSync (src); return null; }
+        fsMod.renameSync (src, dst);
     }
-    if (file)
-        console.log ('[' + (d()) + '] [music] сохранил на диск: ' + (track && track.title ? track.title : 'трек') + ' (' + fmtMb (size) + ')');
-    return file;
+    catch { return null; }
+    console.log ('[' + (d()) + '] [music] сохранил на диск: ' + (track && track.title ? track.title : 'трек') + ' (' + fmtMb (size) + ')');
+    return dst;
 }
 async function cacheDownload (track, holder = {})
 {
@@ -9782,7 +9813,7 @@ async function cacheDownload (track, holder = {})
     (
         track.url,
         {
-            o: pathMod.join (MUSIC_CACHE_DIR, key + '.dl.%(ext)s'),
+            o: cachePartName (key),
             noPart: true,
             quiet: true,
             noWarnings: true,
@@ -9893,7 +9924,12 @@ function cacheTeeStart (track)
                 if (ws.__dead) { try { fsMod.unlinkSync (part); } catch {} return null; }
                 const size = fsMod.existsSync (part) ? fsMod.statSync (part).size : 0;
                 if (size <= 8192) { try { fsMod.unlinkSync (part); } catch {} return null; }
-                const file = pathMod.join (MUSIC_CACHE_DIR, key + '.m4a');
+                const file = cacheFullName (key);
+                if (fsMod.existsSync (file))     // копия уже есть (например, скачалась в фоне) -- второй файл не нужен
+                {
+                    try { fsMod.unlinkSync (part); } catch {}
+                    return file;
+                }
                 fsMod.renameSync (part, file);
                 console.log ('[' + (d()) + '] [music] сохранил на диск: ' + (track.title || 'трек') + ' (' + fmtMb (size) + ')');
                 pruneCache ([file]);
@@ -9917,6 +9953,35 @@ function cacheTeeStart (track)
         },
     };
 }
+function cacheQueueRank ()
+{
+    // порядок цену файлов: 3 -- нужен прямо сейчас (играет, продолжу, готовится, качается);
+    // 2 -- впереди в очереди (тот самый запас, который копится); 1 -- проигранное (уходит первым, самое старое вперёд)
+    const rank = new Map ();
+    const put = (t, level, order) =>
+    {
+        if (!t || t.isLive) return;
+        const k = cacheKeyOf (t);
+        const was = rank.get (k);
+        if (was && was.level >= level) return;
+        rank.set (k, { level: level, order: order || 0 });
+    };
+    for (const id of Object.keys ($music))
+    {
+        const m = $music[id];
+        if (!m) continue;
+        put (m.current, 3);
+        put (m.seekTrack, 3);
+        if (m.preload) put (m.preload.track, 3);
+        if (m.longDl) put (m.longDl.track, 3);
+        if (m.fill) put (m.fill.track, 3);
+        for (let i = 0; i < (m.tracks || []).length; i++)
+            put (m.tracks[i], 2, i + 1);
+    }
+    for (const k of cacheLongBusy) rank.set (k, { level: 3, order: 0 });
+    for (const k of cacheFillBusy) rank.set (k, { level: 3, order: 0 });
+    return rank;
+}
 function pruneCache (keepPaths = [])
 {
     if (!MUSIC_CACHE_MAX_MB) return;
@@ -9924,6 +9989,7 @@ function pruneCache (keepPaths = [])
     let names = [];
     try { names = fsMod.readdirSync (MUSIC_CACHE_DIR); } catch { return; }
     const keep = new Set ((keepPaths || []).filter (Boolean).map (p => pathMod.basename (p)));
+    const rank = cacheQueueRank ();
     const items = [];
     let total = 0;
     for (const n of names)
@@ -9933,29 +9999,37 @@ function pruneCache (keepPaths = [])
         catch {}
     }
     if (total <= limit) return;
-    items.sort ((a, b) => a.at - b.at);
+    for (const it of items)
+    {
+        const r = rank.get (it.n.split ('.')[0]);
+        if (keep.has (it.n) || (r && r.level === 3)) { it.level = 3; it.why = 'нужен сейчас'; }
+        else if (r && r.level === 2) { it.level = 2; it.why = 'ещё впереди в очереди'; it.order = r.order; }
+        else { it.level = 1; it.why = 'уже проигран'; }
+    }
+    items.sort ((a, b) => (a.level - b.level) ||
+        (a.level === 2 ? (b.order - a.order) : 0) || (a.at - b.at));
     let freed = 0;
     for (const it of items)
     {
         if (total - freed <= limit) break;
-        if (keep.has (it.n)) continue;
-        try { fsMod.unlinkSync (it.p); freed += it.size;
-            console.log ('[' + (d()) + '] [music] кэш переполнен -- убрал старый файл (' + fmtMb (it.size) + ')'); } catch {}
+        if (it.level >= 3) break;               // дальше только то, что нужно сейчас
+        try
+        {
+            fsMod.unlinkSync (it.p); freed += it.size;
+            console.log ('[' + (d()) + '] [music] кэш переполнен -- убрал файл (' + fmtMb (it.size) + '): ' + it.why +
+                (it.level === 2 ? ' -- догружу, когда подойдёт ближе' : ''));
+        }
+        catch {}
     }
+    if (freed && total - freed > limit)
+        console.log ('[' + (d()) + '] [music] кэш: лимит ' + MUSIC_CACHE_MAX_MB +
+            ' МБ временно превышен -- остальное нужно сейчас или ещё впереди, убирать нечего');
 }
 function cacheKeysInUse ()
 {
     const set = new Set ();
-    for (const id of Object.keys ($music))
-    {
-        const m = $music[id];
-        if (!m) continue;
-        for (const t of [m.current, m.preload && m.preload.track])
-            if (t && !t.isLive) set.add (cacheKeyOf (t));
-        for (const t of m.tracks)
-            if (t && !t.isLive && Number (t.seek) >= 1) set.add (cacheKeyOf (t));
-    }
-    for (const k of cacheLongBusy) set.add (k);
+    for (const [k, r] of cacheQueueRank ())
+        if (r.level >= 2) set.add (k);
     return set;
 }
 function cacheDropUnused (retries = 5)
@@ -9981,7 +10055,7 @@ function cacheDropUnused (retries = 5)
     if (dropped)
         console.log ('[' + (d()) + '] [music] кэш: убрал ' + dropped + ' ' +
             plural (dropped, 'файл', 'файла', 'файлов') + ' (' + fmtMb (freed) +
-            ') -- на диске остаются только играющий трек и предзагрузка');
+            ') -- на диске остаются только то, что играет, готовится и ещё впереди в очереди');
     if (busy.length && retries > 0)
         setTimeout (() =>
         {
@@ -10022,6 +10096,145 @@ function openCachedTrack (track, file, seekSec = 0)
     const resource = createAudioResource (ff.stdout, { inputType: StreamType.Raw, inlineVolume: true });
     if (resource.volume) resource.volume.setVolume (MUSIC_VOLUME);
     return { resource, viaProxy: false, source: null, proc: null, ff, fromCache: true, seeked: true };
+}
+
+// ---------------------------------------------------------------------------
+// запас вперёд: пока играет музыка, бот сам догружает на диск треки из очереди,
+// которых в запасе ещё нет. Один трек -- одна закачка и один файл, очередь не трогаю.
+// ---------------------------------------------------------------------------
+function cacheFillPlan (m)
+{
+    // что из очереди ещё не лежит на диске (смотрю вперёд до CACHE_FILL_DEPTH треков)
+    const plan = { total: 0, have: 0, part: [], need: [], skip: [] };
+    const list = (m && m.tracks) || [];
+    const seen = new Set ();
+    for (let i = 0; i < list.length && i < CACHE_FILL_DEPTH; i++)
+    {
+        const t = list[i];
+        if (!t || t.gone) continue;
+        const seenKey = cacheKeyOf (t);
+        if (seen.has (seenKey)) continue;      // тот же трек в списке дважды -- это один трек
+        seen.add (seenKey);
+        if (t.isLive) { plan.skip.push ({ t: t, why: 'прямой эфир' }); continue; }
+        const dur = Number (t.duration) || 0;
+        if (!dur) { plan.skip.push ({ t: t, why: 'длительность неизвестна' }); continue; }
+        if (!MUSIC_CACHE_SHORT_MAX_SEC || dur > MUSIC_CACHE_SHORT_MAX_SEC)
+        { plan.skip.push ({ t: t, why: 'длинная запись' }); continue; }
+        plan.total++;
+        if (cacheFind (t)) { plan.have++; continue; }
+        const part = cachePartAny (t);
+        if (part) { plan.have++; plan.part.push ({ t: t, sec: part.sec }); continue; }
+        plan.need.push ({ t: t, at: i + 1 });
+    }
+    return plan;
+}
+function cacheFillPick (m)
+{
+    const plan = cacheFillPlan (m);
+    for (const c of plan.need)
+    {
+        const t = c.t;
+        const key = cacheKeyOf (t);
+        if (cacheFillBusy.has (key) || cacheLongBusy.has (key)) continue;
+        if (t === m.current || t === m.seekTrack) continue;
+        if (m.preload && m.preload.track === t) continue;      // предзагрузка идёт первой
+        if (m.longDl && m.longDl.track === t) continue;
+        const bad = m.fillFail && m.fillFail.get (key);
+        if (bad && bad > Date.now ()) continue;
+        return { track: t, key: key, plan: plan };
+    }
+    return null;
+}
+function cacheFillStop (m)
+{
+    const h = m && m.fill;
+    if (m) m.fill = null;
+    if (!h) return;
+    try { if (typeof h.stop === 'function') h.stop (); } catch {}
+    cacheFillBusy.delete (h.key);
+}
+function cacheFillDone (m, plan)
+{
+    // одна строка, когда весь видимый запас уже на диске (и снова -- как только появится новый трек)
+    if (!plan.total || plan.need.length) { m.fillDone = false; return; }
+    if (m.fillDone) return;
+    m.fillDone = true;
+    console.log ('[' + (d()) + '] [music] запас вперёд собран: ' + plan.have + ' из ' + plan.total +
+        ' ' + plural (plan.total, 'трека', 'треков', 'треков') + ' впереди уже на диске' +
+        (plan.part.length ? ' (ещё ' + plan.part.length + ' начаты частично)' : '') +
+        ' -- новые треки догружу сам, пока играет музыка');
+}
+async function cacheFillTick (guildId)
+{
+    const m = $music[guildId];
+    if (!m || !MUSIC_CACHE || m.leaving || m.fill || m.netWait) return;
+    if (!m.current || !m.connection || !(m.tracks || []).length) return;   // догружаю, только когда музыка идёт
+    if ($deadScan[guildId]) return;                                        // сейчас проверка очереди -- не мешаю
+    const pick = cacheFillPick (m);
+    if (!pick) { cacheFillDone (m, cacheFillPlan (m)); return; }
+    const holder = { key: pick.key, track: pick.track };
+    m.fill = holder;
+    holder.promise = (async () =>
+    {
+        let file = null, err = null;
+        try { file = await cacheDownload (pick.track, holder); }
+        catch (e) { err = e; }
+        return { file: file, err: err };
+    }) ();
+    cacheFillBusy.add (pick.key);
+    console.log ('[' + (d()) + '] [music] догружаю вперёд: ' + (pick.track.title || 'трек') +
+        ' (это ' + pick.plan.need[0].at + '-й от игры; на диске ' + (pick.plan.total - pick.plan.need.length) +
+        ' из ' + pick.plan.total + ' впереди)');
+    let res = null;
+    try { res = await holder.promise; } catch (e) { res = { err: e }; }
+    cacheFillBusy.delete (pick.key);
+    if (m.fill === holder) m.fill = null;
+    if (holder.cancelled) return;
+    if (!res || !res.file)
+    {
+        if (!m.fillFail) m.fillFail = new Map ();
+        m.fillFail.set (pick.key, Date.now () + CACHE_FILL_FAIL_MS);
+        console.error ('[' + (d()) + '] [music] заранее не легло (' + (pick.track.title || 'трек') + '): ' +
+            (res && res.err ? ytDlpErr (res.err, 140) : 'файл на диск не лёг') +
+            ' -- музыку это не ломает: трек заиграет как обычно, попробую позже');
+        return;
+    }
+    const plan = cacheFillPlan (m);
+    if ((m.tracks || []).includes (pick.track))
+        console.log ('[' + (d()) + '] [music] запас вперёд: ' + (pick.track.title || 'трек') + ' -- на диске теперь ' +
+            plan.have + ' из ' + plan.total + ' впереди' + (plan.need.length ? ' (осталось ' + plan.need.length + ')' : ''));
+    else
+        console.log ('[' + (d()) + '] [music] запас вперёд: ' + (pick.track.title || 'трек') +
+            ' -- из очереди он уже ушёл, но копия осталась на диске');
+    cacheFillDone (m, plan);
+}
+if (MUSIC_CACHE)
+    setInterval (() =>
+    {
+        for (const id of Object.keys ($music))
+        {
+            if ($music[id] && $music[id].fill) continue;
+            cacheFillTick (id).catch (() => {});
+        }
+    }, CACHE_FILL_EVERY_MS).unref ();
+
+function cacheQueueSaved (server)
+{
+    // последняя записанная очередь этого сервера: только чтение (бот может работать прямо сейчас)
+    let DatabaseSync = null;
+    try { ({ DatabaseSync } = require ('node:sqlite')); } catch (e) { }
+    const file = pathMod.join (__dirname, server + '.sqlite');
+    if (!DatabaseSync || !fsMod.existsSync (file)) return null;
+    let db = null, rows = [];
+    try
+    {
+        db = new DatabaseSync (file, { readOnly: true });
+        rows = db.prepare ('SELECT key, value FROM keyv').all ();
+    }
+    catch (e) { try { if (db) db.close (); } catch (e2) { } return { broken: oneLine ((e && e.message) || e) }; }
+    try { db.close (); } catch (e) { }
+    const st = dbPeekValue (rows, 'musicState:queue');
+    return (st && typeof st === 'object') ? st : null;
 }
 
 function cacheCli (args = [])
@@ -10075,6 +10288,86 @@ function cacheCli (args = [])
     else if (done.length)
         console.log ('[cache] это ЗАПАС: если YouTube или сеть отвалится, бот возьмёт трек из своей копии и очередь не встанет' +
             ' (не нужно -- выключить: cache_keep_played: false)');
+    {
+        const _doneKeys = new Set (), _partBest = new Map ();
+        for (const f of done) _doneKeys.add (f.n.split ('.')[0]);
+        for (const f of parts)
+        {
+            const _k = f.n.split ('.')[0];
+            const _sec = Math.round (cachePartSeconds (f.size) * CACHE_PART_SAFE_FACTOR);
+            if (!_partBest.has (_k) || _partBest.get (_k) < _sec) _partBest.set (_k, _sec);
+        }
+        let _anyQueue = false;
+        for (const _srv of Object.keys (SERVERS).filter (_k => /^\d{17,20}$/.test (_k)))
+        {
+            const st = cacheQueueSaved (_srv);
+            if (st && st.broken)
+            {
+                console.log ('[cache] сервер ' + _srv + ': не смог прочитать очередь (' + st.broken + ') -- пропускаю');
+                continue;
+            }
+            if (!st) continue;
+            _anyQueue = true;
+            const _nm = (SERVERS[_srv] || {}).name;
+            const cur = st.current || null;
+            const ahead = (Array.isArray (st.tracks) ? st.tracks : []).slice (0, CACHE_FILL_DEPTH);
+            let have = 0, skip = 0, live = 0;
+            const need = [], part = [];
+            for (const t of ahead)
+            {
+                if (!t) continue;
+                if (t.isLive) { live++; continue; }
+                const dur = Number (t.duration) || 0;
+                if (!dur || !MUSIC_CACHE_SHORT_MAX_SEC || dur > MUSIC_CACHE_SHORT_MAX_SEC) { skip++; continue; }
+                const _k = cacheKeyOf (t);
+                if (_doneKeys.has (_k)) { have++; continue; }
+                const _sec = _partBest.get (_k);
+                if (_sec) { have++; part.push ({ t: t, sec: _sec }); continue; }
+                need.push (t);
+            }
+            console.log ('[cache]');
+            console.log ('[cache] --- чего ещё нет в запасе: сервер ' + _srv + (_nm ? ' («' + _nm + '»)' : '') + ' ---');
+            if (cur)
+            {
+                const _ck = cacheKeyOf (cur);
+                console.log ('[cache] играет сейчас: «' + clipText (cur.title || 'трек', 48) + '» -- ' +
+                    (_doneKeys.has (_ck) ? 'своя копия на диске'
+                        : (_partBest.get (_ck) ? 'записано частично, примерно до ' + fmtDur (_partBest.get (_ck))
+                            : 'копии нет, звук идёт потоком')));
+            }
+            if (!ahead.length)
+                console.log ('[cache] очередь пуста -- догружать нечего');
+            else
+            {
+                console.log ('[cache] впереди ' + ahead.length + ' ' +
+                    plural (ahead.length, 'трек', 'трека', 'треков') + ': с копией ' + have +
+                    ', не хватает ' + need.length +
+                    (part.length ? ', начаты частично ' + part.length : '') +
+                    (skip ? ', на диск не кладу (длинные или без длительности) ' + skip : '') +
+                    (live ? ', прямых эфиров ' + live : ''));
+                if (need.length)
+                    console.log ('[cache]   ждут диска (по порядку): ' + need.slice (0, 5).map (t =>
+                        '«' + clipText (t.title || 'трек', 40) + '»' +
+                        (Number (t.duration) > 0 ? ' (' + fmtDur (t.duration) + ')' : '')).join (', ') +
+                        (need.length > 5 ? ' и ещё ' + (need.length - 5) : ''));
+                if (part.length)
+                    console.log ('[cache]   начаты частично: ' + part.slice (0, 3).map (x =>
+                        '«' + clipText (x.t.title || 'трек', 40) + '» до ' + fmtDur (x.sec)).join (', ') +
+                        (part.length > 3 ? ' и ещё ' + (part.length - 3) : ''));
+            }
+            if (st.at)
+                console.log ('[cache] (по последней записи бота: ' + _when (st.at) + ')' +
+                    (st.elapsed ? ', играл на ' + fmtDur (st.elapsed) : ''));
+        }
+        if (_anyQueue)
+        {
+            console.log ('[cache]');
+            console.log ('[cache] это бот догружает сам: пока играет музыка -- по одному треку каждые ' +
+                Math.round (CACHE_FILL_EVERY_MS / 1000) + ' с, вперёд до ' + CACHE_FILL_DEPTH +
+                ' треков; один трек -- один файл, дважды одно и то же не качается; когда место кончается, ' +
+                'первым уходит давно проигранное, а то, что впереди, -- в последнюю очередь');
+        }
+    }
     if (parts.length)
     {
         console.log ('[cache] недокачанное НЕ выбрасывается (v2.72): если позиция трека внутри записанного куска, ' +
@@ -10169,6 +10462,10 @@ function configCli ()
     row ('cache_long_sets', YN (MUSIC_CACHE_LONG_SETS), hasM ('cache_long_sets') ? 'config.json' : 'по умолчанию (вкл)');
     row ('cache_max_mb', MUSIC_CACHE_MAX_MB || '0 (без лимита)', hasM ('cache_max_mb') ? 'config.json' : 'по умолчанию (4096)');
     row ('cache_keep_played', YN (MUSIC_CACHE_KEEP_PLAYED), hasM ('cache_keep_played') ? 'config.json' : 'по умолчанию (вкл: копии остаются запасом)');
+    row ('cache_fill (запас вперёд)', MUSIC_CACHE
+            ? 'да: очередь догружается сама, по одному треку каждые ' + Math.round (CACHE_FILL_EVERY_MS / 1000) + ' с, до ' + CACHE_FILL_DEPTH + ' вперёд'
+            : 'нет (кэш выключен)',
+        'в коде: отдельного ключа нет, живёт вместе с cache');
     row ('queue_check (заранее)', YN (MUSIC_QUEUE_CHECK), hasM ('queue_check') ? 'config.json' : 'по умолчанию (вкл)');
     row ('queue_check_depth', QUEUE_CHECK_DEPTH + ' треков (первые ' + QUEUE_CHECK_STRICT + ' -- yt-dlp)', hasM ('queue_check_depth') ? 'config.json' : 'по умолчанию (20)');
     row ('queue_check_gap_ms', QUEUE_CHECK_GAP_MS + ' мс', hasM ('queue_check_gap_ms') ? 'config.json' : 'по умолчанию (5000)');
@@ -10640,6 +10937,12 @@ async function playNext (guildId)
                     console.log ('[' + (d()) + '] [music] качать не буду: у меня уже есть ' + _diskNow.what +
                         ' -- играю с диска, YouTube для этого не нужен');
             }
+            else if (m.fill && m.fill.track === track && !m.fill.cancelled)
+            {
+                // этот трек уже догружается заранее -- второй раз не качаю
+                console.log ('[' + (d()) + '] [music] эту копию уже догружаю вперёд -- играю потоком, а файл догрузится сам: ' +
+                    (track.title || 'трек'));
+            }
             else if (MUSIC_CACHE && !track.isLive && Number (track.duration) > 0 &&
                 Number (track.duration) <= MUSIC_CACHE_SHORT_MAX_SEC)
             {
@@ -10841,6 +11144,13 @@ function startPreload (guildId)
     {
         if (m.longDl && m.longDl.track !== next && m.longDl.track !== m.current) cancelLongDownload (m);
         startLongDownload (guildId, next, 'заранее: пока играет текущий трек -- к началу сета файл уже на диске');
+    }
+    if (m.fill && m.fill.track === next)
+    {
+        // уже догружается вперёд: второй запрос на тот же трек не запускаю
+        console.log ('[' + (d()) + '] [music] предзагрузку не делаю: этот трек уже догружается на диск вперёд (' +
+            (next.title || 'трек') + ')');
+        return;
     }
     if (MUSIC_CACHE && !next.isLive && next.duration > 0 && next.duration <= MUSIC_CACHE_SHORT_MAX_SEC && !cacheFind (next))
     {
@@ -14784,6 +15094,7 @@ function destroyMusic (guildId, opts = {})
     m.playingSince = null;
     dropPreload (m);
     cancelLongDownload (m);
+    cacheFillStop (m);
     killStream (m.streamHandle);
     m.streamHandle = null;
     try { m.player.stop (true); } catch {}
