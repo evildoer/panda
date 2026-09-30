@@ -19,6 +19,7 @@
 // v2.123 -- голос: после обрыва бот сам возвращается к слушателям и продолжает с того же места; лог сети молчит без перемен
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
+// v2.132 -- свой маршрут по адресам засчитывается путём для музыки только если проверен делом: бот раз в 10 минут прогоняет через него yt-dlp и, если тот не дошёл, за путь его не считает и говорит об этом прямо (проверка самим ботом, а не «мне кажется, работает»)
 // v2.131 -- голос видно по-настоящему: в /health у владельца есть кнопка «Проверить голос по-настоящему» -- если бот в канале и к медиа-адресу ходят пакеты (udp-пинг), она отвечает сразу и музыку не трогает, а если пинга нет -- выходит из канала, входит заново (это и есть проверка медиа-адреса), возвращает музыку на то же место и пишет результат; в самой /health видно и пинг медиа-пути
 // v2.130 -- обход под присмотром и видно, кто за ним следит: сторож (он же хранитель -- пункт 6 в tools/obhod.cmd) сам переподбирает стратегию, автозапуск (пункт 7) только поднимает сторожа при входе, и это решает человек; при старте, если ни один путь к YouTube не работает, владельцу уходит короткое «что сделать сейчас» с готовой командой; дальше бот следит за службой zapret, движком и сторожем -- встал обход или сторожа нет, напишет и скажет, что поставить, а когда поднимется -- сообщит отдельно; состояние сторожа видно в /health и `node . obhod`
 // v2.129 -- обход замечает собственную смерть: если движок работает, а ютуб или дискорд (шлюз, api, голос) не отвечают -- бот говорит владельцу, что стратегия устарела и нужен подбор, а когда отпустит -- сообщает; `node . obhod --start` и кнопка «Поднять обход» возвращают сохранённую стратегию после перезагрузки за пару секунд (один запрос прав, в автозапуск ничего не пишется)
@@ -6344,6 +6345,29 @@ async function directWhy ()
     return d.ok ? '' : 'прямой запрос не проходит (' + (d.why || 'нет ответа') + ')';
 }
 
+const DOH_CARRY_TTL = 10 * 60000;        // «свой маршрут везёт музыку» помню 10 минут: проверка не бесплатная
+const DOH_CARRY_URL = 'https://www.youtube.com/watch?v=aqz-KE-bpKQ';
+let dohCarry = { ok: null, at: 0, why: '' };
+async function dohCarryCheck ()          // по-настоящему: доходит ли yt-dlp до YouTube через свой маршрут по адресам
+{
+    if (dohCarry.at && (Date.now () - dohCarry.at) < DOH_CARRY_TTL) return dohCarry;
+    const port = MUSIC_DOH ? await dohProxyStart () : 0;
+    let ok = false, why = '';
+    if (!port) why = 'свой маршрут не поднялся';
+    else
+    {
+        const r = await ytdlpRunOnce (['--proxy', 'http://127.0.0.1:' + port, '--simulate', '--no-warnings',
+            '--skip-download', '--print', 'id', DOH_CARRY_URL], 45000);
+        ok = !!(r && r.code === 0 && /\S/.test (String (r.out || '')));
+        if (!ok) why = (r && r.code === -1) ? 'yt-dlp через маршрут не ответил за 45 с'
+            : 'yt-dlp через маршрут не дошёл' + (r && r.err ? ': ' + oneLine (r.err, 120) : '');
+    }
+    dohCarry = { ok: ok, at: Date.now (), why: why };
+    console.log ('[' + (d()) + '] [music] свой маршрут по адресам ' + (ok
+        ? 'везёт музыку: yt-dlp через него дошёл до YouTube'
+        : 'музыку НЕ везёт (' + why + ') -- путём для музыки его не считаю'));
+    return dohCarry;
+}
 const DOH_PROBE_TIMEOUT = 6000;          // свой маршрут поднимается и разрешает имя не сразу, поэтому жду дольше прямого
 const DOH_PROBE_FAIL_TTL = 10000;        // «не ответил» помню недолго: со второй попытки он обычно уже работает
 let dohProbeCache = { ok: false, why: '', at: 0 };
@@ -8956,16 +8980,22 @@ async function ytRoutes ()
         const dohPort = MUSIC_DOH ? await dohProxyStart () : 0;
         const dohRoute = dohPort ? { proxy: 'http://127.0.0.1:' + dohPort, kind: 'doh' } : null;
         const dohSig = dohPort ? '|doh:1' : '|doh:0';
+        const dohUse = (dohRoute && !dp.ok) ? (await dohCarryCheck ()).ok : !!dohRoute;   // путь только если он везёт музыку
+        if (dohRoute && !dohUse)
+            routeSigLog ('doh-nocarry', 'прямого пути нет, а свой маршрут по адресам музыку не везёт -- путём для музыки его не считаю; ' +
+                'включи обход DPI (tools\\obhod.cmd) или впиши прокси в MUSIC.proxy; очередь и место в треке держу');
         const out = [];
         if (dp.ok) out.push ({ proxy: '', kind: 'direct' });
-        if (dohRoute) out.push (dohRoute);
+        if (dohRoute && dohUse) out.push (dohRoute);
         if (!dp.ok) out.push ({ proxy: '', kind: 'direct' });
         if (!dp.ok && dnsOk)
             routeSigLog ('direct-bad' + dohSig, 'прокси не задан, а прямой путь не отвечает (' + (dp.why || 'нет ответа') + ') -- ' +
-                (dohRoute ? 'пробую свой DoH-маршрут' : 'похоже на блокировку провайдера: включи обход DPI (запрет/winws) или подними VPN-прокси') +
+                (dohRoute && dohUse ? 'пробую свой DoH-маршрут'
+                    : 'похоже на блокировку провайдера: включи обход DPI (запрет/winws) или подними VPN-прокси' +
+                        (dohRoute ? ' (свой маршрут по адресам музыку не везёт -- проверено живым yt-dlp)' : '')) +
                 '; очередь и место в треке держу, пробую каждые ' + Math.round (NET_PING_STEP_MS / 1000) + ' с');
         else if (!dp.ok)
-            routeSigLog ('dns-bad' + dohSig, 'твой DNS не резолвит youtube.com -- ' + (dohRoute
+            routeSigLog ('dns-bad' + dohSig, 'твой DNS не резолвит youtube.com -- ' + (dohRoute && dohUse
                 ? 'иду своим DoH-маршрутом: имена разрешает сам бот через DNS-over-HTTPS, системный DNS тут не нужен'
                 : 'включи прокси (MUSIC.proxy) или смени DNS: 1.1.1.1 и 8.8.8.8 часто не резолвят youtube.com, а 9.9.9.9 и 94.140.14.14 -- резолвят'));
         else if (dohRoute)
@@ -8987,10 +9017,13 @@ async function ytRoutes ()
     const dohRoute = dohPort ? { proxy: 'http://127.0.0.1:' + dohPort, kind: 'doh' } : null;
     const dohSig = dohPort ? '|doh:1' : '|doh:0';
     const dp = dnsOk ? await directProbe () : { ok: false, why: 'youtube.com локально не резолвится' };
+    const dohUse = (dohRoute && !dp.ok) ? (await dohCarryCheck ()).ok : !!dohRoute;       // путь только если он везёт музыку
+    const dohOk = dohRoute && dohUse ? dohRoute : null;
     if (!alive.length && !dp.ok)
         routeSigLog ('p:|d:0' + dohSig, 'рабочих маршрутов нет: прокси молчат (' + MUSIC_PROXIES.join (', ') +
             '), прямой путь не отвечает (' + (dp.why || 'нет ответа') + ') -- похоже на блокировку провайдера: включи свой обход DPI (запрет/winws) или подними VPN-прокси. ' +
-            (dohRoute ? 'Свой DoH-маршрут у меня есть -- пробую и его. ' : 'Свой DoH-маршрут выключен (MUSIC.doh). ') +
+            (dohOk ? 'Свой DoH-маршрут у меня есть -- пробую и его. '
+                : (dohRoute ? 'Свой DoH-маршрут есть, но музыку он не везёт (проверил живым yt-dlp). ' : 'Свой DoH-маршрут выключен (MUSIC.doh). ')) +
             'очередь и место в треке держу, пробую каждые ' +
             Math.round (NET_PING_STEP_MS / 1000) + ' с');
     else if (!alive.length)
@@ -9008,13 +9041,13 @@ async function ytRoutes ()
             ? 'иду своим DoH-маршрутом: имена разрешает сам бот через DNS-over-HTTPS, системный DNS тут не нужен'
             : 'включи прокси (MUSIC.proxy) или смени DNS: 1.1.1.1 и 8.8.8.8 часто не резолвят youtube.com, а 9.9.9.9 и 94.140.14.14 -- резолвят'));
         const bad = [...liveRoutes];
-        if (dohRoute) bad.push (dohRoute);
+        if (dohOk) bad.push (dohOk);
         if (!bad.length) bad.push (directRoute);
         return await routeMemoryOrder (bad);
     }
     const out = [...liveRoutes];
     if (dp.ok) out.push (directRoute);
-    if (dohRoute) out.push (dohRoute);
+    if (dohOk) out.push (dohOk);
     if (!dp.ok) out.push (directRoute);
     return await routeMemoryOrder (out);
 }
