@@ -19,6 +19,7 @@
 // v2.123 -- голос: после обрыва бот сам возвращается к слушателям и продолжает с того же места; лог сети молчит без перемен
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
+// v2.131 -- голос видно по-настоящему: в /health у владельца есть кнопка «Проверить голос по-настоящему» -- если бот в канале и к медиа-адресу ходят пакеты (udp-пинг), она отвечает сразу и музыку не трогает, а если пинга нет -- выходит из канала, входит заново (это и есть проверка медиа-адреса), возвращает музыку на то же место и пишет результат; в самой /health видно и пинг медиа-пути
 // v2.130 -- обход под присмотром и видно, кто за ним следит: сторож (он же хранитель -- пункт 6 в tools/obhod.cmd) сам переподбирает стратегию, автозапуск (пункт 7) только поднимает сторожа при входе, и это решает человек; при старте, если ни один путь к YouTube не работает, владельцу уходит короткое «что сделать сейчас» с готовой командой; дальше бот следит за службой zapret, движком и сторожем -- встал обход или сторожа нет, напишет и скажет, что поставить, а когда поднимется -- сообщит отдельно; состояние сторожа видно в /health и `node . obhod`
 // v2.129 -- обход замечает собственную смерть: если движок работает, а ютуб или дискорд (шлюз, api, голос) не отвечают -- бот говорит владельцу, что стратегия устарела и нужен подбор, а когда отпустит -- сообщает; `node . obhod --start` и кнопка «Поднять обход» возвращают сохранённую стратегию после перезагрузки за пару секунд (один запрос прав, в автозапуск ничего не пишется)
 // v2.128 -- обход можно вести из консоли: `node . obhod` показывает, что с движком, службой и драйвером (и ничего не меняет), `--engine` приносит движок без прав, `--pick` подбирает и оставляет стратегию, `--stop` возвращает как было; подбор идёт с одним запросом прав Windows, в автозапуск бот ничего не ставит, а кнопка у владельца в /health делает то же
@@ -1356,7 +1357,7 @@ const STARTUP_DM_TEXT =
     '`/queue` -- что играет сейчас и что дальше: кто что поставил и сколько ещё ждать (сообщение обновляется само, пока музыка играет)\n' +
     '`/nowplaying` -- коротко про текущий трек: позиция, кто поставил, что дальше\n' +
     '`/history` -- кто и когда ставил музыку: последние добавления (треки, эфиры, плейлисты)\n' +
-    '`/health` -- здорова ли связь: сколько было обрывов голоса и сети, вернулся ли бот сам и каким путём сейчас идёт звук\n' +
+    '`/health` -- здорова ли связь: сколько было обрывов голоса и сети, вернулся ли бот сам и каким путём сейчас идёт звук (у владельца есть кнопка «Проверить голос по-настоящему»)\n' +
     'Если в канале никого, музыка встаёт на паузу и продолжается, когда кто-то зашёл: бот помнит и трек, и место в нём -- перезапуск и обрыв связи их не сбрасывают.\n' +
     '\n' +
     '🔑 **Свой голосовой канал**\n' +
@@ -15174,6 +15175,98 @@ function netVoiceLines (voice)
     return out;
 }
 
+// Настоящая проверка голоса. Два пути: (1) бот уже в канале и библиотека измерила udp-пинг -- значит
+// пакеты реально ходили к медиа-адресу и вернулись, ничего прерывать не надо; (2) пинга нет -- выхожу,
+// вхожу заново (это и есть проверка медиа-адреса) и возвращаю музыку на то же место.
+let voiceRealBusy = false;
+async function voiceChannelFor (id, fetchIt)      // канал для проверки голоса: из кеша или из Discord
+{
+    if (!id) return null;
+    if (!fetchIt) return client.channels.cache.get (id) || null;
+    try { return (await client.channels.fetch (id)) || null; }
+    catch (e) { return null; }
+}
+function voicePingNow (m)
+{
+    const c = m && m.connection;
+    if (!c || !c.state || c.state.status !== VoiceConnectionStatus.Ready) return null;
+    try
+    {
+        const p = c.ping;
+        if (!p) return null;
+        return { ws: (typeof p.ws === 'number' ? p.ws : null), udp: (typeof p.udp === 'number' ? p.udp : null) };
+    }
+    catch (e) { return null; }
+}
+async function voiceRealCheck (guildId)           // кнопка владельца: проверить голос по-настоящему
+{
+    const m = musicOf (guildId);
+    const t0 = Date.now ();
+    const ping = voicePingNow (m);
+    const wasChId = String ((m.connection && m.connection.joinConfig && m.connection.joinConfig.channelId) || m.savedChannelId || '');
+    if (ping && typeof ping.udp === 'number')
+    {
+        const ch0 = await voiceChannelFor (wasChId, false);
+        return { ok: true, how: 'ping', ms: Date.now () - t0, chName: ch0 ? ch0.name : '', ping: ping };
+    }
+    if (!/^\d{17,20}$/.test (wasChId))
+        return { ok: false, how: 'nochannel', ms: Date.now () - t0, why: 'не знаю канал: бот туда ещё не заходил' };
+    const ch = await voiceChannelFor (wasChId, true);
+    const guild = (ch && ch.guild) ? ch.guild : null;
+    if (!guild)
+        return { ok: false, how: 'nochannel', ms: Date.now () - t0, why: 'канал не нашёлся или он не на сервере' };
+    const wasIn = !!m.connection;
+    const wasPlaying = !!m.current || !!m.seekTrack;
+    const wasWhere = wasPlaying ? Math.max (0, Math.round (playedMsOf (m) / 1000)) : 0;
+    if (wasIn)                                        // выхожу: место в треке и очередь сохраняются (как при обрыве связи)
+    {
+        try { destroyMusic (guildId); } catch (e) { }
+    }
+    let conn = null, ok = false, why = '';
+    try
+    {
+        conn = joinVoiceChannel ({ channelId: ch.id, guildId: guildId, adapterCreator: guild.voiceAdapterCreator, selfDeaf: false });
+        await entersState (conn, VoiceConnectionStatus.Ready, VOICE_CHECK_MS);
+        ok = true;
+    }
+    catch (e) { why = oneLine ((e && e.message) || e); }
+    const p2 = voicePingNow ({ connection: conn });
+    try { if (conn) conn.destroy (); } catch (e) { }
+    if (wasIn)                                        // возвращаю музыку тем же путём, что после обрыва связи
+    {
+        try { startRestored (guildId, ch, guild); } catch (e) { }
+    }
+    const r = { ok: ok, how: 'join', ms: Date.now () - t0, chName: ch.name, why: why, ping: p2, wasIn: wasIn, wasPlaying: wasPlaying, where: wasWhere };
+    console.log ('[' + (d()) + '] [music] настоящая проверка голоса: канал «' + ch.name + '» ' +
+        (ok ? 'поднялся за ' + (r.ms / 1000).toFixed (1) + ' с (медиа-адрес ответил)' : 'не поднялся за ' + (VOICE_CHECK_MS / 1000) + ' с (' + why + ')') +
+        (wasIn ? (wasPlaying ? '; вернул музыку на ' + fmtDur (wasWhere) : '; слушателей и музыки не было') : '; бот в канале не сидел -- только замерил'));
+    return r;
+}
+function voiceRealText (r, chName)
+{
+    const sec = (r.ms / 1000).toFixed (1);
+    if (r.how === 'ping')
+        return '🔊 **Голос по-настоящему: работает.**\n' +
+            '_Пакеты к медиа-адресу ' + (r.chName ? 'канала «' + r.chName + '» ' : '') + 'ходят и возвращаются: пинг голоса ' +
+            (r.ping && typeof r.ping.udp === 'number' ? r.ping.udp + ' мс' : 'измерен') +
+            (r.ping && typeof r.ping.ws === 'number' ? ' (управляющий ' + r.ping.ws + ' мс)' : '') +
+            '. Это самая настоящая проверка, и музыку прерывать не пришлось._';
+    if (r.how === 'nochannel')
+        return '🔊 Не могу проверить: ' + r.why +
+            '.\n_Заведи бота в канал (`/join`) или укажи канал в консоли: `node . voice <id канала>`._';
+    if (r.ok)
+        return '🔊 **Голос по-настоящему: работает.**\n' +
+            '_Канал «' + r.chName + '» поднялся за ' + sec + ' с -- медиа-адрес ответил._\n' +
+            (r.wasIn
+                ? (r.wasPlaying ? '_Музыка вернулась в канал и продолжает с того же места (' + fmtDur (r.where) + ')._' : '_Вернулся в канал сам._')
+                : '_В канале я не сижу -- это был только замер, музыка не тронута._');
+    return '🔊 **Голос по-настоящему: НЕ работает.**\n' +
+        '_Канал «' + r.chName + '» не поднялся за ' + (VOICE_CHECK_MS / 1000) + ' с' + (r.why ? ' (' + r.why + ')' : '') + '._\n' +
+        'Пока это не наладится, музыка играть не сможет: голос -- это единственное, без чего её не слышно.\n' +
+        'Что смотреть: обход DPI и прокси (в `/health` выше), затем проверить голос отдельно, при выключенном боте: `node . voice` (он делает тот же замер, но дольше и подробнее).' +
+        (r.wasIn ? '\n_Музыка вернулась в канал и ждёт._' : '');
+}
+
 async function netHealthText (m, guildId, viewerId)      // ответ на /health: как живёт связь и чем идёт звук
 {
     const owner = isBotOwner (viewerId);
@@ -15190,6 +15283,14 @@ async function netHealthText (m, guildId, viewerId)      // ответ на /hea
                 ' -- очередь и место в треке целы');
         else if (m.pending)
             lines.push ('⏸ На паузе: в канале нет слушателей -- продолжу, когда кто-нибудь зайдёт');
+        const vp = voicePingNow (m);
+        const vch = (m.connection && m.connection.joinConfig) ? m.connection.joinConfig.channelId : '';
+        if (m.connection)
+            lines.push ('🔊 Голос: ' + (m.connection.state && m.connection.state.status === VoiceConnectionStatus.Ready ? 'связь держится' : 'связь не держится') +
+                (vch ? ' (канал «' + (((await voiceChannelFor (vch, false)) || {}).name || vch) + '»)' : '') +
+                (vp && typeof vp.udp === 'number' ? '; к медиа-адресу пакеты ходят (пинг ' + vp.udp + ' мс)' :
+                    '; медиа-адрес сейчас не измерю -- ничего ещё не звучало') +
+                (owner ? ' -- кнопка ниже проверит его по-настоящему' : ''));
     }
     const rs = await routeStatus ();
     lines.push ('🛣 Пути к YouTube: ' + [
@@ -15215,7 +15316,7 @@ async function netHealthText (m, guildId, viewerId)      // ответ на /hea
     if (fix)
         lines.push ('🛠 Поднять обход я попробую сам: движок и хранителя из планировщика -- без прав; если не хватит прав -- напишу, каких именно.' +
             (canStart ? '\n_Сохранённая стратегия есть: её вернёт кнопка «Поднять обход» -- один запрос прав и пара секунд._' : ''));
-    return { text: lines.join ('\n'), fix: fix, canStart: canStart };
+    return { text: lines.join ('\n'), fix: fix, canStart: canStart, owner: owner };
 }
 async function dpiStartFromDiscord ()            // кнопка у владельца: поднять сохранённую стратегию
 {
@@ -16521,6 +16622,25 @@ client.on ('interactionCreate', async (interaction) =>
         const cid = interaction.customId || '';
         const guildId = interaction.guildId;
         if (!(guildId in SERVERS)) return;
+        if (/^h:voice:real$/.test (cid))
+        {
+            if (!isBotOwner (interaction.user.id))
+                return interaction.reply ({ content: '🚫 По-настоящему проверять голос может только владелец бота.', flags: MessageFlags.Ephemeral });
+            if (voiceRealBusy)
+                return interaction.reply ({ content: '🔊 Уже проверяю -- допишу сюда, когда закончу.', flags: MessageFlags.Ephemeral });
+            voiceRealBusy = true;
+            await interaction.deferReply ({ flags: MessageFlags.Ephemeral });
+            try
+            {
+                const r = await voiceRealCheck (guildId);
+                return interaction.editReply ({ content: voiceRealText (r) });
+            }
+            catch (e)
+            {
+                return interaction.editReply ({ content: '🔊 Проверка сорвалась: ' + oneLine ((e && e.message) || e) });
+            }
+            finally { voiceRealBusy = false; }
+        }
         if (/^h:dpi:start$/.test (cid))
         {
             if (!isBotOwner (interaction.user.id))
@@ -17679,17 +17799,27 @@ client.on ('interactionCreate', async (interaction) =>
         {
             await interaction.deferReply ();            // проверка путей занимает пару секунд
             const hr = await netHealthText (m, guildId, interaction.user.id);
-            if (!hr.fix) return interaction.editReply ({ content: hr.text });
-            const row = new ActionRowBuilder ();
-            if (hr.canStart)
-                row.addComponents (new ButtonBuilder ().setCustomId ('h:dpi:start').setLabel ('▶ Поднять обход').setStyle (ButtonStyle.Success));
-            row.addComponents (new ButtonBuilder ().setCustomId ('h:dpi:pick').setLabel ('🛠 Подобрать обход').setStyle (ButtonStyle.Danger));
-            return interaction.editReply
-            ({
-                content: hr.text + '\n_Кнопки ниже делают то, где нужны права: Windows спросит разрешение' +
-                    (hr.canStart ? '; «поднять» вернёт сохранённую стратегию за пару секунд, «подобрать» -- переберёт все (на это время обход останавливается)' : ', на время подбора обход останавливается') + '._',
-                components: [ row ],
-            });
+            const rows = [];
+            let hText = hr.text;
+            if (hr.owner)
+            {
+                const rowV = new ActionRowBuilder ();
+                rowV.addComponents (new ButtonBuilder ().setCustomId ('h:voice:real')
+                    .setLabel ('🔊 Проверить голос по-настоящему').setStyle (ButtonStyle.Primary));
+                rows.push (rowV);
+                hText += '\n_«Проверить голос» -- по-настоящему: если я уже в канале и к медиа-адресу ходят пакеты, отвечу сразу и ничего не прерву; иначе выйду из канала на несколько секунд, проверю медиа-адрес и верну музыку на то же место._';
+            }
+            if (hr.fix)
+            {
+                const row = new ActionRowBuilder ();
+                if (hr.canStart)
+                    row.addComponents (new ButtonBuilder ().setCustomId ('h:dpi:start').setLabel ('▶ Поднять обход').setStyle (ButtonStyle.Success));
+                row.addComponents (new ButtonBuilder ().setCustomId ('h:dpi:pick').setLabel ('🛠 Подобрать обход').setStyle (ButtonStyle.Danger));
+                rows.push (row);
+                hText += '\n_Кнопки про обход делают то, где нужны права: Windows спросит разрешение' +
+                    (hr.canStart ? '; «поднять» вернёт сохранённую стратегию за пару секунд, «подобрать» -- переберёт все (на это время обход останавливается)' : ', на время подбора обход останавливается') + '._';
+            }
+            return interaction.editReply (rows.length ? { content: hText, components: rows } : { content: hText });
         }
         else if (name === 'history')
         {
