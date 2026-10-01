@@ -281,9 +281,33 @@ function Stop-Bypass
     Start-Sleep -Milliseconds 800
 }
 
+$WinwsOut = Join-Path $Work 'winws-out.txt'
+$WinwsErr = Join-Path $Work 'winws-err.txt'
+
 function Start-Winws($winws, $wargs)
 {
-    return Start-Process -FilePath $winws -ArgumentList $wargs -WorkingDirectory (Split-Path $winws -Parent) -WindowStyle Hidden -PassThru
+    # вывод движка пишу в файлы: без них "процесс: упал" ничего не говорит о причине
+    Remove-Item $WinwsOut, $WinwsErr -ErrorAction SilentlyContinue
+    return Start-Process -FilePath $winws -ArgumentList $wargs -WorkingDirectory (Split-Path $winws -Parent) `
+        -WindowStyle Hidden -PassThru -RedirectStandardOutput $WinwsOut -RedirectStandardError $WinwsErr
+}
+
+function WinwsWhy($proc)                        # почему движок не удержался: код выхода и его последняя строка
+{
+    $code = ''
+    try { if ($proc -and $proc.HasExited) { $code = 'код выхода ' + $proc.ExitCode } } catch { }
+    $tail = ''
+    foreach ($f in @($WinwsErr, $WinwsOut))
+    {
+        if (-not (Test-Path $f)) { continue }
+        $lines = @(Get-Content -Path $f -Encoding UTF8 -ErrorAction SilentlyContinue | Where-Object { $_.Trim() -ne '' })
+        if ($lines.Count) { $tail = ([string]$lines[$lines.Count - 1]).Trim() }
+        if ($tail) { break }
+    }
+    if ($tail.Length -gt 140) { $tail = $tail.Substring(0, 140) }
+    $bits = @($code, $tail) | Where-Object { $_ }
+    if (-not $bits) { return 'сказать нечего: движок вышел молча' }
+    return ($bits -join ': ')
 }
 
 function ServiceState($name)
@@ -392,12 +416,14 @@ function Show-Menu
 # ---------- сам подбор: перебрать пресеты и вернуть лучший ----------
 function Invoke-Pick($Strategies, $Winws, $WasRunning)
 {
-    $need = $Strategies.Count * ($Seconds + 4) + 30
+    $need = $Strategies.Count * ($Seconds + 34) + 60    # пауза + три проверки с таймаутами по 8 с (на мёртвой сети они истекают целиком)
     W ('пресетов к проверке: ' + $Strategies.Count + ' (по ' + $Seconds + ' с на каждый)')
     W ('внимание: на время подбора обход останавливается -- youtube и discord будут недоступны примерно ' + $need + ' с, потом сторож вернёт службу сам')
     Arm-Watchdog $WasRunning $need
 
     $results = @()
+    $deadStreak = 0
+    $abort = ''
     foreach ($st in $Strategies)
     {
         Stop-Bypass
@@ -409,16 +435,27 @@ function Invoke-Pick($Strategies, $Winws, $WasRunning)
         $alive = ($proc -and -not $proc.HasExited)
         $mark = 'нет'
         if ($yt -and ($gw -or $api)) { $mark = 'ДА' } elseif ($yt -or $gw -or $api) { $mark = 'частично' }
-        W ($st.Name.PadRight(34) + ' процесс: ' + $(if ($alive) { 'работает' } else { 'упал' }) + ' | youtube: ' + $(if ($yt) { 'да' } else { 'нет' }) + ' | шлюз discord: ' + $(if ($gw) { 'да' } else { 'нет' }) + ' | api discord: ' + $(if ($api) { 'да' } else { 'нет' }) + '  -> ' + $mark)
-        $results += [pscustomobject]@{ Name = $st.Name; Args = $st.Args; Yt = $yt; Gw = $gw; Api = $api; Alive = $alive }
+        $dead = ''
+        if (-not $alive) { $dead = WinwsWhy $proc }
+        W ($st.Name.PadRight(34) + ' процесс: ' + $(if ($alive) { 'работает' } else { 'упал' }) + $(if ($dead) { ' (' + $dead + ')' } else { '' }) + ' | youtube: ' + $(if ($yt) { 'да' } else { 'нет' }) + ' | шлюз discord: ' + $(if ($gw) { 'да' } else { 'нет' }) + ' | api discord: ' + $(if ($api) { 'да' } else { 'нет' }) + '  -> ' + $mark)
+        $results += [pscustomobject]@{ Name = $st.Name; Args = $st.Args; Yt = $yt; Gw = $gw; Api = $api; Alive = $alive; Dead = $dead }
         Stop-Bypass
+        if ($alive) { $deadStreak = 0 } else { $deadStreak++ }
+        if ($deadStreak -ge 3)
+        {
+            $abort = 'движок не запускается вообще: ' + $deadStreak + ' пресета подряд упали сразу' +
+                $(if ($dead) { ' (последний: ' + $dead + ')' } else { '' }) +
+                '. Это не про выбор стратегии -- проверь драйвер WinDivert, права администратора и конфликт с VPN или другим сетевым фильтром.'
+            W ('прекращаю перебор: ' + $abort)
+            break
+        }
     }
 
     # берём ту, где работают ОБА пути; только если такой нет -- довольствуемся частичной
     $best = $results | Where-Object { $_.Yt -and ($_.Gw -or $_.Api) } | Select-Object -First 1
     if (-not $best) { $best = $results | Where-Object { $_.Gw -or $_.Api } | Select-Object -First 1 }
     if (-not $best) { $best = $results | Where-Object { $_.Yt } | Select-Object -First 1 }
-    return $best
+    return @{ Best = $best; Results = $results; Abort = $abort }
 }
 
 # ---------- хранитель: держит оба пути рабочими ----------
@@ -633,7 +670,10 @@ $wasRunning = ($svcBefore -eq 'Running')
 $strategies = @(Get-Strategies $dir)
 if (-not $strategies.Count) { W 'ОШИБКА: не нашёл ни одного пресета general*.bat'; exit 4 }
 
-$best = Invoke-Pick $strategies $winws $wasRunning
+$pick = Invoke-Pick $strategies $winws $wasRunning
+$best = $pick.Best
+$results = $pick.Results
+$pickAbort = $pick.Abort
 
 if (-not $SkipVoice -and $best)
 {
@@ -710,8 +750,12 @@ if ($best)
 }
 else
 {
+    if ($pickAbort) { W ('виноват не набор пресетов: ' + $pickAbort) }
     W 'ни одна стратегия из этой папки не дала ни YouTube, ни Discord.'
-    W 'Что делать: обновить набор zapret (там добавляют пресеты под новых провайдеров) или взять другой обход.'
+    if ($pickAbort)
+        { W 'Пока движок не запускается, проверить стратегии невозможно -- обновление набора тут не поможет.' }
+    else
+        { W 'Что делать: обновить набор zapret (там добавляют пресеты под новых провайдеров) или взять другой обход.' }
     Restore-Service $wasRunning
 }
 W 'готово'
