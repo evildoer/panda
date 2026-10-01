@@ -42,6 +42,18 @@
 // а если нода совсем не умеет ходить по маршруту музыки -- честное «не знаю»; 4) по аудиту всех сетевых проверок:
 // у пинга прокси, прямого запроса и запроса через свой маршрут появились жёсткие сторожа, а разрешение имени
 // youtube.com через системный справочник ограничено 5 секундами -- раньше молчащий DNS мог подвесить проверку.
+// v2.145 -- по живому случаю 02.10 (трек с SoundCloud «играл» 21 минуту в тишине, время шло, звука не было):
+// 1) для адресов SoundCloud маршруты теперь собираются отдельно -- прокси идут первыми, даже если порт прокси молчит,
+// а прямой путь остаётся только когда прокси не задан вовсе: на этой сети его медиа-поток напрямую не отдаёт НИ БАЙТА
+// (живой yt-dlp: 0 Б/с и вечные Read timed out против 1 МБ/с через SOCKS), а память маршрутов перед этим поставила
+// direct первым -- в 00:09 прокси на минуту флапнули, и ютуб напрямую тогда отвечал; 2) у потока появился сторож:
+// если плеер минуту не получает ни одного пакета звука (resource.playbackDuration не растёт), трек перезапускается
+// с того же места (маршрут пересобирается -- у SoundCloud станет прокси), а если молчит и сеть -- бот держит очередь
+// и место, как при обрыве; 3) строка «📚 Пачки» в /queue переехала вниз, к «👥 По авторам» и остальной справке --
+// она больше не разрывает «Сейчас» и «Очередь»; 4) у цепочки кнопок q: появился общий хвост: кнопка из старого
+// сообщения (у которой нет обработчика) честно отвечает «меню устарело», а не остаётся без ответа; живой интерфейс
+// это не меняет -- все живые кнопки отвечают выше; 5) в ноде теперь есть SOCKS (socks-proxy-agent): проверка
+// очереди ходит ровно тем же маршрутом, что и музыка (раньше SOCKS-адрес молча уходил напрямую).
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -6940,8 +6952,8 @@ async function dpiStrategyHealth (why)           // обход работает,
     const disc = await dpiDiscordState ();
     const ytOk = !!dp.ok;                                  // прямой путь: тревога только если и ЗАПАСНЫЕ пути молчат
     // Прямой путь молчит -- проверяю запасные ПО-НАСТОЯЩЕМУ, живым yt-dlp: сначала прокси, потом свой маршрут по адресам.
-    // (лёгким HTTPS-запросом через прокси проверить нельзя: HTTP-инбаунд VPN в живом логе не тянет CONNECT, а socks-агента
-    // в зависимостях нет -- поэтому спрашиваю ровно того, кто везёт музыку, и его же ответу и верю.)
+    // (проверять надо именно «везёт ли медиа»: сперва дешёвый пинг порта, потом живой yt-dlp -- его же ответ и верю;
+    // с v2.145 нода умеет и SOCKS, но лёгкий oEmbed подтверждал бы только «имя отвечает», а не что поедут медиа.)
     // Раньше считался только прямой путь, и тревога «обход перестал помогать» поднималась, пока музыка играла через
     // прокси или шла из диска (так и вышло 22:57: музыка играла, а письмо кричало об аварии).
     let spareWhy = '';
@@ -9389,6 +9401,23 @@ async function ytRoutes ()
     return await routeMemoryOrder (out);
 }
 
+// SoundCloud на этой сети открывается только прокси: его медиа-поток (HLS с playback.media-streaming.soundcloud.cloud)
+// напрямую не отдаёт НИ ОДНОГО байта -- живой случай 02.10: трек «играл» 21 минуту в тишине, потому что память маршрутов
+// поставила direct первым (в 00:09 прокси на минуту флапнули, и ютуб напрямую в тот момент отвечал). Обход DPI его не спасает.
+// Поэтому для адресов SoundCloud прокси-маршруты идут первыми, даже если дешёвый пинг прокси молчит: лучше подождать
+// сеть (очередь и место в треке держатся), чем играть тишину. Прямой путь -- только когда прокси не задан вовсе.
+async function ytRoutesFor (url)
+{
+    const routes = await ytRoutes ();
+    if (!isScUrl (url) || !MUSIC_PROXIES.length) return routes;
+    const front = routes.filter (r => r && r.kind === 'proxy' && r.proxy);
+    const seen = new Set (front.map (r => r.proxy));
+    for (const p of MUSIC_PROXIES)
+        if (!seen.has (p)) { front.push ({ proxy: p, kind: 'proxy' }); seen.add (p); }
+    const doh = routes.filter (r => r && r.kind === 'doh' && r.proxy);
+    return front.length ? [...front, ...doh] : routes;
+}
+
 function sectionProxyFor (viaProxy)
 {
     const self = /^https?:\/\//i.test (String (viaProxy || '')) ? viaProxy : '';
@@ -9547,7 +9576,7 @@ function ytRouteLabel (route, addr)
 async function ytDlpRun (query, optsBase)
 {
     const startedAt = Date.now ();
-    let routes = await ytRoutes ();
+    let routes = await ytRoutesFor (query);
     let lastErr;
     let failedRoutes = 0;
     let triedList = [];
@@ -10827,7 +10856,7 @@ function cachePromoteParts (key, track)
 async function cacheDownload (track, holder = {})
 {
     cacheDirReady ();
-    const viaProxy = ((await ytRoutes ())[0] || {}).proxy || '';
+    const viaProxy = ((await ytRoutesFor (track.url))[0] || {}).proxy || '';
     const key = cacheKeyOf (track);
     cacheDropParts (key);
     const proc = ytdlp.exec
@@ -11637,7 +11666,7 @@ async function createTrackStream (track, seekSec = 0, seekMode = 'sections', par
             }
         }
     }
-    let viaProxy = ((await ytRoutes ())[0] || {}).proxy || '';
+    let viaProxy = ((await ytRoutesFor (track.url))[0] || {}).proxy || '';
     const seek = (seekMode === 'sections' && seekSec >= 1 && !track.isLive);
     const seekProxy = seek ? sectionProxyFor (viaProxy) : '';
     const seekInFfmpeg = (seekMode === 'ffseek' && seekSec >= 1 && !track.isLive);
@@ -11890,10 +11919,114 @@ function musicNetStall (guildId, track, at, e)
     return true;
 }
 
+const STREAM_STALL_MS = 15000;        // столько секунд без единого пакета звука -- поток завис
+const STREAM_STALL_START_MS = 25000;  // до первого звука жду дольше: сеть бывает просто медленной
+const STREAM_STALL_LIVE_MS = 30000;   // у прямого эфира пауза бывает длиннее обычного
+const STREAM_WATCH_STEP_MS = 3000;
+
+function streamWatchStop (m)
+{
+    if (!m || !m.streamWatch) return;
+    clearInterval (m.streamWatch.h);
+    m.streamWatch = null;
+}
+
+// Живой случай 02.10: трек с SoundCloud бот стримил «напрямую», а тот не отдал ни байта -- время в /queue шло
+// по часам, звука не было, и очередь ждала его 21 минуту (при длине трека 2:36). Плеер считает реально съеденный
+// звук в resource.playbackDuration: не растёт -- источник молчит. Тогда пробую тот же трек заново (маршрут
+// пересоберётся -- у SoundCloud он станет прокси), а если молчит и сеть -- держу место и жду её, как при обрыве.
+function streamWatchStart (m, track, resource, guildId)
+{
+    streamWatchStop (m);
+    if (!m || !track || !resource) return;
+    const w = { h: null, resource: resource, track: track, audioMs: -1, at: Date.now (), checking: false };
+    w.h = setInterval (() =>
+    {
+        if (m.streamWatch !== w) return;
+        if (m.current !== track || m.seekTrack === track || m.pending) { streamWatchStop (m); return; }
+        const st = m.player && m.player.state ? m.player.state.status : null;
+        if (st === AudioPlayerStatus.Paused)
+        {
+            w.audioMs = Number (resource.playbackDuration) || 0;
+            w.at = Date.now ();
+            return;
+        }
+        if (st !== AudioPlayerStatus.Playing) return;
+        const audioMs = Number (resource.playbackDuration) || 0;
+        if (audioMs !== w.audioMs) { w.audioMs = audioMs; w.at = Date.now (); return; }
+        const quiet = Date.now () - w.at;
+        const need = track.isLive ? STREAM_STALL_LIVE_MS
+            : (audioMs > 0 ? STREAM_STALL_MS : STREAM_STALL_START_MS);
+        if (quiet < need || w.checking) return;
+        w.checking = true;
+        streamWatchStop (m);
+        // Если звука не было вовсе, позиция по часам врёт: начинаю с той секунды,
+        // с которой этот запуск был задуман (живой случай 02.10: стрим шёл без данных, а таймер гнал вперёд).
+        const at = (audioMs > 0) ? Math.round (playedMsOf (m) / 1000)
+            : Math.max (0, Math.round (Number (m.startedAtSec) || 0));
+        const why = 'источник молчит ' + Math.round (quiet / 1000) + ' с' +
+            (audioMs > 0 ? '' : ' и не отдал ни одного пакета звука');
+        console.error ('[' + (d()) + '] [music] поток завис (' + why + '): ' + (track.title || 'трек') +
+            ' -- проверяю путь и пробую тот же трек заново' + (track.isLive ? ' (эфир -- с живого края)' : ''));
+        (async () =>
+        {
+            let up = true;
+            try { up = await netRouteAnswers (); } catch (e) { up = false; }
+            const mm = $music[guildId];
+            if (!mm || mm.current !== track) return;
+            if (!up)
+            {
+                musicNetStall (guildId, track, at, { message: why + ': сеть/прокси не отвечает' });
+                try { mm.player.stop (true); } catch {}
+                return;
+            }
+            streamRetrySame (guildId, track, at, 'поток завис: ' + why);
+        }) ().catch (e => console.error ('[music] сторож потока: ' + oneLine ((e && e.message) || e)));
+    }, STREAM_WATCH_STEP_MS);
+    if (w.h.unref) w.h.unref ();
+    m.streamWatch = w;
+}
+
+// Один и тот же трек заново, с той же секунды: так же, как при обрыве потока -- попыток не больше трёх,
+// потом честно пропускаю. Живёт рядом со сторожем, чтобы поведение при зависании и при обрыве совпадало.
+function streamRetrySame (guildId, track, at, whyText)
+{
+    const m = musicOf (guildId);
+    if (!m || m.current !== track) return false;
+    const pos = track.isLive ? 0 : Math.max (0, Math.round (Number (at) || 0));
+    if (pos > (m.lastErrorAt || 0) + 30) m.streamRetries = 0;
+    m.lastErrorAt = pos;
+    const attempt = (m.streamRetries || 0) + 1;
+    if (attempt > MUSIC_STREAM_RETRIES)
+    {
+        console.error ('[' + (d()) + '] [music] ' + whyText + ' -- пробовал ' + MUSIC_STREAM_RETRIES +
+            ' раз, пропускаю: ' + (track.title || 'трек'));
+        m.streamRetries = 0;
+        m.current = null;
+        trackNotice (guildId, track, '⚠️ **' + (track.title || 'Трек') + '** -- ' + whyText +
+            ', не удалось воспроизвести, пропускаю.');
+        m.player.stop (true);
+        return true;
+    }
+    m.streamRetries = attempt;
+    m.playedMs = pos * 1000;
+    m.playingSince = null;
+    m.current = null;
+    m.tracks.unshift (track);
+    m.seekTrack = track;
+    m.seekSec = pos;
+    console.error ('[' + (d()) + '] [music] ' + whyText + ' (' + (pos ? 'на ' + fmtDur (pos) : 'в самом начале') +
+        ') -- продолжаю тот же трек, попытка ' + attempt + '/' + MUSIC_STREAM_RETRIES);
+    saveMusicState (guildId);
+    m.player.stop (true);
+    return true;
+}
+
 async function playNext (guildId)
 {
     const m = musicOf (guildId);
     if (m.leaving) return;
+    streamWatchStop (m);
     killStream (m.streamHandle);
     m.streamHandle = null;
     if (!m.tracks.length)
@@ -12067,6 +12200,7 @@ async function playNext (guildId)
         m.player.play (resource);
         m.playFailStreak = 0;
         m.seekLoose = false;
+        if (!playedFromDisk && !fromPart) streamWatchStart (m, track, resource, guildId);
         if (m.netWait)
         {
             const _w = m.netWait;
@@ -15956,13 +16090,15 @@ function queueView (m, start, moveSel = 0, opts = {})
     const wait = queueWaitText (m);
     const build = hint =>
     {
-        const mid = [net, packList, move, hint].filter (Boolean).join ('\n');
+        // «Пачки» стоят внизу, вместе с остальной справкой: строка не должна разрывать «Сейчас» и «Очередь»
+        // (живая просьба владельца 02.10).
+        const mid = [net, move, hint].filter (Boolean).join ('\n');
         return queueHeadText (m) +
         (mid ? '\n' + QSEP + '\n' + mid + '\n' + QSEP : '\n' + QSEP) +
         '\n**Очередь (' + total + ')**' + (page.start > 1 ? ' · с №' + page.start : '') + ':\n' + page.list +
         (restNow () > 0 ? '\n*...и ещё ' + restNow () + '*' : '') +
         '\n' + QSEP + '\n' +
-        [authors, wait, check].filter (Boolean).join ('\n');
+        [packList, authors, wait, check].filter (Boolean).join ('\n');
     };
     let content;
     if (!total) content = queueHeadText (m);
@@ -16918,10 +17054,11 @@ function oembedRouteBlocked (addr)
     return !!t && t > Date.now ();
 }
 
-// Чем из ноды вообще можно постучаться в YouTube. В зависимостях нет socks-агента, поэтому SOCKS-адрес
-// нода не умеет -- и раньше запрос молча шёл НАПРЯМУЮ (врал, что «проверил через прокси»). Теперь беру
-// первый адрес, который нода умеет везти (HTTP-инбаунд или свой маршрут по адресам), а если таких нет --
-// прямое соединение только тогда, когда прямой путь ДОКАЗАН; иначе честное «не знаю», без запроса мимо прокси.
+// Чем из ноды постучаться в YouTube. С v2.145 нода умеет и SOCKS (socks-proxy-agent в зависимостях),
+// поэтому проверка очереди может идти ровно тем же адресом, что и музыка (живой случай 02.10: SOCKS-адрес
+// молча уходил НАПРЯМУЮ, как будто «проверка через прокси»). Беру первый адрес, который нода умеет везти
+// (SOCKS, HTTP-инбаунд или свой маршрут по адресам), а если таких нет -- прямое соединение только тогда,
+// когда прямой путь ДОКАЗАН; иначе честное «не знаю», без запроса мимо прокси.
 async function oembedRoute ()
 {
     const preferred = await proxyForFetch ();          // так пошла бы музыка
@@ -16999,9 +17136,9 @@ function oembedNote (verdict)
     oembedHintTold = true;
     console.error ('[' + (d()) + '] [music] проверка очереди: не могу достучаться до YouTube (DNS/сеть) -- ' +
         'мёртвые видео, как и раньше, узнаются только при подходе к эфиру. ' +
-        'SOCKS-адрес нода сама не умеет (в зависимостях нет socks-агента): проверка идёт через первый адрес, ' +
-        'который нода умеет (HTTP-инбаунд или свой маршрут), -- а если таких нет, я честно отвечаю «не знаю» ' +
-        'и мимо прокси не хожу. Проверь MUSIC.proxy (нужен http-адрес) или выключи MUSIC.queue_check вовсе');
+        'Проверка идёт тем же маршрутом, что и музыка (SOCKS нода умеет с v2.145), а если ни один прокси ' +
+        'и прямой путь не отвечают -- я честно отвечаю «не знаю» и мимо прокси не хожу. ' +
+        'Проверь MUSIC.proxy (годятся и socks5://, и http://) и сеть/VPN -- или выключи MUSIC.queue_check вовсе');
 }
 
 async function deadProbe (url, strict = false)
@@ -17406,6 +17543,7 @@ function joinVoiceNow (guildId, voiceChannel, guild, reason = '')
             m.playerWired = true;
             m.player.on (AudioPlayerStatus.Idle, () =>
             {
+                streamWatchStop (m);
                 const _deadErr = (m.streamHandle && m.streamHandle.proc) ? m.streamHandle.proc.lastErr : null;
                 killStream (m.streamHandle);
                 m.streamHandle = null;
@@ -18256,7 +18394,20 @@ client.on ('interactionCreate', async (interaction) =>
         const replyView = async (at = page, moveSel = 0) =>
         {
             const view = queueView (m, at, moveSel, ctx);
-            await interaction.update ({ content: view.content, components: view.components, allowedMentions: { parse: [] } });
+            try
+            {
+                await interaction.update ({ content: view.content, components: view.components, allowedMentions: { parse: [] } });
+            }
+            catch (e)
+            {
+                // сообщение под кнопкой уже не обновить (удалено или слишком старое) -- честно отвечаю, а не молчу
+                await interaction.reply
+                ({
+                    content: '⌛ Это сообщение /queue уже не обновить -- вызови `/queue` заново.',
+                    flags: MessageFlags.Ephemeral,
+                }).catch (() => {});
+                return;
+            }
             queueWatch (m, interaction.message, ctx, at, view.content, moveSel, queueCompSig (view.components));
         };
         const mPage = /^q:(rf|[pn])(?::(?:first|prev|next|last))?:(\d+)$/.exec (cid);
@@ -18782,9 +18933,28 @@ client.on ('interactionCreate', async (interaction) =>
         if (cid === 'q:dx') return interaction.update ({ content: '✖ Отменено -- очередь на месте.', components: [] });
         if (cid === 'q:clear') return askClear (false);
         if (cid === 'q:stop') return askClear (true);
+        // Общий хвост цепочки q:: сюда доходит всё, что не обработано выше. У старых сообщений /queue бывают
+        // кнопки с прежним видом id -- их не разбирает ни один обработчик, и раньше нажатие оставалось без ответа
+        // (Discord показывал «Приложение не ответило вовремя»). Живые кнопки сюда не доходят вовсе: они отвечают
+        // выше, поэтому интерфейс это не меняет. Старый выбор нужного трека (меню со значением-номером) по-прежнему
+        // работает: он приходит как выбор, а не как кнопка.
         let res;
         if (cid === 'q:skip') res = queueSkip (guildId, who, ctx);
-        else res = queueRemove (guildId, parseInt ((interaction.values || [])[0], 10), who, ctx);
+        else
+        {
+            const tailSel = parseInt (String ((interaction.values || [])[0] === undefined ? '' : (interaction.values || [])[0]), 10);
+            if (Number.isInteger (tailSel) && tailSel >= 1 && tailSel <= m.tracks.length)
+                res = queueRemove (guildId, tailSel, who, ctx);
+            else
+            {
+                console.log ('[' + (d()) + '] [btn] ' + whoText (who) + 'кнопка /queue из старого сообщения (' + cid + ') -- отвечаю, что меню устарело');
+                return interaction.reply
+                ({
+                    content: '⏳ Эта кнопка устарела -- сообщение /queue обновлялось после неё. Вызови `/queue` заново.',
+                    flags: MessageFlags.Ephemeral,
+                }).catch (() => {});
+            }
+        }
         await replyView (queueKeptPage (msgId, page));
         return interaction.followUp ({ content: res.text, flags: MessageFlags.Ephemeral });
     }
