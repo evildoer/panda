@@ -54,6 +54,15 @@
 // сообщения (у которой нет обработчика) честно отвечает «меню устарело», а не остаётся без ответа; живой интерфейс
 // это не меняет -- все живые кнопки отвечают выше; 5) в ноде теперь есть SOCKS (socks-proxy-agent): проверка
 // очереди ходит ровно тем же маршрутом, что и музыка (раньше SOCKS-адрес молча уходил напрямую).
+// v2.146 -- по просьбе владельца: 1) у SoundCloud появилась своя фоновая проверка пути -- раз в 5 минут (и по
+// взгляду в /health) живой yt-dlp тянет ПЕРВЫЕ КИЛОБАЙТЫ ЗВУКА своего же SC-трека из очереди (очередь чиста -- из
+// истории): метаданные у него идут по любому пути, а медиа доказывает только ручей, не капля (порог 64 КБ);
+// вердикт по каждому адресу виден в /health (везёт/не везёт, когда проверял и на каком треке), а маршрут, про
+// который известно, что SC он не везёт, уходит назад в порядке для SC-адресов (из списка не выкидывается:
+// память короткая); 2) сторож тишины теперь метит молчавший маршрут: адрес на минуту уходит из первых, а для SC
+// ещё и в память проверки -- повтор трека не упрётся в тот же молчащий путь. Заодно замер 02.10 показал, зачем
+// в конфиге http-адрес: прямой путь дал 0 байт за 25 с, socks5 -- 203 КБ за 4.8 с, а http://127.0.0.1:10809 --
+// 66 КБ за 4.5 с (живой трек с SoundCloud); ffmpeg на перемотках умеет только HTTP, так что он не мёртвый груз.
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -6520,6 +6529,161 @@ async function proxyCarryCheck (addr)    // по-настоящему: дохо�
     proxyCarryBusy.set (a, job);
     try { return await job; } finally { proxyCarryBusy.delete (a); }
 }
+
+// SoundCloud проверяю отдельно и НАСТОЯЩИМИ байтами звука: метаданные у него идут по любому пути, а медиа (HLS
+// с playback.media-streaming.soundcloud.cloud) прямому маршруту не отдаёт ни байта (живой случай 02.10: 21 минута
+// тишины). Поэтому тяну через yt-dlp первые килобайты: пришёл ручей -- маршрут SoundCloud везёт; капля или ничего
+// -- не везёт. Проверка не выдумывает адресов: беру СВОЙ трек из очереди (его и играем), а если очередь чиста --
+// из истории. Результат виден в /health, а маршрут, про который известно, что SC он не везёт, уходит назад
+// в ytRoutesFor (из списка не выкидываю: память короткая, а промахнуться на удалённом треке не страшно).
+const SC_CARRY_MS = 25000;                 // сколько жду первые килобайты
+const SC_CARRY_MIN_BYTES = 64 * 1024;      // меньше 64 КБ -- это «капля»: прямой путь ровно так и виснет
+const SC_CARRY_TTL = 10 * 60000;           // «везёт» помню 10 минут: проверка не бесплатная
+const SC_CARRY_FAIL_TTL = 2 * 60000;       // «не везёт» -- 2 минуты: трек мог быть удалён, перепроверю
+const SC_CARRY_EVERY_MS = 5 * 60000;       // фоновая проверка не чаще этого
+const scCarry = new Map ();                // адрес -> { ok, at, why }
+const scCarryBusy = new Map ();            // адрес -> идущая проверка (одну и ту же не гоняю дважды)
+let scCarryProbe = null;                   // { title, at } -- на каком треке проверял (видно в /health)
+let scCarryKickAt = 0;
+
+function scCarryNote (addr, ok, why)       // отметка из живого опыта (сторож тишины), без запуска yt-dlp
+{
+    const a = String (addr || '');
+    if (!a) return;
+    scCarry.set (a, { ok: !!ok, at: Date.now (), why: String (why || '') });
+}
+
+function scCarryTrackFind ()               // свой SC-трек: сперва очередь, потом история
+{
+    for (const gid of Object.keys ($music))
+    {
+        const m = $music[gid];
+        if (!m) continue;
+        for (const t of [m.current, m.seekTrack, ...(m.tracks || [])])
+            if (t && t.url && isScUrl (t.url)) return { url: t.url, title: t.title || 'трек с SoundCloud' };
+        for (const e of (Array.isArray (m.history) ? m.history : []))
+            for (const u of ((e && e.urls) || []))
+                if (isScUrl (u)) return { url: u, title: ((e.titles || [])[0]) || 'трек с SoundCloud' };
+    }
+    return null;
+}
+
+async function scCarryUrlFind ()
+{
+    let q = scCarryTrackFind ();
+    if (q) return q;
+    for (const gid of Object.keys ($music))
+    {
+        try { await historyLoad (gid); } catch (e) { }
+        q = scCarryTrackFind ();
+        if (q) return q;
+    }
+    return null;
+}
+
+function scCarryByteRun (addr, url)        // тянет первые килобайты звука и обрывает yt-dlp -- файл нам не нужен
+{
+    return new Promise (resolve =>
+    {
+        let done = false, got = 0, err = '', proc = null, t = null;
+        const fin = (ok, why) =>
+        {
+            if (done) return;
+            done = true;
+            if (t) clearTimeout (t);
+            try { if (proc && typeof proc.kill === 'function') proc.kill (); } catch (e) { }
+            resolve ({ ok: ok, why: String (why || '') });
+        };
+        try
+        {
+            proc = ytdlp.exec (url,
+            {
+                o: '-', quiet: true, noWarnings: true, noPlaylist: true, socketTimeout: 10,
+                ...(addr ? { proxy: addr } : {}),
+                f: 'bestaudio[acodec!=none][ext=m4a]/bestaudio[acodec!=none]/bestaudio/best',
+                bufferSize: '1M', retries: 1,
+            });
+        }
+        catch (e) { return fin (false, 'yt-dlp не запустился: ' + oneLine ((e && e.message) || e, 120)); }
+        if (proc && typeof proc.catch === 'function') proc.catch (() => {});
+        t = setTimeout (() => fin (false, got > 0
+            ? 'пришло только ' + fmtMb (got) + ' за ' + Math.round (SC_CARRY_MS / 1000) + ' с'
+            : 'ни байта за ' + Math.round (SC_CARRY_MS / 1000) + ' с'), SC_CARRY_MS);
+        if (t.unref) t.unref ();
+        if (proc.stdout) proc.stdout.on ('data', b =>
+        {
+            got += b.length;
+            if (got >= SC_CARRY_MIN_BYTES) fin (true, '');
+        });
+        if (proc.stderr) proc.stderr.on ('data', b => { err += String (b); });
+        if (typeof proc.on !== 'function') return;              // не процесс -- ждём только таймер
+        proc.on ('close', code => fin (false, got > 0
+            ? 'поток закрылся, пришло только ' + fmtMb (got)
+            : 'yt-dlp закрылся без звука' + (err ? ': ' + oneLine (err, 120) : ' (код ' + code + ')')));
+    });
+}
+
+async function scCarryCheck (addr, url)
+{
+    const a = String (addr || '');
+    if (!a || !url) return { ok: false, at: 0, why: 'нечего проверять' };
+    const c = scCarry.get (a);
+    if (c && (Date.now () - c.at) < (c.ok ? SC_CARRY_TTL : SC_CARRY_FAIL_TTL)) return c;
+    const busy = scCarryBusy.get (a);
+    if (busy) return await busy;
+    const job = (async () =>
+    {
+        const r = await scCarryByteRun (a, url);
+        const prev = scCarry.get (a);
+        const out = { ok: r.ok, at: Date.now (), why: r.ok ? '' : r.why };
+        scCarry.set (a, out);
+        if (!prev || prev.ok !== out.ok)
+            console.log ('[' + (d()) + '] [music] SoundCloud через ' + a + ' ' + (out.ok
+                ? 'везёт: yt-dlp отдал первые килобайты звука'
+                : 'НЕ везёт (' + out.why + ') -- для SoundCloud его пути держу запасными'));
+        return out;
+    }) ();
+    scCarryBusy.set (a, job);
+    try { return await job; } finally { scCarryBusy.delete (a); }
+}
+
+async function scCarryTick ()              // фоном: у ютуба свой запасной путь, у SoundCloud -- свой
+{
+    if (!BOT_RUN || !MUSIC_PROXIES.length) return;
+    const find = await scCarryUrlFind ();
+    if (!find) return;
+    scCarryProbe = { title: find.title, at: Date.now () };
+    const addrs = [...MUSIC_PROXIES];
+    if (MUSIC_DOH)
+    {
+        const port = await dohProxyStart ();
+        if (port) addrs.push ('http://127.0.0.1:' + port);
+    }
+    for (const a of addrs)
+    {
+        const c = scCarry.get (a);
+        if (c && (Date.now () - c.at) < (c.ok ? SC_CARRY_TTL : SC_CARRY_FAIL_TTL)) continue;
+        try { await scCarryCheck (a, find.url); } catch (e) { }
+    }
+}
+
+function scCarryKick ()                    // /health просят -- обновляю в фоне, к следующему взгляду
+{
+    if (!BOT_RUN) return;
+    if (Date.now () - scCarryKickAt < 60000) return;
+    scCarryKickAt = Date.now ();
+    const t = setTimeout (() => scCarryTick ().catch (() => {}), 800);
+    if (t.unref) t.unref ();
+}
+
+if (BOT_RUN)
+{
+    setInterval (() => { scCarryTick ().catch (() => {}); }, SC_CARRY_EVERY_MS).unref ();
+    // и один ранний проход: к первому взгляду в /health проверка уже есть (если в истории/очереди есть SC-трек)
+    const scFirstTick = setTimeout (() => { scCarryTick ().catch (() => {}); }, 75000);
+    if (scFirstTick.unref) scFirstTick.unref ();
+}
+
 const DOH_PROBE_TIMEOUT = 6000;          // свой маршрут поднимается и разрешает имя не сразу, поэтому жду дольше прямого
 const DOH_PROBE_FAIL_TTL = 10000;        // «не ответил» помню недолго: со второй попытки он обычно уже работает
 let dohProbeCache = { ok: false, why: '', at: 0 };
@@ -9414,6 +9578,16 @@ async function ytRoutesFor (url)
     const seen = new Set (front.map (r => r.proxy));
     for (const p of MUSIC_PROXIES)
         if (!seen.has (p)) { front.push ({ proxy: p, kind: 'proxy' }); seen.add (p); }
+    if (front.length > 1)
+    {
+        // Свежая память проверки SoundCloud: маршрут, про который известно, что SC он не везёт, уходит назад
+        // (проверяет фоном scCarryTick, отмечает и сторож тишины). Если «не везёт» про все -- порядок не
+        // трогаю: память короткая, а трек, на котором проверял, мог быть к тому времени удалён.
+        const rank = r => { const c = scCarry.get (r.proxy); return c ? (c.ok ? 0 : 2) : 1; };
+        const keep = [...front];
+        front.sort ((x, y) => rank (x) - rank (y));
+        if (front.every (r => rank (r) === 2)) { front.length = 0; front.push (...keep); }
+    }
     const doh = routes.filter (r => r && r.kind === 'doh' && r.proxy);
     return front.length ? [...front, ...doh] : routes;
 }
@@ -11935,7 +12109,7 @@ function streamWatchStop (m)
 // по часам, звука не было, и очередь ждала его 21 минуту (при длине трека 2:36). Плеер считает реально съеденный
 // звук в resource.playbackDuration: не растёт -- источник молчит. Тогда пробую тот же трек заново (маршрут
 // пересоберётся -- у SoundCloud он станет прокси), а если молчит и сеть -- держу место и жду её, как при обрыве.
-function streamWatchStart (m, track, resource, guildId)
+function streamWatchStart (m, track, resource, guildId, viaProxy)
 {
     streamWatchStop (m);
     if (!m || !track || !resource) return;
@@ -11960,6 +12134,12 @@ function streamWatchStart (m, track, resource, guildId)
         if (quiet < need || w.checking) return;
         w.checking = true;
         streamWatchStop (m);
+        // Маршрут, который ничего не привёз, помечаю ненадёжным на время: следующий запуск трека соберёт
+        // маршруты заново и не будет упираться в тот же молчащий путь. Про SoundCloud -- ещё и отдельная
+        // память проверки: в ytRoutesFor такой адрес уйдёт назад, к заведомо везущим.
+        if (viaProxy) proxyMarkBad (viaProxy);
+        if (viaProxy && !audioMs && isScUrl (track.url))
+            scCarryNote (viaProxy, false, 'поток не отдал ни одного байта звука');
         // Если звука не было вовсе, позиция по часам врёт: начинаю с той секунды,
         // с которой этот запуск был задуман (живой случай 02.10: стрим шёл без данных, а таймер гнал вперёд).
         const at = (audioMs > 0) ? Math.round (playedMsOf (m) / 1000)
@@ -12200,7 +12380,7 @@ async function playNext (guildId)
         m.player.play (resource);
         m.playFailStreak = 0;
         m.seekLoose = false;
-        if (!playedFromDisk && !fromPart) streamWatchStart (m, track, resource, guildId);
+        if (!playedFromDisk && !fromPart) streamWatchStart (m, track, resource, guildId, viaProxy);
         if (m.netWait)
         {
             const _w = m.netWait;
@@ -16869,6 +17049,29 @@ async function netHealthText (m, guildId, viewerId)      // ответ на /hea
             ', музыку через него ещё не проверял');
     lines.push ('🚚 Запасные пути -- чем музыка может ехать (везёт ли ютуб, проверяет живой yt-dlp):\n' +
         spare.map (s => '  • ' + s).join ('\n'));
+    // SoundCloud отдельно: его медиа устроено иначе -- прямой путь у него виснет без байта, а ютуб по тому же
+    // маршруту едет. Поэтому проверка тянет НАСТОЯЩИЕ первые килобайты звука его же трека из очереди.
+    if (MUSIC_PROXIES.length || MUSIC_DOH)
+    {
+        scCarryKick ();                                    // обновляю в фоне: к следующему взгляду будет свежее
+        const scAddrs = [...MUSIC_PROXIES];
+        if (MUSIC_DOH)
+        {
+            const scPort = await dohProxyStart ();
+            if (scPort) scAddrs.push ('http://127.0.0.1:' + scPort);
+        }
+        const scParts = scAddrs.map (a =>
+        {
+            const c = scCarry.get (a);
+            return a + ' -- ' + (c
+                ? ((c.ok ? 'везёт' : 'не везёт' + (c.why ? ' (' + oneLine (c.why, 60) + ')' : '')) +
+                    ', проверено ' + fmtAgo (ripe - c.at) + ' назад')
+                : 'ещё не проверял');
+        });
+        lines.push ('🎧 SoundCloud (живой yt-dlp, первые килобайты звука; напрямую его медиа не идёт): ' +
+            (scParts.length ? scParts.join ('; ') : 'маршрутов нет') +
+            (scCarryProbe ? '\n  • проверял на своём треке «' + clipWords (scCarryProbe.title, 60) + '»' : ''));
+    }
     const keep = await dpiKeeperState ();
     lines.push ('👁 Сторож обхода (хранитель): ' + keeperWords (keep) +
         (keep.proc ? ' -- значит обход чинится сам, каждые пару минут.'
