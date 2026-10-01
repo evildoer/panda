@@ -17,6 +17,7 @@
 // v2.121 -- собранное о сети разбирается: одна таблица, графики по часам и дням, поиск зацепок и прогноз, который сверяется с фактом
 // v2.122 -- связки адресов: один адрес на много имён; первым идёт тот, через кого музыка уже шла
 // v2.123 -- голос: после обрыва бот сам возвращается к слушателям и продолжает с того же места; лог сети молчит без перемен
+// v2.139 -- поиск стал выбором: /play по названию больше не хватает первый попавшийся трек, а показывает список вариантов (12 с YouTube, каждый -- с автором и длиной) личным сообщением; отметки ставятся галочками в меню (можно несколько), «➕ Добавить отмеченное» ставит выбранное одной пачкой на имя выбирающего, а в канал уходит та же короткая строка, что и от обычного /play; адреса вариантов не выдумываются -- играет ровно выбранное; склейка названий работает только при слиянии источников (внутри одной выдачи разные записи одной песни -- это разные варианты, их не прячу), а SoundCloud ищется отдельной кнопкой «Ещё» со своим пределом времени -- на этой сети он доступен только через прокси, и держать его ожидание на всех нельзя; опция «сразу» возвращает прежнее поведение, а если поиск не прошёл, бот говорит причину и предлагает прислать ссылку
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -1372,7 +1373,7 @@ const STARTUP_DM_TEXT =
     '\n' +
     '🎧 **Слушать музыку**\n' +
     'Заходи в голосовой канал, где сидит бот, -- и слушай. Включает и добавляет музыку тот, у кого есть роль **DJ** (её выдают администраторы и модеры).\n' +
-    '`/play` ссылка или запрос -- поставить трек, плейлист или прямой эфир\n' +
+    '`/play` ссылка или название -- по ссылке поставлю сразу, по названию покажу варианты (можно отметить один или несколько)\n' +
     '`/queue` -- что играет сейчас и что дальше: кто что поставил и сколько ещё ждать (сообщение обновляется само, пока музыка играет)\n' +
     '`/nowplaying` -- коротко про текущий трек: позиция, кто поставил, что дальше\n' +
     '`/history` -- кто и когда ставил музыку: последние добавления (треки, эфиры, плейлисты)\n' +
@@ -4740,7 +4741,7 @@ async function welcomeEmbed (server, user, refresh = false)
         (rules ? rules + '🔗 ' + link + '\n' : '\n' + link + '\n');
     let desc = prefixOn
         ? `${user}, привет! 👋\n\n` + rulesPart +
-          `\n🎵 **Музыка:** \`/play ссылка или запрос\`, очередь -- \`/queue\`,\n` +
+          `\n🎵 **Музыка:** \`/play ссылка или название\` (по названию -- варианты на выбор), очередь -- \`/queue\`,\n` +
           `выйти боту из канала -- \`/leave\` (управляют админы, модеры и роль DJ).\n` +
           `📌 Инструкция по боту -- в любой момент \`/help\`.\n` +
           `\nЕсли что-то непонятно или не работает -- напиши администрации.`
@@ -12912,6 +12913,418 @@ function authorBlockInsertAt (tracks, byId)
     return tracks.length;
 }
 
+// Добавление треков в очередь -- один путь и для `/play` (ссылка или «сразу»), и для выбора из найденного
+// списка. Ничего не решает за зовущего: треки встают его блоком, будится предзагрузка, состояние сохраняется.
+function musicQueueTracks (m, guildId, tracks, userId)
+{
+    const shouldStart = !!m.connection && !m.current;
+    qGluePlaying (m);
+    const insAt = authorBlockInsertAt (m.tracks, userId);
+    const blockBefore = insAt < m.tracks.length;
+    m.tracks.splice (insAt, 0, ...tracks);
+    scheduleVoiceStatus (guildId);
+    schedulePresence ();
+    scheduleDeadScan (guildId);
+    if (!shouldStart) startPreload (guildId);
+    saveMusicState (guildId);
+    return { shouldStart: shouldStart, insAt: insAt, blockBefore: blockBefore };
+}
+
+// Где играю и надо ли переехать: одни и те же слова в /play и в выборе из поиска.
+// move -- значит зовущий в другом канале: вызывающий делает то же, что и раньше (connectTo).
+function musicWhereNote (m, guildId, callerVoice)
+{
+    const mine = m.connection ? m.connection.joinConfig.channelId : null;
+    const mineCh = mine ? client.channels.cache.get (mine) : null;
+    const mineName = mineCh ? '«' + mineCh.name + '»' : 'другом канале';
+    const minePeople = mine ? humansInChannel (guildId, mine) : 0;
+    if (m.connection && callerVoice && callerVoice.id !== mine && minePeople > 0)
+        return { note: '\n🎧 Играю в ' + mineName + ' (' + minePeople + ' -- слушают) -- там и продолжу.' +
+                '\n❔ Перейти к тебе в «' + callerVoice.name + '»?', move: false,
+            askMoveRow: new ActionRowBuilder ().addComponents
+            (
+                new ButtonBuilder ()
+                    .setCustomId ('q:mvh:' + guildId + ':' + callerVoice.id).setLabel ('🚚 Перейти')
+                    .setStyle (ButtonStyle.Success),
+                new ButtonBuilder ()
+                    .setCustomId ('q:mvn').setLabel (('✖ Остаться в ' + mineName).slice (0, 78))
+                    .setStyle (ButtonStyle.Secondary)
+            ) };
+    if (callerVoice && (!m.connection || callerVoice.id !== mine))
+        return { note: (mine && mine !== callerVoice.id) ? '\n🚚 Переехал в «' + callerVoice.name + '».' : '',
+            askMoveRow: null, move: true };
+    return { note: '', askMoveRow: null, move: false };
+}
+
+// Общий финал «добавил»: авторство, пачка в очереди, история. Вызывающий сам решает, куда сказать --
+// обычная команда отвечает прямо в канал, а выбор из поиска говорит личным сообщением и короткой
+// строкой в канал (чтобы в канале остался тот же след, что и от `/play`).
+function musicAddApply (interaction, guildId, m, tracks, query, where, opts = {})
+{
+    const addedAt = Date.now ();
+    for (const t of tracks)
+    {
+        t.byId = interaction.user.id;
+        t.byName = interaction.user.username;
+        t.addAt = addedAt;
+        t.addIn = interaction.channelId;
+        if (!t.streamUrl) t.streamUrl = t.url;
+    }
+    if (where && where.move) connectTo (interaction);
+    m.textChannelId = interaction.channelId;
+    const ins = musicQueueTracks (m, guildId, tracks, interaction.user.id);
+    historyAdd (guildId,
+    {
+        at: addedAt,
+        byId: interaction.user.id,
+        byName: interaction.user.username,
+        inCh: interaction.channelId,
+        n: tracks.length,
+        live: tracks.filter (t => t.isLive).length,
+        titles: tracks.map (t => t.title || t.url || ''),
+        q: query,
+        urls: tracks.map (t => t.url || ''),
+        ids: tracks.map (t => ytKey (t.url)),
+    }).catch (e => console.error ('[music] история добавлений: ' + oneLine ((e && e.message) || e)));
+    const text = (opts.head || '🎶 Добавлено') + ': **' + (tracks[0].title || query || tracks[0].url) + '**' +
+        (tracks.length > 1 ? ' + ещё ' + (tracks.length - 1) + ' треков' : '') +
+        '\nИсточник: `' + (tracks[0].author || '?') + '` | Длина: `' + fmtDur (tracks[0].duration, tracks[0].isLive) + '`' +
+        ((where && where.note) || '') +
+        (m.connection ? (ins.shouldStart ? '\n▶️ Запускаю...' : '') :
+            '\n⏳ Я не в канале -- заиграю, когда позовёшь `/join`.') +
+        (ins.blockBefore ? '\n📚 Пачка встала в конец твоего блока в очереди (№' + ins.insAt + ').' : '');
+    queueMsgRedraw (guildId, 300).catch (() => {});
+    if (ins.shouldStart) playNext (guildId);
+    return { ins: ins, text: text, askMoveRow: (where && where.askMoveRow) || null };
+}
+
+// Поиск по названию: не «первый попавшийся», а список вариантов, из которого можно отметить один
+// или несколько и добавить их одной кнопкой. Главный источник -- YouTube (отвечает быстро), второй --
+// SoundCloud: на этой сети он открыт только через VPN, поэтому вместе с главным его не жду --
+// он ищется отдельной кнопкой, по желанию выбирающего.
+const SEARCH_YT_N = 12;                // сколько вариантов беру у YouTube за один поиск
+const SEARCH_SC_N = 6;                 // сколько беру у SoundCloud по кнопке «Ещё»
+const SEARCH_MAIN_MS = 25000;          // сколько жду главный поиск
+const SEARCH_MORE_MS = 16000;          // сколько жду SoundCloud
+const SEARCH_TTL_MS = 20 * 60 * 1000;  // сколько живёт открытый список
+const SEARCH_MAX = 40;                 // сколько открытых списков держу в памяти
+const SEARCH_ROW_MAX = 25;             // больше 25 вариантов Discord в одно меню не пустит
+const $search = new Map ();
+let searchTk = 0;
+
+function searchTok () { return (++searchTk).toString (36); }
+
+function searchGc ()
+{
+    const now = Date.now ();
+    for (const [k, s] of $search)
+        if (now - s.at > SEARCH_TTL_MS) $search.delete (k);
+    while ($search.size > SEARCH_MAX)
+    {
+        let oldK = '', oldAt = Infinity;
+        for (const [k, s] of $search) if (s.at < oldAt) { oldAt = s.at; oldK = k; }
+        if (!oldK) break;
+        $search.delete (oldK);
+    }
+}
+
+// Ключ сравнения названий: «KARA - STEP M/V» и «KARA – STEP (Official Video)» -- это одно и то же.
+function searchSame (title)
+{
+    return String (title || '').toLowerCase ()
+        .replace (/\([^)]*\)|\[[^\]]*\]/g, ' ')
+        .replace (/\b(official|video|audio|lyrics?|m\/v|mv|hd|hq|karaoke|караоке|cover|кавер|remastered|remaster)\b/g, ' ')
+        .replace (/[^a-zа-я0-9]+/g, '')
+        .slice (0, 48);
+}
+
+// Одна находка поиска -- обычный трек (тот же вид, что у trackInfo) или null, если это не трек:
+// плейлисты, каналы и будущие эфиры в список не беру.
+function searchTrackFrom (e, prov)
+{
+    if (!e || !e.title) return null;
+    if (e.live_status === 'is_upcoming' || e.live_status === 'post_live') return null;
+    const url = String (e.webpage_url || e.url || '');
+    if (!/^https?:\/\//i.test (url)) return null;
+    if (prov === 'yt' && !/(youtube\.com\/watch|youtu\.be\/|\/shorts\/|\/live\/)/.test (url)) return null;
+    if (prov === 'sc' && !(/^https?:\/\/soundcloud\.com\/[^\/\s]+\/[^\/\s]+/.test (url) && !/\/sets\//.test (url))) return null;
+    const thumb = (Array.isArray (e.thumbnails) && e.thumbnails.length)
+        ? String ((e.thumbnails[e.thumbnails.length - 1] || {}).url || '') : '';
+    return {
+        url: url,
+        streamUrl: url,
+        title: clipWords (String (e.title), 160),
+        duration: Math.max (0, Math.round (Number (e.duration) || 0)),
+        author: clipWords (String (e.uploader || e.channel || ''), 90),
+        isLive: e.live_status === 'is_live',
+        thumbnail: thumb,
+    };
+}
+
+// Внутри одной выдачи чищу только один и тот же адрес: разные записи одной песни (клип, текст, ремикс)
+// -- это разные варианты, их прятать нельзя. Склейка по названию -- только при слиянии двух источников.
+function searchParse (info, prov, n)
+{
+    const out = [], seen = {};
+    const entries = (info && Array.isArray (info.entries)) ? info.entries : [];
+    for (const e of entries)
+    {
+        const t = searchTrackFrom (e, prov);
+        if (!t) continue;
+        if (seen[t.url]) continue;
+        seen[t.url] = true;
+        out.push ({ t: t, prov: prov });
+        if (out.length >= n) break;
+    }
+    return out;
+}
+
+// Тихий запуск yt-dlp со своим пределом времени: поиск не должен держать ответ дольше, чем нужно.
+function searchRun (query, opts, budgetMs, label)
+{
+    return new Promise (resolve =>
+    {
+        let done = false, out = '', errText = '';
+        const finish = r => { if (!done) { done = true; resolve (r); } };
+        let proc;
+        try { proc = ytdlp.exec (query, opts); }
+        catch (e) { return finish ({ ok: false, why: ytDlpErr (e, 140) }); }
+        if (proc && typeof proc.catch === 'function') proc.catch (() => {});
+        if (proc.stdout) proc.stdout.on ('data', d => { out += String (d); });
+        if (proc.stderr) proc.stderr.on ('data', d => { errText += String (d); });
+        const guard = setTimeout (() =>
+        {
+            try { proc.kill (); } catch (e) { }
+            finish ({ ok: false, why: label + ' не ответил за ' + Math.round (budgetMs / 1000) + ' с' });
+        }, budgetMs);
+        if (typeof proc.on !== 'function') return;   // не процесс -- ждём только таймер
+        proc.on ('error', e => { clearTimeout (guard); finish ({ ok: false, why: ytDlpErr (e, 140) }); });
+        proc.on ('close', code =>
+        {
+            clearTimeout (guard);
+            if (code !== 0)
+                return finish ({ ok: false, why: ytDlpErr ({ stderr: errText }, 160) || (label + ': yt-dlp завершился с кодом ' + code) });
+            let info = null;
+            try { info = JSON.parse (out); }
+            catch (e)
+            {
+                const a = out.indexOf ('{'), b = out.lastIndexOf ('}');   // если перед делом что-то напечаталось -- беру сам ответ
+                if (a >= 0 && b > a) { try { info = JSON.parse (out.slice (a, b + 1)); } catch (e2) { info = null; } }
+            }
+            finish (info ? { ok: true, info: info } : { ok: false, why: label + ': ответ не разобрался' });
+        });
+    });
+}
+
+// Поиск у одного поставщика. YouTube идёт общим путём музыки (обход DPI, прокси, свой маршрут), а
+// SoundCloud -- только через прокси: напрямую его на этой сети не пускают, и обход тут не спасает.
+async function searchProvider (prov, query, n, budgetMs)
+{
+    const q = (prov === 'sc' ? 'scsearch' : 'ytsearch') + n + ':' + query;
+    if (prov === 'yt')
+    {
+        const run = ytDlpRun (q, { dumpSingleJson: true, noWarnings: true, flatPlaylist: true, retries: 0, extractorRetries: 0 })
+            .then (info => ({ ok: true, info: info }), e => ({ ok: false, why: ytDlpErr (e, 160) }));
+        const r = await Promise.race ([run,
+            new Promise (res => setTimeout (() => res ({ ok: false, why: 'не ответил за ' + Math.round (budgetMs / 1000) + ' с' }), budgetMs))]);
+        return r.ok ? { ok: true, list: searchParse (r.info, 'yt', n) } : { ok: false, why: r.why, list: [] };
+    }
+    const tries = MUSIC_PROXIES.slice (0, 2);
+    if (!tries.length) tries.push ('');
+    const per = Math.max (2500, Math.round (budgetMs / tries.length));
+    let why = '';
+    for (const addr of tries)
+    {
+        const opts = Object.assign
+        (
+            { dumpSingleJson: true, quiet: true, noWarnings: true, flatPlaylist: true, retries: 0, extractorRetries: 0, socketTimeout: 8 },
+            addr ? { proxy: addr } : {}
+        );
+        const one = await searchRun (q, opts, per, prov === 'sc' ? 'SoundCloud' : q);
+        if (one.ok) return { ok: true, list: searchParse (one.info, prov, n) };
+        why = one.why;
+    }
+    return { ok: false, why: why, list: [] };
+}
+
+function searchMerge (s, add)
+{
+    let got = 0;
+    for (const x of add)
+    {
+        const k = searchSame (x.t.title);
+        if (k && s.keys.has (k)) continue;
+        if (k) s.keys.add (k);
+        s.list.push (x);
+        got++;
+    }
+    return got;
+}
+
+function searchProvText (s)
+{
+    let yt = 0, sc = 0;
+    for (const x of s.list) { if (x.prov === 'sc') sc++; else yt++; }
+    const parts = [];
+    if (yt) parts.push ('YouTube ' + yt);
+    if (sc) parts.push ('SoundCloud ' + sc);
+    return parts.length ? ' (' + parts.join (', ') + ')' : '';
+}
+
+// Отметки в списке: нажатие добавляет вариант к отмеченным, повторное -- снимает. Discord при
+// мультивыборе присылает то, что отмечено в меню сейчас, поэтому «всё уже отмечено -- снимаю».
+function searchToggle (s, vals)
+{
+    const idx = [];
+    for (const v of (vals || []))
+    {
+        const i = parseInt (v, 10);
+        if (!isNaN (i) && i >= 0 && i < s.list.length) idx.push (i);
+    }
+    if (!idx.length) return 0;
+    if (idx.every (i => s.chosen.has (i)))
+    {
+        for (const i of idx) s.chosen.delete (i);
+        return -idx.length;
+    }
+    let added = 0;
+    for (const i of idx) if (!s.chosen.has (i)) { s.chosen.add (i); added++; }
+    return added;
+}
+
+function searchView (s)
+{
+    const sel = new StringSelectMenuBuilder ()
+        .setCustomId ('ps:s:' + s.tk)
+        .setMinValues (0)
+        .setMaxValues (Math.min (Math.max (1, s.list.length), SEARCH_ROW_MAX))
+        .setPlaceholder ('🎵 Отметь варианты (можно несколько)…')
+        .addOptions (s.list.slice (0, SEARCH_ROW_MAX).map ((x, i) =>
+        ({
+            label: ((s.chosen.has (i) ? '✅ ' : '') + (i + 1) + '. ' + (x.t.title || 'трек')).slice (0, 100),
+            description: ((x.t.author || 'без автора') + ' · ' + fmtDur (x.t.duration, x.t.isLive) +
+                (x.prov === 'sc' ? ' · SoundCloud' : '')).slice (0, 100),
+            value: String (i),
+        })));
+    const add = new ButtonBuilder ()
+        .setCustomId ('ps:a:' + s.tk)
+        .setLabel (s.chosen.size ? '➕ Добавить отмеченное: ' + s.chosen.size : '➕ Добавить отмеченное')
+        .setStyle (ButtonStyle.Success)
+        .setDisabled (!s.chosen.size);
+    const rows =
+    [
+        new ActionRowBuilder ().addComponents (sel),
+        new ActionRowBuilder ().addComponents
+        (
+            add,
+            new ButtonBuilder ().setCustomId ('ps:e:' + s.tk)
+                .setLabel (s.moreBusy ? '⏳ Ищу у SoundCloud…' : (s.moreDone ? '🔁 Ещё раз: SoundCloud' : '➕ Ещё: SoundCloud'))
+                .setStyle (ButtonStyle.Secondary).setDisabled (!!s.moreBusy),
+            new ButtonBuilder ().setCustomId ('ps:x:' + s.tk).setLabel ('✖ Закрыть').setStyle (ButtonStyle.Secondary)
+        ),
+    ];
+    const content = '🔎 **Поиск: «' + s.query + '»**\n' +
+        'Нашёл вариантов: **' + s.list.length + '**' + searchProvText (s) +
+        '. Отметь нужные (можно несколько) и нажми «➕ Добавить отмеченное» -- каждый встанет в очередь на твоё имя.\n' +
+        (s.note ? s.note + '\n' : '') +
+        (s.chosen.size ? '✅ Отмечено: **' + s.chosen.size + '**' : '');
+    return { content: content, components: rows };
+}
+
+// `/play` без ссылки: сначала показываю варианты (личным сообщением: список длинный, канал не засоряю).
+async function playSearchShow (interaction, query)
+{
+    await interaction.deferReply ({ flags: MessageFlags.Ephemeral });
+    const r = await searchProvider ('yt', query, SEARCH_YT_N, SEARCH_MAIN_MS);
+    if (!r.list.length)
+    {
+        if (!r.ok)
+            console.error ('[' + (d()) + '] [music] поиск «' + query + '» не прошёл: ' + oneLine (r.why || 'без причины'));
+        return interaction.editReply ({ content: '🔎 Ничего не нашлось по запросу «' + query + '»' +
+            (r.ok ? '.\n_Попробуй другие слова -- или пришли ссылку: её я приму сразу._'
+                : ' -- и сам поиск не прошёл: `' + (r.why || 'без причины') + '`\n_Ссылку я приму сразу: пришли её в `/play`._'),
+            allowedMentions: { parse: [] } });
+    }
+    const tk = searchTok ();
+    const s =
+    {
+        tk: tk, guildId: interaction.guildId, userId: interaction.user.id, query: query,
+        list: r.list, keys: new Set (r.list.map (x => searchSame (x.t.title)).filter (Boolean)),
+        chosen: new Set (), note: '', moreDone: false, moreBusy: false, at: Date.now (),
+    };
+    $search.set (tk, s);
+    searchGc ();
+    const view = searchView (s);
+    await interaction.editReply ({ content: view.content, components: view.components, allowedMentions: { parse: [] } });
+}
+
+// Нажатия в списке найденного: отметка (s), добавление отмеченного (a), поиск у SoundCloud (e), закрыть (x).
+async function playSearchClick (interaction, kind, tk)
+{
+    const s = $search.get (tk);
+    if (!s || s.userId !== interaction.user.id || s.guildId !== interaction.guildId)
+        return interaction.reply ({ content: '🔎 Этот список уже не актуален -- вызови `/play` заново.', flags: MessageFlags.Ephemeral });
+    s.at = Date.now ();
+    if (kind === 'x')
+    {
+        $search.delete (tk);
+        return interaction.update ({ content: '✖ Поиск закрыт -- музыка на месте.', components: [] });
+    }
+    if (kind === 's')
+    {
+        searchToggle (s, interaction.values);
+        const v = searchView (s);
+        return interaction.update ({ content: v.content, components: v.components, allowedMentions: { parse: [] } });
+    }
+    if (kind === 'e')
+    {
+        if (s.moreBusy) return interaction.deferUpdate ();
+        s.moreBusy = true;
+        try { await interaction.deferUpdate (); } catch (e) { }
+        const r = await searchProvider ('sc', s.query, SEARCH_SC_N, SEARCH_MORE_MS);
+        s.moreBusy = false;
+        s.moreDone = true;
+        if (r.ok && r.list.length)
+        {
+            const got = searchMerge (s, r.list);
+            s.note = got ? '➕ SoundCloud: ' + (got === 1 ? 'ещё 1 вариант' : 'ещё ' + got + ' вариантов') + ' в списке.'
+                : 'SoundCloud: новых вариантов не нашлось -- те, что нашёл, уже в списке.';
+        }
+        else if (r.ok)
+            s.note = 'SoundCloud: по этим словам у него ничего не нашлось.';
+        else
+            s.note = 'SoundCloud не ответил' + (r.why ? ' (' + r.why + ')' : '') +
+                ' -- на этой сети он открыт только через VPN (`proxy` в config.json).';
+        const v = searchView (s);
+        return interaction.editReply ({ content: v.content, components: v.components, allowedMentions: { parse: [] } });
+    }
+    const picks = [];
+    for (const i of [...s.chosen].sort ((a, b) => a - b))
+        if (s.list[i]) picks.push (Object.assign ({}, s.list[i].t));
+    if (!picks.length)
+        return interaction.reply ({ content: '🔎 Сначала отметь варианты в списке, потом нажми «➕ Добавить отмеченное».', flags: MessageFlags.Ephemeral });
+    $search.delete (tk);
+    await interaction.update ({ content: '⏳ Добавляю: ' + picks.length + (picks.length === 1 ? ' трек…' : ' трека…'), components: [] });
+    const guildId = s.guildId, m = musicOf (guildId);
+    const callerVoice = interaction.member && interaction.member.voice ? interaction.member.voice.channel : null;
+    const where = musicWhereNote (m, guildId, callerVoice);
+    const who = interaction.member ? uuu (interaction.member) : interaction.user.username;
+    const done = musicAddApply (interaction, guildId, m, picks, s.query, where, { head: '🎶 **' + who + '** добавил' });
+    try
+    {
+        await interaction.editReply ({ content: '✅ Добавил: **' + (picks[0].title || s.query) + '**' +
+            (picks.length > 1 ? ' + ещё ' + (picks.length - 1) + ' треков' : '') +
+            (m.connection ? '\nСмотри `/queue`.' : '\n⏳ Я не в канале -- заиграю, когда позовёшь `/join`.'), components: [] });
+    }
+    catch (e) { }
+    try
+    {
+        await interaction.channel.send ({ content: done.text, components: done.askMoveRow ? [done.askMoveRow] : [],
+            allowedMentions: { parse: [] } });
+    }
+    catch (e) { }
+}
+
 function qKey (t) { return byIdOf (t); }
 
 function qRunLen (list, i, key)
@@ -16798,11 +17211,14 @@ const musicCommands =
         .setDescription ('Инструкция: как пользоваться ботом'),
     new SlashCommandBuilder ()
         .setName ('play')
-        .setDescription ('Добавить в очередь: ссылка (YouTube/плейлист/эфир) или поиск')
+        .setDescription ('Добавить в очередь: ссылка (YouTube/плейлист/эфир) или поиск с выбором вариантов')
         .addStringOption (o =>
             o.setName ('запрос')
              .setDescription ('Ссылка или название трека')
-             .setRequired (true)),
+             .setRequired (true))
+        .addBooleanOption (o =>
+            o.setName ('сразу')
+             .setDescription ('Название трека: взять первый результат сразу, без списка вариантов')),
     new SlashCommandBuilder ()
         .setName ('join')
         .setDescription ('Зайти в твой голосовой канал и остаться там (даже без музыки)'),
@@ -17254,6 +17670,9 @@ client.on ('interactionCreate', async (interaction) =>
             dpiPickFromDiscord ().catch (() => { });
             return;
         }
+        const mPs = /^ps:(s|a|x|e):([a-z0-9]{1,12})$/.exec (cid);
+        if (mPs)
+            return playSearchClick (interaction, mPs[1], mPs[2]);
         const m = musicOf (guildId);
         const mOwn = /^(?:q:rm|q:mv|q:mx):(\d+)$/.exec (cid);
         const page = mOwn ? (parseInt (mOwn[1], 10) || 1) : 1;
@@ -18136,10 +18555,12 @@ client.on ('interactionCreate', async (interaction) =>
 
         if (name === 'play')
         {
+            const query = interaction.options.getString ('запрос');
             const callerVoice = interaction.member && interaction.member.voice ? interaction.member.voice.channel : null;
-            await interaction.deferReply ();
-            let query = interaction.options.getString ('запрос');
+            if (!isUrl (query) && interaction.options.getBoolean ('сразу') !== true)
+                return playSearchShow (interaction, query);        // поиск: сначала показываю варианты
 
+            await interaction.deferReply ();
             let tracks;
             try
             {
@@ -18151,80 +18572,9 @@ client.on ('interactionCreate', async (interaction) =>
             }
             if (!tracks.length)
                 return interaction.editReply ('❌ Пустой результат.');
-            const addedAt = Date.now ();
-            for (const t of tracks)
-            {
-                t.byId = interaction.user.id;
-                t.byName = interaction.user.username;
-                t.addAt = addedAt;
-                t.addIn = interaction.channelId;
-            }
-
-            const mine = m.connection ? m.connection.joinConfig.channelId : null;
-            const mineCh = mine ? client.channels.cache.get (mine) : null;
-            const mineName = mineCh ? '«' + mineCh.name + '»' : 'другом канале';
-            const minePeople = mine ? humansInChannel (guildId, mine) : 0;
-            let note = '';
-            let askMoveRow = null;
-            if (m.connection && callerVoice && callerVoice.id !== mine && minePeople > 0)
-            {
-                note = '\n🎧 Играю в ' + mineName + ' (' + minePeople + ' -- слушают) -- там и продолжу.' +
-                    '\n❔ Перейти к тебе в «' + callerVoice.name + '»?';
-                askMoveRow = new ActionRowBuilder ().addComponents
-                (
-                    new ButtonBuilder ()
-                        .setCustomId ('q:mvh:' + guildId + ':' + callerVoice.id).setLabel ('🚚 Перейти')
-                        .setStyle (ButtonStyle.Success),
-                    new ButtonBuilder ()
-                        .setCustomId ('q:mvn').setLabel (('✖ Остаться в ' + mineName).slice (0, 78))
-                        .setStyle (ButtonStyle.Secondary)
-                );
-            }
-            else if (callerVoice && (!m.connection || callerVoice.id !== mine))
-            {
-                const wasElsewhere = !!mine && mine !== callerVoice.id;
-                connectTo (interaction);
-                if (wasElsewhere) note = '\n🚚 Переехал в «' + callerVoice.name + '».';
-            }
-
-            m.textChannelId = interaction.channelId;
-            const shouldStart = !!m.connection && !m.current;
-            qGluePlaying (m);
-            const _insAt = authorBlockInsertAt (m.tracks, interaction.user.id);
-            const _blockBefore = _insAt < m.tracks.length;
-            m.tracks.splice (_insAt, 0, ...tracks);
-            scheduleVoiceStatus (guildId);
-            schedulePresence ();
-            scheduleDeadScan (guildId);
-            if (!shouldStart) startPreload (guildId);
-            saveMusicState (guildId);
-            historyAdd (guildId,
-            {
-                at: addedAt,
-                byId: interaction.user.id,
-                byName: interaction.user.username,
-                inCh: interaction.channelId,
-                n: tracks.length,
-                live: tracks.filter (t => t.isLive).length,
-                titles: tracks.map (t => t.title || t.url || ''),
-                q: query,
-                urls: tracks.map (t => t.url || ''),
-                ids: tracks.map (t => ytKey (t.url)),
-            }).catch (e => console.error ('[music] история добавлений: ' + oneLine ((e && e.message) || e)));
-            await interaction.editReply
-            (
-                '🎶 Добавлено: **' + (tracks[0].title || query) + '**' +
-                (tracks.length > 1 ? ' + ещё ' + (tracks.length - 1) + ' треков' : '') +
-                '\nИсточник: `' + tracks[0].author + '` | Длина: `' + fmtDur (tracks[0].duration, tracks[0].isLive) + '`' +
-                note +
-                (m.connection ? (shouldStart ? '\n▶️ Запускаю...' : '') :
-                    '\n⏳ Я не в канале -- заиграю, когда позовёшь `/join`.') +
-                (_blockBefore ? '\n📚 Пачка встала в конец твоего блока в очереди (№' + _insAt + ').' : ''),
-                { components: askMoveRow ? [askMoveRow] : [] }
-            );
-            qRedraw ();
-            if (shouldStart)
-                playNext (guildId);
+            const _wh = musicWhereNote (m, guildId, callerVoice);
+            const _done = musicAddApply (interaction, guildId, m, tracks, query, _wh);
+            await interaction.editReply ({ content: _done.text, components: _done.askMoveRow ? [_done.askMoveRow] : [] });
         }
         else if (name === 'stop')
         {
