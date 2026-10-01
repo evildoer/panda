@@ -33,6 +33,15 @@
 // «🚚 Перейти»/«✖ Остаться» (mvh/mvn) и прежнюю «Играть следующим» (mq) -- нажатие молча висело без ответа, и Discord
 // показывал «Приложение не ответило вовремя» (живые клики 22:50 и 22:53); теперь кнопка либо работает, либо честно
 // отвечает «меню устарело -- вызови /queue заново».
+// v2.144 -- по живым замечаниям владельца: 1) в /health есть видимый блок «Запасные пути»: что музыка может везти
+// и КОГДА это проверялось -- прямой путь, каждый прокси (живой yt-dlp: везёт/не везёт, возраст проверки) и свой маршрут
+// по адресам; 2) кнопка «Ещё: SoundCloud» больше не молчит: сразу показывает «⏳ Ищу…», а пока идёт поиск (до 16 с)
+// под списком виден ход -- попытка N из M, адрес и сколько прошло; в конце -- прежний итог; 3) проверка очереди
+// больше не подменяет SOCKS-маршрут прямым запросом (socks-агента в зависимостях нет, и раньше запрос молча шёл
+// напрямую) и не может зависнуть: у неё сторож, у неповёзшего адреса -- память на 5 минут (музыку это не трогает),
+// а если нода совсем не умеет ходить по маршруту музыки -- честное «не знаю»; 4) по аудиту всех сетевых проверок:
+// у пинга прокси, прямого запроса и запроса через свой маршрут появились жёсткие сторожа, а разрешение имени
+// youtube.com через системный справочник ограничено 5 секундами -- раньше молчащий DNS мог подвесить проверку.
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -6322,10 +6331,14 @@ function pingProxy (addr, timeoutMs = MUSIC_PROXY_TIMEOUT)
         catch { return resolve (false); }
         let s = new (require ('net').Socket) ();
         let done = false;
-        let fin = ok => { if (done) return; done = true; try { s.destroy (); } catch {} resolve (ok); };
+        let hard = null;
+        let fin = ok => { if (done) return; done = true; if (hard) clearTimeout (hard); try { s.destroy (); } catch {} resolve (ok); };
         s.setTimeout (timeoutMs, () => fin (false));
         s.once ('connect', () => fin (true));
         s.once ('error',    () => fin (false));
+        // жёсткий сторож: если в адресе имя, а системный справочник молчит, события сокета можно не дождаться
+        hard = setTimeout (() => fin (false), timeoutMs + 1000);
+        if (hard.unref) hard.unref ();
         s.connect (port, host);
     });
 }
@@ -6363,6 +6376,20 @@ async function proxyForFetch ()
     return (await directUsable ()) ? '' : (MUSIC_PROXIES[0] || '');
 }
 
+async function dnsLookupQuick (name, ms = 5000)   // у системного справочника нет своего срока: молчит -- думаю «не резолвится», а не жду вечно
+{
+    let timer = null;
+    try
+    {
+        return await Promise.race
+        ([
+            require ('dns').promises.lookup (name),
+            new Promise (res => { timer = setTimeout (() => res (null), ms); if (timer.unref) timer.unref (); }),
+        ]);
+    }
+    finally { if (timer) clearTimeout (timer); }
+}
+
 async function directUsable ()
 {
     const now = Date.now ();
@@ -6370,8 +6397,7 @@ async function directUsable ()
     let ok = true;
     try
     {
-        const dns = require ('dns').promises;
-        const r = await dns.lookup ('www.youtube.com');
+        const r = await dnsLookupQuick ('www.youtube.com');
         ok = !!(r && r.address);
     }
     catch { ok = false; }
@@ -6391,7 +6417,8 @@ function probeDirectOnce ()
     return new Promise (resolve =>
     {
         let done = false;
-        const fin = (ok, why) => { if (done) return; done = true; resolve ({ ok: !!ok, why: String (why || '') }); };
+        let hard = null;
+        const fin = (ok, why) => { if (done) return; done = true; if (hard) clearTimeout (hard); resolve ({ ok: !!ok, why: String (why || '') }); };
         let req = null;
         try
         {
@@ -6401,6 +6428,10 @@ function probeDirectOnce ()
                 res.resume ();
                 fin (res.statusCode >= 200 && res.statusCode < 400, 'HTTP ' + res.statusCode);
             });
+            // сторож: пока адрес ищется, события сокета могут не прийти вообще -- без него проверка повисла бы
+            hard = setTimeout (() => { try { if (req) req.destroy (); } catch (e) { }
+                fin (false, 'сторож сработал: ответа не было за ' + Math.round ((DIRECT_PROBE_TIMEOUT + 2000) / 1000) + ' с'); }, DIRECT_PROBE_TIMEOUT + 2000);
+            if (hard.unref) hard.unref ();
             req.on ('timeout', () => { try { req.destroy (); } catch {}
                 fin (false, 'нет ответа за ' + Math.round (DIRECT_PROBE_TIMEOUT / 1000) + ' с'); });
             req.on ('error', e => fin (false, (e && (e.code || e.message)) || 'ошибка соединения'));
@@ -6485,7 +6516,8 @@ function probeDohOnce (port)             // отвечает ли YouTube чер
     return new Promise (resolve =>
     {
         let done = false;
-        const fin = (ok, why) => { if (done) return; done = true; resolve ({ ok: !!ok, why: String (why || '') }); };
+        let hard = null;
+        const fin = (ok, why) => { if (done) return; done = true; if (hard) clearTimeout (hard); resolve ({ ok: !!ok, why: String (why || '') }); };
         let req = null;
         try
         {
@@ -6497,6 +6529,11 @@ function probeDohOnce (port)             // отвечает ли YouTube чер
                 res.resume ();
                 fin (res.statusCode >= 200 && res.statusCode < 400, 'HTTP ' + res.statusCode);
             });
+            // сторож: через CONNECT-прокси запрос может не получить ни timeout, ни error (живой случай 02.10) --
+            // без него проверка повисла бы навсегда
+            hard = setTimeout (() => { try { if (req) req.destroy (); } catch (e) { }
+                fin (false, 'сторож сработал: ответа не было за ' + Math.round ((DOH_PROBE_TIMEOUT + 2000) / 1000) + ' с'); }, DOH_PROBE_TIMEOUT + 2000);
+            if (hard.unref) hard.unref ();
             req.on ('timeout', () => { try { req.destroy (); } catch { }
                 fin (false, 'нет ответа за ' + Math.round (DOH_PROBE_TIMEOUT / 1000) + ' с'); });
             req.on ('error', e => fin (false, (e && (e.code || e.message)) || 'ошибка соединения'));
@@ -13251,7 +13288,7 @@ function searchRun (query, opts, budgetMs, label)
 
 // Поиск у одного поставщика. YouTube идёт общим путём музыки (обход DPI, прокси, свой маршрут), а
 // SoundCloud -- только через прокси: напрямую его на этой сети не пускают, и обход тут не спасает.
-async function searchProvider (prov, query, n, budgetMs)
+async function searchProvider (prov, query, n, budgetMs, onTry)   // onTry: кому сказать, что началась очередная попытка
 {
     const q = (prov === 'sc' ? 'scsearch' : 'ytsearch') + n + ':' + query;
     if (prov === 'yt')
@@ -13266,8 +13303,10 @@ async function searchProvider (prov, query, n, budgetMs)
     if (!tries.length) tries.push ('');
     const per = Math.max (2500, Math.round (budgetMs / tries.length));
     let why = '';
-    for (const addr of tries)
+    for (let i = 0; i < tries.length; i++)
     {
+        const addr = tries[i];
+        if (onTry) { try { onTry ({ i: i + 1, n: tries.length, addr: addr || 'напрямую' }); } catch (e) { } }
         const opts = Object.assign
         (
             { dumpSingleJson: true, quiet: true, noWarnings: true, flatPlaylist: true, retries: 0, extractorRetries: 0, socketTimeout: 8 },
@@ -13398,6 +13437,70 @@ async function playSearchShow (interaction, query, top)
     await interaction.editReply ({ content: view.content, components: view.components, allowedMentions: { parse: [] } });
 }
 
+// Кнопка «Ещё: SoundCloud»: поиск бывает до 16 с, а тишина выглядит как «не сработало». Поэтому сразу показываю,
+// что ищу (кнопка становится «⏳ Ищу…», под списком -- строка хода), и обновляю её по ходу: попытка, адрес, сколько
+// прошло; в конце -- прежний итог (сколько добавилось или чем не вышло).
+async function searchMoreRun (interaction, s)
+{
+    const t0 = Date.now ();
+    const at = { i: 0, n: 0, addr: '' };
+    let stop = false, wake = null;
+    const view = () =>
+    {
+        const v = searchView (s);
+        return { content: v.content, components: v.components, allowedMentions: { parse: [] } };
+    };
+    const tick = (async () =>
+    {
+        while (!stop)
+        {
+            await Promise.race
+            ([
+                new Promise (r => { const t = setTimeout (r, 3000); if (t.unref) t.unref (); }),
+                new Promise (r => { wake = r; }),
+            ]);
+            if (stop) break;
+            const sec = Math.max (1, Math.round ((Date.now () - t0) / 1000));
+            s.note = '⏳ Ищу у SoundCloud' + (at.n ? ': попытка ' + Math.max (1, at.i) + ' из ' + at.n +
+                (at.addr ? ' (' + at.addr + ')' : '') : '') + ' -- прошло ' + sec + ' с; он отвечает не сразу.';
+            try { await interaction.editReply (view ()); } catch (e) { }
+        }
+    }) ();
+    const finishNote = r =>
+    {
+        s.moreDone = true;
+        if (r.ok && r.list.length)
+        {
+            const got = searchMerge (s, r.list);
+            s.note = got ? '➕ SoundCloud: ' + (got === 1 ? 'ещё 1 вариант' : 'ещё ' + got + ' вариантов') + ' в списке.'
+                : 'SoundCloud: новых вариантов не нашлось -- те, что нашёл, уже в списке.';
+        }
+        else if (r.ok)
+            s.note = 'SoundCloud: по этим словам у него ничего не нашлось.';
+        else
+            s.note = 'SoundCloud не ответил' + (r.why ? ' (' + r.why + ')' : '') +
+                ' -- на этой сети он открыт только через VPN (`proxy` в config.json).';
+    };
+    let answer = { ok: false, why: '', list: [] };
+    try
+    {
+        s.note = '⏳ Ищу у SoundCloud...';
+        try { await interaction.editReply (view ()); } catch (e) { }          // видно сразу, а не через 16 с
+        answer = await searchProvider ('sc', s.query, SEARCH_SC_N, SEARCH_MORE_MS,
+            p => { at.i = p.i; at.n = p.n; at.addr = p.addr; });
+    }
+    catch (e) { answer = { ok: false, why: oneLine ((e && e.message) || e, 120), list: [] }; }
+    finally
+    {
+        stop = true;
+        if (wake) wake ();
+        s.moreBusy = false;
+        await tick.catch (() => { });
+    }
+    finishNote (answer);
+    return interaction.editReply (view ());
+}
+
 // Нажатия в списке найденного: отметка (s), добавление отмеченного (a), поиск у SoundCloud (e), закрыть (x),
 // «в начало своей пачки» (t) -- куда встанут отмеченные.
 async function playSearchClick (interaction, kind, tk)
@@ -13428,22 +13531,7 @@ async function playSearchClick (interaction, kind, tk)
         if (s.moreBusy) return interaction.deferUpdate ();
         s.moreBusy = true;
         try { await interaction.deferUpdate (); } catch (e) { }
-        const r = await searchProvider ('sc', s.query, SEARCH_SC_N, SEARCH_MORE_MS);
-        s.moreBusy = false;
-        s.moreDone = true;
-        if (r.ok && r.list.length)
-        {
-            const got = searchMerge (s, r.list);
-            s.note = got ? '➕ SoundCloud: ' + (got === 1 ? 'ещё 1 вариант' : 'ещё ' + got + ' вариантов') + ' в списке.'
-                : 'SoundCloud: новых вариантов не нашлось -- те, что нашёл, уже в списке.';
-        }
-        else if (r.ok)
-            s.note = 'SoundCloud: по этим словам у него ничего не нашлось.';
-        else
-            s.note = 'SoundCloud не ответил' + (r.why ? ' (' + r.why + ')' : '') +
-                ' -- на этой сети он открыт только через VPN (`proxy` в config.json).';
-        const v = searchView (s);
-        return interaction.editReply ({ content: v.content, components: v.components, allowedMentions: { parse: [] } });
+        return await searchMoreRun (interaction, s);
     }
     const picks = [];
     for (const i of [...s.chosen].sort ((a, b) => a - b))
@@ -16619,6 +16707,32 @@ async function netHealthText (m, guildId, viewerId)      // ответ на /hea
                 ? ', сам подстраховал имена Discord: ' + dnsStats.__help.ok + ' ' +
                   plural (dnsStats.__help.ok, 'раз', 'раза', 'раз') : ''),
     ].join ('; '));
+    // Запасные пути отдельно: не только «отвечает ли порт», а везёт ли через них ютуб настоящая проверка
+    // (живой yt-dlp), и когда её делали -- чтобы один взгляд на /health отвечал на вопрос «чем поедет музыка».
+    const ripe = Date.now ();
+    const spare = [];
+    spare.push ('прямой: ' + (rs.dp.ok ? 'работает' : 'не проходит') +
+        (directProbeCache.at ? ', проверено ' + fmtAgo (ripe - directProbeCache.at) + ' назад' : ', ещё не проверялся'));
+    for (const p of MUSIC_PROXIES)
+    {
+        const c = proxyCarry.get (p);
+        if (c && c.at)
+            spare.push ('прокси ' + p + ': ' + (c.ok ? 'музыку везёт' : 'музыку не везёт' +
+                (c.why ? ' (' + oneLine (c.why, 70) + ')' : '')) + ', проверено ' + fmtAgo (ripe - c.at) + ' назад');
+        else
+            spare.push ('прокси ' + p + ': ' + (rs.alive.indexOf (p) >= 0
+                ? 'порт отвечает, музыку через него ещё не проверял' : 'порт не отвечает'));
+    }
+    if (!MUSIC_PROXIES.length) spare.push ('прокси не задан');
+    if (!MUSIC_DOH) spare.push ('свой маршрут по адресам: выключен (MUSIC.doh)');
+    else if (dohCarry.at)
+        spare.push ('свой маршрут по адресам: ' + (dohCarry.ok ? 'музыку везёт' : 'музыку не везёт' +
+            (dohCarry.why ? ' (' + oneLine (dohCarry.why, 70) + ')' : '')) + ', проверено ' + fmtAgo (ripe - dohCarry.at) + ' назад');
+    else
+        spare.push ('свой маршрут по адресам: включён' + (rs.dohOk ? ', моя проверка через него проходит' : '') +
+            ', музыку через него ещё не проверял');
+    lines.push ('🚚 Запасные пути -- чем музыка может ехать (везёт ли ютуб, проверяет живой yt-dlp):\n' +
+        spare.map (s => '  • ' + s).join ('\n'));
     const keep = await dpiKeeperState ();
     lines.push ('👁 Сторож обхода (хранитель): ' + keeperWords (keep) +
         (keep.proc ? ' -- значит обход чинится сам, каждые пару минут.'
@@ -16794,22 +16908,70 @@ function proxyAgentFor (addr)
 }
 
 const YT_URL_RE = /^https?:\/\/(?:www\.|m\.|music\.)?youtube\.com\/(?:watch|shorts|live|embed)|^https?:\/\/youtu\.be\//i;
+// Адрес, через который проверка только что не прошла, не мучаю каждым треком: помню 5 минут и иду
+// следующим путём. Это память только проверки -- музыка по этому адресу, как и раньше, ходит без запретов.
+const OEMBED_ROUTE_FAIL_TTL = 5 * 60000;
+const oembedBadUntil = new Map ();
+function oembedRouteBlocked (addr)
+{
+    const t = oembedBadUntil.get (String (addr || ''));
+    return !!t && t > Date.now ();
+}
+
+// Чем из ноды вообще можно постучаться в YouTube. В зависимостях нет socks-агента, поэтому SOCKS-адрес
+// нода не умеет -- и раньше запрос молча шёл НАПРЯМУЮ (врал, что «проверил через прокси»). Теперь беру
+// первый адрес, который нода умеет везти (HTTP-инбаунд или свой маршрут по адресам), а если таких нет --
+// прямое соединение только тогда, когда прямой путь ДОКАЗАН; иначе честное «не знаю», без запроса мимо прокси.
+async function oembedRoute ()
+{
+    const preferred = await proxyForFetch ();          // так пошла бы музыка
+    if (!preferred) return { addr: '', agent: null };  // прямой путь -- как и было
+    let agent = oembedRouteBlocked (preferred) ? null : proxyAgentFor (preferred);
+    if (agent) return { addr: preferred, agent: agent };
+    for (const p of MUSIC_PROXIES)
+    {
+        if (p === preferred || oembedRouteBlocked (p)) continue;
+        agent = proxyAgentFor (p);
+        if (agent) return { addr: p, agent: agent };
+    }
+    if (MUSIC_DOH)
+    {
+        const port = await dohProxyStart ();           // свой маршрут -- он мой, CONNECT умеет
+        const dohAddr = port ? 'http://127.0.0.1:' + port : '';
+        if (dohAddr && !oembedRouteBlocked (dohAddr))
+        {
+            agent = proxyAgentFor (dohAddr);
+            if (agent) return { addr: dohAddr, agent: agent };
+        }
+    }
+    if (await directWorks ()) return { addr: '', agent: null };
+    return null;
+}
+
 async function oembedProbe (url)
 {
     if (!YT_URL_RE.test (String (url || ''))) return 'unknown';
-    const proxyAddr = await proxyForFetch ();
+    let httpsMod;
+    try { httpsMod = require ('https'); } catch { return 'neterr'; }
+    const route = await oembedRoute ();
+    if (!route) return 'neterr';
     return new Promise (resolve =>
     {
-        let httpsMod;
-        try { httpsMod = require ('https'); } catch { return resolve ('neterr'); }
-        const agent = proxyAddr ? proxyAgentFor (proxyAddr) : null;
-        let done = false;
-        const fin = v => { if (done) return; done = true; resolve (v); };
+        let done = false, hard = null;
+        const fin = v =>
+        {
+            if (done) return;
+            done = true;
+            if (hard) clearTimeout (hard);
+            if (v === 'neterr' && route.addr)                      // этот адрес проверку не повёз -- не мучаю его каждым треком
+                oembedBadUntil.set (route.addr, Date.now () + OEMBED_ROUTE_FAIL_TTL);
+            resolve (v);
+        };
         let req;
         try
         {
             req = httpsMod.get ('https://www.youtube.com/oembed?format=json&url=' + encodeURIComponent (url),
-                { agent, timeout: DEAD_PROBE_TIMEOUT },
+                { agent: route.agent, timeout: DEAD_PROBE_TIMEOUT },
                 res =>
                 {
                     res.resume ();
@@ -16819,6 +16981,10 @@ async function oembedProbe (url)
                 });
         }
         catch { return fin ('neterr'); }
+        // сторож: через CONNECT-прокси запрос может не получить ни timeout, ни error (живой случай 02.10) --
+        // без него проверка очереди повисла бы навсегда
+        hard = setTimeout (() => { try { if (req) req.destroy (); } catch (e) { } fin ('neterr'); }, DEAD_PROBE_TIMEOUT + 2000);
+        if (hard.unref) hard.unref ();
         req.on ('timeout', () => { try { req.destroy (); } catch {} fin ('neterr'); });
         req.on ('error', () => fin ('neterr'));
     });
@@ -16833,8 +16999,9 @@ function oembedNote (verdict)
     oembedHintTold = true;
     console.error ('[' + (d()) + '] [music] проверка очереди: не могу достучаться до YouTube (DNS/сеть) -- ' +
         'мёртвые видео, как и раньше, узнаются только при подходе к эфиру. ' +
-        'Проверь MUSIC.proxy (запрос идёт по адресу из конфига: socks5 -- с резолвом имени на стороне прокси, http -- как есть) ' +
-        'или выключи MUSIC.queue_check вовсе');
+        'SOCKS-адрес нода сама не умеет (в зависимостях нет socks-агента): проверка идёт через первый адрес, ' +
+        'который нода умеет (HTTP-инбаунд или свой маршрут), -- а если таких нет, я честно отвечаю «не знаю» ' +
+        'и мимо прокси не хожу. Проверь MUSIC.proxy (нужен http-адрес) или выключи MUSIC.queue_check вовсе');
 }
 
 async function deadProbe (url, strict = false)
