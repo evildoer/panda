@@ -20,6 +20,7 @@
 // v2.139 -- поиск стал выбором: /play по названию больше не хватает первый попавшийся трек, а показывает список вариантов (12 с YouTube, каждый -- с автором и длиной) личным сообщением; отметки ставятся галочками в меню (можно несколько), «➕ Добавить отмеченное» ставит выбранное одной пачкой на имя выбирающего, а в канал уходит та же короткая строка, что и от обычного /play; адреса вариантов не выдумываются -- играет ровно выбранное; склейка названий работает только при слиянии источников (внутри одной выдачи разные записи одной песни -- это разные варианты, их не прячу), а SoundCloud ищется отдельной кнопкой «Ещё» со своим пределом времени -- на этой сети он доступен только через прокси, и держать его ожидание на всех нельзя; опция «сразу» возвращает прежнее поведение, а если поиск не прошёл, бот говорит причину и предлагает прислать ссылку
 // v2.140 -- по живым замечаниям владельца: в списке найденного есть кнопка «⬆ В начало моей пачки» -- отмеченные треки встают в НАЧАЛО своей пачки в очереди (не в начало очереди и не разрывая чужие; своей пачки ещё нет -- обычное добавление в конец), и там же видно, с какого номера начинается своя пачка; для видимости пачкой в /queue ничего запоминать не нужно -- выбранное и так встаёт блоком автора; /history больше не теряет SoundCloud: в записи виден источник, хранится настоящий адрес (у ютуба -- короткий id, как и было), поэтому «Поставить заново» и «Взять один трек» возвращают ровно ту находку, а у SC-пачки без адреса бот честно говорит искать заново; /health можно звать прямо в личке с ботом (команда лежит и в общем списке, иначе личка её не видит): в личке отвечает в личке, показывает сервер, где сейчас музыка, и кнопки проверки голоса помнят этот сервер; в /health видно и сколько раз бот сам страховал имена Discord; про пропавший трек с SoundCloud бот больше не говорит «видео больше нет на YouTube»; сбой при добавлении выбранного из поиска теперь называет причину, а не оставляет человека с «Добавляю…»
 // v2.141 -- по живым замечаниям владельца: «в начало» и «в конец» в меню трека считаются по СВОЕЙ пачке (трекам того же автора), а не по всей очереди -- для всего плейлиста у админов и модеров остаются номер («На позицию…», /move) и пачки (/push), а чужие треки от этого шага не уезжают вниз; рядом новая кнопка «⏫ Играть следующим» -- поднимает выбранный трек в начало своей пачки одним нажатием и честно говорит, сколько музыки до него и что впереди ещё чужие пачки; в /play появилась опция «наверх» -- и обычная ссылка, и «сразу» умеют ставить треки в начало своей пачки; и найдена настоящая причина «заиграло с самого начала» из живого лога: предзагрузка открывает поток С НУЛЯ и позиции продолжения не знает, поэтому прерванный трек (подняли его пачку, сняли с эфира) шёл сначала -- теперь трек с позицией продолжения открывается заново на нужной секунде (это видно в логе), а потоковую предзагрузку для такого трека бот заранее не делает (на диск -- по-прежнему качает)
+// v2.142 -- по живым замечаниям владельца: опция «сразу» у /play убрана целиком (по названию -- всегда список вариантов, ссылка ставится сразу); в меню трека под /queue одна кнопка «⏫ В начало» вместо двух («В начало пачки» и «Играть следующим») -- поднимает трек в начало пачки ЕГО автора и сразу говорит, сколько музыки до него (у админов и модеров -- тоже по пачке выбранного автора); из /queue и /nowplaying убрана строка «🌐 Маршрут…» -- такие сведения живут только в /health владельца и `node . net`; сторож голоса больше не будит владельца из-за одной пропущенной проверки связи (в живом логе было три письма подряд без причины) -- тревога со второй, как и обещает комментарий: библиотека закрывает канал после третьей; живое обновление /queue сверяет не только текст, но и СОСТАВ интерфейса -- если меню «Трек» или «Автор» пропало, бот вернёт его сам, не дожидаясь «Обновить»; и починена ещё одна потеря места в треке: когда все ушли, музыка встала на паузу, а автор другого трека слушает в своей комнате, бот переезжал к нему и трек возвращался в конец очереди БЕЗ своей секунды -- теперь место остаётся на самом треке
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -12821,7 +12822,10 @@ function mediaWatchRun (now)
         const udpLive = mediaProbeOk > 0 && !mediaWatchOff;     // медиа-пинг вообще отвечал хоть раз
         const udpLost = udpLive && v.misses >= MEDIA_PROBE_MISS;
         const udpSlow = udpLive && v.high >= MEDIA_PING_HIGH_N;
-        const wsLost = v.wsMissed >= 1;
+        // Одна пропущенная проверка связи -- ещё не беда: такое бывает от шума сети и само проходит к
+        // следующему замеру (владелец видел такие ложные письма по три раза подряд). Бью тревогу со
+        // второй проверки: библиотека закрывает канал после третьей, значит вторая -- это уже обрыв.
+        const wsLost = v.wsMissed >= MEDIA_WS_MISS_DOOMED;
         const wsSlow = v.wsHigh >= MEDIA_WS_HIGH_N;
         if (!udpLost && !udpSlow && !wsLost && !wsSlow)
         {
@@ -12963,7 +12967,7 @@ function authorBlockFirstAt (tracks, byId)
     return -1;
 }
 
-// Добавление треков в очередь -- один путь и для `/play` (ссылка или «сразу»), и для выбора из найденного
+// Добавление треков в очередь -- один путь и для `/play` (по ссылке), и для выбора из найденного
 // списка. Ничего не решает за зовущего: треки встают его блоком, будится предзагрузка, состояние сохраняется.
 // `top` -- «в начало своей пачки»: своей пачки ещё нет -- это обычное добавление в конец запрошенного места.
 function musicQueueTracks (m, guildId, tracks, userId, opts = {})
@@ -13479,7 +13483,7 @@ function qPackStaffText ()
     return '🚫 **Двигать и убирать пачки могут только админы и модеры.**\n' +
         '_Такое действие задевает чужие треки, и им легко испортить слушателям порядок. ' +
         'Своё DJ распоряжается сам: трек -- кнопками «🗂 Трек: подвинуть или убрать…» под `/queue` ' +
-        '(«⏫ Играть следующим» и «⏫ В начало пачки» -- в начало СВОЕЙ пачки, «⬇ Ниже» -- свободно), ' +
+        '(«⏫ В начало» -- в начало СВОЕЙ пачки, «⬇ Ниже» -- свободно), ' +
         'а всю свою пачку можно убрать кнопкой «🧹 Очистить»._';
 }
 
@@ -14297,8 +14301,8 @@ const QUEUE_HINT_SHORT = QSMALL + 'Действия -- кнопками ниже
 const QUEUE_HINT_FULL =
     QSMALL + 'Перемотать внутри трека -- «◀ 30 с» / «30 с ▶» / «⏱ На таймкод…» или /seek;' +
     ' свой трек (у админов и модеров -- любой).' + '\n' +
-    QSMALL + 'Подвинуть -- выбери трек в меню ниже (выше/ниже, «В начало пачки», «В конец пачки»,' +
-    ' «Играть следующим» или «На позицию…»), либо командой /move номер to номер.' + '\n' +
+    QSMALL + 'Подвинуть -- выбери трек в меню ниже (выше/ниже, «В начало», «В конец»' +
+    ' или «На позицию…»), либо командой /move номер to номер.' + '\n' +
     QSMALL + 'Прыгнуть по очереди -- /jump или кнопка «⤴ Другой трек» (список треков):' +
     ' DJ -- по своим, админы и модеры -- любым.' +
     ' Срочный переход (прерванный трек вернётся в очередь, с того же места) либо «Обрезать до трека»' +
@@ -14347,7 +14351,7 @@ function queueListBudget (m)
     const chrome = queueHeadText (m).length + queueWaitText (m).length +
         queueAuthorsText (m).length + queueCheckText (m).length +
         queuePacksText (m).length +
-        netWaitText (m).length + netRouteText (m.guildId, OWNER_HOSTER).length +
+        netWaitText (m).length +
         QUEUE_GLUE + queueHintText ().length;
     return Math.max (200, QUEUE_MSG_LIMIT - chrome);
 }
@@ -14552,10 +14556,10 @@ function queueComponents (page, m, moveSel = 0, opts = {})
                     .setCustomId ('q:rx:' + moveSel + ':' + start).setLabel ('🗑 Убрать')
                     .setStyle (ButtonStyle.Danger),
                 new ButtonBuilder ()
-                    .setCustomId ('q:mt:' + moveSel).setLabel ('⏫ В начало пачки')
+                    .setCustomId ('q:mt:' + moveSel).setLabel ('⏫ В начало')
                     .setStyle (ButtonStyle.Primary).setDisabled (moveSel <= packHead),
                 new ButtonBuilder ()
-                    .setCustomId ('q:mb:' + moveSel).setLabel ('⏬ В конец пачки')
+                    .setCustomId ('q:mb:' + moveSel).setLabel ('⏬ В конец')
                     .setStyle (ButtonStyle.Primary).setDisabled (moveSel >= packTail),
                 new ButtonBuilder ()
                     .setCustomId ('q:mp:' + moveSel).setLabel ('#️⃣ На позицию…')
@@ -14570,9 +14574,6 @@ function queueComponents (page, m, moveSel = 0, opts = {})
             new ActionRowBuilder ().addComponents
             (
                 new ButtonBuilder ()
-                    .setCustomId ('q:mq:' + moveSel).setLabel ('⏫ Играть следующим')
-                    .setStyle (ButtonStyle.Success).setDisabled (moveSel <= packHead),
-                new ButtonBuilder ()
                     .setCustomId ('q:mu:' + moveSel).setLabel ('⬆ Выше')
                     .setStyle (ButtonStyle.Primary).setDisabled (moveSel <= 1),
                 new ButtonBuilder ()
@@ -14584,6 +14585,11 @@ function queueComponents (page, m, moveSel = 0, opts = {})
             )
         );
     }
+    // Discord показывает не больше пяти рядов; больше строить не должны. Если это случится (кто-то
+    // добавит ряд сверху), лучше сказать вслух, чем молча потерять меню «Трек» или «Автор».
+    if (rows.length > 5)
+        console.error ('[' + (d()) + '] [music] рядов в сообщении /queue больше пяти (' + rows.length +
+            ') -- лишние не покажу');
     return rows.slice (0, 5);
 }
 
@@ -15180,7 +15186,7 @@ function packEdgeNo (m, n, edge)
 // чужие пачки от такого шага не уезжают вниз. Это работает одинаково и DJ, и админам с модерами:
 // поднять трек ко всему началу очереди можно номером (`/move` или «На позицию…»), а пачку целиком
 // двигают только админы и модеры (`/push`), поэтому «в начало» здесь не значит «перед всеми».
-// `opts.next` -- это кнопка «Играть следующим»: место то же, но в ответе видно, когда трек заиграет.
+// `opts.next` -- для кнопки «В начало»: место то же, но в ответе видно, когда трек заиграет.
 function queueMoveEdges (guildId, n, edge, who, opts = {})
 {
     const m = musicOf (guildId);
@@ -15207,8 +15213,7 @@ function queueMoveEdges (guildId, n, edge, who, opts = {})
     const res = queueMove (guildId, n, to, who, { staff: !!opts.staff, actorId: opts.actorId });
     if (!res.ok) return res;
     let text = '📚 **' + (moved.title || 'трек') + '**: №' + n + ' -> №' + res.to + ' -- ' +
-        (opts.next ? 'играть следующим (' + (tail ? 'конец' : 'начало') + ' ' + packTxt + ')'
-                   : (tail ? 'в конец' : 'в начало') + ' ' + packTxt);
+        (tail ? 'в конец' : 'в начало') + ' ' + packTxt;
     if (opts.next)
     {
         const others = m.tracks.slice (0, res.to - 1).some (t => qKey (t) !== key);
@@ -15735,38 +15740,6 @@ function netWaitText (m)
         '; очередь и место в треке держатся';
 }
 
-function netRouteText (guildId, viewerId)   // строка для сообщений в канале: БЕЗ адресов (их видит кто угодно)
-{
-    if (!isBotOwner (viewerId)) return '';
-    const bits = [];
-    const u = routeUseOf (guildId);
-    const inUseBad = !!(u && u.proxy && proxyBrieflyBad (u.proxy));
-    let addr = false;
-    if (u)
-    {
-        bits.push (u.kind === 'disk'
-            ? '🌐 Маршрут: не нужен -- этот трек играю с диска'
-            : '🌐 Маршрут: ' + (u.proxy ? 'прокси' : 'DIRECT (напрямую)') +
-              (inUseBad ? ' (сейчас со сбоем)' : ''));
-        if (u.proxy) addr = true;
-        const spare = MUSIC_PROXIES.filter (p => p !== u.proxy && !proxyBrieflyBad (p));
-        if (spare.length) { bits.push ('запасной: есть'); addr = true; }
-    }
-    if (MUSIC_PROXIES.length && directProbeCache.ok === false && dnsCache.ok !== false)
-        bits.push ('⚠ DIRECT не отвечает (' + (directProbeCache.why || 'нет ответа') +
-            ') -- если прокси отвалится, музыка подождёт сеть');
-    const bad = MUSIC_PROXIES.filter (p => proxyBrieflyBad (p) && !(u && String (u.proxy) === String (p)));
-    if (bad.length)
-    {
-        bits.push ('со сбоем: ' + bad.length + ' шт');
-        addr = true;
-    }
-    // Адреса прокси -- только владельцу и только там, где сообщение видит он один: /health и `node . net`.
-    // В /queue и /nowplaying это общий текст канала, поэтому его читает любой, кто в этом канале.
-    if (addr && isBotOwner (viewerId)) bits.push ('адреса -- в /health и `node . net`');
-    return bits.length ? QSMALL + bits.join (' · ') : '';
-}
-
 function nowPlayingText (m, guildId, viewerId)
 {
     const t = m.current || m.seekTrack || null;
@@ -15802,8 +15775,6 @@ function nowPlayingText (m, guildId, viewerId)
     if (way) lines.push (QSMALL + way);
     const net = netWaitText (m);
     if (net) lines.push (net);
-    const route = netRouteText (guildId, viewerId);
-    if (route) lines.push (route);
     lines.push (queueWaitText (m));
     const next = (m.preload && m.preload.track) || m.tracks[0] || null;
     if (next) lines.push (QSMALL + '⏭ Дальше: ' + (next.title || 'трек'));
@@ -15823,7 +15794,6 @@ function queueView (m, start, moveSel = 0, opts = {})
     const packList = queuePacksText (m);
     const check = queueCheckText (m);
     const net = netWaitText (m);
-    const route = netRouteText (m.guildId, opts.actorId);
     const wait = queueWaitText (m);
     const build = hint =>
     {
@@ -15833,7 +15803,7 @@ function queueView (m, start, moveSel = 0, opts = {})
         '\n**Очередь (' + total + ')**' + (page.start > 1 ? ' · с №' + page.start : '') + ':\n' + page.list +
         (restNow () > 0 ? '\n*...и ещё ' + restNow () + '*' : '') +
         '\n' + QSEP + '\n' +
-        [authors, wait, check, route].filter (Boolean).join ('\n');
+        [authors, wait, check].filter (Boolean).join ('\n');
     };
     let content;
     if (!total) content = queueHeadText (m);
@@ -15867,14 +15837,23 @@ function queueWatchForget (m, msgId)
     m.qMsgs = m.qMsgs.filter (w => !w || String (w.id) !== String (msgId));
 }
 
-function queueWatch (m, msg, ctx, page, text, move)
+// Отпечаток кнопок и меню сообщения /queue. Живое обновление сверяет не только текст, но и состав
+// интерфейса: если по какой-то причине пропал пункт (меню «Трек»/«Автор»), следующая сверка вернёт его сама,
+// не дожидаясь нажатия «Обновить».
+function queueCompSig (rows)
+{
+    try { return JSON.stringify ((rows || []).map (r => (r && typeof r.toJSON === 'function') ? r.toJSON () : r)); }
+    catch (e) { return ''; }
+}
+
+function queueWatch (m, msg, ctx, page, text, move, comp)
 {
     if (!QUEUE_LIVE_MS || !m || !msg || !msg.id) return;
     if (!Array.isArray (m.qMsgs)) m.qMsgs = [];
     const old = queueWatchOf (m, msg.id);
     const rec = { ch: msg.channelId, id: msg.id, ctx: ctx, page: Math.max (1, Number (page) || 1),
                   text: String (text || ''), move: Math.max (0, Number (move) || 0), at: Date.now (),
-                  first: old ? !!old.first : true };
+                  comp: String (comp || ''), first: old ? !!old.first : true };
     if (old) m.qMsgs[m.qMsgs.indexOf (old)] = rec;
     else m.qMsgs.push (rec);
     const _who = ctx && ctx.actorId ? String (ctx.actorId) : '';
@@ -15907,7 +15886,7 @@ function queueWatchRestore (saved)
         out.push ({ ch: String (s.ch), id: String (s.id), page: Math.max (1, Number (s.page) || 1),
                     ctx: { actorId: String (s.actorId || ''), actorName: String (s.actorName || ''),
                            staff: !!s.staff },
-                    text: '', move: 0, at: Date.now () });
+                    text: '', comp: '', move: 0, at: Date.now () });
     }
     return out.slice (0, QUEUE_LIVE_MAX);
 }
@@ -15929,7 +15908,8 @@ async function queueLiveOne (m, w)
     catch (e) { queueWatchForget (m, w.id); return; }
     const empty = !m.current && !m.tracks.length && !m.seekTrack;
     const content = view.content;
-    if (content === w.text)
+    const sig = queueCompSig (view.components);
+    if (content === w.text && sig === (w.comp || ''))
     {
         if (empty) queueWatchForget (m, w.id);
         return;
@@ -15944,6 +15924,7 @@ async function queueLiveOne (m, w)
             { allowedMentions: { parse: [] } })));
         if (w.first) { w.first = false; console.log ('[' + (d()) + '] [music] сообщение /queue обновил сам (стр. ' + w.page + ')'); }
         w.text = content;
+        w.comp = sig;
         w.err = false;
         if (empty) queueWatchForget (m, w.id);
     }
@@ -15986,6 +15967,7 @@ async function queueMsgRedraw (guildId, delayMs = 0)
                 view.components.length ? { content: view.content, components: view.components } : { content: view.content },
                 { allowedMentions: { parse: [] } })));
             w.text = view.content;
+            w.comp = queueCompSig (view.components);
             w.at = Date.now ();
             w.err = false;
         }
@@ -16966,6 +16948,11 @@ function skipAbsentAuthors (guildId, curChId)
         console.error ('[music] пропуск отсутствующих авторов: переехать не вышло: ' + oneLine (e.message));
         return false;
     }
+    // Место трека не теряем: без этого он вернётся в очередь и заиграет с нуля (живой случай: все ушли,
+    // музыка встала на паузу, а автор другого трека слушает в своей комнате -- трек уезжал в конец
+    // очереди без своей секунды). Теперь он помнит место сам (t.seek), и playNext с него продолжит.
+    if (m.current) m.current.seek = Math.max (0, Math.round (playedMsOf (m) / 1000));
+    else if (m.seekTrack && m.seekSec) m.seekTrack.seek = Math.max (0, Math.round (m.seekSec || 0));
     m.tracks = m.tracks.slice (cut).concat (moved);
     m.current = null;
     m.seekTrack = null;
@@ -17549,9 +17536,6 @@ const musicCommands =
              .setDescription ('Ссылка или название трека')
              .setRequired (true))
         .addBooleanOption (o =>
-            o.setName ('сразу')
-             .setDescription ('Название трека: взять первый результат сразу, без списка вариантов'))
-        .addBooleanOption (o =>
             o.setName ('наверх')
              .setDescription ('Поставить в начало СВОЕЙ пачки в очереди (играть следующим среди своих)')),
     new SlashCommandBuilder ()
@@ -17854,9 +17838,9 @@ const QUEUE_ACTIONS =
     [/^q:dx$/, '✖ Отмена'],
     [/^q:tr:/, '🗂 трек: подвинуть или убрать'],
     [/^q:rx:/, '🗑 Убрать'],
-    [/^q:mt:/, '⏫ В начало пачки'],
-    [/^q:mb:/, '⏬ В конец пачки'],
-    [/^q:mq:/, '⏫ Играть следующим'],
+    [/^q:mt:/, '⏫ В начало'],
+    [/^q:mb:/, '⏬ В конец'],
+    [/^q:mq:/, '⏫ Играть следующим (прежняя кнопка)'],
     [/^q:mp:/, '#️⃣ На позицию…'],
     [/^q:mpos:/, '#️⃣ На позицию… (окно ввода)'],
     [/^q:mz:/, '▶ Играющим'],
@@ -18035,7 +18019,7 @@ client.on ('interactionCreate', async (interaction) =>
         {
             const view = queueView (m, at, moveSel, ctx);
             await interaction.update ({ content: view.content, components: view.components, allowedMentions: { parse: [] } });
-            queueWatch (m, interaction.message, ctx, at, view.content, moveSel);
+            queueWatch (m, interaction.message, ctx, at, view.content, moveSel, queueCompSig (view.components));
         };
         const mPage = /^q:(rf|[pn])(?::(?:first|prev|next|last))?:(\d+)$/.exec (cid);
         if (mPage)
@@ -18201,8 +18185,10 @@ client.on ('interactionCreate', async (interaction) =>
         const mTopBot = /^q:m([tb]):(\d+)$/.exec (cid);
         if (mTopBot)
         {
+            const head = mTopBot[1] === 't';
             const n = parseInt (mTopBot[2], 10) || 0;
-            const res = queueMoveEdges (guildId, n, mTopBot[1] === 't' ? 'head' : 'tail', who, ctx);
+            const res = queueMoveEdges (guildId, n, head ? 'head' : 'tail', who,
+                { staff: ctx.staff, actorId: ctx.actorId, next: head });
             if (!res.ok)
                 return interaction.reply ({ content: res.text, flags: MessageFlags.Ephemeral });
             const at = queuePageOf (m, res.to);
@@ -18327,12 +18313,13 @@ client.on ('interactionCreate', async (interaction) =>
                 if (w2)
                 {
                     w2.text = view.content;
+                    w2.comp = queueCompSig (view.components);
                     w2.page = at;
                     w2.move = 0;
                     w2.at = Date.now ();
                     w2.err = false;
                 }
-                else queueWatch (m, src, oCtx, at, view.content, 0);
+                else queueWatch (m, src, oCtx, at, view.content, 0, queueCompSig (view.components));
             }
         };
         const msgId = interaction.message ? interaction.message.id : '0';
@@ -18944,14 +18931,14 @@ client.on ('interactionCreate', async (interaction) =>
             const query = interaction.options.getString ('запрос');
             const wantTop = interaction.options.getBoolean ('наверх') === true;
             const callerVoice = interaction.member && interaction.member.voice ? interaction.member.voice.channel : null;
-            if (!isUrl (query) && interaction.options.getBoolean ('сразу') !== true)
+            if (!isUrl (query))
                 return playSearchShow (interaction, query, wantTop);  // поиск: сначала показываю варианты
 
             await interaction.deferReply ();
             let tracks;
             try
             {
-                tracks = isUrl (query) ? await playlistInfo (query) : [await trackInfo ('ytsearch1:' + query)];
+                tracks = await playlistInfo (query);
             }
             catch (e)
             {
@@ -19210,7 +19197,7 @@ client.on ('interactionCreate', async (interaction) =>
                 )
             );
             const sentMsg = (sent && sent.resource && sent.resource.message) || null;
-            if (sentMsg) queueWatch (m, sentMsg, ctxQ, fromQ, view.content, 0);
+            if (sentMsg) queueWatch (m, sentMsg, ctxQ, fromQ, view.content, 0, queueCompSig (view.components));
         }
         else if (name === 'leave')
         {
