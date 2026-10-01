@@ -21,7 +21,7 @@
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
 // v2.133 -- присмотр говорит и о поломке, которую видит впервые: если служба обхода есть и работает (или сторож есть), а движка winws.exe нет -- это уже не «не поднимали», а поломка, и владельцу уходит то же письмо (раньше оно требовало, чтобы предыдущая проверка видела движок живым); плюс исправлена ошибка запуска: включатель присмотра стоял выше своих настроек и валил старт бота (Cannot access 'DPI_STAT_EVERY_MS' before initialization)
-// v2.136 -- письмо хозяину уходит ТОЛЬКО в личку: отчеты о здоровье бота (обход, служба, драйвер, права, пиджи, куски журнала) больше не сыплются в общий журнал сервера -- там техподробностям не место; копия в журнал сервера осталась только по явной просьбе (opts.log), и то для того, что не про технику
+// v2.136 -- письмо хозяину уходит только в личку: отчеты о здоровье бота (обход, служба, драйвер, права, пиджи, куски журнала) больше не сыплются в общий журнал сервера -- там техподробностям не место; копию в журнал сервера хозяин может включить сам ключом owner_mail_in_log_channel в config.json (по умолчанию выключено), и в `node . config` видно, откуда взято это решение
 // v2.135 -- по разбору живого лога (шлюз не резолвился, подбор шёл впустую): консольная команда больше не поднимает бота (из-за этого `node . obhod --pick --voice` шёл при живом боте, хотя режим требует обратного), сторож голоса следит и по служебному каналу голоса (пропущенные проверки связи и его пинг -- вторая пропущенная значит гарантированный обрыв), а если медиа-адрес не отвечает на наш udp-пинг, сторож не выключается, а честно говорит, что следит по служебному каналу; [poll] больше не винит интент при обрыве сети, [queue] и [gw] не сыпят одной строкой на каждый проход, подбор называет причину падения winws.exe и прекращается, если движок не стартует вообще
 // v2.132 -- свой маршрут по адресам засчитывается путём для музыки только если проверен делом: бот раз в 10 минут прогоняет через него yt-dlp и, если тот не дошёл, за путь его не считает и говорит об этом прямо (проверка самим ботом, а не «мне кажется, работает»)
 // v2.131 -- голос видно по-настоящему: в /health у владельца есть кнопка «Проверить голос по-настоящему» -- если бот в канале и к медиа-адресу ходят пакеты (udp-пинг), она отвечает сразу и музыку не трогает, а если пинга нет -- выходит из канала, входит заново (это и есть проверка медиа-адреса), возвращает музыку на то же место и пишет результат; в самой /health видно и пинг медиа-пути
@@ -72,6 +72,7 @@ const
     MESSAGE_CONTENT,
     GUILD_MEMBERS,
     OWNER, MUSIC,
+    owner_mail_in_log_channel,
     db_key, db_key_prev,
     privacy_url,
     show_privacy_url,
@@ -1325,6 +1326,9 @@ const USE_MESSAGE_CONTENT = MESSAGE_CONTENT !== false;
 const USE_GUILD_MEMBERS = GUILD_MEMBERS !== false;
 
 const OWNER_HOSTER = /^\d{17,20}$/.test (String (OWNER || '')) ? String (OWNER) : '';
+// Письма хозяину (отчеты о здоровье бота с техподробностями) по умолчанию идут ТОЛЬКО в личку. Кому
+// нужна копия в журнале сервера -- тот сам включает ключ в config.json (по умолчанию выключено).
+const OWNER_MAIL_IN_LOG = (owner_mail_in_log_channel === true);
 const STARTUP_DMS = (Array.isArray (STARTUP_DM) ? STARTUP_DM
         : (STARTUP_DM === undefined || STARTUP_DM === null ? [] : [STARTUP_DM]))
     .map (_u => String (_u === undefined || _u === null ? '' : _u).trim ())
@@ -5498,7 +5502,7 @@ function configSanityIssues ()
                 'беру состояние «ключа нет» (в config.example.json написано, что это значит для этого ключа)');
         }
     };
-    boolKeys (CONFIG_RAW, 'config.json', ['DEBUG', 'MESSAGE_CONTENT', 'GUILD_MEMBERS']);
+    boolKeys (CONFIG_RAW, 'config.json', ['DEBUG', 'MESSAGE_CONTENT', 'GUILD_MEMBERS', 'owner_mail_in_log_channel']);
     boolKeys (MUSIC_CFG, 'MUSIC', ['normalize', 'skip_absent_author', 'cache', 'cache_keep_played', 'queue_check']);
     for (let server in SERVERS)
     {
@@ -5636,7 +5640,7 @@ const CONFIG_ORDER = {
         ['_ЧТО ЭТО'], ['_ПРО_КОММЕНТАРИИ'], ['_ПРО_ЭТАЛОН'], ['_ВЕРХНИЙ_УРОВЕНЬ'],
         ['ID', 'TOKEN', 'PREFIX'],
         ['DEBUG', 'MESSAGE_CONTENT', 'GUILD_MEMBERS'],
-        ['STARTUP_DM', 'OWNER', 'db_key', 'db_key_prev'],
+        ['STARTUP_DM', 'OWNER', 'owner_mail_in_log_channel', 'db_key', 'db_key_prev'],
         ['privacy_url', 'show_privacy_url'],
         ['backup_minutes', 'backup_keep'],
         ['log_dir', 'log_keep_months'],
@@ -6553,9 +6557,10 @@ async function routeStatus ()       // проверка путей: её чит�
     return { dnsOk, dp, dpi, svc, drv, alive, dead, dohPort, dohOk, bookN, parts, advice, noPath: (!dp.ok && !alive.length) };
 }
 
-// Письмо хозяину -- ТОЛЬКО в личные сообщения. Это отчеты о здоровье бота с техподробностями (обход,
-// служба, драйвер, права, пиджи, куски журнала): в общем канале сервера им не место. Копия в журнал
-// сервера -- лишь по явной просьбе (opts.log), и только для того, что не про технику.
+// Письмо хозяину уходит в личные сообщения, а в журнал сервера -- только когда хозяин сам включил
+// owner_mail_in_log_channel (или конкретное письмо явно просит копию: opts.log). По умолчанию в журнал
+// не идём: там отчеты о здоровье бота с техподробностями (обход, служба, драйвер, права, пиджи, куски
+// журнала) -- им место в личке.
 async function notifyHoster (text, opts = {})
 {
     let sent = 0;
@@ -6565,7 +6570,7 @@ async function notifyHoster (text, opts = {})
         try { const usr = await client.users.fetch (id); if (usr) { await sendFit (usr, text); sent++; } }
         catch (e) { console.error ('[' + (d()) + '] письмо владельцу не ушло: ' + ((e && e.message) || e)); }
     }
-    if (opts.log)
+    if (opts.log || OWNER_MAIL_IN_LOG)
         for (const srv of Object.keys (SERVERS))
             if (SERVERS[srv] && SERVERS[srv].log_channel)
                 try { await logTo (SERVERS[srv].log_channel).send (text); sent++; } catch (e) { }
@@ -11161,6 +11166,7 @@ function configCli ()
     row ('GUILD_MEMBERS', YN (USE_GUILD_MEMBERS), hasTop ('GUILD_MEMBERS') ? 'config.json' : 'по умолчанию (запрашиваю)');
     row ('STARTUP_DM', Array.isArray (STARTUP_DM) ? STARTUP_DM.length + ' адрес(ов)' : '--', hasTop ('STARTUP_DM') ? 'config.json' : 'по умолчанию (никому)');
     row ('OWNER (хостинг)', OWNER_HOSTER || 'НЕ ЗАДАН (нет /rekey и контакта)', hasTop ('OWNER') ? 'config.json' : '-- (в файле нет)');
+    row ('owner_mail_in_log_channel (письма хозяину в журнал сервера)', YN (OWNER_MAIL_IN_LOG), hasTop ('owner_mail_in_log_channel') ? 'config.json' : 'по умолчанию (выкл: отчёты о здоровье бота -- только в личку)');
     row ('db_key', DB_KEYS.length ? 'задан (шифрование ВКЛ)' : 'пусто (база открыта)', hasTop ('db_key') ? 'config.json' : '-- (в файле нет)');
     row ('db_key_prev', Array.isArray (db_key_prev) ? db_key_prev.length + ' шт' : '0', hasTop ('db_key_prev') ? 'config.json' : 'по умолчанию (0)');
     row ('privacy_url', PRIVACY_URL ? 'задан' : 'пусто (ссылки не будет)', hasTop ('privacy_url') ? 'config.json' : '-- (в файле нет)');
