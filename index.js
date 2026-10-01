@@ -23,6 +23,7 @@
 // v2.133 -- присмотр говорит и о поломке, которую видит впервые: если служба обхода есть и работает (или сторож есть), а движка winws.exe нет -- это уже не «не поднимали», а поломка, и владельцу уходит то же письмо (раньше оно требовало, чтобы предыдущая проверка видела движок живым); плюс исправлена ошибка запуска: включатель присмотра стоял выше своих настроек и валил старт бота (Cannot access 'DPI_STAT_EVERY_MS' before initialization)
 // v2.136 -- письмо хозяину уходит только в личку: отчеты о здоровье бота (обход, служба, драйвер, права, пиджи, куски журнала) больше не сыплются в общий журнал сервера -- там техподробностям не место; копию в журнал сервера хозяин может включить сам ключом owner_mail_in_log_channel в config.json (по умолчанию выключено), и в `node . config` видно, откуда взято это решение
 // v2.135 -- по разбору живого лога (шлюз не резолвился, подбор шёл впустую): консольная команда больше не поднимает бота (из-за этого `node . obhod --pick --voice` шёл при живом боте, хотя режим требует обратного), сторож голоса следит и по служебному каналу голоса (пропущенные проверки связи и его пинг -- вторая пропущенная значит гарантированный обрыв), а если медиа-адрес не отвечает на наш udp-пинг, сторож не выключается, а честно говорит, что следит по служебному каналу; [poll] больше не винит интент при обрыве сети, [queue] и [gw] не сыпят одной строкой на каждый проход, подбор называет причину падения winws.exe и прекращается, если движок не стартует вообще
+// v2.138 -- имена Discord под присмотром: шлюз, голосовые серверы и api разрешает системный справочник, и когда он молчит или не смог (в живом логе -- 30 строк «getaddrinfo ENOTFOUND gateway-us-east1-b.discord.gg» подряд, вход висел минутами, а проверка голоса не входила в канал за 25 с), бот отвечает сам -- сперва из книги адресов (мгновенно), потом своими справочниками (DoH и обычные, они на этой машине отвечали всегда); успешный ответ системы он тоже кладёт в книгу с пометкой источника, чтобы потом отвечать без задержки, а чужие имена и ошибки не подменяет и без нужды не ждёт: система ответила -- её слово; своё -- только для discord.gg, discord.com, discordapp.com, discordapp.net; ключ MUSIC.dns_help (по умолчанию включено), свои счётчики попали в `node . net`
 // v2.137 -- по живым замечаниям владельца: кнопка «Проверить голос по-настоящему» больше не пугает зря -- если музыка шла, а заново войти не вышло, бот говорит прямо, что голос сейчас работает и не вышло только новое подключение, называет шаг, на котором застрял (не пришёл адрес голосового сервера или не ответил медиа-адрес -- вместо библиотечного «The operation was aborted»), и пробует войти второй раз после короткой паузы; если вернуться не вышло совсем, музыка остаётся ждать сеть и бот возвращается сам, как после настоящего обрыва; строка маршрута в /queue и /nowplaying больше не называет адреса прокси (они -- владельцу в /health и `node . net`), из /health убрана повторная просьба про сторожа обхода (владелец решил его не ставить), а отказ Discord 40032 «цель не в голосовом канале» при снятии мута/глухоты больше не печатает стек -- это не поломка бота
 // v2.132 -- свой маршрут по адресам засчитывается путём для музыки только если проверен делом: бот раз в 10 минут прогоняет через него yt-dlp и, если тот не дошёл, за путь его не считает и говорит об этом прямо (проверка самим ботом, а не «мне кажется, работает»)
 // v2.131 -- голос видно по-настоящему: в /health у владельца есть кнопка «Проверить голос по-настоящему» -- если бот в канале и к медиа-адресу ходят пакеты (udp-пинг), она отвечает сразу и музыку не трогает, а если пинга нет -- выходит из канала, входит заново (это и есть проверка медиа-адреса), возвращает музыку на то же место и пишет результат; в самой /health видно и пинг медиа-пути
@@ -869,7 +870,7 @@ function netCli ()       // разбор собранного: что знаем
         if (newestName) console.log ('[net]   свежайшее имя: ' + newestName + ' (' + _when (newest) + '); самое давнее: ' + (oldestName || '--') + ' (' + _when (oldest) + ')');
         many.sort ((a, b) => b[1] - a[1]);
         if (many.length) console.log ('[net]   больше всего адресов: ' + many.slice (0, 5).map (x => x[0] + ' -- ' + x[1]).join (', '));
-        const srcs = Object.keys (stats).map (k => ({ n: k, ok: (stats[k] || {}).ok || 0, fail: (stats[k] || {}).fail || 0, ms: (stats[k] || {}).ms || 0 }))
+        const srcs = Object.keys (stats).filter (k => k.indexOf ('__') !== 0).map (k => ({ n: k, ok: (stats[k] || {}).ok || 0, fail: (stats[k] || {}).fail || 0, ms: (stats[k] || {}).ms || 0 }))
             .sort ((a, b) => (b.ok - a.ok) || (a.ms - b.ms));
         if (srcs.length)
         {
@@ -877,6 +878,11 @@ function netCli ()       // разбор собранного: что знаем
             for (const s of srcs.slice (0, 8))
                 console.log ('[net]   ' + s.n.padEnd (24) + s.ok + '/' + s.fail + (s.ms ? ', ' + Math.round (s.ms) + ' мс' : ''));
         }
+        const help = stats.__help || null;
+        if (help)
+            console.log ('[net] сам разрешал имена Discord (системный молчал или не смог): ' + (help.ok || 0) + ' раз' +
+                (help.fail ? ', не вышло ' + help.fail : '') + (help.ms ? ', свой ответ в среднем ' + Math.round (help.ms) + ' мс' : '') +
+                (help.last ? '; последнее -- «' + help.last + '»' : ''));
         const pkeys = Object.keys (pools).filter (k => k.indexOf ('pool:') === 0);
         if (pkeys.length)
             console.log ('[net] копилки адресов: ' + pkeys.map (k => k.slice (5) + ' -- ' + Object.keys ((pools[k] || {}).ips || {}).length).join (', '));
@@ -2360,6 +2366,21 @@ process.on ('uncaughtException',  e =>
     const p = crashIncident ('uncaughtException', e, 'бот продолжает работу -- сработала страховка уровня процесса');
     if (p) console.error ('[' + (d()) + '] [crash] отчёт о сбое: ' + p);
 });
+
+// Свой справочник страхует имена Discord.
+// Системный DNS временами молчит: в живом логе 01.10 было 30 строк подряд «getaddrinfo ENOTFOUND
+// gateway-us-east1-b.discord.gg», и вход висел, пока ОС не сдастся -- а шлюз, голосовые серверы и api
+// идут только через системный справочник, нашего шифрованного они не касались. Поэтому подмену ставлю
+// ДО входа в Discord: система ответила -- её слово (и адрес идёт в общую книгу), система молчит или не
+// может -- отвечаю сам: сперва из книги (мгновенно), потом своими справочниками (DoH и обычные: на
+// этой машине они отвечали всегда). Своё -- только для имён Discord, всё остальное не трогаю.
+// Настройки объявляю здесь же, чтобы подмена видела их сразу; сами функции -- в разделе сети ниже.
+const DNS_HELP_ON = !(MUSIC && MUSIC.dns_help === false);
+const DNS_HELP_SUFFIX = ['discord.gg', 'discord.com', 'discordapp.com', 'discordapp.net'];
+const DNS_HELP_WAIT_MS = 2500;      // столько жду системный справочник, потом отвечаю сам
+const DNS_HELP_ASK_MS = 3000;       // столько даю своим справочникам на ответ (DoH и обычные)
+const DNS_HELP_LOG_GAP_MS = 5 * 60 * 1000;
+if (DNS_HELP_ON) dnsLookupPatchInstall ();
 
 async function messageContentAllowed ()
 {
@@ -5653,7 +5674,7 @@ const CONFIG_ORDER = {
         ['SERVERS'],
     ],
     MUSIC: [
-        ['proxy', 'doh', 'dpi_heal', 'cookies_file', 'cookies_from_browser'],
+        ['proxy', 'doh', 'dpi_heal', 'dns_help', 'cookies_file', 'cookies_from_browser'],
         ['ytdlp_auto_update', 'ytdlp_update_after_fails', 'ytdlp_check_days', 'ytdlp_update_days'],
         ['normalize', 'filter'],
         ['channel_status', 'skip_absent_author'],
@@ -8685,8 +8706,9 @@ const DNS_ASK_DEADLINE_MS = 4000;   // одному имени -- не боль�
 // или молчит, адреса других всё равно попали в книгу -- прятать от нас нечего;
 // (3) если ответ пришёл с проверенной подписью (DNSSEC, поле AD), такие адреса идут первыми:
 // подделать подписанный ответ ТСПУ не может, а подмена без подписи лежит в конце.
-async function dnsAskAll (name)
+async function dnsAskAll (name, deadlineMs)
 {
+    const _dead = Number (deadlineMs) > 0 ? Number (deadlineMs) : DNS_ASK_DEADLINE_MS;
     const srcs = dnsSourcesOrdered ().filter (q => !(q.kind === 'doh' && !MUSIC_DOH));
     const got = await Promise.all (srcs.map (q => new Promise (res =>
     {
@@ -8700,7 +8722,7 @@ async function dnsAskAll (name)
         try
         {
             if (q.kind === 'doh')
-                dohAsk (q, name, DNS_ASK_DEADLINE_MS).then (v =>
+                dohAsk (q, name, _dead).then (v =>
                 {
                     if (v && v.ip)
                     {
@@ -8709,7 +8731,7 @@ async function dnsAskAll (name)
                     }
                     done (v);
                 }, () => done (null));
-            else if (q.kind === 'plain') plainDnsAsk (q.ip, name, DNS_ASK_DEADLINE_MS).then (done, () => done (null));
+            else if (q.kind === 'plain') plainDnsAsk (q.ip, name, _dead).then (done, () => done (null));
             else require ('dns').promises.lookup (name).then (r =>
             {
                 done ((r && r.address && !dohBadIp (r.address)) ? { ip: r.address, ips: [r.address], ttl: 0 } : null);
@@ -8745,11 +8767,162 @@ async function dnsAskAll (name)
         src: (ok.length > 1 ? ok.length + ' справочника' : ok[0].q.src) };
 }
 
-async function dnsAskSources (name)   // то же, но одним адресом: для обновления книги по сроку
+async function dnsAskSources (name, deadlineMs)   // то же, но одним адресом: для обновления книги по сроку
 {
-    const all = await dnsAskAll (name);
+    const all = await dnsAskAll (name, deadlineMs);
     if (!all) return null;
     return { ip: all.list[0].ip, ips: all.list.map (x => x.ip), ttl: all.ttl, src: all.src, ms: all.ms, info: all.info };
+}
+
+// --- подмена смотрящего за именами: системный справочник не смог или молчит -- отвечаю сам --------
+let dnsHelpOk = 0, dnsHelpFail = 0, dnsHelpLog = { at: 0, n: 0 };
+
+function dnsHelpName (host)                       // за какие имена отвечаю сам (Discord)
+{
+    const h = String (host || '').toLowerCase ().replace (/\.$/, '');
+    if (!h || /^\d{1,3}(\.\d{1,3}){3}$/.test (h)) return false;
+    return DNS_HELP_SUFFIX.some (s => h === s || h.endsWith ('.' + s));
+}
+
+function dnsHelpCount (ok, ms, name)              // счёт для владельца: сколько раз страховал и вышло ли (видно в `node . net`)
+{
+    try
+    {
+        if (!dnsStats) dnsStats = {};
+        const h = dnsStats.__help || (dnsStats.__help = { ok: 0, fail: 0, ms: 0, at: 0, last: '' });
+        if (ok)
+        {
+            h.ok++;
+            h.ms = h.ms ? Math.round (h.ms * 0.7 + (Number (ms) || 0) * 0.3) : (Number (ms) || 0);
+            h.at = Date.now ();
+            h.last = name;
+        }
+        else h.fail++;
+        dnsBookSave ();
+    }
+    catch (e) { }
+}
+
+function dnsHelpReport (name, how, ms)           // одно событие -- одна строка, повторы -- счётом
+{
+    dnsHelpOk++;
+    dnsHelpCount (true, ms, name);
+    const now = Date.now ();
+    const n = dnsHelpLog.n || 0;
+    if ((now - (dnsHelpLog.at || 0)) < DNS_HELP_LOG_GAP_MS) { dnsHelpLog.n = n + 1; return; }
+    dnsHelpLog = { at: now, n: 0 };
+    console.log ('[' + (d()) + '] [net] системный справочник не ответил -- имя «' + name + '» разрешил сам (' + how + ')' +
+        (n ? '; а ещё ' + n + ' ' + plural (n, 'имя', 'имени', 'имён') + ' за это время' : ''));
+}
+
+function dnsHelpNote (name, ips, ms)              // система ответила сама -- адрес в книгу: пригодится, когда она замолчит
+{
+    const list = (Array.isArray (ips) ? ips : [ips]).filter (x => x && !dohBadIp (x));
+    if (!list.length) return;
+    dnsNote (name, list, Number (ms) || 0, 'системный резолвер', 0, null).catch (() => { });
+}
+
+async function dnsHelpIps (name)                  // сперва книга (мгновенно), потом свои справочники
+{
+    const t0 = Date.now ();
+    try
+    {
+        const book = await dnsBookLoad ();
+        const rec = book[name];
+        if (rec && rec.ips && rec.ips.length)
+        {
+            const now = Date.now ();
+            const ttl = Math.max (DNS_TTL_MIN, Math.min (DNS_TTL_MAX, rec.ttl || DNS_TTL_DEF));
+            const fresh = rec.ips.filter (x => x && typeof x.ip === 'string' && !dohBadIp (x.ip) && !x.old &&
+                !(x.fail > 0 && (now - x.fail) < DNS_FAIL_ASLEEP) && (now - (x.at || 0)) < ttl);
+            if (fresh.length)
+            {
+                fresh.sort (dnsIpCmp (now));                        // подписанные и проверенные -- вперёд
+                return { ips: fresh.map (x => x.ip), how: 'из книги адресов', ms: Date.now () - t0 };
+            }
+        }
+    }
+    catch (e) { }
+    const got = await dnsAskSources (name, DNS_HELP_ASK_MS);
+    if (got && got.ips && got.ips.length)
+    {
+        try { await dnsNote (name, got.ips, got.ms, got.src, got.ttl, got.info); } catch (e) { }
+        return { ips: got.ips.slice (), how: 'спросил сам, ответил ' + got.src, ms: Date.now () - t0 };
+    }
+    dnsHelpFail++;
+    dnsHelpCount (false, 0, name);
+    return null;
+}
+
+function dnsLookupPatchInstall ()                 // ставится один раз, до входа в Discord
+{
+    const dns = require ('dns');
+    if (!dns || dns.__helpPatch) return;
+    const native = dns.lookup;
+    if (typeof native !== 'function') return;
+    const wrapped = function (host, options, callback)
+    {
+        if (typeof options === 'function') { callback = options; options = {}; }
+        options = options || {};
+        const name = String (host || '');
+        if (typeof callback !== 'function' || Number (options.family) === 6 || !dnsHelpName (name))
+            return native.call (dns, host, options, callback);      // всё, что не про Discord, -- как было
+
+        const t0 = Date.now ();
+        const all = !!options.all;
+        let done = false, orig = null, help = null, asked = false;
+        const finish = (err, address, family) =>
+        {
+            if (done) return;
+            done = true;
+            try { clearTimeout (timer); } catch (e) { }
+            callback (err, address, family);
+        };
+        const shape = ips => all ? ips.map (ip => ({ address: ip, family: 4 })) : ips[0];
+        const tryAnswer = () =>
+        {
+            if (done) return;
+            if (help && help.ips && help.ips.length)                 // свой ответ: книга или справочники
+            {
+                dnsHelpReport (name, help.how, help.ms);
+                dnsHelpNote (name, help.ips, 0);
+                return finish (null, shape (help.ips), 4);
+            }
+            if (help === false && orig)                              // ничего не нашёл -- слово системы, как раньше
+                return finish (orig.err, orig.address, orig.family);
+        };
+        const ask = () =>
+        {
+            if (asked) return;
+            asked = true;
+            dnsHelpIps (name).then (h => { help = h || false; tryAnswer (); }, () => { help = false; tryAnswer (); });
+        };
+        const timer = setTimeout (ask, DNS_HELP_WAIT_MS);            // система молчит -- отвечаю сам
+        try { if (timer.unref) timer.unref (); } catch (e) { }
+        try
+        {
+            native.call (dns, host, options, (err, address, family) =>
+            {
+                orig = { err: err, address: address, family: family };
+                if (done) return;
+                if (!err)                                            // система ответила -- верю ей, адрес -- в книгу
+                {
+                    const ips = all ? (Array.isArray (address) ? address.map (a => a && a.address) : [])
+                                    : (address ? [address] : []);
+                    dnsHelpNote (name, ips, Date.now () - t0);
+                    return finish (err, address, family);
+                }
+                ask ();
+                tryAnswer ();
+            });
+        }
+        catch (e) { finish (e); }
+    };
+    try { wrapped.__promisify__ = native.__promisify__; } catch (e) { }   // кто зовёт через promisify -- не ломается
+    dns.lookup = wrapped;
+    dns.__helpPatch = true;
+    if (BOT_RUN)
+        console.log ('[' + (d()) + '] [net] имена Discord (шлюз, голос, api) страхую сам: системный справочник не ответит или замолчит -- отвечу из книги адресов, а потом своим DoH (MUSIC.dns_help; выключить: false)');
 }
 
 async function dnsWarm ()               // книга живёт как справочник: у записи есть срок, истёк -- спрашиваю заново
@@ -11185,6 +11358,7 @@ function configCli ()
     row ('proxy', MUSIC_PROXIES.length ? MUSIC_PROXIES.join (', ') : 'нет -- напрямую (DIRECT)', hasM ('proxy') ? 'config.json' : (process.env.MUSIC_PROXY ? 'переменная окружения MUSIC_PROXY' : '-- (в файле нет)'));
     row ('doh (свой маршрут по адресам)', YN (MUSIC_DOH), hasM ('doh') ? 'config.json' : 'по умолчанию (вкл: имена разрешаю сам, системный DNS не участвует)');
     row ('dpi_heal (поднимать обход сам)', YN (MUSIC_DPI_HEAL), hasM ('dpi_heal') ? 'config.json' : 'по умолчанию (вкл: пробую поднять обход, когда ни один путь не отвечает)');
+    row ('dns_help (страховать имена Discord)', YN (DNS_HELP_ON), hasM ('dns_help') ? 'config.json' : 'по умолчанию (вкл: система замолчала -- разрешаю шлюз, голос и api сам, из книги и DoH)');
     row ('cookies_file', MUSIC_COOKIES_FILE || '-- (не задан)', hasM ('cookies_file') ? 'config.json' : '-- (в файле нет)');
     row ('cookies_from_browser (необязательный)', MUSIC_COOKIES_BROWSER || '-- (не задан)', hasM ('cookies_from_browser') ? 'config.json' : 'не нужен, если задан cookies_file');
     row ('normalize (громкость)', YN (MUSIC_NORMALIZE), hasM ('normalize') ? 'config.json' : 'по умолчанию (вкл)');
