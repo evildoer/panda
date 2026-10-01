@@ -18,6 +18,7 @@
 // v2.122 -- связки адресов: один адрес на много имён; первым идёт тот, через кого музыка уже шла
 // v2.123 -- голос: после обрыва бот сам возвращается к слушателям и продолжает с того же места; лог сети молчит без перемен
 // v2.139 -- поиск стал выбором: /play по названию больше не хватает первый попавшийся трек, а показывает список вариантов (12 с YouTube, каждый -- с автором и длиной) личным сообщением; отметки ставятся галочками в меню (можно несколько), «➕ Добавить отмеченное» ставит выбранное одной пачкой на имя выбирающего, а в канал уходит та же короткая строка, что и от обычного /play; адреса вариантов не выдумываются -- играет ровно выбранное; склейка названий работает только при слиянии источников (внутри одной выдачи разные записи одной песни -- это разные варианты, их не прячу), а SoundCloud ищется отдельной кнопкой «Ещё» со своим пределом времени -- на этой сети он доступен только через прокси, и держать его ожидание на всех нельзя; опция «сразу» возвращает прежнее поведение, а если поиск не прошёл, бот говорит причину и предлагает прислать ссылку
+// v2.140 -- по живым замечаниям владельца: в списке найденного есть кнопка «⬆ В начало моей пачки» -- отмеченные треки встают в НАЧАЛО своей пачки в очереди (не в начало очереди и не разрывая чужие; своей пачки ещё нет -- обычное добавление в конец), и там же видно, с какого номера начинается своя пачка; для видимости пачкой в /queue ничего запоминать не нужно -- выбранное и так встаёт блоком автора; /history больше не теряет SoundCloud: в записи виден источник, хранится настоящий адрес (у ютуба -- короткий id, как и было), поэтому «Поставить заново» и «Взять один трек» возвращают ровно ту находку, а у SC-пачки без адреса бот честно говорит искать заново; /health можно звать прямо в личке с ботом (команда лежит и в общем списке, иначе личка её не видит): в личке отвечает в личке, показывает сервер, где сейчас музыка, и кнопки проверки голоса помнят этот сервер; в /health видно и сколько раз бот сам страховал имена Discord; про пропавший трек с SoundCloud бот больше не говорит «видео больше нет на YouTube»; сбой при добавлении выбранного из поиска теперь называет причину, а не оставляет человека с «Добавляю…»
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -1377,7 +1378,7 @@ const STARTUP_DM_TEXT =
     '`/queue` -- что играет сейчас и что дальше: кто что поставил и сколько ещё ждать (сообщение обновляется само, пока музыка играет)\n' +
     '`/nowplaying` -- коротко про текущий трек: позиция, кто поставил, что дальше\n' +
     '`/history` -- кто и когда ставил музыку: последние добавления (треки, эфиры, плейлисты)\n' +
-    '`/health` -- здорова ли связь: сколько было обрывов голоса и сети, вернулся ли бот сам и каким путём сейчас идёт звук (у владельца есть кнопка «Проверить голос по-настоящему»)\n' +
+    '`/health` -- здорова ли связь: сколько было обрывов голоса и сети, вернулся ли бот сам и каким путём сейчас идёт звук (у владельца есть кнопка «Проверить голос по-настоящему»; у него же она работает и в личке с ботом)\n' +
     'Если в канале никого, музыка встаёт на паузу и продолжается, когда кто-то зашёл: бот помнит и трек, и место в нём -- перезапуск и обрыв связи их не сбрасывают.\n' +
     '\n' +
     '🔑 **Свой голосовой канал**\n' +
@@ -6206,6 +6207,7 @@ const
     ButtonBuilder,
     ButtonStyle,
     StringSelectMenuBuilder,
+    InteractionContextType,
 } = require ('discord.js');
 
 const MUSIC_CFG = MUSIC || {};
@@ -11809,11 +11811,11 @@ async function playNext (guildId)
     {
         const dead = m.tracks.shift ();
         deadDropNote (guildId);
-        console.error ('[' + (d()) + '] [music] видео больше нет на YouTube (проверено предзагрузкой): ' +
+        console.error ('[' + (d()) + '] [music] ' + goneWords (dead) + ' (проверено предзагрузкой): ' +
             (dead.title || 'трек') + ' -- убрал из очереди' +
             (dead.warn ? ' (этот трек проверка заранее помечала подозрительным)' : ''));
         if (!dead.goneTold)
-            trackNotice (guildId, dead, '🗑 **' + (dead.title || 'Трек') + '** -- видео больше нет на YouTube, убрал из очереди.');
+            trackNotice (guildId, dead, '🗑 **' + (dead.title || 'Трек') + '** -- ' + goneWords (dead) + ', убрал из очереди.');
     }
     while (m.tracks.length && !m.tracks[0]) { m.tracks.shift (); console.error ('[' + (d()) + '] [music] в очереди была пустая запись -- убрал'); }
     if (!m.tracks.length) return playNext (guildId);
@@ -11883,7 +11885,7 @@ async function playNext (guildId)
                 catch (e)
                 {
                     if (isGoneError (e))
-                        console.error ('[' + (d()) + '] [music] видео больше нет на YouTube (' + (track.title || 'трек') +
+                        console.error ('[' + (d()) + '] [music] ' + goneWords (track) + ' (' + (track.title || 'трек') +
                             ') -- запускать поток бессмысленно: ' + ytDlpErr (e, 120));
                     else
                         console.error ('[' + (d()) + '] [music] на диск не легло (' + (track.title || 'трек') +
@@ -11999,9 +12001,9 @@ async function playNext (guildId)
         m.current = null;
         deadDropNote (guildId);
         {
-            const _why = isGoneError (e) ? 'видео больше нет на YouTube' : ytDlpErr (e, 160);
+            const _why = isGoneError (e) ? goneWords (track) : ytDlpErr (e, 160);
             trackNotice (guildId, track, (isGoneError (e) ? '🗑 **' : '⚠️ **') + (track.title || 'Трек') +
-                '** -- ' + (isGoneError (e) ? 'видео больше нет на YouTube: убрал из очереди.'
+                '** -- ' + (isGoneError (e) ? goneWords (track) + ': убрал из очереди.'
                     : 'не запустился, пропускаю.' + (_why ? ' Причина: ' + _why : '')));
         }
         m.playFailStreak = (m.playFailStreak || 0) + 1;
@@ -12110,7 +12112,7 @@ function startPreload (guildId)
                 if (isGoneError (lastErr))
                 {
                     next.gone = true;
-                    console.error ('[' + (d()) + '] [music] видео больше нет на YouTube (' + (next.title || 'трек') +
+                    console.error ('[' + (d()) + '] [music] ' + goneWords (next) + ' (' + (next.title || 'трек') +
                         ') -- уберу его из очереди, когда дойдёт; очередь не трогаю: ' + ytDlpErr (lastErr, 120));
                     return null;
                 }
@@ -12150,7 +12152,7 @@ function startPreload (guildId)
                 {
                     if (!isGoneError (e) || next.gone) return;
                     next.gone = true;
-                    console.error ('[' + (d()) + '] [music] видео больше нет на YouTube (' + (next.title || 'трек') +
+                    console.error ('[' + (d()) + '] [music] ' + goneWords (next) + ' (' + (next.title || 'трек') +
                         ') -- уберу из очереди, когда дойдёт; очередь не трогаю: ' + ytDlpErr (e, 120));
                 });
             wireStreamErrors (m, next, r.resource, r.viaProxy, guildId);
@@ -12163,10 +12165,10 @@ function startPreload (guildId)
             if (isGoneError (e))
             {
                 next.gone = true;
-                console.error ('[' + (d()) + '] [music] видео больше нет на YouTube (' + (next.title || 'трек') +
+                console.error ('[' + (d()) + '] [music] ' + goneWords (next) + ' (' + (next.title || 'трек') +
                     ') -- уберу его из очереди, когда дойдёт; очередь не трогаю: ' + ytDlpErr (e, 120));
                 next.goneTold = true;
-                trackNotice (guildId, next, '🗑 **' + (next.title || 'Трек') + '** -- видео больше нет на YouTube: ' +
+                trackNotice (guildId, next, '🗑 **' + (next.title || 'Трек') + '** -- ' + goneWords (next) + ': ' +
                     'уберу из очереди, когда дойдёт. Поставь другой трек, если он нужен.');
                 return null;
             }
@@ -12193,10 +12195,10 @@ function wireStreamErrors (m, track, resource, viaProxy, guildId)
         }
         if (isGoneError (e))
         {
-            console.error ('[' + (d()) + '] [music] видео больше нет на YouTube (' + (track.title || 'трек') +
+            console.error ('[' + (d()) + '] [music] ' + goneWords (track) + ' (' + (track.title || 'трек') +
                 ') -- убираю из очереди: ' + ytDlpErr (e, 120));
             deadDropNote (guildId);
-            trackNotice (guildId, track, '🗑 **' + (track.title || 'Трек') + '** -- видео больше нет на YouTube, убираю из очереди.');
+            trackNotice (guildId, track, '🗑 **' + (track.title || 'Трек') + '** -- ' + goneWords (track) + ', убираю из очереди.');
             m.current = null;
             m.playedMs = 0;
             m.playingSince = null;
@@ -12905,6 +12907,23 @@ function byIdOf (t) { return (t && t.byId) ? String (t.byId) : ''; }
 function byNameOf (t) { return (t && t.byName) ? String (t.byName) : 'без автора'; }
 function isBy (t, id) { return !!id && byIdOf (t) === String (id); }
 
+// Откуда трек: у ютуба источник -- обычное дело, и его я нигде не подписываю; у остальных называю вслух
+// (SoundCloud в этой сети живёт только через прокси, и «видео больше нет на YouTube» про него -- неправда).
+function isScUrl (url) { return /soundcloud\.com/i.test (String (url || '')); }
+function srcNameOf (url)
+{
+    const s = String (url || '');
+    if (isScUrl (s)) return 'SoundCloud';
+    if (/youtube\.com|youtu\.be/i.test (s)) return '';
+    if (/bandcamp\.com/i.test (s)) return 'Bandcamp';
+    return /^https?:/i.test (s) ? 'не YouTube' : '';
+}
+function goneWords (track)
+{
+    const tag = srcNameOf (track && (track.url || track.streamUrl));
+    return tag ? tag + ' больше не отдаёт этот трек' : 'видео больше нет на YouTube';
+}
+
 function authorBlockInsertAt (tracks, byId)
 {
     if (!byId) return tracks.length;
@@ -12913,13 +12932,25 @@ function authorBlockInsertAt (tracks, byId)
     return tracks.length;
 }
 
+// Начало своей пачки -- для «поставить следующим» внутрь своего же блока.
+function authorBlockFirstAt (tracks, byId)
+{
+    if (!byId) return -1;
+    for (let i = 0; i < tracks.length; i++)
+        if (tracks[i] && isBy (tracks[i], byId)) return i;
+    return -1;
+}
+
 // Добавление треков в очередь -- один путь и для `/play` (ссылка или «сразу»), и для выбора из найденного
 // списка. Ничего не решает за зовущего: треки встают его блоком, будится предзагрузка, состояние сохраняется.
-function musicQueueTracks (m, guildId, tracks, userId)
+// `top` -- «в начало своей пачки»: своей пачки ещё нет -- это обычное добавление в конец запрошенного места.
+function musicQueueTracks (m, guildId, tracks, userId, opts = {})
 {
     const shouldStart = !!m.connection && !m.current;
     qGluePlaying (m);
-    const insAt = authorBlockInsertAt (m.tracks, userId);
+    const ownHead = opts.top ? authorBlockFirstAt (m.tracks, userId) : -1;
+    const topAt = ownHead >= 0;
+    const insAt = topAt ? ownHead : authorBlockInsertAt (m.tracks, userId);
     const blockBefore = insAt < m.tracks.length;
     m.tracks.splice (insAt, 0, ...tracks);
     scheduleVoiceStatus (guildId);
@@ -12927,7 +12958,7 @@ function musicQueueTracks (m, guildId, tracks, userId)
     scheduleDeadScan (guildId);
     if (!shouldStart) startPreload (guildId);
     saveMusicState (guildId);
-    return { shouldStart: shouldStart, insAt: insAt, blockBefore: blockBefore };
+    return { shouldStart: shouldStart, insAt: insAt, blockBefore: blockBefore, topAt: topAt };
 }
 
 // Где играю и надо ли переехать: одни и те же слова в /play и в выборе из поиска.
@@ -12972,7 +13003,7 @@ function musicAddApply (interaction, guildId, m, tracks, query, where, opts = {}
     }
     if (where && where.move) connectTo (interaction);
     m.textChannelId = interaction.channelId;
-    const ins = musicQueueTracks (m, guildId, tracks, interaction.user.id);
+    const ins = musicQueueTracks (m, guildId, tracks, interaction.user.id, { top: !!opts.top });
     historyAdd (guildId,
     {
         at: addedAt,
@@ -12984,15 +13015,20 @@ function musicAddApply (interaction, guildId, m, tracks, query, where, opts = {}
         titles: tracks.map (t => t.title || t.url || ''),
         q: query,
         urls: tracks.map (t => t.url || ''),
-        ids: tracks.map (t => ytKey (t.url)),
+        ids: tracks.map (t => historyAddrOf (t.url)),
     }).catch (e => console.error ('[music] история добавлений: ' + oneLine ((e && e.message) || e)));
+    const srcTag = srcNameOf (tracks[0].url || tracks[0].streamUrl);
     const text = (opts.head || '🎶 Добавлено') + ': **' + (tracks[0].title || query || tracks[0].url) + '**' +
+        (srcTag ? ' (' + srcTag + ')' : '') +
         (tracks.length > 1 ? ' + ещё ' + (tracks.length - 1) + ' треков' : '') +
-        '\nИсточник: `' + (tracks[0].author || '?') + '` | Длина: `' + fmtDur (tracks[0].duration, tracks[0].isLive) + '`' +
+        '\nКанал: `' + (tracks[0].author || '?') + '` | Длина: `' + fmtDur (tracks[0].duration, tracks[0].isLive) + '`' +
         ((where && where.note) || '') +
         (m.connection ? (ins.shouldStart ? '\n▶️ Запускаю...' : '') :
             '\n⏳ Я не в канале -- заиграю, когда позовёшь `/join`.') +
-        (ins.blockBefore ? '\n📚 Пачка встала в конец твоего блока в очереди (№' + ins.insAt + ').' : '');
+        (ins.topAt ? '\n📚 Пачка встала в начало твоей пачки в очереди (№' + (ins.insAt + 1) + ').' : '') +
+        (ins.blockBefore ? '\n📚 Пачка встала в конец твоего блока в очереди (№' + (ins.insAt + 1) + ').' : '') +
+        (opts.top && !ins.topAt && m.tracks.length > tracks.length
+            ? '\n📚 Своих треков в очереди не было -- поставил в конец, как обычно.' : '');
     queueMsgRedraw (guildId, 300).catch (() => {});
     if (ins.shouldStart) playNext (guildId);
     return { ins: ins, text: text, askMoveRow: (where && where.askMoveRow) || null };
@@ -13211,6 +13247,8 @@ function searchView (s)
         .setLabel (s.chosen.size ? '➕ Добавить отмеченное: ' + s.chosen.size : '➕ Добавить отмеченное')
         .setStyle (ButtonStyle.Success)
         .setDisabled (!s.chosen.size);
+    const ownQ = ($music[s.guildId] && Array.isArray ($music[s.guildId].tracks))
+        ? authorBlockFirstAt ($music[s.guildId].tracks, s.userId) : -1;
     const rows =
     [
         new ActionRowBuilder ().addComponents (sel),
@@ -13220,12 +13258,17 @@ function searchView (s)
             new ButtonBuilder ().setCustomId ('ps:e:' + s.tk)
                 .setLabel (s.moreBusy ? '⏳ Ищу у SoundCloud…' : (s.moreDone ? '🔁 Ещё раз: SoundCloud' : '➕ Ещё: SoundCloud'))
                 .setStyle (ButtonStyle.Secondary).setDisabled (!!s.moreBusy),
+            new ButtonBuilder ().setCustomId ('ps:t:' + s.tk)
+                .setLabel (s.top ? '⬆ Ставлю наверх своей пачки' : '⬆ В начало моей пачки')
+                .setStyle (s.top ? ButtonStyle.Primary : ButtonStyle.Secondary),
             new ButtonBuilder ().setCustomId ('ps:x:' + s.tk).setLabel ('✖ Закрыть').setStyle (ButtonStyle.Secondary)
         ),
     ];
     const content = '🔎 **Поиск: «' + s.query + '»**\n' +
         'Нашёл вариантов: **' + s.list.length + '**' + searchProvText (s) +
         '. Отметь нужные (можно несколько) и нажми «➕ Добавить отмеченное» -- каждый встанет в очередь на твоё имя.\n' +
+        (s.top ? '⬆ Ставлю **в начало твоей пачки**' + (ownQ >= 0 ? ' (она начинается с №' + (ownQ + 1) + ')' :
+            ' -- своих треков в очереди нет, поэтому встанут в конец, как обычно') + '; выключить -- та же кнопка.\n' : '') +
         (s.note ? s.note + '\n' : '') +
         (s.chosen.size ? '✅ Отмечено: **' + s.chosen.size + '**' : '');
     return { content: content, components: rows };
@@ -13250,7 +13293,7 @@ async function playSearchShow (interaction, query)
     {
         tk: tk, guildId: interaction.guildId, userId: interaction.user.id, query: query,
         list: r.list, keys: new Set (r.list.map (x => searchSame (x.t.title)).filter (Boolean)),
-        chosen: new Set (), note: '', moreDone: false, moreBusy: false, at: Date.now (),
+        chosen: new Set (), note: '', moreDone: false, moreBusy: false, top: false, at: Date.now (),
     };
     $search.set (tk, s);
     searchGc ();
@@ -13258,7 +13301,8 @@ async function playSearchShow (interaction, query)
     await interaction.editReply ({ content: view.content, components: view.components, allowedMentions: { parse: [] } });
 }
 
-// Нажатия в списке найденного: отметка (s), добавление отмеченного (a), поиск у SoundCloud (e), закрыть (x).
+// Нажатия в списке найденного: отметка (s), добавление отмеченного (a), поиск у SoundCloud (e), закрыть (x),
+// «в начало своей пачки» (t) -- куда встанут отмеченные.
 async function playSearchClick (interaction, kind, tk)
 {
     const s = $search.get (tk);
@@ -13273,6 +13317,12 @@ async function playSearchClick (interaction, kind, tk)
     if (kind === 's')
     {
         searchToggle (s, interaction.values);
+        const v = searchView (s);
+        return interaction.update ({ content: v.content, components: v.components, allowedMentions: { parse: [] } });
+    }
+    if (kind === 't')
+    {
+        s.top = !s.top;
         const v = searchView (s);
         return interaction.update ({ content: v.content, components: v.components, allowedMentions: { parse: [] } });
     }
@@ -13309,11 +13359,30 @@ async function playSearchClick (interaction, kind, tk)
     const callerVoice = interaction.member && interaction.member.voice ? interaction.member.voice.channel : null;
     const where = musicWhereNote (m, guildId, callerVoice);
     const who = interaction.member ? uuu (interaction.member) : interaction.user.username;
-    const done = musicAddApply (interaction, guildId, m, picks, s.query, where, { head: '🎶 **' + who + '** добавил' });
+    // Любая беда тут раньше оставляла человека с «⏳ Добавляю…» и без ответа -- теперь скажу вслух, что именно не вышло.
+    let done = null;
+    try
+    {
+        done = musicAddApply (interaction, guildId, m, picks, s.query, where,
+            { head: '🎶 **' + who + '** добавил', top: s.top });
+    }
+    catch (e)
+    {
+        console.error ('[' + (d()) + '] [music] (кто: ' + who + ') выбор из поиска не добавился: ' +
+            oneLine ((e && e.message) || e));
+        try
+        {
+            await interaction.editReply ({ content: '⚠️ Не смог добавить выбранное: `' +
+                oneLine ((e && e.message) || e, 150) + '`\n_Посмотри `/queue`: если трек там есть, всё в порядке; если нет -- вызови `/play` заново._', components: [] });
+        }
+        catch (e2) { }
+        return;
+    }
     try
     {
         await interaction.editReply ({ content: '✅ Добавил: **' + (picks[0].title || s.query) + '**' +
             (picks.length > 1 ? ' + ещё ' + (picks.length - 1) + ' треков' : '') +
+            (done.ins.topAt ? '\n📚 В начало твоей пачки (№' + (done.ins.insAt + 1) + ').' : '') +
             (m.connection ? '\nСмотри `/queue`.' : '\n⏳ Я не в канале -- заиграю, когда позовёшь `/join`.'), components: [] });
     }
     catch (e) { }
@@ -13535,7 +13604,7 @@ async function historySeedFromQueue (guildId)
         b.n++;
         if (t.isLive) b.live++;
         if (b.titles.length < HISTORY_TITLES_STORE) b.titles.push (t.title || t.url || '');
-        if (b.ids.length < 500) b.ids.push (ytKey (t.url));
+        if (b.ids.length < 500) b.ids.push (historyAddrOf (t.url));
         if (b.urls.length < 3 && /^https?:/i.test (String (t.url || ''))) b.urls.push (String (t.url).slice (0, 200));
     }
     const list = historyTrim ([...byKey.values ()].sort ((a, b) => b.at - a.at));
@@ -13665,7 +13734,8 @@ async function historyAdd (guildId, entry)
         titles: (entry.titles || []).slice (0, HISTORY_TITLES_STORE).map (t => String (t || '').slice (0, 90)),
         urls: (entry.urls || []).filter (u => /^https?:/i.test (String (u || '')))
             .slice (0, 3).map (u => String (u).slice (0, 200)),
-        ids: (entry.ids || []).slice (0, 500).map (s => String (s || '')).filter (Boolean),
+        ids: (entry.ids || []).slice (0, 500).map (s => String (s || '').slice (0, 200)).filter (Boolean),
+        src: entry.src || historySrcOfIds (entry.ids),
     });
     m.history = historyTrim (m.history);
     await historySave (guildId);
@@ -13680,6 +13750,42 @@ function ytKey (url)
     m = s.match (/\/shorts\/([\w-]{6,20})/);            if (m) return m[1];
     m = s.match (/^([\w-]{6,20})$/);                    if (m) return m[1];
     return s.slice (0, 60);
+}
+
+// Что кладу в историю, чтобы трек можно было поставить заново ровно тот же: у ютуба -- его id, у всех
+// прочих -- полный адрес (раньше он обрезался до 60 знаков и по нему уже ничего не открывалось).
+function historyAddrOf (url)
+{
+    const s = String (url || '');
+    if (!/^https?:/i.test (s)) return '';
+    if (/youtube\.com|youtu\.be/i.test (s)) return ytKey (s);
+    return s.slice (0, 190);
+}
+
+// Откуда пачка: ютуб -- обычное дело, SoundCloud и прочее называю вслух (видно в /history).
+function historySrcOfIds (ids)
+{
+    let yt = 0, sc = 0, other = 0;
+    for (const id of (Array.isArray (ids) ? ids : []))
+    {
+        const s = String (id || '');
+        if (!s) continue;
+        if (isScUrl (s)) sc++;
+        else if (/^[\w-]{6,20}$/.test (s)) yt++;
+        else other++;
+    }
+    if (sc && (yt || other)) return 'mix';
+    if (sc) return 'sc';
+    if (other && !yt) return 'other';
+    return 'yt';
+}
+function historySrcText (e)
+{
+    const s = String ((e && e.src) || '');
+    if (s === 'sc') return ' · SoundCloud';
+    if (s === 'mix') return ' · YouTube + SoundCloud';
+    if (s === 'other') return ' · не YouTube';
+    return '';
 }
 
 function historyBlocksOf (list)
@@ -13729,7 +13835,8 @@ function historyText (guildId, page = 1)
         (pages > 1 ? '\n_Дальше -- кнопками листания под сообщением._' : '');
     const budget = HISTORY_MSG_LIMIT - head.length - 2 - tail.length;
     const linkLine = b => '`' + stamp (b.at) + '`' + (b.times > 1 ? ' ×' + b.times : '') + ' ' +
-        (b.key ? '`' + b.key.slice (0, 90) + '`' : (historyTitlesOf (b.e)[0] || 'без названия'));
+        (b.key ? '`' + b.key.slice (0, 90) + '`' : (historyTitlesOf (b.e)[0] || 'без названия')) +
+        historySrcText (b.e);
     const titleLine = (n, t) => n + '. ' + (String (t).length > HISTORY_TITLE_CLIP
         ? String (t).slice (0, HISTORY_TITLE_CLIP - 1).trimEnd () + '…' : String (t));
     const previewOf = (b, per) =>
@@ -13809,7 +13916,9 @@ function historyTitlesOf (e)
 }
 function historyLinkOf (id)
 {
-    return /^[\w-]{6,20}$/.test (String (id || '')) ? 'https://youtu.be/' + id : '';
+    const s = String (id || '');
+    if (/^https?:\/\//i.test (s)) return s;                                 // запись хранит полный адрес
+    return /^[\w-]{6,20}$/.test (s) ? 'https://youtu.be/' + s : '';
 }
 const HISTORY_LINK_PAGE = 15;
 function historyPageSize (e)
@@ -13884,19 +13993,22 @@ function historyExpandRows (e, off, n)
     return [new ActionRowBuilder ().addComponents (...btns)];
 }
 
-function historyOneRow (part)
+// В меню «взять один трек» в значении идёт НОМЕР строки, а не адрес: у SoundCloud адрес не влезает
+// в предел Discord (100 знаков), а номер -- всегда. Сервер и пачку несёт сам значок кнопки.
+function historyOneRow (e, part, first)
 {
     const opts = [], seen = new Set ();
-    for (const p of (Array.isArray (part) ? part : []))
+    for (let i = 0; i < (Array.isArray (part) ? part.length : 0); i++)
     {
-        const id = String ((p && p.id) || '');
-        if (!id || seen.has (id) || !historyLinkOf (id)) continue;
-        seen.add (id);
-        opts.push ({ label: clipped ('⤓ ' + (p.title || id), 100), value: id });
+        const p = part[i];
+        const link = historyLinkOf (p && p.id);
+        if (!link || seen.has (link)) continue;
+        seen.add (link);
+        opts.push ({ label: clipped ('⤓ ' + (p.title || link), 100), value: String (first + i) });
     }
     if (!opts.length) return null;
     const sel = new StringSelectMenuBuilder ()
-        .setCustomId ('q:hget')
+        .setCustomId ('q:hget:' + (Number (e && e.at) || 0))
         .setPlaceholder ('⤓ Взять в очередь ОДИН трек из этой страницы…');
     sel.addOptions (opts);
     return new ActionRowBuilder ().addComponents (sel);
@@ -13909,7 +14021,8 @@ function historyExpandView (e, off)
     const total = historySizeOf (e);
     const head = '📜 **Состав пачки** -- `' + historyStamp (e.at) + '` ' + (e.byName || 'без автора') + ': ' +
         total + ' ' + plural (total, 'трек', 'трека', 'треков') +
-        ((e.live && e.n > 1) ? ' (' + e.live + ' 🔴 ' + plural (e.live, 'эфир', 'эфира', 'эфиров') + ')' : '');
+        ((e.live && e.n > 1) ? ' (' + e.live + ' 🔴 ' + plural (e.live, 'эфир', 'эфира', 'эфиров') + ')' : '') +
+        historySrcText (e);
     if (!titles.length)
         return { text: head + '\n_' + 'Состав не сохранён -- запись старая: тогда сохранялись'
             + ' только первые три названия (в /history они видны).' +
@@ -13924,7 +14037,7 @@ function historyExpandView (e, off)
     {
         const link = historyLinkOf (pairs[i] && pairs[i].id);
         lines.push (String (i + 1).padStart (2, ' ') + '. ' + clipped (titles[i], HISTORY_EXPAND_CLIP) +
-            (link ? ' — ' + link : ''));
+            (link ? ' — ' + clipped (link, 80) : ''));
     }
     const notes = [];
     if (titles.length < total)
@@ -13934,7 +14047,7 @@ function historyExpandView (e, off)
     if (e.q) notes.push ('запуск: `' + clipped (e.q, 60) + '` -- кнопкой «▶ Поставить заново» эта пачка вернётся в очередь целиком');
     else notes.push ('поставить заново не смогу: в записи нет того, что вводили в /play (запись старая или пачка перенесена из очереди)');
     const rows = historyExpandRows (e, off, titles.length);
-    const oneRow = historyOneRow (pairs.slice (first, first + size));
+    const oneRow = historyOneRow (e, pairs.slice (first, first + size), first);
     if (oneRow)
     {
         rows.push (oneRow);
@@ -13947,6 +14060,25 @@ function historyExpandView (e, off)
     return { text: text, rows: rows, titles: titles.length };
 }
 
+const HISTORY_READD_EXACT_MAX = 8;      // больше не берусь открывать по одному адресу: каждый -- отдельный запрос
+
+// Адреса из записи -- самый верный способ поставить ровно то же самое: и YouTube, и SoundCloud.
+// Работает, когда запись сохранила адрес для каждого трека пачки (старые записи -- только через поиск).
+function historyExactUrls (e)
+{
+    const pairs = historyPairsOf (e);
+    const n = historySizeOf (e);
+    if (!pairs.length || pairs.length !== n || n > HISTORY_READD_EXACT_MAX) return [];
+    const urls = [];
+    for (const p of pairs)
+    {
+        const l = historyLinkOf (p.id);
+        if (!l) return [];
+        urls.push (l);
+    }
+    return urls;
+}
+
 async function historyReAdd (guildId, at, userId, byName, inCh)
 {
     const m = musicOf (guildId);
@@ -13955,14 +14087,30 @@ async function historyReAdd (guildId, at, userId, byName, inCh)
     if (!e)
         return { ok: false, text: '🕘 Этой пачки в истории уже нет -- она ушла по лимиту. Вызови `/history` заново.' };
     const q = String (e.q || '').trim ();
-    if (!q)
-        return { ok: false, text: '🕘 В записи этой пачки нет того, что вводили в `/play` '
+    const exact = historyExactUrls (e);
+    if (!exact.length && !q)
+        return { ok: false, text: '🕘 В записи этой пачки нет ни адресов, ни того, что вводили в `/play` '
             + '(запись старая или пачка перенесена из очереди) -- добавь её заново ссылкой в `/play`.' };
-    let tracks;
-    try { tracks = isUrl (q) ? await playlistInfo (q) : [await trackInfo ('ytsearch1:' + q)]; }
+    if (!exact.length && e.src === 'sc')
+        return { ok: false, text: '🕘 Это пачка с SoundCloud, а адресов в записи нет -- найди её заново '
+            + 'поиском в `/play` (кнопка «➕ Ещё: SoundCloud»).' };
+    const from = exact.length ? exact[0] : q;
+    let tracks = [];
+    try
+    {
+        if (exact.length)
+        {
+            for (const u of exact)
+            {
+                const t = await trackInfo (u).catch (() => null);
+                if (t) tracks.push (t);
+            }
+        }
+        else tracks = isUrl (q) ? await playlistInfo (q) : [await trackInfo ('ytsearch1:' + q)];
+    }
     catch (err)
     {
-        return { ok: false, text: '❌ Не смог поставить заново (`' + clipped (q, 60) + '`): `' + ytDlpErr (err, 150) + '`' };
+        return { ok: false, text: '❌ Не смог поставить заново (`' + clipped (from, 60) + '`): `' + ytDlpErr (err, 150) + '`' };
     }
     if (!tracks.length)
         return { ok: false, text: '❌ Пустой результат -- похоже, этой пачки больше нет.' };
@@ -13987,7 +14135,7 @@ async function historyReAdd (guildId, at, userId, byName, inCh)
         at: addedAt, byId: userId, byName: byName, inCh: inCh, n: tracks.length,
         live: tracks.filter (t => t.isLive).length,
         titles: tracks.map (t => t.title || t.url || ''),
-        q: q, urls: tracks.map (t => t.url || ''), ids: tracks.map (t => ytKey (t.url)),
+        q: q, urls: tracks.map (t => t.url || ''), ids: tracks.map (t => historyAddrOf (t.url)),
     }).catch (err => console.error ('[music] история добавлений: ' + oneLine ((err && err.message) || err)));
     if (m.connection && !m.current) playNext (guildId);
     const live = tracks.filter (t => t.isLive).length;
@@ -13996,14 +14144,17 @@ async function historyReAdd (guildId, at, userId, byName, inCh)
         (live ? ' (' + live + ' 🔴 ' + plural (live, 'эфир', 'эфира', 'эфиров') + ')' : '') +
         '\n' + QSMALL + 'место в очереди: №' + (insAt + 1) + '-' + (insAt + tracks.length) +
         ' (в конце твоего блока, как обычный `/play`); всего в очереди: ' + m.tracks.length +
-        '\n' + QSMALL + 'источник: `' + clipped (q, 80) + '`\n' +
+        (exact.length && tracks.length < exact.length
+            ? '\n' + QSMALL + 'адресов в записи: ' + exact.length + ', открылось ' + tracks.length +
+              ' -- остальные я сейчас взять не смог' : '') +
+        '\n' + QSMALL + 'источник: `' + clipped (from, 80) + '`\n' +
         QSMALL + '_В очередь их поставил ты: бот едет к автору играющего трека, иначе он уехал бы к тому, кого в канале нет._' };
 }
 
-async function historyReAddOne (guildId, keyId, userId, byName, inCh)
+async function historyReAddOne (guildId, addr, userId, byName, inCh)
 {
     const m = musicOf (guildId);
-    const url = historyLinkOf (keyId);
+    const url = historyLinkOf (addr);
     if (!url)
         return { ok: false, text: '🕘 У этого трека в записи нет адреса -- поставить его можно только заново (ссылкой в `/play`).' };
     let t;
@@ -14031,7 +14182,7 @@ async function historyReAddOne (guildId, keyId, userId, byName, inCh)
     {
         at: addedAt, byId: userId, byName: byName, inCh: inCh, n: 1,
         live: t.isLive ? 1 : 0,
-        titles: [t.title || url], q: url, urls: [t.url || ''], ids: [ytKey (t.url)],
+        titles: [t.title || url], q: url, urls: [t.url || ''], ids: [historyAddrOf (t.url)],
     }).catch (err => console.error ('[music] история добавлений: ' + oneLine ((err && err.message) || err)));
     if (m.connection && !m.current) playNext (guildId);
     return { ok: true, text: '⤓ **Взял из пачки -- в очередь:** ' + (t.title || url) +
@@ -16308,7 +16459,10 @@ async function netHealthText (m, guildId, viewerId)      // ответ на /hea
         'прокси: ' + (MUSIC_PROXIES.length
             ? (rs.alive.length ? 'отвечает' + (owner ? ' (' + rs.alive.join (', ') + ')' : '') : 'задан, но молчит')
             : 'не задан'),
-        'свой маршрут по адресам: ' + (rs.dohPort ? 'включён' + (rs.bookN ? ', в книге ' + rs.bookN + ' имён' : '') : 'выключен'),
+        'свой маршрут по адресам: ' + (rs.dohPort ? 'включён' + (rs.bookN ? ', в книге ' + rs.bookN + ' имён' : '') : 'выключен') +
+            ((dnsStats && dnsStats.__help && dnsStats.__help.ok)
+                ? ', сам подстраховал имена Discord: ' + dnsStats.__help.ok + ' ' +
+                  plural (dnsStats.__help.ok, 'раз', 'раза', 'раз') : ''),
     ].join ('; '));
     const keep = await dpiKeeperState ();
     lines.push ('👁 Сторож обхода (хранитель): ' + keeperWords (keep) +
@@ -16323,6 +16477,75 @@ async function netHealthText (m, guildId, viewerId)      // ответ на /hea
             (canStart ? '\n_Сохранённая стратегия есть: её вернёт кнопка «Поднять обход» -- один запрос прав и пара секунд._' : ''));
     return { text: lines.join ('\n'), fix: fix, canStart: canStart, owner: owner };
 }
+
+// Какой сервер показывать в личке: у личного сообщения своего сервера нет, а /health говорит о музыке,
+// голосе и очереди. Показываю тот, где музыка живёт сейчас; если нигде -- первый разрешённый сервер.
+function healthGuildId ()
+{
+    let best = '', bestScore = 0;
+    for (const gid of Object.keys ($music))
+    {
+        if (!gid || gid === 'null' || !(gid in SERVERS)) continue;
+        const m = $music[gid];
+        if (!m) continue;
+        const score = (m.connection ? 4 : 0) + (m.current ? 2 : 0) + ((m.tracks && m.tracks.length) ? 1 : 0);
+        if (score > bestScore) { bestScore = score; best = gid; }
+    }
+    if (best) return best;
+    for (const gid of Object.keys (SERVERS)) if (SERVERS[gid].allow) return gid;
+    return '';
+}
+
+// /health: в канале -- ответ там же и тайно (адреса прокси и обхода видит только владелец), в личке --
+// ответ в личке. Кнопки проверки голоса несут номер сервера: у кнопки в личке своего сервера тоже нет.
+async function musicHealthCommand (interaction)
+{
+    if (!isBotOwner (interaction.user.id))
+        return interaction.reply ({ content: '🚫 `/health` -- личная команда владельца бота.', flags: MessageFlags.Ephemeral });
+    // Команда лежит и в общем списке (иначе личка её не видит), поэтому она может прийти с чужого сервера:
+    // там у бота нет ни музыки, ни голоса -- говорю об этом прямо, а не отвечаю пустотой.
+    if (interaction.guildId && !(interaction.guildId in SERVERS))
+        return interaction.reply ({ content: '🚫 Этот сервер боту не настроен: музыки и голоса здесь у него нет.\n' +
+            '_Зови `/health` на своём сервере или в личке._', flags: MessageFlags.Ephemeral });
+    const inDm = !interaction.guildId;
+    await interaction.deferReply (inDm ? undefined : { flags: MessageFlags.Ephemeral });   // в канале -- тайно, в личке -- просто в личке
+    let guildId = interaction.guildId;
+    let where = '';
+    if (inDm)
+    {
+        guildId = healthGuildId ();
+        const g = guildId ? client.guilds.cache.get (guildId) : null;
+        const live = !!(guildId && $music[guildId] && ($music[guildId].connection || $music[guildId].current ||
+            ($music[guildId].tracks || []).length));
+        where = guildId
+            ? '✉️ Это личка: показываю сервер «' + ((g && g.name) || guildId) + '»' + (live ? ' -- там сейчас музыка.' : '.')
+            : '✉️ Это личка, и серверов с музыкой сейчас нет -- расскажу про связь как есть.';
+    }
+    const m = guildId ? musicOf (guildId) : null;
+    const hr = await netHealthText (m, guildId, interaction.user.id);
+    const rows = [];
+    let hText = (where ? where + '\n' : '') + hr.text;
+    if (hr.owner)
+    {
+        const rowV = new ActionRowBuilder ();
+        rowV.addComponents (new ButtonBuilder ().setCustomId ('h:voice:real' + (guildId ? ':' + guildId : ''))
+            .setLabel ('🔊 Проверить голос по-настоящему').setStyle (ButtonStyle.Primary));
+        rows.push (rowV);
+        hText += '\n_«Проверить голос» -- по-настоящему: если я уже в канале и к медиа-адресу ходят пакеты, отвечу сразу и ничего не прерву; иначе выйду из канала на несколько секунд, проверю медиа-адрес и верну музыку на то же место (вход пробую дважды -- первый может не успеть после выхода). Если войти не выйдет, а музыка до проверки играла, так и скажу: голос сейчас работает, не вышло только новое подключение._';
+    }
+    if (hr.fix)
+    {
+        const row = new ActionRowBuilder ();
+        if (hr.canStart)
+            row.addComponents (new ButtonBuilder ().setCustomId ('h:dpi:start').setLabel ('▶ Поднять обход').setStyle (ButtonStyle.Success));
+        row.addComponents (new ButtonBuilder ().setCustomId ('h:dpi:pick').setLabel ('🛠 Подобрать обход').setStyle (ButtonStyle.Danger));
+        rows.push (row);
+        hText += '\n_Кнопки про обход делают то, где нужны права: Windows спросит разрешение' +
+            (hr.canStart ? '; «поднять» вернёт сохранённую стратегию за пару секунд, «подобрать» -- переберёт все (на это время обход останавливается)' : ', на время подбора обход останавливается') + '._';
+    }
+    return interaction.editReply (rows.length ? { content: hText, components: rows } : { content: hText });
+}
+
 async function dpiStartFromDiscord ()            // кнопка у владельца: поднять сохранённую стратегию
 {
     if (dpiHealBusy) { await notifyHoster ('🛠 Сейчас занят обходом -- допишу, когда закончу.'); return; }
@@ -16869,10 +17092,10 @@ function joinVoiceNow (guildId, voiceChannel, guild, reason = '')
                 let _dropped = false;
                 if (playing && !asked && isGoneError (_deadErr))
                 {
-                    console.error ('[' + (d()) + '] [music] видео больше нет на YouTube (' + (playing.title || 'трек') +
+                    console.error ('[' + (d()) + '] [music] ' + goneWords (playing) + ' (' + (playing.title || 'трек') +
                         ') -- убираю из очереди: ' + ytDlpErr (_deadErr, 120));
                     deadDropNote (guildId);
-                    trackNotice (guildId, playing, '🗑 **' + (playing.title || 'Трек') + '** -- видео больше нет на YouTube, убираю из очереди.');
+                    trackNotice (guildId, playing, '🗑 **' + (playing.title || 'Трек') + '** -- ' + goneWords (playing) + ', убираю из очереди.');
                     m.current = null;
                     m.playedMs = 0;
                     m.playingSince = null;
@@ -17204,6 +17427,13 @@ function isUrl (s)
     return /^https?:\/\//i.test (s);
 }
 
+// /health зовут и в канале, и в личке. В личке работают только команды, поставленные на все серверы
+// сразу, поэтому /health есть и в общем списке (в серверах его перекрывает та же команда на месте).
+const healthCommand = new SlashCommandBuilder ()
+    .setName ('health')
+    .setDescription ('Здорова ли связь: обрывы голоса и сети и каким путём сейчас идёт звук (видит только владелец)')
+    .setContexts (InteractionContextType.Guild, InteractionContextType.BotDM);
+
 const musicCommands =
 [
     new SlashCommandBuilder ()
@@ -17377,9 +17607,7 @@ const musicCommands =
     new SlashCommandBuilder ()
         .setName ('nowplaying')
         .setDescription ('Что играет сейчас: трек, позиция, кто поставил и что дальше'),
-    new SlashCommandBuilder ()
-        .setName ('health')
-        .setDescription ('Здорова ли связь: обрывы голоса и сети и каким путём сейчас идёт звук (видит только владелец)'),
+    healthCommand,
     new SlashCommandBuilder ()
         .setName ('history')
         .setDescription ('История добавлений: кто, когда и что поставил (треки, эфиры, плейлисты)'),
@@ -17457,6 +17685,15 @@ async function registerMusicCommands ()
                     _code === 404 ? ' -- Discord не знает такое приложение (404): проверь ID приложения (или TOKEN -- они от одного приложения?)' :
                         _code === 403 ? ' -- у бота нет права ставить команды на этом сервере (403)' : ''));
         }
+    }
+    try
+    {
+        await rest.put (Routes.applicationCommands (appId), { body: [healthCommand] });
+        console.log ('[' + (d()) + '] [music] /health поставлен и на все серверы сразу -- теперь он работает и в личке с ботом');
+    }
+    catch (e)
+    {
+        console.error ('[music] не смог поставить /health в личку: ' + e.message);
     }
 }
 
@@ -17628,16 +17865,20 @@ client.on ('interactionCreate', async (interaction) =>
     if (interaction.isButton () || interaction.isStringSelectMenu ())
     {
         const cid = interaction.customId || '';
-        const guildId = interaction.guildId;
-        if (!(guildId in SERVERS)) return;
-        if (/^h:voice:real$/.test (cid))
+        // Кнопки /health работают и в личке: у личного сообщения своего сервера нет, поэтому проверка голоса
+        // несёт номер сервера в себе, а кнопки обхода от сервера не зависят вовсе.
+        const mHv = /^h:voice:real(?::(\d{5,25}))?$/.exec (cid);
+        const mHdpi = /^h:dpi:(?:start|pick)$/.test (cid);
+        const guildId = (mHv && mHv[1]) ? mHv[1] : interaction.guildId;
+        if (!(guildId in SERVERS) && !mHv && !mHdpi) return;
+        if (mHv)
         {
             if (!isBotOwner (interaction.user.id))
                 return interaction.reply ({ content: '🚫 По-настоящему проверять голос может только владелец бота.', flags: MessageFlags.Ephemeral });
             if (voiceRealBusy)
                 return interaction.reply ({ content: '🔊 Уже проверяю -- допишу сюда, когда закончу.', flags: MessageFlags.Ephemeral });
             voiceRealBusy = true;
-            await interaction.deferReply ({ flags: MessageFlags.Ephemeral });
+            await interaction.deferReply (interaction.guildId ? { flags: MessageFlags.Ephemeral } : undefined);
             try
             {
                 const r = await voiceRealCheck (guildId);
@@ -17670,7 +17911,7 @@ client.on ('interactionCreate', async (interaction) =>
             dpiPickFromDiscord ().catch (() => { });
             return;
         }
-        const mPs = /^ps:(s|a|x|e):([a-z0-9]{1,12})$/.exec (cid);
+        const mPs = /^ps:(s|a|x|e|t):([a-z0-9]{1,12})$/.exec (cid);
         if (mPs)
             return playSearchClick (interaction, mPs[1], mPs[2]);
         const m = musicOf (guildId);
@@ -17777,7 +18018,11 @@ client.on ('interactionCreate', async (interaction) =>
         const mHre = /^q:hre:(\d+)$/.exec (cid);
         if (mHre)
         {
-            await interaction.update ({ content: '⏳ Ставлю пачку заново (спрашиваю YouTube)...', components: [] });
+            await historyLoad (guildId);
+            const eBack = historyFind (m.history, mHre[1]);
+            const srcBack = eBack ? srcNameOf ((eBack.urls || [])[0] || '') : '';
+            await interaction.update ({ content: '⏳ Ставлю пачку заново' +
+                (srcBack ? ' (спрашиваю ' + srcBack + ')' : ' (спрашиваю YouTube)') + '...', components: [] });
             const res = await historyReAdd (guildId, mHre[1], interaction.user.id,
                 interaction.user.username, interaction.channelId);
             console.log ('[' + (d()) + '] [music] (кто: ' + who + ') поставил пачку из /history заново: ' +
@@ -17785,13 +18030,25 @@ client.on ('interactionCreate', async (interaction) =>
             queueMsgRedraw (guildId, 300).catch (() => {});
             return interaction.editReply ({ content: (res.ok ? '' : '⚠️ ') + res.text });
         }
-        if (cid === 'q:hget')
+        const mHget = /^q:hget(?::(\d+))?$/.exec (cid);
+        if (mHget)
         {
-            const idGet = String ((interaction.values || [])[0] || '');
-            if (!historyLinkOf (idGet))
+            const val = String ((interaction.values || [])[0] || '');
+            let addr = '';
+            if (mHget[1])
+            {
+                // новая схема: в значении -- номер строки, адрес лежит в самой записи
+                await historyLoad (guildId);
+                const eOne = historyFind (m.history, mHget[1]);
+                const pOne = eOne ? historyPairsOf (eOne)[parseInt (val, 10) || 0] : null;
+                addr = pOne ? historyLinkOf (pOne.id) : '';
+            }
+            else addr = historyLinkOf (val);        // старое сообщение: в значении был сам адрес
+            if (!addr)
                 return interaction.update ({ content: '🕘 Этот трек взять не из чего -- в записи нет его адреса.', components: [] });
-            await interaction.update ({ content: '⏳ Беру трек из пачки (спрашиваю YouTube)...', components: [] });
-            const one = await historyReAddOne (guildId, idGet, interaction.user.id,
+            await interaction.update ({ content: '⏳ Беру трек из пачки' +
+                (isScUrl (addr) ? ' (спрашиваю SoundCloud)' : ' (спрашиваю YouTube)') + '...', components: [] });
+            const one = await historyReAddOne (guildId, addr, interaction.user.id,
                 interaction.user.username, interaction.channelId);
             console.log ('[' + (d()) + '] [music] (кто: ' + who + ') взял из пачки /history один трек: ' +
                 (one.ok ? 'ок' : 'не вышло'));
@@ -18538,6 +18795,18 @@ client.on ('interactionCreate', async (interaction) =>
             '\nСохрани его отдельно от config.json -- без него записи базы не читаются. Перезапуск не нужен.');
     }
     if (!['play','join','stop','skip','pause','resume','seek','queue','nowplaying','history','health','leave','remove','clear','jump','move','push','repeat','repeat-list','filter'].includes (name)) return;
+    if (name === 'health')
+    {
+        // своя ветка: /health зовут и в личке, где сервера нет
+        return musicHealthCommand (interaction).catch (e =>
+        {
+            console.error ('[music] ошибка /health: ' + oneLine ((e && e.message) || e, 150));
+            const text = '❌ Ошибка: ' + String ((e && e.message) || e).slice (0, 150);
+            return (interaction.deferred || interaction.replied)
+                ? interaction.editReply (text).catch (() => {})
+                : interaction.reply ({ content: text, flags: MessageFlags.Ephemeral }).catch (() => {});
+        });
+    }
     const guildId = interaction.guildId;
     const m = musicOf (guildId);
     const qRedraw = (ms = 300) => queueMsgRedraw (guildId, ms).catch (() => {});
@@ -18736,35 +19005,6 @@ client.on ('interactionCreate', async (interaction) =>
         else if (name === 'nowplaying')
         {
             return interaction.reply (nowPlayingText (m, guildId, interaction.user.id));
-        }
-        else if (name === 'health')
-        {
-            if (!isBotOwner (interaction.user.id))      // там адреса прокси и обхода -- их нельзя показывать всем
-                return interaction.reply ({ content: '🚫 `/health` -- личная команда владельца бота.', flags: MessageFlags.Ephemeral });
-            await interaction.deferReply ({ flags: MessageFlags.Ephemeral });   // ответ виден только тому, кто спросил
-
-            const hr = await netHealthText (m, guildId, interaction.user.id);
-            const rows = [];
-            let hText = hr.text;
-            if (hr.owner)
-            {
-                const rowV = new ActionRowBuilder ();
-                rowV.addComponents (new ButtonBuilder ().setCustomId ('h:voice:real')
-                    .setLabel ('🔊 Проверить голос по-настоящему').setStyle (ButtonStyle.Primary));
-                rows.push (rowV);
-                hText += '\n_«Проверить голос» -- по-настоящему: если я уже в канале и к медиа-адресу ходят пакеты, отвечу сразу и ничего не прерву; иначе выйду из канала на несколько секунд, проверю медиа-адрес и верну музыку на то же место (вход пробую дважды -- первый может не успеть после выхода). Если войти не выйдет, а музыка до проверки играла, так и скажу: голос сейчас работает, не вышло только новое подключение._';
-            }
-            if (hr.fix)
-            {
-                const row = new ActionRowBuilder ();
-                if (hr.canStart)
-                    row.addComponents (new ButtonBuilder ().setCustomId ('h:dpi:start').setLabel ('▶ Поднять обход').setStyle (ButtonStyle.Success));
-                row.addComponents (new ButtonBuilder ().setCustomId ('h:dpi:pick').setLabel ('🛠 Подобрать обход').setStyle (ButtonStyle.Danger));
-                rows.push (row);
-                hText += '\n_Кнопки про обход делают то, где нужны права: Windows спросит разрешение' +
-                    (hr.canStart ? '; «поднять» вернёт сохранённую стратегию за пару секунд, «подобрать» -- переберёт все (на это время обход останавливается)' : ', на время подбора обход останавливается') + '._';
-            }
-            return interaction.editReply (rows.length ? { content: hText, components: rows } : { content: hText });
         }
         else if (name === 'history')
         {
