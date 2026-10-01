@@ -23,6 +23,7 @@
 // v2.133 -- присмотр говорит и о поломке, которую видит впервые: если служба обхода есть и работает (или сторож есть), а движка winws.exe нет -- это уже не «не поднимали», а поломка, и владельцу уходит то же письмо (раньше оно требовало, чтобы предыдущая проверка видела движок живым); плюс исправлена ошибка запуска: включатель присмотра стоял выше своих настроек и валил старт бота (Cannot access 'DPI_STAT_EVERY_MS' before initialization)
 // v2.136 -- письмо хозяину уходит только в личку: отчеты о здоровье бота (обход, служба, драйвер, права, пиджи, куски журнала) больше не сыплются в общий журнал сервера -- там техподробностям не место; копию в журнал сервера хозяин может включить сам ключом owner_mail_in_log_channel в config.json (по умолчанию выключено), и в `node . config` видно, откуда взято это решение
 // v2.135 -- по разбору живого лога (шлюз не резолвился, подбор шёл впустую): консольная команда больше не поднимает бота (из-за этого `node . obhod --pick --voice` шёл при живом боте, хотя режим требует обратного), сторож голоса следит и по служебному каналу голоса (пропущенные проверки связи и его пинг -- вторая пропущенная значит гарантированный обрыв), а если медиа-адрес не отвечает на наш udp-пинг, сторож не выключается, а честно говорит, что следит по служебному каналу; [poll] больше не винит интент при обрыве сети, [queue] и [gw] не сыпят одной строкой на каждый проход, подбор называет причину падения winws.exe и прекращается, если движок не стартует вообще
+// v2.137 -- по живым замечаниям владельца: кнопка «Проверить голос по-настоящему» больше не пугает зря -- если музыка шла, а заново войти не вышло, бот говорит прямо, что голос сейчас работает и не вышло только новое подключение, называет шаг, на котором застрял (не пришёл адрес голосового сервера или не ответил медиа-адрес -- вместо библиотечного «The operation was aborted»), и пробует войти второй раз после короткой паузы; если вернуться не вышло совсем, музыка остаётся ждать сеть и бот возвращается сам, как после настоящего обрыва; строка маршрута в /queue и /nowplaying больше не называет адреса прокси (они -- владельцу в /health и `node . net`), из /health убрана повторная просьба про сторожа обхода (владелец решил его не ставить), а отказ Discord 40032 «цель не в голосовом канале» при снятии мута/глухоты больше не печатает стек -- это не поломка бота
 // v2.132 -- свой маршрут по адресам засчитывается путём для музыки только если проверен делом: бот раз в 10 минут прогоняет через него yt-dlp и, если тот не дошёл, за путь его не считает и говорит об этом прямо (проверка самим ботом, а не «мне кажется, работает»)
 // v2.131 -- голос видно по-настоящему: в /health у владельца есть кнопка «Проверить голос по-настоящему» -- если бот в канале и к медиа-адресу ходят пакеты (udp-пинг), она отвечает сразу и музыку не трогает, а если пинга нет -- выходит из канала, входит заново (это и есть проверка медиа-адреса), возвращает музыку на то же место и пишет результат; в самой /health видно и пинг медиа-пути
 // v2.130 -- обход под присмотром и видно, кто за ним следит: сторож (он же хранитель -- пункт 6 в tools/obhod.cmd) сам переподбирает стратегию, автозапуск (пункт 7) только поднимает сторожа при входе, и это решает человек; при старте, если ни один путь к YouTube не работает, владельцу уходит короткое «что сделать сейчас» с готовой командой; дальше бот следит за службой zapret, движком и сторожем -- встал обход или сторожа нет, напишет и скажет, что поставить, а когда поднимется -- сообщит отдельно; состояние сторожа видно в /health и `node . obhod`
@@ -3588,6 +3589,18 @@ function logVoiceEvent (oldState, newState)
     catch (e) { console.error ('[voice] ошибка записи в лог: ' + e.message); }
 }
 
+// Снятие мута/глухоты после выхода из канала: если человек уже не в голосовом, Discord отвечает 40032
+// «Target user is not connected to voice» -- это не поломка бота, и стеком пугать не надо.
+function voiceEditQuiet (p, what)
+{
+    if (!p || typeof p.catch !== 'function') return;
+    p.catch (e =>
+    {
+        const code = (e && e.code) || (e && e.rawError && e.rawError.code);
+        if (code === 40032 || code === 10013) return;      // уже не в канале -- снимать нечего
+        console.error ('[' + (d()) + '] [voice] ' + what + ': ' + oneLine ((e && e.message) || e));
+    });
+}
 client.on ('voiceStateUpdate', async (oldState, newState) =>
 {
     const server = newState.guild.id;
@@ -3636,15 +3649,9 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
         if (newState.channel === null && newState.channelId)
         {
             if (newState.serverMute)
-            {
-                newState.setMute (false)
-                .catch (console.error);
-            }
+                voiceEditQuiet (newState.setMute (false), 'снятие мута при выходе из канала');
             if (newState.serverDeaf)
-            {
-                newState.setDeaf (false)
-                .catch (console.error);
-            }
+                voiceEditQuiet (newState.setDeaf (false), 'снятие глухоты при выходе из канала');
         }
         if (newState.channel && newState.channel.id)
         {
@@ -3664,14 +3671,12 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                 {
                     if (newState.serverMute)
                     {
-                        newState.setMute (false)
-                        .catch (e => console.error ('[voiceStateUpdate] общий канал, снятие мута: ' + e.message));
+                        voiceEditQuiet (newState.setMute (false), 'общий канал, снятие мута');
                         appealLog (server, newState);
                     }
                     if (newState.serverDeaf)
                     {
-                        newState.setDeaf (false)
-                        .catch (e => console.error ('[voiceStateUpdate] общий канал, снятие глухоты: ' + e.message));
+                        voiceEditQuiet (newState.setDeaf (false), 'общий канал, снятие глухоты');
                         console.log ('[' + (d()) + '] [voice] общий канал: снят деф с ' + uuu (newState.member));
                     }
                     return;
@@ -12266,6 +12271,8 @@ async function loginWithIntentFallback ()
 
 const VOICE_CHECK_LOGIN_S = 30;
 const VOICE_CHECK_MS = 25000;
+const VOICE_TRY_MS = 10000;      // проверка голоса кнопкой: одна попытка входа (вторая -- после короткой паузы)
+const VOICE_TRY_PAUSE_MS = 2000; // после выхода Discord и библиотека ещё доделывают его -- даю им пару секунд
 if (/^voice$/i.test (String (process.argv[2] || '')))
 {
     const _want = String (process.argv[3] || '').trim ();
@@ -12341,20 +12348,24 @@ if (/^voice$/i.test (String (process.argv[2] || '')))
         catch (e) { return _fin (1, 'не смог начать подключение: ' + oneLine ((e && e.message) || e)); }
         const _onErr = e => { if (!_why) _why = oneLine ((e && e.message) || e); };
         _conn.on ('error', _onErr);
+        let _stage = '';
         _conn.on ('stateChange', (o, n) =>
         {
+            if (n && n.status) _stage = n.status;
             if (!_why && n && n.status === VoiceConnectionStatus.Disconnected) _why = 'связь оборвалась сразу после подключения';
         });
         let _ok = false;
         try { await entersState (_conn, VoiceConnectionStatus.Ready, VOICE_CHECK_MS); _ok = true; }
         catch (e) { if (!_why) _why = oneLine ((e && e.message) || e); }
         const _sec = ((Date.now () - _t0) / 1000).toFixed (1);
+        const _stuck = _ok ? '' : voiceJoinStage (_stage || (_conn && _conn.state && _conn.state.status));
         try { _conn.destroy (); } catch (e) { }
         if (_ok)
             return _fin (0, 'голос работает: канал «' + _ch.name + '» поднялся за ' + _sec +
                 ' с (медиа-адрес ответил) -- музыка заиграет');
         return _fin (1, 'голос НЕ работает: канал «' + _ch.name + '» не поднялся за ' + (VOICE_CHECK_MS / 1000) +
-            ' с' + (_why ? ' (' + _why + ')' : '') + ' -- пока это не наладится, музыка играть не сможет');
+            ' с' + (_stuck ? ': ' + _stuck : '') + (_why ? ' (' + _why + ')' : '') +
+            ' -- пока это не наладится, музыка играть не сможет');
     }) ();
 }
 
@@ -14884,28 +14895,35 @@ function netWaitText (m)
         '; очередь и место в треке держатся';
 }
 
-function netRouteText (guildId, viewerId)
+function netRouteText (guildId, viewerId)   // строка для сообщений в канале: БЕЗ адресов (их видит кто угодно)
 {
     if (!isBotOwner (viewerId)) return '';
     const bits = [];
     const u = routeUseOf (guildId);
     const inUseBad = !!(u && u.proxy && proxyBrieflyBad (u.proxy));
+    let addr = false;
     if (u)
     {
         bits.push (u.kind === 'disk'
             ? '🌐 Маршрут: не нужен -- этот трек играю с диска'
-            : '🌐 Маршрут: ' + (u.proxy ? 'прокси ' + u.proxy : 'DIRECT (напрямую)') +
+            : '🌐 Маршрут: ' + (u.proxy ? 'прокси' : 'DIRECT (напрямую)') +
               (inUseBad ? ' (сейчас со сбоем)' : ''));
+        if (u.proxy) addr = true;
         const spare = MUSIC_PROXIES.filter (p => p !== u.proxy && !proxyBrieflyBad (p));
-        if (spare.length) bits.push ('запасной: ' + spare[0]);
+        if (spare.length) { bits.push ('запасной: есть'); addr = true; }
     }
     if (MUSIC_PROXIES.length && directProbeCache.ok === false && dnsCache.ok !== false)
         bits.push ('⚠ DIRECT не отвечает (' + (directProbeCache.why || 'нет ответа') +
             ') -- если прокси отвалится, музыка подождёт сеть');
     const bad = MUSIC_PROXIES.filter (p => proxyBrieflyBad (p) && !(u && String (u.proxy) === String (p)));
     if (bad.length)
-        bits.push ('со сбоем: ' + bad.map (p => p + ' (ещё ' +
-            fmtAgo (Math.max (0, (proxyBadUntil.get (String (p)) || 0) - Date.now ())) + ')').join (', '));
+    {
+        bits.push ('со сбоем: ' + bad.length + ' шт');
+        addr = true;
+    }
+    // Адреса прокси -- только владельцу и только там, где сообщение видит он один: /health и `node . net`.
+    // В /queue и /nowplaying это общий текст канала, поэтому его читает любой, кто в этом канале.
+    if (addr && isBotOwner (viewerId)) bits.push ('адреса -- в /health и `node . net`');
     return bits.length ? QSMALL + bits.join (' · ') : '';
 }
 
@@ -15514,6 +15532,33 @@ function voicePingNow (m)
     }
     catch (e) { return null; }
 }
+function voiceJoinStage (status)                  // на каком шаге застрял вход -- своими словами, без «The operation was aborted»
+{
+    if (status === VoiceConnectionStatus.Signalling)
+        return 'Discord не прислал адрес голосового сервера (служебная связь не ответила)';
+    if (status === VoiceConnectionStatus.Connecting)
+        return 'служебная связь ответила, а медиа-адрес нет (проверка udp не прошла)';
+    if (status === VoiceConnectionStatus.Disconnected)
+        return 'связь оборвалась сразу после подключения';
+    return '';
+}
+async function voiceJoinTry (ch, guild, ms)       // одна попытка войти; при неудаче соединение закрываю
+{
+    let conn = null, why = '';
+    try
+    {
+        conn = joinVoiceChannel ({ channelId: ch.id, guildId: guild.id, adapterCreator: guild.voiceAdapterCreator, selfDeaf: false });
+        await entersState (conn, VoiceConnectionStatus.Ready, ms);
+        return { conn: conn, ok: true, why: '', stuck: '' };
+    }
+    catch (e)
+    {
+        why = oneLine ((e && e.message) || e);
+        const stuck = voiceJoinStage ((conn && conn.state && conn.state.status) || '');
+        try { if (conn) conn.destroy (); } catch (e2) { }
+        return { conn: null, ok: false, why: why, stuck: stuck };
+    }
+}
 async function voiceRealCheck (guildId)           // кнопка владельца: проверить голос по-настоящему
 {
     const m = musicOf (guildId);
@@ -15538,24 +15583,49 @@ async function voiceRealCheck (guildId)           // кнопка владель
     {
         try { destroyMusic (guildId); } catch (e) { }
     }
-    let conn = null, ok = false, why = '';
-    try
+    let tries = 0;
+    let tr = await voiceJoinTry (ch, guild, VOICE_TRY_MS);          // первая попытка
+    tries++;
+    if (!tr.ok)                                   // первый вход мог не успеть после выхода -- даю связи пару секунд и пробую ещё раз
     {
-        conn = joinVoiceChannel ({ channelId: ch.id, guildId: guildId, adapterCreator: guild.voiceAdapterCreator, selfDeaf: false });
-        await entersState (conn, VoiceConnectionStatus.Ready, VOICE_CHECK_MS);
-        ok = true;
+        await new Promise (res => setTimeout (res, VOICE_TRY_PAUSE_MS));
+        tr = await voiceJoinTry (ch, guild, VOICE_TRY_MS);
+        tries++;
     }
-    catch (e) { why = oneLine ((e && e.message) || e); }
-    const p2 = voicePingNow ({ connection: conn });
-    try { if (conn) conn.destroy (); } catch (e) { }
+    const ok = tr.ok, why = tr.why, stuck = tr.stuck;
+    const p2 = voicePingNow ({ connection: tr.conn });
+    try { if (tr.conn) tr.conn.destroy (); } catch (e) { }
+    let waiting = false, back = false;
     if (wasIn)                                        // возвращаю музыку тем же путём, что после обрыва связи
     {
         try { startRestored (guildId, ch, guild); } catch (e) { }
+        const m2 = $music[guildId];
+        back = !!(m2 && m2.connection);
+        if (m2)
+        {
+            if (back) m2.netWait = null;              // музыка вернулась -- ждать сети нечего
+            else
+            {
+                // вернуться не вышло: музыка ждёт сеть, как после настоящего обрыва, и я вернусь сам
+                m2.leftByUser = false;
+                m2.savedChannelId = ch.id;
+                if (!m2.netWait)
+                    m2.netWait = { tries: 0, at: Date.now (), lastWhy: 'проверка голоса: не смог вернуться в канал', rejoinAt: 0, rejoinLogged: false };
+                if (!m2.voiceOut) voiceOutageStart (guildId, 'проверка голоса: не смог вернуться в канал');
+            }
+            waiting = !!(m2.connection && m2.pending);
+        }
     }
-    const r = { ok: ok, how: 'join', ms: Date.now () - t0, chName: ch.name, why: why, ping: p2, wasIn: wasIn, wasPlaying: wasPlaying, where: wasWhere };
-    console.log ('[' + (d()) + '] [music] настоящая проверка голоса: канал «' + ch.name + '» ' +
-        (ok ? 'поднялся за ' + (r.ms / 1000).toFixed (1) + ' с (медиа-адрес ответил)' : 'не поднялся за ' + (VOICE_CHECK_MS / 1000) + ' с (' + why + ')') +
-        (wasIn ? (wasPlaying ? '; вернул музыку на ' + fmtDur (wasWhere) : '; слушателей и музыки не было') : '; бот в канале не сидел -- только замерил'));
+    const r = { ok: ok, how: 'join', ms: Date.now () - t0, chName: ch.name, why: why, stuck: stuck, ping: p2,
+        wasIn: wasIn, wasPlaying: wasPlaying, where: wasWhere, waiting: waiting, back: back, tries: tries };
+    const _what = ok ? 'поднялся за ' + (r.ms / 1000).toFixed (1) + ' с' + (tries > 1 ? ' (со второй попытки)' : '') + ' (медиа-адрес ответил)'
+        : (wasIn && wasPlaying ? 'заново не поднялся за ' : 'не поднялся за ') + (r.ms / 1000).toFixed (1) + ' с' +
+          (tries > 1 ? ' (пробовал дважды)' : '') + (stuck ? ' -- застрял: ' + stuck : '') + (why ? ' (' + why + ')' : '');
+    console.log ('[' + (d()) + '] [music] настоящая проверка голоса: канал «' + ch.name + '» ' + _what +
+        (wasIn ? (wasPlaying
+            ? (back ? (waiting ? '; музыка в канале и ждёт слушателя' : '; музыку вернул на ' + fmtDur (wasWhere))
+                    : '; музыку вернуть не вышло -- жду сеть и вернусь сам')
+            : '; слушателей и музыки не было') : '; бот в канале не сидел -- только замерил'));
     return r;
 }
 function voiceRealText (r, chName)
@@ -15576,8 +15646,26 @@ function voiceRealText (r, chName)
             (r.wasIn
                 ? (r.wasPlaying ? '_Музыка вернулась в канал и продолжает с того же места (' + fmtDur (r.where) + ')._' : '_Вернулся в канал сам._')
                 : '_В канале я не сижу -- это был только замер, музыка не тронута._');
+    if (r.wasIn && r.wasPlaying)
+    {
+        // Музыка шла до проверки, значит голос работал; не вышло только НОВОЕ подключение.
+        // Говорю это честно: пугать «голос не работает» тут нельзя.
+        if (r.back)
+            return '🔊 **Голос сейчас работает -- а заново войти не получилось.**\n' +
+                '_До проверки я был в канале «' + r.chName + '» и музыка шла. Я вышел, чтобы проверить медиа-адрес, и за ' +
+                sec + ' с войти обратно не успел' + (r.tries > 1 ? ' (пробовал дважды)' : '') + (r.stuck ? ': ' + r.stuck : '') + '._\n' +
+                (r.waiting ? '_Музыка снова в канале и ждёт слушателя (помню ' + fmtDur (r.where) + '). Как зайдёшь -- продолжу._'
+                    : '_Музыку вернул на то же место (' + fmtDur (r.where) + ') -- играет._') + '\n' +
+                '_Раз музыка слышна, голос в порядке: не вышло только новое подключение. Значит, после обрыва связи вернуться сразу может не получиться -- повтори проверку позже (`node . voice` при выключенном боте расскажет подробнее)._';
+        return '🔊 **Проверка сорвала музыку: войти заново не вышло.**\n' +
+            '_До проверки я был в канале «' + r.chName + '» и музыка шла, а войти обратно за ' + sec +
+            ' с не получилось' + (r.tries > 1 ? ' (пробовал дважды)' : '') + (r.stuck ? ': ' + r.stuck : '') + '._\n' +
+            'Это уже похоже на беду на пути к серверам голоса, а не на саму проверку: я вернусь сам, как только связь ответит (место в треке и очередь помню).\n' +
+            'Что смотреть: обход DPI и прокси в `/health` выше; подробнее -- `node . voice` при выключенном боте.';
+    }
     return '🔊 **Голос по-настоящему: НЕ работает.**\n' +
-        '_Канал «' + r.chName + '» не поднялся за ' + (VOICE_CHECK_MS / 1000) + ' с' + (r.why ? ' (' + r.why + ')' : '') + '._\n' +
+        '_Канал «' + r.chName + '» не поднялся за ' + sec + ' с' + (r.tries > 1 ? ' (пробовал дважды)' : '') +
+        (r.stuck ? ': ' + r.stuck : (r.why ? ' (' + r.why + ')' : '')) + '._\n' +
         'Пока это не наладится, музыка играть не сможет: голос -- это единственное, без чего её не слышно.\n' +
         'Что смотреть: обход DPI и прокси (в `/health` выше), затем проверить голос отдельно, при выключенном боте: `node . voice` (он делает тот же замер, но дольше и подробнее).' +
         (r.wasIn ? '\n_Музыка вернулась в канал и ждёт._' : '');
@@ -15639,12 +15727,9 @@ async function netHealthText (m, guildId, viewerId)      // ответ на /hea
     lines.push ('👁 Сторож обхода (хранитель): ' + keeperWords (keep) +
         (keep.proc ? ' -- значит обход чинится сам, каждые пару минут.'
             : keep.task ? ' -- поднимется сам при входе в систему; если обход встанет, замечу и напишу.'
-            : ' -- если обход встанет, я это замечу и напишу, но чинить придётся вручную: в `tools\\obhod.cmd` пункт 6 ставит сторожа, пункт 7 -- он же в автозапуске.'));
-    lines.push (rs.advice.replace (/^-- /, ''));
+            : ' -- если обход встанет, я это замечу и напишу; сам он не поднимется (ни после сбоя, ни после перезагрузки компьютера).'));
+    lines.push ('💡 ' + rs.advice.replace (/^-- /, ''));
     const fix = !!(owner && rs.noPath && rs.dpi !== true && MUSIC_DPI_HEAL);
-    if (!rs.noPath && rs.dpi === true && !keep.proc && !keep.task)
-        lines.push ((owner ? '👁 Обход никто не сторожит: он работает' : '👁 Обход работает, но его никто не сторожит') +
-            ' -- если он встанет, я это замечу и напишу, а чинить придётся вручную (`tools\\obhod.cmd`, пункт 6).');
     const canStart = !!(fix && fsMod.existsSync (DPI_CHOSEN));
     if (fix)
         lines.push ('🛠 Поднять обход я попробую сам: движок и хранителя из планировщика -- без прав; если не хватит прав -- напишу, каких именно.' +
@@ -18143,7 +18228,7 @@ client.on ('interactionCreate', async (interaction) =>
                 rowV.addComponents (new ButtonBuilder ().setCustomId ('h:voice:real')
                     .setLabel ('🔊 Проверить голос по-настоящему').setStyle (ButtonStyle.Primary));
                 rows.push (rowV);
-                hText += '\n_«Проверить голос» -- по-настоящему: если я уже в канале и к медиа-адресу ходят пакеты, отвечу сразу и ничего не прерву; иначе выйду из канала на несколько секунд, проверю медиа-адрес и верну музыку на то же место._';
+                hText += '\n_«Проверить голос» -- по-настоящему: если я уже в канале и к медиа-адресу ходят пакеты, отвечу сразу и ничего не прерву; иначе выйду из канала на несколько секунд, проверю медиа-адрес и верну музыку на то же место (вход пробую дважды -- первый может не успеть после выхода). Если войти не выйдет, а музыка до проверки играла, так и скажу: голос сейчас работает, не вышло только новое подключение._';
             }
             if (hr.fix)
             {
