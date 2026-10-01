@@ -25,8 +25,8 @@
 // v2.143 -- по живому случаю 22:57 (тревога «обход перестал помогать», а музыка играла): обход стережёт и ЗАПАСНЫЕ пути.
 // Раньше тревога поднималась, если не отвечал только ПРЯМОЙ путь, -- хотя музыка в это время шла через прокси или из
 // диска (в логе письмо кричало об аварии, пока треки качались через прокси за 4 секунды). Теперь при мёртвом прямом
-// бот сначала ПО-НАСТОЯЩЕМУ проверяет прокси (запрос к ютубу через него) и свой маршрут по адресам (yt-dlp), и «обход
-// перестал помогать» говорится только когда молчат ВСЕ пути; есть запасной -- в журнал уходит одна спокойная строка,
+// бот сначала ПО-НАСТОЯЩЕМУ проверяет прокси (yt-dlp через него -- им же ходит и музыка) и свой маршрут по адресам
+// (тоже yt-dlp), и «обход перестал помогать» говорится только когда молчат ВСЕ пути; есть запасной -- в журнал уходит одна спокойная строка,
 // а владельцу ничего (после запасного и «снова помогает» молчит: прямой путь флапает, письма сыпались бы на каждый
 // флап). В письме об аварии видно, что запасные пути проверены, а в письме сторожа -- что музыка идёт запасным.
 // Заодно исправлены «устаревшие» кнопки под /queue: белый список кнопок в interactionCreate не знал «▶ Играющим» (mz),
@@ -6450,6 +6450,33 @@ async function dohCarryCheck ()          // по-настоящему: дохо�
         : 'музыку НЕ везёт (' + why + ') -- путём для музыки его не считаю'));
     return dohCarry;
 }
+const PROXY_CARRY_TTL = 10 * 60000;      // «прокси везёт музыку» помню 10 минут: проверка не бесплатная
+const PROXY_CARRY_FAIL_TTL = 2 * 60000;  // «не везёт» -- только 2 минуты: yt-dlp спотыкается и зря, попробую ещё раз
+const proxyCarry = new Map ();           // адрес -> { ok, at, why }
+const proxyCarryBusy = new Map ();       // адрес -> идущая проверка (двумя проходами одно и то же не гоняю)
+async function proxyCarryCheck (addr)    // по-настоящему: доходит ли yt-dlp до YouTube через этот прокси (им же ходит и музыка)
+{
+    const a = String (addr || '');
+    if (!a) return { ok: false, at: 0, why: 'адрес пуст' };
+    const c = proxyCarry.get (a);
+    if (c && (Date.now () - c.at) < (c.ok ? PROXY_CARRY_TTL : PROXY_CARRY_FAIL_TTL)) return c;
+    const busy = proxyCarryBusy.get (a);
+    if (busy) return await busy;
+    const job = (async () =>
+    {
+        const r = await ytdlpRunOnce (['--proxy', a, '--simulate', '--no-warnings',
+            '--skip-download', '--print', 'id', DOH_CARRY_URL], 45000);
+        const ok = !!(r && r.code === 0 && /\S/.test (String (r.out || '')));
+        const out = { ok: ok, at: Date.now (), why: ok ? '' : ((r && r.code === -1) ? 'yt-dlp через прокси не ответил за 45 с'
+            : 'yt-dlp через прокси не дошёл' + (r && r.err ? ': ' + oneLine (r.err, 120) : '')) };
+        proxyCarry.set (a, out);
+        console.log ('[' + (d()) + '] [music] прокси ' + a + ' ' + (ok ? 'везёт музыку: yt-dlp через него дошёл до YouTube'
+            : 'музыку НЕ везёт (' + out.why + ') -- живым путём его не считаю'));
+        return out;
+    }) ();
+    proxyCarryBusy.set (a, job);
+    try { return await job; } finally { proxyCarryBusy.delete (a); }
+}
 const DOH_PROBE_TIMEOUT = 6000;          // свой маршрут поднимается и разрешает имя не сразу, поэтому жду дольше прямого
 const DOH_PROBE_FAIL_TTL = 10000;        // «не ответил» помню недолго: со второй попытки он обычно уже работает
 let dohProbeCache = { ok: false, why: '', at: 0 };
@@ -6875,14 +6902,17 @@ async function dpiStrategyHealth (why)           // обход работает,
     const dp = dnsOk ? await directProbe () : { ok: false, why: 'youtube.com локально не резолвится' };
     const disc = await dpiDiscordState ();
     const ytOk = !!dp.ok;                                  // прямой путь: тревога только если и ЗАПАСНЫЕ пути молчат
-    // Прямой путь молчит -- проверяю запасные ПО-НАСТОЯЩЕМУ: ютуб через прокси (лёгкий запрос) и свой маршрут (yt-dlp).
+    // Прямой путь молчит -- проверяю запасные ПО-НАСТОЯЩЕМУ, живым yt-dlp: сначала прокси, потом свой маршрут по адресам.
+    // (лёгким HTTPS-запросом через прокси проверить нельзя: HTTP-инбаунд VPN в живом логе не тянет CONNECT, а socks-агента
+    // в зависимостях нет -- поэтому спрашиваю ровно того, кто везёт музыку, и его же ответу и верю.)
     // Раньше считался только прямой путь, и тревога «обход перестал помогать» поднималась, пока музыка играла через
     // прокси или шла из диска (так и вышло 22:57: музыка играла, а письмо кричало об аварии).
     let spareWhy = '';
     if (!ytOk && MUSIC_PROXIES.length)
         for (const p of MUSIC_PROXIES)
-            if ((await oembedProbe (DOH_CARRY_URL, p)) !== 'neterr')
+            if (await pingProxy (p, 1500))                       // сначала дешёвая проверка: порт прокси вообще отвечает
             {
+                if (!(await proxyCarryCheck (p)).ok) continue;   // потом настоящая: доходит ли через него yt-dlp (им же ходит и музыка)
                 proxyMarkGood (p);
                 spareWhy = 'прокси ' + p + ' ютуб везёт';
                 break;
@@ -16764,10 +16794,10 @@ function proxyAgentFor (addr)
 }
 
 const YT_URL_RE = /^https?:\/\/(?:www\.|m\.|music\.)?youtube\.com\/(?:watch|shorts|live|embed)|^https?:\/\/youtu\.be\//i;
-async function oembedProbe (url, viaProxy)     // viaProxy: проверить ровно через этот адрес (без него -- маршрут, которым пойдёт музыка)
+async function oembedProbe (url)
 {
     if (!YT_URL_RE.test (String (url || ''))) return 'unknown';
-    const proxyAddr = (viaProxy === undefined) ? await proxyForFetch () : String (viaProxy || '');
+    const proxyAddr = await proxyForFetch ();
     return new Promise (resolve =>
     {
         let httpsMod;
