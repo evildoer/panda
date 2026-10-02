@@ -133,6 +133,12 @@
 // Теперь предел настраиваемый (MUSIC.playlist_max, по умолчанию 200, 0 -- без предела) и назван при старте;
 // если треков больше предела, /play честно говорит, сколько их всего и что лимит можно поднять в config.json.
 // Заодно пустые записи (недоступные видео) отбрасываются, а не роняют разбор списка.
+// v2.156 -- по просьбе владельца: большой плейлист можно брать частями, не поднимая предел. Под ответом /play
+// появилась кнопка «➕ Добавить остаток (N)»: она берёт следующий кусок того же плейлиста через --playlist-start
+// (проверено живьём: с 171-го yt-dlp отдаёт 7 записей из 177 и по-прежнему называет, сколько всего), обновляет
+// ТО ЖЕ сообщение и честно говорит, сколько взято и сколько осталось; взяли всё -- кнопка исчезает. Записи
+// живут в памяти 6 часов (в id -- соль процесса), поэтому кнопка из старого сообщения после перезапуска честно
+// отвечает «меню устарело», а не путает плейлисты; при сбое сети кнопка остаётся, и можно нажать ещё раз.
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -10357,15 +10363,22 @@ async function trackInfo (query)
     };
 }
 
-async function playlistInfo (query)
+// start -- с какого НОМЕРА (нумерация с 1) брать список: так большой плейлист берётся частями (--playlist-start),
+// не поднимая предел. yt-dlp и в этом режиме называет, сколько всего в списке (playlist_count).
+async function playlistInfo (query, start = 0)
 {
-    const info = await ytDlpRun (query, { dumpSingleJson: true, noWarnings: true, flatPlaylist: true });
+    const from = Math.max (0, Math.floor (Number (start) || 0));   // 0 -- с начала
+    const args = { dumpSingleJson: true, noWarnings: true, flatPlaylist: true };
+    if (from > 0) args.playlistStart = from;
+    const info = await ytDlpRun (query, args);
     if (!info._type || info._type !== 'playlist')
-        return { tracks: [await trackInfo (query)], total: 1, limit: 0 };
+        return { tracks: [await trackInfo (query)], total: 1, limit: 0, url: query, start: 1, taken: 1 };
     // Пустые записи (недоступные видео в списке) отбрасываю, а не падаю на них.
     const all = (Array.isArray (info.entries) ? info.entries : []).filter (e => e && (e.url || e.webpage_url || e.id));
-    const total = all.length;
-    const entries = (MUSIC_PLAYLIST_MAX > 0 && total > MUSIC_PLAYLIST_MAX) ? all.slice (0, MUSIC_PLAYLIST_MAX) : all;
+    const at = from > 0 ? from : 1;
+    const named = Math.max (0, Math.floor (Number (info.playlist_count) || 0));
+    const total = Math.max (named, at - 1 + all.length);
+    const entries = (MUSIC_PLAYLIST_MAX > 0 && all.length > MUSIC_PLAYLIST_MAX) ? all.slice (0, MUSIC_PLAYLIST_MAX) : all;
     const tracks = entries.map
     (
         e =>
@@ -10379,7 +10392,7 @@ async function playlistInfo (query)
             thumbnail: e.thumbnail || '',
         })
     );
-    return { tracks: tracks, total: total, limit: MUSIC_PLAYLIST_MAX };
+    return { tracks: tracks, total: total, limit: MUSIC_PLAYLIST_MAX, url: query, start: at, taken: tracks.length };
 }
 
 // Список урезан -- говорим об этом прямо, а не молчим: человек должен знать и сколько всего, и где предел.
@@ -10387,10 +10400,146 @@ function playlistWarnText (info)
 {
     const total = Number (info && info.total) || 0;
     const taken = Number (info && info.tracks && info.tracks.length) || 0;
-    if (!(info && Number (info.limit) > 0 && total > taken)) return '';
+    if (!(info && Number (info.start || 1) <= 1 && Number (info.limit) > 0 && total > taken)) return '';
     return '\n⚠️ В плейлисте ' + total + ' ' + plural (total, 'трек', 'трека', 'треков') +
         ' -- за один /play беру первые ' + taken + ' (лимит MUSIC.playlist_max, по умолчанию 200).' +
         ' Чтобы взять все, подними лимит в config.json (0 -- без предела) и позови /play с этой же ссылкой снова.';
+}
+
+// v2.156: «➕ Добавить остаток» -- большой плейлист берётся частями, не поднимая предел. Память короткая:
+// после перезапуска кнопка честно отвечает, что меню устарело (как и меню поиска), поэтому в записи лежат адрес,
+// сколько уже взято, сколько всего и время; в id добавлена случайная соль процесса, чтобы старая кнопка из прежнего
+// сообщения не попала в новую запись с тем же номером.
+const PLREST_TTL_MS = 6 * 60 * 60 * 1000;
+const PLREST_MAX = 100;
+const PLREST_SALT = Math.random ().toString (36).slice (2, 6);
+let plrestSeq = 0;
+const $plrest = new Map ();
+
+function plrestSweep (now = Date.now ())
+{
+    for (const [id, rec] of $plrest)
+        if (!rec || (now - (Number (rec.at) || 0)) > PLREST_TTL_MS) $plrest.delete (id);
+    while ($plrest.size > PLREST_MAX)
+    {
+        let oldId = null, oldAt = Infinity;
+        for (const [id, rec] of $plrest)
+            if ((Number (rec && rec.at) || 0) < oldAt) { oldAt = Number (rec.at) || 0; oldId = id; }
+        if (oldId === null) break;
+        $plrest.delete (oldId);
+    }
+}
+
+// Сколько в списке осталось ПОСЛЕ взятого куска.
+function playlistMoreOf (info)
+{
+    const at = Math.max (1, Math.floor (Number (info && info.start) || 1));
+    const done = at - 1 + (Math.floor (Number (info && info.taken)) || 0);
+    return Math.max (0, (Math.floor (Number (info && info.total)) || 0) - done);
+}
+
+function plrestRow (id, more)
+{
+    return new ActionRowBuilder ().addComponents
+    (
+        new ButtonBuilder ()
+            .setCustomId ('q:plr:' + id)
+            .setLabel (('➕ Добавить остаток (' + more + ')').slice (0, 80))
+            .setStyle (ButtonStyle.Primary)
+    );
+}
+
+// Кнопка «остаток» для ответа /play: заводит запись и возвращает строку-пояснение и ряд с кнопкой.
+function playlistRestMake (info, guildId, userId, byName)
+{
+    const more = playlistMoreOf (info);
+    if (!(more > 0 && Number (info && info.limit) > 0 && String ((info && info.url) || ''))) return null;
+    const id = PLREST_SALT + (++plrestSeq).toString (36);
+    $plrest.set (id,
+    {
+        url: String (info.url),
+        guildId: String (guildId || ''),
+        total: Math.floor (Number (info.total)) || 0,
+        taken: (Math.max (1, Math.floor (Number (info.start) || 1)) - 1) + (Math.floor (Number (info.taken)) || 0),
+        byId: String (userId || ''),
+        byName: String (byName || ''),
+        at: Date.now (),
+        busy: false,
+    });
+    plrestSweep ();
+    return { id: id, more: more, row: plrestRow (id, more),
+        text: '\n📄 Осталось в плейлисте: ' + more + ' ' + plural (more, 'трек', 'трека', 'треков') +
+            ' -- кнопка ниже возьмёт следующие ' + Math.min (more, MUSIC_PLAYLIST_MAX) + ' (как обычный /play).' };
+}
+
+// Ответ на нажатие «остатка»: правлю то же сообщение, а если его уже нет -- отвечаю лично (как принято у /queue).
+async function plrestReply (interaction, content, components)
+{
+    try { return await interaction.editReply ({ content: content, components: components }); }
+    catch (e)
+    {
+        return interaction.followUp ({ content: content, components: components, flags: MessageFlags.Ephemeral })
+            .catch (() => {});
+    }
+}
+
+// Нажатие «➕ Добавить остаток»: беру следующий кусок того же плейлиста и обновляю то же сообщение.
+async function playRestClick (interaction, guildId, m, id, ctx)
+{
+    const fail = text => interaction.reply ({ content: text, flags: MessageFlags.Ephemeral }).catch (() => {});
+    let rec = $plrest.get (id);
+    if (!rec || rec.guildId !== String (guildId) || (Date.now () - (Number (rec.at) || 0)) > PLREST_TTL_MS)
+    {
+        if (rec) $plrest.delete (id);
+        return fail ('⌛ Эта кнопка устарела: прошло больше 6 часов или бот перезапускался -- '
+            + 'позови `/play` с этой же ссылкой заново.');
+    }
+    if (rec.busy) return fail ('⏳ Уже беру остаток этого плейлиста -- подожди пару секунд.');
+    rec.busy = true;
+    try
+    {
+        await interaction.deferUpdate ();
+        const info = await playlistInfo (rec.url, rec.taken + 1);
+        const got = info.tracks.length;
+        rec.total = Math.max (rec.total, Math.floor (Number (info.total)) || 0);
+        if (!got)
+        {
+            $plrest.delete (id);
+            return await plrestReply (interaction, '📄 Больше в этом плейлисте брать нечего: взято ' +
+                rec.taken + ' из ' + rec.total + ' -- дальше источник ничего не отдаёт.', []);
+        }
+        const callerVoice = interaction.member && interaction.member.voice ? interaction.member.voice.channel : null;
+        const _wh = musicWhereNote (m, guildId, callerVoice);
+        const _done = musicAddApply (interaction, guildId, m, info.tracks, rec.url, _wh, { head: '➕ Добавлено ещё' });
+        rec.taken += got;
+        const more = Math.max (0, rec.total - rec.taken);
+        const rows = _done.askMoveRow ? [_done.askMoveRow] : [];
+        let line;
+        if (more > 0)
+        {
+            rec.at = Date.now ();
+            rows.push (plrestRow (id, more));
+            line = '\n📄 Осталось в плейлисте: ' + more + ' ' + plural (more, 'трек', 'трека', 'треков') +
+                ' (взято ' + rec.taken + ' из ' + rec.total + ') -- кнопка ниже возьмёт следующие ' +
+                Math.min (more, MUSIC_PLAYLIST_MAX) + '.';
+        }
+        else
+        {
+            $plrest.delete (id);
+            line = '\n📄 Плейлист взят целиком: ' + rec.taken + ' ' + plural (rec.taken, 'трек', 'трека', 'треков') + '.';
+        }
+        return await plrestReply (interaction, _done.text + line, rows);
+    }
+    catch (err)
+    {
+        console.log ('[' + (d()) + '] [music] (кто: ' +
+            ((ctx && ctx.actorName) || interaction.user.username) + ') остаток плейлиста взять не вышло: ' +
+            oneLine ((err && err.message) || err));
+        const left = Math.max (1, rec.total - rec.taken);
+        return await plrestReply (interaction, '❌ Не смог взять остаток (`' + clipped (rec.url, 60) +
+            '`): `' + ytDlpErr (err, 150) + '` -- кнопку оставляю, попробуй ещё раз.', [plrestRow (id, left)]);
+    }
+    finally { const r = $plrest.get (id); if (r) r.busy = false; }
 }
 
 let musicNormalizeReady = false;
@@ -19076,6 +19225,7 @@ const QUEUE_ACTIONS =
     [/^q:mu:/, '⬆ Выше'],
     [/^q:md:/, '⬇ Ниже'],
     [/^q:mx:/, '✖ Вернуться'],
+    [/^q:plr:/, '➕ Добавить остаток'],
     [/^q:mvh:/, '🚚 Перейти'],
     [/^q:mvn/, '✖ Остаться'],
     [/^q:mv/, 'меню: куда играть'],
@@ -19743,6 +19893,10 @@ client.on ('interactionCreate', async (interaction) =>
                 flags: MessageFlags.Ephemeral,
             });
         }
+        // v2.156: «➕ Добавить остаток» под ответом /play -- беру следующий кусок большого плейлиста.
+        const mPlr = /^q:plr:([a-z0-9]{1,16})$/.exec (cid);
+        if (mPlr)
+            return playRestClick (interaction, guildId, m, mPlr[1], ctx);
         const mDau = /^q:(?:dau|dap):([^:]*):(\d*)$/.exec (cid);
         if (mDau)
         {
@@ -20220,7 +20374,11 @@ client.on ('interactionCreate', async (interaction) =>
             const _wh = musicWhereNote (m, guildId, callerVoice);
             const _done = musicAddApply (interaction, guildId, m, info.tracks, query, _wh,
                 { top: wantTop, warn: playlistWarnText (info) });
-            await interaction.editReply ({ content: _done.text, components: _done.askMoveRow ? [_done.askMoveRow] : [] });
+            const _rows = _done.askMoveRow ? [_done.askMoveRow] : [];
+            const _rest = playlistRestMake (info, guildId, interaction.user.id,
+                interaction.member ? uuu (interaction.member) : interaction.user.username);
+            if (_rest) _rows.push (_rest.row);
+            await interaction.editReply ({ content: _done.text + (_rest ? _rest.text : ''), components: _rows });
         }
         else if (name === 'stop')
         {
