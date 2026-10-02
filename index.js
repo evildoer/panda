@@ -9053,7 +9053,8 @@ function netHourDigestLines (book, hours, pools, rev, checks)   // коротк�
     if (bones.length)
     {
         const b = bones[0], short = String (b.text || '').split ('. ')[0];
-        const heldH = netBoneLedger ? Math.max (0, Math.round ((Date.now () - (netBoneLedger.at || Date.now ())) / 3600000)) : 0;
+        // время беру только у ТОЙ ЖЕ зацепки: если память от другой (или пустая), честнее промолчать, чем показать чужой срок
+        const heldH = (netBoneLedger && netBoneLedger.text === b.text) ? Math.max (0, Math.round ((Date.now () - (netBoneLedger.at || Date.now ())) / 3600000)) : 0;
         parts.push (short + ((b.kind || heldH > 0) ? ' (' + (b.kind || 'зацепка') + (heldH > 0 ? ', держится ' + heldH + ' ч' : '') + ')' : ''));
     }
     else
