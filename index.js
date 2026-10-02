@@ -107,6 +107,11 @@
 // опция: имя сверяется в момент события по id ИЛИ по имени канала, и без такого канала она просто никого не
 // освобождает -- поломки нет, тревожить владельца незачем. Рабочие ключи (log_channel, pipe_channel_source,
 // pipe_channel_target, channel_common, temp_lobby) и роли по-прежнему проверяются: там пропажа канала ломает работу.
+// v2.153 -- по просьбе владельца: часовой блок [net] сжат с десятка строк до трёх -- «кто отвечает» (источники
+// с процентами ответов и скоростью, просевшие названы отдельно), «где запас» (сильнейшая зацепка с временем,
+// сколько держится, и первый шаг плана) и «что ждать» (прогноз следующего часа; опасные часы названы прямо).
+// Подробный разбор -- книга, графики, связки, полный план, сверки прогнозов -- никуда не пропал: он в `node . net`.
+// Стартовый блок печатает ту же сводку, а повторяющиеся из часа в час одинаковые строки больше не выводятся.
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -7619,15 +7624,11 @@ if (BOT_RUN)
             await netGuessLoad ();
             await netBoneLoad ();
             const bk = await dnsBookLoad (), hs = await netHoursLoad ();
-            for (const v of netGuessCheck (hs)) console.log ('[' + (d()) + '] [net] сверка прогноза: ' + v);
             const bones = netBonesFind (bk, hs, ipNames);
-            const bv = netBoneVerdict (netBoneLedger, bk, hs);
-            if (bv) console.log ('[' + (d()) + '] [net] ' + bv);            if (bones.length) { console.log ('[' + (d()) + '] [net] зацепка (' + bones[0].kind + '): ' + bones[0].text); netBoneTake (bones); }
-            for (const l of netLinksLines (bk, ipMem, ipNames, 2)) console.log ('[' + (d()) + '] [net] ' + l);
-            for (const l of netPlanLines (bk, ipMem, ipNames).slice (0, 2)) console.log ('[' + (d()) + '] [net] план: ' + l);
+            if (bones.length) netBoneTake (bones);                // зацепку запоминаю, даже когда в лог идёт только сводка
+            const checks = netGuessCheck (hs);                     // сверки нужны не для лога, а для счёта прогнозов (и архива)
+            for (const l of netHourDigestLines (bk, hs, ipMem, ipNames, checks)) console.log ('[' + (d()) + '] [net] ' + l);
             netGuessMake (hs);
-            for (const l of netForecastLines (hs, netGuess, netGuessScore).filter (x => /^(на |опасаться|мои прогнозы|прогноз)/.test (x)).slice (0, 4))
-                console.log ('[' + (d()) + '] [net] ' + l);
         }
         catch (e) { }
     }, 5000);
@@ -7640,24 +7641,18 @@ if (BOT_RUN)
         netHoursSave (true);
     }, 5 * 60 * 1000);
     try { poolTimer.unref (); } catch (e) { }
-    const reportTimer = setInterval (async () =>                       // разбор собранного -- раз в час, коротко
+    const reportTimer = setInterval (async () =>                       // разбор собранного -- раз в час: три строки (кто отвечает, где запас, что ждать); подробности -- `node . net`
     {
         try
         {
             const book = await dnsBookLoad (), hours = await netHoursLoad ();
             await netGuessLoad ();
             await netBoneLoad ();
-            const lines = netAnalyticsLines (book, hours);
-            console.log ('[' + (d()) + '] [net] разбор за час: ' + lines.slice (0, 3).join (' | '));
-            for (const v of netGuessCheck (hours)) console.log ('[' + (d()) + '] [net] сверка прогноза: ' + v);
             const bones = netBonesFind (book, hours, ipNames);
-            const bv = netBoneVerdict (netBoneLedger, book, hours);
-            if (bv) console.log ('[' + (d()) + '] [net] ' + bv);            if (bones.length) { console.log ('[' + (d()) + '] [net] зацепка (' + bones[0].kind + '): ' + bones[0].text); netBoneTake (bones); }
-            for (const l of netLinksLines (book, ipMem, ipNames, 2)) console.log ('[' + (d()) + '] [net] ' + l);
-            for (const l of netPlanLines (book, ipMem, ipNames).slice (0, 2)) console.log ('[' + (d()) + '] [net] план: ' + l);
+            if (bones.length) netBoneTake (bones);
+            const checks = netGuessCheck (hours);
+            for (const l of netHourDigestLines (book, hours, ipMem, ipNames, checks)) console.log ('[' + (d()) + '] [net] ' + l);
             netGuessMake (hours);
-            for (const l of netForecastLines (hours, netGuess, netGuessScore).filter (x => /^(на |опасаться|мои прогнозы|прогноз)/.test (x)).slice (0, 4))
-                console.log ('[' + (d()) + '] [net] ' + l);
         }
         catch (e) { }
     }, 60 * 60 * 1000);
@@ -8504,16 +8499,15 @@ function dnsSourcesOrdered ()
     list.sort ((a, b) => score (a) - score (b));
     return list;
 }
-function netAnalyticsLines (book, hours)     // чистая функция: только считает и делает выводы, ничего не читает сама
+function netSourceRows (hours)   // источники по часам: ответы, отказы, скорость, мёртвые часы -- одним списком (им пользуются и разбор, и короткая сводка)
 {
-    const lines = [];
     const srcs = {};
     for (const h of Object.keys (hours || {}).sort ())
     {
         const b = hours[h] || {};
         for (const s of Object.keys (b.bySrc || {}))
         {
-            const e = b.bySrc[s], o = srcs[s] || (srcs[s] = { ok: 0, fail: 0, ms: 0, bad: [] });
+            const e = b.bySrc[s], o = srcs[s] || (srcs[s] = { name: s, ok: 0, fail: 0, ms: 0, bad: [] });
             o.ok += e.ok || 0;
             o.fail += e.fail || 0;
             if (e.ms) o.ms = o.ms ? Math.round (o.ms * 0.7 + e.ms * 0.3) : e.ms;
@@ -8521,11 +8515,16 @@ function netAnalyticsLines (book, hours)     // чистая функция: т�
             if (tot >= 3 && !(e.ok > 0)) o.bad.push (h);      // в этот час источник не ответил ни разу
         }
     }
-    for (const s of Object.keys (srcs).sort ((a, b) => (srcs[b].ok - srcs[a].ok) || (srcs[a].ms - srcs[b].ms)))
+    return Object.keys (srcs).map (k => srcs[k]).filter (o => (o.ok + o.fail) > 0)
+        .sort ((a, b) => (b.ok - a.ok) || (a.ms - b.ms));
+}
+function netAnalyticsLines (book, hours)     // чистая функция: только считает и делает выводы, ничего не читает сама
+{
+    const lines = [];
+    for (const o of netSourceRows (hours))
     {
-        const o = srcs[s], tot = o.ok + o.fail;
-        if (!tot) continue;
-        lines.push ('источник ' + s + ': отвечал в ' + Math.round (100 * o.ok / tot) + '% случаев из ' + tot +
+        const tot = o.ok + o.fail;
+        lines.push ('источник ' + o.name + ': отвечал в ' + Math.round (100 * o.ok / tot) + '% случаев из ' + tot +
             (o.ms ? ', в среднем ' + Math.round (o.ms) + ' мс' : '') +
             (o.bad.length ? '; мёртвые часы: ' + o.bad.slice (-4).join (', ') : ''));
     }
@@ -9027,6 +9026,72 @@ function netPlanLines (book, pools, rev)     // как этим пользова
     if (links.length)
         lines.push ('выгода: связок ' + links.length + ', самая широкая закрывает ' + maxNames + ' имени сразу -- проверил один адрес, поднял всё имя целиком');
     return lines;
+}
+function netHourDigestLines (book, hours, pools, rev, checks)   // короткая сводка вместо десятка строк: кто отвечает, где запас, что ждать; подробности -- `node . net`
+{
+    const out = [];
+    // 1) кто отвечает
+    const rows = netSourceRows (hours);
+    if (rows.length)
+    {
+        const good = [], weak = [];
+        for (const r of rows)
+        {
+            const tot = r.ok + r.fail, pct = tot ? Math.round (100 * r.ok / tot) : 0;
+            const el = r.name + ' -- ' + pct + '%' +
+                (r.ms ? (r.ms >= 2500 ? ' (медленно, ~' + (r.ms / 1000).toFixed (1).replace ('.', ',') + ' с)' : ' (~' + Math.round (r.ms) + ' мс)') : '');
+            if (pct < 60) weak.push (el); else good.push (el);
+        }
+        out.push ('кто отвечает: ' + (good.slice (0, 4).join (', ') || 'никто из основных') +
+            (good.length > 4 ? ', и ещё ' + (good.length - 4) + ' помельче' : '') +
+            (weak.length ? '; проседает: ' + weak.join ('; ') : ''));
+    }
+    else out.push ('кто отвечает: за это время замеров ещё нет -- копилка источников пополнится после работы справочников');
+    // 2) где запас: сильнейшая зацепка и первый шаг плана
+    const parts = [];
+    const bones = netBonesFind (book, hours, rev);
+    if (bones.length)
+    {
+        const b = bones[0], short = String (b.text || '').split ('. ')[0];
+        const heldH = netBoneLedger ? Math.max (0, Math.round ((Date.now () - (netBoneLedger.at || Date.now ())) / 3600000)) : 0;
+        parts.push (short + ((b.kind || heldH > 0) ? ' (' + (b.kind || 'зацепка') + (heldH > 0 ? ', держится ' + heldH + ' ч' : '') + ')' : ''));
+    }
+    else
+    {
+        const links = netLinksFind (book, pools, rev);
+        const best = links.filter (l => l.music)[0] || links[0];
+        if (best) parts.push (best.why.split (' -- ')[0]);
+    }
+    const plans = netPlanLines (book, pools, rev);
+    if (plans.length)
+        parts.push ('план: ' + plans[0].replace ('первым делом -- проверенный на музыке: ', 'проверенный на музыке -- ').replace (' -- это факт, я его не угадываю', ''));
+    out.push ('где запас: ' + (parts.join ('; ') || 'пока не за что зацепиться -- коплю измерения'));
+    // 3) что ждать в следующий час
+    const fc = [];
+    for (const l of netForecastLines (hours, netGuess, netGuessScore))
+    {
+        const m = /^на (\d\d):00 (.+?): ожидаю (\d+)% ответов/.exec (l);
+        if (!m) continue;
+        const ms = /, ~(\d+) мс(?:;|$)/.exec (l);
+        fc.push ({ at: m[1], src: m[2], pct: Number (m[3]), ms: ms ? Number (ms[1]) : 0 });
+    }
+    if (fc.length)
+    {
+        const good = fc.filter (x => x.pct >= 60), weak = fc.filter (x => x.pct < 60);
+        out.push ('что ждать: на ' + fc[0].at + ':00 -- ' + (good.map (x => x.src + ' ' + x.pct + '%' + (x.ms ? ' (~' + Math.round (x.ms) + ' мс)' : '')).join (', ') || 'ничего уверенного') +
+            (weak.length ? '; опасаться: ' + weak.map (x => x.src + ' ' + x.pct + '%').join ('; ') : ''));
+    }
+    // сверки прошлых прогнозов -- коротко (подробности и архив -- в `node . net`)
+    if (checks && checks.length)
+    {
+        const items = checks.map (x =>
+        {
+            const m = /^(сбылось|брак): \d\d:00, (.+?) -- я говорил (\d+)%, вышло (\d+)%/.exec (x);
+            return m ? m[2] + ': ' + m[3] + '% -> ' + m[4] + '% (' + m[1] + ')' : x;
+        });
+        out.push ('сверка прогноза: ' + items.join ('; '));
+    }
+    return out;
 }
 
 async function dnsBookInfo ()
