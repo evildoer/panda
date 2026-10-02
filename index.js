@@ -84,6 +84,14 @@
 // превью на голые адреса, а они появились у одиночных песен в v2.147. Теперь адрес одиночной песни идёт в
 // угловых скобках (та же кликабельная ссылка, но без карточки), адрес-запуск пачки -- в коде, как и было,
 // а у самого сообщения истории стоит SuppressEmbeds -- превью гасятся целиком, и на листании страниц тоже.
+// v2.150 -- по просьбе владельца: у базы появилась команда сжатия `node . compact` (SQLite VACUUM) --
+// она возвращает файлу место, которое осталось от удалённых записей (/forget, чистка истории, старые состояния):
+// обычная работа этого места не отдаёт, и файл растёт свободными страницами. Порядок жёсткий и без вариантов:
+// проверка целостности -> копия базы с датой (штатная ротация backup_keep) -> сжатие -> снова целостность и
+// сверка числа записей; без копии сжатие не запускается, копия остаётся на месте (её имя подсказывает restore).
+// Если база занята живым ботом (он как раз пишет), команда честно говорит об этом и ничего не портит: неудачный
+// VACUUM SQLite откатывает сам. Размер до/после и число свободных страниц печатаются, а свободные страницы снова
+// копятся по мере удаления записей -- команду можно повторять когда угодно.
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -432,7 +440,7 @@ const DB_ENC_PREFIX = 'enc1:';
 const DB_ENC_SALT = 'pandamia-db-v1';
 const DB_ENC_HEX = /^[0-9a-fA-F]{64}$/;
 
-const CONSOLE_CMDS = ['help', 'config', 'keygen', 'dump', 'net', 'files', 'cache', 'privacy', 'backup', 'checkpoint', 'backups', 'restore', 'clearstatus', 'unkey', 'fixauthors', 'cookies', 'ytdlp', 'voice', 'obhod'];
+const CONSOLE_CMDS = ['help', 'config', 'keygen', 'dump', 'net', 'files', 'cache', 'privacy', 'backup', 'compact', 'checkpoint', 'backups', 'restore', 'clearstatus', 'unkey', 'fixauthors', 'cookies', 'ytdlp', 'voice', 'obhod'];
 const CONSOLE_HELP =
 [
     ['node .',                    'запустить бота и смотреть живой лог (Ctrl+C -- выйти)'],
@@ -451,6 +459,7 @@ const CONSOLE_HELP =
     ['node . checkpoint [метка]', 'сделать контрольную точку (файл с датой в имени; бот их не удаляет)'],
     ['node . backups',            'что есть: база, копии с датой и контрольные точки'],
     ['node . restore [метка]',    'вернуть базу из самой свежей копии (без метки) или из копии/точки по метке'],
+    ['node . compact',            'сжать базу: вернуть файлу свободные страницы (копия и проверка целостности до и после -- обязательны)'],
     ['node . clearstatus <id>',   'разово снять свою строку из статуса голосового канала'],
     ['node . voice [id канала]',  'проверить вход в голосовой канал по-настоящему (музыка играет именно там)'],
     ['node . obhod',              'обход блокировки: что сейчас, что можно сделать (--engine --pick --start --stop; нужны права -- один запрос)'],
@@ -1107,6 +1116,7 @@ function filesCli ()
     console.log ('  node . backups                -- что есть: база, копии с датой и все точки');
     console.log ('  node . restore                -- вернуть базу из самой свежей копии');
     console.log ('  node . restore before-cleanup -- вернуть из копии или точки по метке (часть имени или дата)');
+    console.log ('  node . compact                -- сжать базу: вернуть файлу свободные страницы (сначала копия, потом сжатие, потом проверка)');
     console.log ('  node . clearstatus 123456789012345678 -- снять свою строку из шапки канала (id канала)');
     console.log ('  node . privacy                -- пересобрать PRIVACY.md из шаблона (имена спросит у Discord)');
     console.log ('  node . privacy --offline      -- то же, но без обращения к сети');
@@ -2042,6 +2052,129 @@ function dbRestoreCli (_sel)
     return _fail ? 1 : 0;
 }
 
+function dbSizeText (_b)
+{
+    const _n = Math.max (0, Math.round (Number (_b || 0)));
+    return (_n / 1048576).toFixed (2).replace ('.', ',') + ' МБ (' +
+        String (_n).replace (/\B(?=(\d{3})+(?!\d))/g, ' ') + ' Б)';
+}
+
+function dbPagesInfo (_file)   // «воздух» в файле: столько страниц уже никому не нужно, но место они ещё занимают
+{
+    const _f = require ('fs');
+    if (!_f.existsSync (_file)) return null;
+    let DatabaseSync = null;
+    try { ({ DatabaseSync } = require ('node:sqlite')); } catch (e) { }
+    if (!DatabaseSync) return null;
+    let _db = null;
+    try
+    {
+        _db = new DatabaseSync (_file, { readOnly: true });
+        const _one = _sql =>
+        {
+            try { const _r = _db.prepare (_sql).get (); return Number (_r ? Object.values (_r)[0] : 0) || 0; }
+            catch (e) { return 0; }
+        };
+        const _size = _one ('PRAGMA page_size'), _pages = _one ('PRAGMA page_count'), _free = _one ('PRAGMA freelist_count');
+        return { pageSize: _size, pages: _pages, free: _free, freeBytes: _size * _free };
+    }
+    catch (e) { return null; }
+    finally { try { if (_db) _db.close (); } catch (e) { } }
+}
+
+function dbCompactMake (_file)   // сам VACUUM: свободные страницы не убирает ничто другое -- ими файл и толстеет
+{
+    let DatabaseSync = null;
+    try { ({ DatabaseSync } = require ('node:sqlite')); } catch (e) { }
+    if (!DatabaseSync)
+        return { ok: false, why: 'нужен Node 23+ (встроенный node:sqlite) -- запусти через node.cmd или портативный Node из папки бота' };
+    let _db = null;
+    try
+    {
+        _db = new DatabaseSync (_file);
+        try { _db.exec ('PRAGMA busy_timeout = 15000'); } catch (e) { }       // базу может держать живой бот: подожди, а не падай сразу
+        _db.exec ('VACUUM');
+        return { ok: true };
+    }
+    catch (e)
+    {
+        const _why = String ((e && e.message) || e);
+        return { ok: false, why: _why, busy: /busy|locked/i.test (_why) };
+    }
+    finally { try { if (_db) _db.close (); } catch (e) { } }
+}
+
+function dbCompactCli ()
+{
+    $cliOwnScreen ();
+    let _fail = 0;
+    console.log ('[compact] сжатие базы (SQLite VACUUM): файлу возвращается место, оставшееся от удалённых записей');
+    console.log ('[compact] (/forget, чистка истории, старые состояния -- самого файла они не уменьшают: место лежит свободными страницами).');
+    console.log ('[compact] порядок: проверка целостности -> копия базы с датой -> сжатие -> снова целостность и сверка числа записей.');
+    console.log ('[compact] без копии не сжимаю; копия остаётся на месте -- если что, `node . restore`.');
+    const _f = require ('fs');
+    for (const _srv of dbServerListOn ())
+    {
+        const _nm = _srv + ((SERVERS[_srv] || {}).name ? ' («' + SERVERS[_srv].name + '»)' : '');
+        const _file = dbFileOf (_srv);
+        const _before = dbIntegrity (_file);
+        if (!_before.exists) { console.log ('[compact] ' + _nm + ': базы ещё нет -- сжимать нечего'); continue; }
+        if (!_before.ok)
+        {
+            console.log ('[compact] ' + _nm + ': база НЕ ЧИТАЕТСЯ (' + _before.why + ') -- НЕ трогаю.');
+            console.log ('[compact]   сначала верни её: `node . restore`; посмотреть, что есть: `node . backups`');
+            _fail++; continue;
+        }
+        const _rowsTxt = _before.rows + ' ' + plural (_before.rows, 'запись', 'записи', 'записей');
+        const _sizeBefore = _f.statSync (_file).size;
+        const _pagesBefore = dbPagesInfo (_file);
+        if (_pagesBefore && _pagesBefore.free === 0)
+        {
+            console.log ('[compact] ' + _nm + ': свободных страниц в файле нет -- сжимать нечего (' +
+                dbSizeText (_sizeBefore) + ', ' + _rowsTxt + ')');
+            continue;
+        }
+        const _bak = dbBackupMake (_srv);
+        if (!_bak.ok)
+        {
+            console.log ('[compact] ' + _nm + ': копию сделать не вышло (' + _bak.why + ') -- без копии не сжимаю');
+            _fail++; continue;
+        }
+        console.log ('[compact] ' + _nm + ': копия на всякий случай -- ' + dbTail (_bak.path) + ' (' + _bak.rows + ' ' +
+            plural (_bak.rows, 'запись', 'записи', 'записей') + ', файл прочитан)' +
+            (_bak.gone.length ? ', старых копий убрал ' + _bak.gone.length + ' (держу ' + BACKUP_KEEP + ')' : ''));
+        const _vac = dbCompactMake (_file);
+        if (!_vac.ok)
+        {
+            console.log ('[compact] ' + _nm + ': сжатие не вышло: ' + _vac.why);
+            if (_vac.busy)
+                console.log ('[compact]   база занята (бот как раз в неё пишет): повтори позже или закрой бота на время сжатия -- база осталась целой, копия уже лежит');
+            else
+                console.log ('[compact]   база осталась как была (неудачный VACUUM SQLite откатывает сам), копия ' + dbTail (_bak.path) + ' лежит рядом');
+            _fail++; continue;
+        }
+        const _after = dbIntegrity (_file);
+        if (!_after.ok || _after.rows !== _before.rows)
+        {
+            console.log ('[compact] ' + _nm + ': после сжатия база не сошлась (' +
+                (_after.ok ? 'записей ' + _after.rows + ' вместо ' + _before.rows : _after.why) + ') -- бота на такой базе не запускай');
+            console.log ('[compact]   верни базу из копии: `node . restore ' +
+                dbTail (_bak.path).replace (_srv + '.backup-', '').replace (/\.sqlite$/, '') + '`');
+            _fail++; continue;
+        }
+        const _sizeAfter = _f.statSync (_file).size;
+        const _pagesAfter = dbPagesInfo (_file);
+        console.log ('[compact] ' + _nm + ': ' + dbSizeText (_sizeBefore) + ' -> ' + dbSizeText (_sizeAfter) +
+            (_sizeAfter < _sizeBefore ? ' (сэкономил ' + dbSizeText (_sizeBefore - _sizeAfter) + ')' : ' (файл и так был плотный)') +
+            (_pagesBefore && _pagesAfter ? '; свободных страниц: ' + _pagesBefore.free + ' -> ' + _pagesAfter.free : ''));
+        console.log ('[compact] ' + _nm + ': записи целы -- ' + _after.rows + ' ' +
+            plural (_after.rows, 'запись', 'записи', 'записей') + ' (как было), integrity_check: ok');
+    }
+    console.log ('[compact] свободные страницы копятся снова по мере удаления записей -- команду можно повторять когда угодно;' +
+        ' копии с датой уходят сами' + (BACKUP_KEEP ? ' (держу ' + BACKUP_KEEP + ')' : '') + '.');
+    return _fail ? 1 : 0;
+}
+
 function dbArgAfter (_cmd)
 {
     const _a = process.argv.slice (2);
@@ -2071,6 +2204,12 @@ if (process.argv.slice (2).some (_a => /^restore$/i.test (_a)))
 {
     let _code = 1;
     try { _code = dbRestoreCli (dbArgAfter ('restore')); } catch (e) { console.log ('[restore] ошибка: ' + ((e && e.message) || e)); }
+    $cliDone (_code);
+}
+if (process.argv.slice (2).some (_a => /^compact$/i.test (_a)))
+{
+    let _code = 1;
+    try { _code = dbCompactCli (); } catch (e) { console.log ('[compact] ошибка: ' + ((e && e.message) || e)); }
     $cliDone (_code);
 }
 dbStartupGuard ();
