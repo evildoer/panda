@@ -80,6 +80,10 @@
 // файл cookie: после КАЖДОГО запуска он складывает в него свой набор (проверено живьём 02.10 -- файл менялся за
 // секунды, а склейка в него откатывалась), поэтому бот даёт ему свежую КОПИЮ (logs/ytdlp-cookies/cookie-run.txt,
 // обновляется сама при правке оригинала) -- сам файл остаётся таким, каким его положили.
+// v2.149 -- по живому взгляду владельца: /history превращался в ленту карточек с обложками -- Discord рисует
+// превью на голые адреса, а они появились у одиночных песен в v2.147. Теперь адрес одиночной песни идёт в
+// угловых скобках (та же кликабельная ссылка, но без карточки), адрес-запуск пачки -- в коде, как и было,
+// а у самого сообщения истории стоит SuppressEmbeds -- превью гасятся целиком, и на листании страниц тоже.
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -14561,6 +14565,8 @@ function historyText (guildId, page = 1)
         ' Весь состав -- кнопкой «📜 Все треки»._' +
         (pages > 1 ? '\n_Дальше -- кнопками листания под сообщением._' : '');
     const budget = HISTORY_MSG_LIMIT - head.length - 2 - tail.length;
+    // У пачки в начале строки стоит то, что вводили в /play -- и запрос, и адрес уходят в код (`...`):
+    // Discord превью на код не рисует, а адрес-запуск иначе превращался бы в карточку.
     const linkLine = b => '`' + stamp (b.at) + '`' + (b.times > 1 ? ' ×' + b.times : '') + ' ' +
         (b.key ? '`' + b.key.slice (0, 90) + '`' : (historyTitlesOf (b.e)[0] || 'без названия')) +
         historySrcText (b.e);
@@ -14584,13 +14590,16 @@ function historyText (guildId, page = 1)
         return '';
     };
     // Одиночный трек показываю им самим: время, название и адрес -- по нему сразу видно, что это и откуда.
+    // Адрес -- в угловых скобках: в Discord это та же кликабельная ссылка, но без огромной карточки-обложки,
+    // которой он отвечает на голый адрес (живой случай 02.10: /history превращался в ленту превью).
+    const angle = l => '<' + l + '>';
     const singleLine = b =>
     {
         const t = String (historyTitlesOf (b.e)[0] || b.key || 'без названия');
         const link = linkOfEntry (b.e);
         return '`' + stamp (b.at) + '`' + (b.times > 1 ? ' ×' + b.times : '') + ' 🎵 ' +
             (t.length > HISTORY_TITLE_CLIP ? t.slice (0, HISTORY_TITLE_CLIP - 1).trimEnd () + '…' : t) +
-            (link ? ' — ' + clipped (link, 100) : '') +
+            (link ? ' — ' + angle (clipped (link, 100)) : '') +
             historySrcText (b.e);
     };
     const rowOf = (b, per) =>
@@ -18901,7 +18910,8 @@ client.on ('interactionCreate', async (interaction) =>
             await historyLoad (guildId);
             const at = parseInt (mHg[1], 10) || 1;
             return interaction.update
-            ({ content: historyText (guildId, at), components: historyComponents (guildId, at) });
+            ({ content: historyText (guildId, at), components: historyComponents (guildId, at),
+               flags: MessageFlags.SuppressEmbeds });
         }
         if (cid === 'q:hi')
         {
@@ -19987,9 +19997,11 @@ client.on ('interactionCreate', async (interaction) =>
             await historyLoad (guildId);
             const hRows = historyComponents (guildId, 1);
             const hText = historyText (guildId, 1);
+            // Превью-карточки в истории ни к чему (и мало ли какой адрес попадёт в название трека):
+            // гашу их для всего сообщения.
             return interaction.reply (hRows.length
-                ? { content: hText, components: hRows }
-                : hText);
+                ? { content: hText, components: hRows, flags: MessageFlags.SuppressEmbeds }
+                : { content: hText, flags: MessageFlags.SuppressEmbeds });
         }
         else if (name === 'repeat')
         {
