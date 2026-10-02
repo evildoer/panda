@@ -92,6 +92,16 @@
 // Если база занята живым ботом (он как раз пишет), команда честно говорит об этом и ничего не портит: неудачный
 // VACUUM SQLite откатывает сам. Размер до/после и число свободных страниц печатаются, а свободные страницы снова
 // копятся по мере удаления записей -- команду можно повторять когда угодно.
+// v2.152 -- по живой просьбе владельца: лог стал тише, фон больше не топит события (замер по боевому логу:
+// 784 строки «IP отдаю загрузчику» на каждое соединение yt-dlp + 97 «копилка адресов» + 58 одинаковых
+// «прокси НЕ везёт» + 47 повторов «везёт» + 37 «подозрительных нет» + 25 «/queue обновил сам» = ~1050 из
+// 3908 строк в сутки, а команд и кнопок людей было 141). Теперь такое копится, а раз в 5 минут выходит ОДНА
+// сводка (bgLogFlush): сколько адресов отдано, для каких имён и каким способом, сколько раз адрес не ответил.
+// Важное по-прежнему говорится сразу -- «адрес не ответил» один раз на имя за окно, треки «под вопросом»
+// из проверки очереди (и письмо хозяину) -- но поток её копий больше не заливает лог. Вердикты путей
+// (прямой/прокси/свой маршрут, SoundCloud) в лог идут ТОЛЬКО при СМЕНЕ, а не каждый замер: свежесть
+// проверки всегда видна в /health. Копилка адресов, самообновления /queue и «подозрительных нет» -- счётчики
+// в той же сводке.
 // v2.151 -- по живой просьбе владельца: проверка конфига больше НЕ ругается на deaf_exempt (в логе стояло
 // «[config] deaf_exempt = "Кабинет Уролога": такого канала на сервере нет -- проверь config.json»). Это просто
 // опция: имя сверяется в момент события по id ИЛИ по имени канала, и без такого канала она просто никого не
@@ -6657,10 +6667,12 @@ async function dohCarryCheck ()          // по-настоящему: дохо�
         if (!ok) why = (r && r.code === -1) ? 'yt-dlp через маршрут не ответил за 45 с'
             : 'yt-dlp через маршрут не дошёл' + (r && r.err ? ': ' + oneLine (r.err, 120) : '');
     }
+    const prevD = dohCarry;
     dohCarry = { ok: ok, at: Date.now (), why: why };
-    console.log ('[' + (d()) + '] [music] свой маршрут по адресам ' + (ok
-        ? 'везёт музыку: yt-dlp через него дошёл до YouTube'
-        : 'музыку НЕ везёт (' + why + ') -- путём для музыки его не считаю'));
+    if (prevD.ok === null || prevD.ok !== ok)      // смена вердикта -- событие; повтор того же в лог не идёт
+        console.log ('[' + (d()) + '] [music] свой маршрут по адресам ' + (ok
+            ? 'везёт музыку: yt-dlp через него дошёл до YouTube'
+            : 'музыку НЕ везёт (' + why + ') -- путём для музыки его не считаю'));
     return dohCarry;
 }
 const PROXY_CARRY_TTL = 10 * 60000;      // «прокси везёт музыку» помню 10 минут: проверка не бесплатная
@@ -6682,9 +6694,13 @@ async function proxyCarryCheck (addr)    // по-настоящему: дохо�
         const ok = !!(r && r.code === 0 && /\S/.test (String (r.out || '')));
         const out = { ok: ok, at: Date.now (), why: ok ? '' : ((r && r.code === -1) ? 'yt-dlp через прокси не ответил за 45 с'
             : 'yt-dlp через прокси не дошёл' + (r && r.err ? ': ' + oneLine (r.err, 120) : '')) };
+        const prevP = proxyCarry.get (a);
         proxyCarry.set (a, out);
-        console.log ('[' + (d()) + '] [music] прокси ' + a + ' ' + (ok ? 'везёт музыку: yt-dlp через него дошёл до YouTube'
-            : 'музыку НЕ везёт (' + out.why + ') -- живым путём его не считаю'));
+        // Говорю только при СМЕНЕ вердикта (в день таких строк было 58 одинаковых подряд), а свежесть
+        // проверки всегда видна в /health.
+        if (!prevP || prevP.ok !== out.ok)
+            console.log ('[' + (d()) + '] [music] прокси ' + a + ' ' + (ok ? 'везёт музыку: yt-dlp через него дошёл до YouTube'
+                : 'музыку НЕ везёт (' + out.why + ') -- живым путём его не считаю'));
         return out;
     }) ();
     proxyCarryBusy.set (a, job);
@@ -7794,13 +7810,79 @@ function plainDnsAsk (server, name, timeoutMs = 1500)
     });
 }
 
-let ipViaLogged = '';
-function ipViaLog (via, extra)
+// ФОН НЕ ДОЛЖЕН ТОПИТЬ ЛОГ (живая просьба владельца 02.10): «IP отдаю загрузчику» печаталось на КАЖДОЕ
+// соединение yt-dlp -- за день таких строк 784 из 3908, и настоящие события в них тонули. Теперь такое копится
+// по именам и способам, а раз в LOG_SUM_EVERY_MS выходит ОДНА сводная строка. Важное (адрес не ответил) --
+// говорится сразу, но не чаще раза на имя за окно; состояния путей (везёт / не везёт) -- только при СМЕНЕ,
+// а не каждый замер (текущее состояние всегда видно в /health); мелкая фоновая мелочь (копилка адресов,
+// самообновления /queue, тихая проверка очереди) идёт в ту же сводку.
+const LOG_SUM_EVERY_MS = 5 * 60000;      // как часто говорю итог фона одной строкой
+function bgLogNew ()
 {
-    if (!BOT_RUN || (via + extra) === ipViaLogged) return;
-    ipViaLogged = via + extra;
-    console.log ('[' + (d()) + '] [music] ' + via + (extra ? ' (' + extra + ')' : '') +
-        ' -- IP отдаю загрузчику (yt-dlp) через свой локальный маршрут, системный DNS и hosts не нужны');
+    return { at: Date.now (), n: 0, names: {}, kinds: {}, retry: 0, retryNames: {}, quiet: 0, said: {},
+             pool: {}, poolTotal: 0, selfQ: 0, selfQPage: 0, deadOk: 0, deadChecked: 0, last: '' };
+}
+let bgSum = bgLogNew ();
+function bgTop (obj, max)
+{
+    return Object.keys (obj).sort ((a, b) => obj[b] - obj[a]).slice (0, max)
+        .map (k => k + ' -- ' + obj[k]).join (', ');
+}
+function bgLogFlush ()                 // одна строка на всё, что накопилось; пусто -- молчу совсем
+{
+    const s = bgSum, now = Date.now ();
+    const mins = Math.max (1, Math.round ((now - s.at) / 60000));
+    const out = [];
+    if (s.n)
+        out.push ('маршрут по адресам (yt-dlp через мой локальный путь): отдал ' + s.n + ' ' +
+            plural (s.n, 'адрес', 'адреса', 'адресов') +
+            (Object.keys (s.names).length ? ' (имён: ' + Object.keys (s.names).length + '; главные: ' + bgTop (s.names, 3) + ')' : '') +
+            (Object.keys (s.kinds).length ? '; способы: ' + bgTop (s.kinds, 4) : '') +
+            (s.retry ? '; адрес не отвечал -- ' + s.retry + ' ' + plural (s.retry, 'раз', 'раза', 'раз') +
+                (Object.keys (s.retryNames).length ? ' (' + bgTop (s.retryNames, 3) + ')' : '') : '') +
+            (s.quiet ? '; справочники молчали, ответ дала книга -- ' + s.quiet + ' ' + plural (s.quiet, 'раз', 'раза', 'раз') : ''));
+    for (const svc of Object.keys (s.pool))
+        out.push ('копилка адресов ' + svc + ': +' + s.pool[svc] + (s.poolTotal ? ' (всего ' + s.poolTotal + ')' : ''));
+    if (s.selfQ)
+        out.push ('сообщение /queue обновлял сам: ' + s.selfQ + ' ' + plural (s.selfQ, 'раз', 'раза', 'раз') +
+            (s.selfQPage ? ' (последний раз -- стр. ' + s.selfQPage + ')' : ''));
+    if (s.deadOk)
+        out.push ('проверка очереди: ' + s.deadChecked + ' ' + plural (s.deadChecked, 'трек', 'трека', 'треков') +
+            ' проверено -- подозрительных нет');
+    if (out.length)
+    {
+        console.log ('[' + (d()) + '] [music] сводка за ' + mins + ' мин: ' + out.join (' | '));
+        if (s.last) console.log ('[' + (d()) + '] [music] последнее с маршрута: ' + s.last);
+    }
+    bgSum = bgLogNew ();              // окно закрыто даже если было тихо -- просто начинаем новое
+}
+if (BOT_RUN) setInterval (bgLogFlush, LOG_SUM_EVERY_MS).unref ();
+
+function ipViaLog (via, extra, name, kind)      // обычный фон маршрута -- в сводку, не в лог
+{
+    if (!BOT_RUN) return;
+    bgSum.n++;
+    if (name) bgSum.names[name] = (bgSum.names[name] || 0) + 1;
+    if (kind) bgSum.kinds[kind] = (bgSum.kinds[kind] || 0) + 1;
+    bgSum.last = via + (extra ? ' (' + extra + ')' : '');
+}
+function ipViaQuietLog (via, extra)             // «справочники молчали»: не авария (книга выручила), но пусть будет видно
+{
+    if (!BOT_RUN) return;
+    bgSum.quiet++;
+    bgSum.last = via + (extra ? ' (' + extra + ')' : '');
+}
+function ipViaFailLog (via, extra, name)        // «адрес не ответил»: важное -- сразу, но не чаще раза на имя за окно
+{
+    if (!BOT_RUN) return;
+    bgSum.retry++;
+    if (name) bgSum.retryNames[name] = (bgSum.retryNames[name] || 0) + 1;
+    bgSum.last = via + (extra ? ' (' + extra + ')' : '');
+    const key = String (name || via);
+    if (bgSum.said[key]) return;                  // уже говорили в этом окне -- остальное попадёт в сводку
+    bgSum.said[key] = 1;
+    console.log ('[' + (d()) + '] [music] ⚠️ ' + via + (extra ? ' (' + extra + ')' : '') +
+        ' -- загрузчику отдаю следующий адрес (итог за окно будет в сводке)');
 }
 
 // Хранение: ЗАПИСИ НЕ УДАЛЯЮТСЯ НИКОГДА -- ни по количеству, ни по возрасту. Информация получена,
@@ -8995,8 +9077,9 @@ async function poolAdd (svc, ips)
     ipMem[key] = { ips: cur, at: Date.now () };   // ни одного адреса не выбрасываю: беру по кругу -- кого давно не брали
     if (added)
     {
-        console.log ('[' + (d()) + '] [music] копилка адресов ' + svc + ': +' + added +
-            ' (всего ' + Object.keys (cur).length + ')');
+        // В лог не печатаю на каждое пополнение (в день таких строк было 97) -- уйдёт в общую сводку фона.
+        bgSum.pool[svc] = (bgSum.pool[svc] || 0) + added;
+        bgSum.poolTotal = Object.keys (cur).length;
         await ipMemSave ();
     }
 }
@@ -9132,7 +9215,7 @@ async function ipResolve (name)
         if (ip)
         {
             ipViaLog ('играю по своей записи (' + (rec.src || 'своя книга') + (rec.hits ? ', пригодилась ' + rec.hits + ' раз' : '') + ')',
-                name + ' -> ' + ip + ', запись ' + Math.round ((now - (rec.at || 0)) / 1000) + ' с назад, ttl ' + Math.round ((rec.ttl || DNS_TTL_DEF) / 1000) + ' с');
+                name + ' -> ' + ip + ', запись ' + Math.round ((now - (rec.at || 0)) / 1000) + ' с назад, ttl ' + Math.round ((rec.ttl || DNS_TTL_DEF) / 1000) + ' с', name, 'своя запись');
             dohCache.set (name, { ip: ip, at: now });
             return ip;
         }
@@ -9146,7 +9229,7 @@ async function ipResolve (name)
         const nrec = await dnsNote (name, ips, best.ms, all.src, all.ttl, all.info);
         ipViaLog ('взял ответ у ' + all.src + (all.ad ? ' (подпись проверена)' : ''),
             name + ' -> ' + best.ip + ' за ' + best.ms + ' мс' +
-            (ips.length > 1 ? ' (собрал адресов: ' + ips.length + ')' : ''));
+            (ips.length > 1 ? ' (собрал адресов: ' + ips.length + ')' : ''), name, 'ответ справочника');
         const svc = poolSvcForHost (name);
         if (svc) poolAdd (svc, ips);     // и в копилку сервиса -- на случай, когда имя взять будет неоткуда
         if (nrec && !nrec.hits) nrec.hits = 0;
@@ -9155,7 +9238,7 @@ async function ipResolve (name)
     const old = rec ? dnsBestIp (rec) : null;
     if (old)
     {
-        ipViaLog ('справочная молчит -- беру свою запись', name + ' -> ' + old);
+        ipViaQuietLog ('справочная молчит -- беру свою запись', name + ' -> ' + old);
         dohCache.set (name, { ip: old, at: Date.now () });
         return old;
     }
@@ -9576,7 +9659,7 @@ function dohProxyStart ()
                     try { up.destroy (); } catch (e) { }
                     ipFailNote (host, c.ip);
                     if (c.svc) poolTouch (c.ip, true);
-                    ipViaLog ('адрес не ответил -- беру следующий', host + ' -> ' + c.ip + ' (попытка ' + idx + ' из ' + cand.length + ')');
+                    ipViaFailLog ('адрес не ответил -- беру следующий', host + ' -> ' + c.ip + ' (попытка ' + idx + ' из ' + cand.length + ')', host);
                     tryNext ();
                 }, IP_TRY_TIMEOUT_MS);
                 up.on ('error', () =>
@@ -9586,7 +9669,7 @@ function dohProxyStart ()
                     clearTimeout (timer);
                     ipFailNote (host, c.ip);
                     if (c.svc) poolTouch (c.ip, true);
-                    ipViaLog ('адрес не ответил -- беру следующий', host + ' -> ' + c.ip + ' (попытка ' + idx + ' из ' + cand.length + ')');
+                    ipViaFailLog ('адрес не ответил -- беру следующий', host + ' -> ' + c.ip + ' (попытка ' + idx + ' из ' + cand.length + ')', host);
                     tryNext ();
                 });
                 cSock.on ('error', () => { try { up.destroy (); } catch (e) { } });
@@ -16797,7 +16880,7 @@ async function queueLiveOne (m, w)
         await msg.edit (fitPayload (Object.assign (
             view.components.length ? { content: content, components: view.components } : { content: content },
             { allowedMentions: { parse: [] } })));
-        if (w.first) { w.first = false; console.log ('[' + (d()) + '] [music] сообщение /queue обновил сам (стр. ' + w.page + ')'); }
+        if (w.first) { w.first = false; bgSum.selfQ++; bgSum.selfQPage = w.page; }   // в сводку, не отдельной строкой
         w.text = content;
         w.comp = sig;
         w.err = false;
@@ -17863,9 +17946,11 @@ async function deadScan (guildId)
         $deadScan[guildId] = false;
         if (checked)
         {
-            console.log ('[' + (d()) + '] [music] проверка очереди: проверено ' + checked + ' ' +
-                plural (checked, 'трек', 'трека', 'треков') + ' -- ' +
-                (warned ? 'под вопросом: ' + warned + ' (из очереди не убрал)' : 'подозрительных нет'));
+            // Подозрительные треки -- важное, говорю сразу (и в личку хозяину). «Всё чисто» -- фон: в сводку.
+            if (warned)
+                console.log ('[' + (d()) + '] [music] проверка очереди: проверено ' + checked + ' ' +
+                    plural (checked, 'трек', 'трека', 'треков') + ' -- под вопросом: ' + warned + ' (из очереди не убрал)');
+            else { bgSum.deadOk++; bgSum.deadChecked += checked; }
             deadCheckNote (guildId, { at: Date.now (), checked: checked });
         }
         deadWarnSend (told);
