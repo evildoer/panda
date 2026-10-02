@@ -6541,8 +6541,10 @@ const SC_CARRY_MIN_BYTES = 64 * 1024;      // меньше 64 КБ -- это «�
 const SC_CARRY_TTL = 10 * 60000;           // «везёт» помню 10 минут: проверка не бесплатная
 const SC_CARRY_FAIL_TTL = 2 * 60000;       // «не везёт» -- 2 минуты: трек мог быть удалён, перепроверю
 const SC_CARRY_EVERY_MS = 5 * 60000;       // фоновая проверка не чаще этого
+const SC_CARRY_DRM_TTL = 30 * 60000;       // трек, который сам под DRM, 30 минут не беру для проверки маршрута
 const scCarry = new Map ();                // адрес -> { ok, at, why }
 const scCarryBusy = new Map ();            // адрес -> идущая проверка (одну и ту же не гоняю дважды)
+const scCarryDrm = new Map ();             // адрес трека -> когда выяснилось, что он зашифрован (DRM)
 let scCarryProbe = null;                   // { title, at } -- на каком треке проверял (видно в /health)
 let scCarryKickAt = 0;
 
@@ -6555,15 +6557,17 @@ function scCarryNote (addr, ok, why)       // отметка из живого �
 
 function scCarryTrackFind ()               // свой SC-трек: сперва очередь, потом история
 {
+    const now = Date.now ();
+    const fresh = u => { const at = scCarryDrm.get (String (u || '')); return !(at && (now - at) < SC_CARRY_DRM_TTL); };
     for (const gid of Object.keys ($music))
     {
         const m = $music[gid];
         if (!m) continue;
         for (const t of [m.current, m.seekTrack, ...(m.tracks || [])])
-            if (t && t.url && isScUrl (t.url)) return { url: t.url, title: t.title || 'трек с SoundCloud' };
+            if (t && t.url && isScUrl (t.url) && fresh (t.url)) return { url: t.url, title: t.title || 'трек с SoundCloud' };
         for (const e of (Array.isArray (m.history) ? m.history : []))
             for (const u of ((e && e.urls) || []))
-                if (isScUrl (u)) return { url: u, title: ((e.titles || [])[0]) || 'трек с SoundCloud' };
+                if (isScUrl (u) && fresh (u)) return { url: u, title: ((e.titles || [])[0]) || 'трек с SoundCloud' };
     }
     return null;
 }
@@ -6586,13 +6590,13 @@ function scCarryByteRun (addr, url)        // тянет первые килоб
     return new Promise (resolve =>
     {
         let done = false, got = 0, err = '', proc = null, t = null;
-        const fin = (ok, why) =>
+        const fin = (ok, why, drm) =>
         {
             if (done) return;
             done = true;
             if (t) clearTimeout (t);
             try { if (proc && typeof proc.kill === 'function') proc.kill (); } catch (e) { }
-            resolve ({ ok: ok, why: String (why || '') });
+            resolve ({ ok: ok, why: String (why || ''), drm: !!drm });
         };
         try
         {
@@ -6619,7 +6623,8 @@ function scCarryByteRun (addr, url)        // тянет первые килоб
         if (typeof proc.on !== 'function') return;              // не процесс -- ждём только таймер
         proc.on ('close', code => fin (false, got > 0
             ? 'поток закрылся, пришло только ' + fmtMb (got)
-            : 'yt-dlp закрылся без звука' + (err ? ': ' + oneLine (err, 120) : ' (код ' + code + ')')));
+            : 'yt-dlp закрылся без звука' + (err ? ': ' + oneLine (err, 120) : ' (код ' + code + ')'),
+            got === 0 && isDrmError (err)));
     });
 }
 
@@ -6634,6 +6639,15 @@ async function scCarryCheck (addr, url)
     const job = (async () =>
     {
         const r = await scCarryByteRun (a, url);
+        if (r.drm)
+        {
+            // Это не про маршрут: сам трек зашифрован, скачать его нельзя (cookie не помогают). Проверку
+            // маршрута не порчу -- иначе DRM-трек оговорил бы все адреса; для следующей проверки возьму другой трек.
+            scCarryDrm.set (String (url), Date.now ());
+            console.log ('[' + (d()) + '] [music] SoundCloud-проверка: сам трек под DRM-защитой (cookie не помогают) -- ' +
+                'маршрут ' + a + ' не виню, на следующую проверку возьму другой трек');
+            return { ok: false, at: 0, why: 'трек под DRM', drm: true };
+        }
         const prev = scCarry.get (a);
         const out = { ok: r.ok, at: Date.now (), why: r.ok ? '' : r.why };
         scCarry.set (a, out);
@@ -6663,7 +6677,9 @@ async function scCarryTick ()              // фоном: у ютуба свой
     {
         const c = scCarry.get (a);
         if (c && (Date.now () - c.at) < (c.ok ? SC_CARRY_TTL : SC_CARRY_FAIL_TTL)) continue;
-        try { await scCarryCheck (a, find.url); } catch (e) { }
+        let r = null;
+        try { r = await scCarryCheck (a, find.url); } catch (e) { }
+        if (r && r.drm) break;                 // трек зашифрован: остальные адреса по нему гонять незачем
     }
 }
 
@@ -9592,19 +9608,44 @@ async function ytRoutesFor (url)
     return front.length ? [...front, ...doh] : routes;
 }
 
-function sectionProxyFor (viaProxy)
+// Маршрут для СЕКЦИИ (перемотка куском): ffmpeg понимает только http-прокси, SOCKS ему не годится.
+// Если http-адрес из конфига молчит, пробую СВОЙ DoH-маршрут -- для ffmpeg он такой же обычный http-прокси,
+// а имена по нему разрешает сам бот (системный DNS не нужен). Живой случай 02.10: при мёртвом 10809 секции
+// уходили напрямую и получали 403, хотя свой DoH-маршрут в тот момент вёз музыку. Возвращаю строку-адрес
+// (её и запоминает открытый поток) -- по ней же sectionProxyWhy честно скажет, куда секция пошла.
+async function sectionProxyFor (viaProxy)
 {
     const self = /^https?:\/\//i.test (String (viaProxy || '')) ? viaProxy : '';
     if (self && !proxyBrieflyBad (self)) return self;
     for (const p of MUSIC_PROXIES)
         if (/^https?:\/\//i.test (p) && p !== self && !proxyBrieflyBad (p)) return p;
+    if (MUSIC_DOH)
+    {
+        const port = await dohProxyStart ();
+        const doh = port ? ('http://127.0.0.1:' + port) : '';
+        if (doh && doh !== self && !proxyBrieflyBad (doh))
+        {
+            console.log ('[' + (d()) + '] [music] секция перемотки: ' + (self
+                ? 'рабочего http-адреса нет (' + self + ' сейчас помечен ненадёжным)'
+                : 'в конфиге нет живого http-адреса') + ' -- беру свой DoH-маршрут ' + doh +
+                ' (он для ffmpeg обычный http-прокси)');
+            return doh;
+        }
+    }
     return self;
 }
 
 function sectionProxyWhy (sectionProxy)
 {
+    if (sectionProxy && dohProxyPort && sectionProxy === 'http://127.0.0.1:' + dohProxyPort)
+        return ' (секция шла через свой DoH-маршрут http://127.0.0.1:' + dohProxyPort +
+            ' -- для ffmpeg он обычный http-прокси)';
     if (sectionProxy) return ' (секция шла через ' + sectionProxy + ')';
-    return MUSIC_PROXIES.some (p => /^https?:\/\//i.test (p))
+    const http = MUSIC_PROXIES.some (p => /^https?:\/\//i.test (p));
+    if (MUSIC_DOH) return http
+        ? ' (HTTP-прокси из конфига молчит, и свой DoH-маршрут не ответил -- секция шла напрямую)'
+        : ' (в конфиге только SOCKS, а свой DoH-маршрут не ответил -- секция шла напрямую)';
+    return http
         ? ' (у HTTP-прокси сбой -- секция шла напрямую)'
         : ' (в конфиге только SOCKS, а ffmpeg его не понимает -- секция шла напрямую)';
 }
@@ -9688,6 +9729,15 @@ function isGoneError (e)
 {
     const s = String ((e && (e.stderr || e.message)) || e);
     return /video unavailable|this video is unavailable|has been removed|removed by the uploader|is not available|private video|no longer available|has been terminated|blocked (?:it )?(?:on copyright|in your country)|not available in your country/i.test (s);
+}
+
+// Часть треков SoundCloud отдаёт зашифрованными (DRM): yt-dlp их скачать не может -- ни с cookie, ни без.
+// Живой случай 02.10: трек «Golden» трижды обрывался, третий раз уводил за собой выравнивание громкости,
+// и очередь теряла на нём около минуты. Такой трек теперь пропускаю сразу и говорю об этом прямо.
+function isDrmError (e)
+{
+    const s = String ((e && (e.stderr || e.message)) || e);
+    return /drm protected|digital rights management/i.test (s);
 }
 
 function streamFirstData (source, proc, ms)
@@ -11418,9 +11468,12 @@ async function cacheFillTick (guildId)
     {
         if (!m.fillFail) m.fillFail = new Map ();
         m.fillFail.set (pick.key, Date.now () + CACHE_FILL_FAIL_MS);
+        const _drm = isDrmError (res && res.err);
         console.error ('[' + (d()) + '] [music] заранее не легло (' + (pick.track.title || 'трек') + '): ' +
             (res && res.err ? ytDlpErr (res.err, 140) : 'файл на диск не лёг') +
-            ' -- музыку это не ломает: трек заиграет как обычно, попробую позже');
+            (_drm ? ' -- это DRM-защита источника (cookie не помогают): скачать его нельзя,' +
+                    ' но музыку это не ломает -- попробую позже, если он отдаст обычный поток'
+                  : ' -- музыку это не ломает: трек заиграет как обычно, попробую позже'));
         return;
     }
     const plan = cacheFillPlan (m);
@@ -11842,7 +11895,7 @@ async function createTrackStream (track, seekSec = 0, seekMode = 'sections', par
     }
     let viaProxy = ((await ytRoutesFor (track.url))[0] || {}).proxy || '';
     const seek = (seekMode === 'sections' && seekSec >= 1 && !track.isLive);
-    const seekProxy = seek ? sectionProxyFor (viaProxy) : '';
+    const seekProxy = seek ? await sectionProxyFor (viaProxy) : '';
     const seekInFfmpeg = (seekMode === 'ffseek' && seekSec >= 1 && !track.isLive);
     const ytdlpStream = ytdlp.exec
     (
@@ -11931,6 +11984,9 @@ async function createTrackStream (track, seekSec = 0, seekMode = 'sections', par
     );
     if (resource.volume)
         resource.volume.setVolume (MUSIC_VOLUME);
+    // Причину отказа потока сторожа спрашивают уже после обрыва: кладу рядом живую ссылку на ошибку yt-dlp,
+    // чтобы отличить DRM или «трека больше нет» от настоящего сбоя сети (сам текст ошибки плеера -- про данные).
+    try { resource.dlErr = () => ytdlpStream.lastErr; } catch (e) { }
     return { resource, viaProxy, source: ytdlpStream.stdout, proc: ytdlpStream, ff: ff, tee: tee,
              sectionProxy: seekProxy,
              seeked: (seekMode === 'sections' && seek) || (seekMode === 'ffseek' && !!ff) };
@@ -12627,6 +12683,32 @@ function wireStreamErrors (m, track, resource, viaProxy, guildId)
     resource.playStream.once ('error', e =>
     {
         const playing = m.current === track;
+        let dlErr = null;
+        try { dlErr = (typeof resource.dlErr === 'function') ? resource.dlErr () : null; } catch (e2) { }
+        if (isDrmError (e) || isDrmError (dlErr))
+        {
+            // Скачать нельзя, и cookie тут не помогают -- трек не бросаю в «удалённые», просто пропускаю:
+            // SoundCloud иногда отдаёт тот же трек и обычным потоком, пусть попробует позже.
+            if (playing)
+            {
+                console.error ('[' + (d()) + '] [music] ' + (track.title || 'трек') +
+                    ': источник отдаёт трек под DRM-защитой -- скачать нельзя (cookie не помогают), пропускаю сразу: ' +
+                    ytDlpErr (dlErr || e, 140));
+                trackNotice (guildId, track, '🎬 **' + (track.title || 'Трек') + '** -- SoundCloud отдаёт его ' +
+                    'под DRM-защитой: скачать такой трек нельзя (cookie тут не помогают), пропускаю. ' +
+                    'Если нужен -- попробуй другой его вариант или другой источник. Очередь играет дальше.');
+                m.streamRetries = 0;
+                m.current = null;
+                m.player.stop (true);
+            }
+            else
+            {
+                console.error ('[music] предзагрузка: трек под DRM-защитой (' + (track.title || 'трек') +
+                    ') -- пропускаю: ' + ytDlpErr (dlErr || e, 120));
+                if (m.preload && m.preload.track === track) m.preload = null;
+            }
+            return;
+        }
         if (viaProxy && isNetworkError (e)) proxyMarkBad (viaProxy);
         if (!playing)
         {
@@ -14324,13 +14406,19 @@ function historyText (guildId, page = 1)
     const cur = Math.min (Math.max (1, Math.floor (Number (page) || 1)), pages);
     const slice = blocks.slice ((cur - 1) * HISTORY_PAGE_BLOCKS, cur * HISTORY_PAGE_BLOCKS);
     const sum = historyTotalTracks (list);
-    const head = '🕘 **История добавлений** -- ' + list.length + ' ' +
-        plural (list.length, 'пачка', 'пачки', 'пачек') + ', ' + sum + ' ' +
-        plural (sum, 'трек', 'трека', 'треков') +
+    // Одиночную песню пачкой не считаю (владелец так и просил): она и в списке показана собой -- названием
+    // и адресом, -- а не строкой поискового запроса. В счётчике пачек её тоже нет.
+    const packs = list.filter (e => historyTracksOf (e) > 1).length;
+    const singles = list.length - packs;
+    const head = '🕘 **История добавлений** -- ' +
+        (packs ? packs + ' ' + plural (packs, 'пачка', 'пачки', 'пачек') : 'пачек нет') +
+        (singles ? ' + ' + singles + ' ' + plural (singles, 'одиночный трек', 'одиночных трека', 'одиночных треков') : '') +
+        ', всего ' + sum + ' ' + plural (sum, 'трек', 'трека', 'треков') +
         (pages > 1 ? ' -- страница ' + cur + ' из ' + pages : '') + ':\n' + QSEP;
     const withX = slice.some (b => b.times > 1);
     const tail = '\n' + QSEP + '\n_Строка -- одна пачка: время, ссылка и первые треки списком.' +
         (withX ? ' «×N» -- столько раз подряд ставили одну и ту же ссылку.' : '') +
+        ' Одиночная песня -- своей строкой с 🎵 (сразу с названием и адресом).' +
         ' Весь состав -- кнопкой «📜 Все треки»._' +
         (pages > 1 ? '\n_Дальше -- кнопками листания под сообщением._' : '');
     const budget = HISTORY_MSG_LIMIT - head.length - 2 - tail.length;
@@ -14347,13 +14435,37 @@ function historyText (guildId, page = 1)
         if (t.length > out.length) out.push ('…и ещё ' + (t.length - out.length));
         return out;
     };
+    const linkOfEntry = e =>
+    {
+        for (const id of ((e && e.ids) || []))
+        {
+            const l = historyLinkOf (id);
+            if (l) return l;
+        }
+        return '';
+    };
+    // Одиночный трек показываю им самим: время, название и адрес -- по нему сразу видно, что это и откуда.
+    const singleLine = b =>
+    {
+        const t = String (historyTitlesOf (b.e)[0] || b.key || 'без названия');
+        const link = linkOfEntry (b.e);
+        return '`' + stamp (b.at) + '`' + (b.times > 1 ? ' ×' + b.times : '') + ' 🎵 ' +
+            (t.length > HISTORY_TITLE_CLIP ? t.slice (0, HISTORY_TITLE_CLIP - 1).trimEnd () + '…' : t) +
+            (link ? ' — ' + clipped (link, 100) : '') +
+            historySrcText (b.e);
+    };
+    const rowOf = (b, per) =>
+    {
+        if (historySizeOf (b.e) === 1 && historyTitlesOf (b.e).length === 1) return singleLine (b);
+        return [linkLine (b)].concat (previewOf (b, per)).join ('\n');
+    };
     const rowsOf = per =>
     {
         const out = [];
         let len = 0;
         for (const b of slice)
         {
-            const part = [linkLine (b)].concat (previewOf (b, per)).join ('\n');
+            const part = rowOf (b, per);
             if (len + part.length + 2 > budget) break;
             out.push (part);
             len += part.length + 2;
