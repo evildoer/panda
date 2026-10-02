@@ -112,6 +112,21 @@
 // сколько держится, и первый шаг плана) и «что ждать» (прогноз следующего часа; опасные часы названы прямо).
 // Подробный разбор -- книга, графики, связки, полный план, сверки прогнозов -- никуда не пропал: он в `node . net`.
 // Стартовый блок печатает ту же сводку, а повторяющиеся из часа в час одинаковые строки больше не выводятся.
+// v2.154 -- по итогам разбора с чистого взгляда; всё -- про честность данных:
+// 1) в книге адресов поле fail всегда было МЕТКОЙ ВРЕМЕНИ последнего сбоя (её читают выбор адреса и
+// сторож сна, а успех её обнуляет), но аналитика, зацепки и план читали его как СЧЁТЧИК -- отсюда мусор
+// в `node . net` («277 ответ / 1790942271597 отказ») и ложные «подсеть режется». Теперь счётчик отказов
+// ведётся отдельно (fails), fail остаётся меткой времени, а старые метки при загрузке книги один раз и
+// идемпотентно превращаются в «хотя бы один отказ»; то же правило применено в консольном разборе.
+// 2) срок зацепки больше не сбрасывается из-за пересчёта чисел в её описании: у зацепок появился
+// опознавательный ключ (адрес/подсеть/источник), и память сравнивает суть, а не полный текст; срок в
+// сводке показывается только для той же зацепки.
+// 3) прогноз на следующий час записывается ДО печати сводки (если сводка споткнётся, час всё равно
+// измерен), а найденные зацепки передаются в сводку готовыми -- без повторного пересчёта.
+// В tools/zapret-pick.ps1: одноразовый сторож службы возвращает zapret только если рабочий обход НЕ
+// оставлен (нет живого хранителя и нет winws.exe), а после успешной замены снимается совсем; заодно
+// починен сам хранитель -- он не разворачивал результат подбора (брал хеш-таблицу вместо Best) и
+// поднимал winws без аргументов, то есть починка не работала вовсе.
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -930,6 +945,7 @@ function netCli ()       // разбор собранного: что знаем
         try { if (_db) _db.close (); } catch (e) { }
         const _get = name => dbPeekValue (_rows, name);
         const book = _get ('dnsbook:map') || {};
+        dnsFailMigrate (book);      // в консоли база читается напрямую: старые метки сбоя привожу к счётчикам тем же правилом, что и бот при загрузке
         const stats = _get ('dnsbook:stats') || {};
         const pools = _get ('netState:ip_map') || {};
         const rev = _get ('netState:ip_names') || {};
@@ -7627,8 +7643,8 @@ if (BOT_RUN)
             const bones = netBonesFind (bk, hs, ipNames);
             if (bones.length) netBoneTake (bones);                // зацепку запоминаю, даже когда в лог идёт только сводка
             const checks = netGuessCheck (hs);                     // сверки нужны не для лога, а для счёта прогнозов (и архива)
-            for (const l of netHourDigestLines (bk, hs, ipMem, ipNames, checks)) console.log ('[' + (d()) + '] [net] ' + l);
-            netGuessMake (hs);
+            netGuessMake (hs);                                     // прогноз записываю ДО печати: если сводка споткнётся, час всё равно измерен
+            for (const l of netHourDigestLines (bk, hs, ipMem, ipNames, checks, bones)) console.log ('[' + (d()) + '] [net] ' + l);
         }
         catch (e) { }
     }, 5000);
@@ -7651,8 +7667,8 @@ if (BOT_RUN)
             const bones = netBonesFind (book, hours, ipNames);
             if (bones.length) netBoneTake (bones);
             const checks = netGuessCheck (hours);
-            for (const l of netHourDigestLines (book, hours, ipMem, ipNames, checks)) console.log ('[' + (d()) + '] [net] ' + l);
             netGuessMake (hours);
+            for (const l of netHourDigestLines (book, hours, ipMem, ipNames, checks, bones)) console.log ('[' + (d()) + '] [net] ' + l);
         }
         catch (e) { }
     }, 60 * 60 * 1000);
@@ -8033,6 +8049,13 @@ async function dnsBookLoad ()
         catch (e) { }
         dnsBook = (map && typeof map === 'object' && !Array.isArray (map)) ? map : {};
         dnsStats = (st && typeof st === 'object' && !Array.isArray (st)) ? st : {};
+        const _failMig = dnsFailMigrate (dnsBook);       // старые отметки сбоя (в fail лежала метка времени) превращаю в счётчик -- один раз, идемпотентно
+        if (_failMig)
+        {
+            dnsSaveTimer = null;
+            await dnsBookSave (true);
+            console.log ('[' + (d()) + '] [music] книга адресов: у ' + _failMig + ' адресов старая отметка сбоя стала счётчиком (fail -- когда сбоил, fails -- сколько раз)');
+        }
         try
         {
             const old = await ipMemLoad ();
@@ -8042,7 +8065,7 @@ async function dnsBookLoad ()
                 const r = old[k];
                 if (!r || !r.ip || !/^\d{1,3}(\.\d{1,3}){3}$/.test (String (r.ip))) continue;
                 const rec = dnsBook[k] || (dnsBook[k] = dnsRecMake (k));
-                if (!rec.ips.some (x => x.ip === r.ip)) rec.ips.push ({ ip: r.ip, at: r.at || Date.now (), ms: 0, src: 'прежняя книга', ok: 0, fail: 0, lastUsed: 0 });
+                if (!rec.ips.some (x => x.ip === r.ip)) rec.ips.push ({ ip: r.ip, at: r.at || Date.now (), ms: 0, src: 'прежняя книга', ok: 0, fail: 0, fails: 0, lastUsed: 0 });
                 rec.at = Math.max (rec.at || 0, r.at || 0);
                 delete old[k];
                 moved++;
@@ -8086,6 +8109,18 @@ function dnsRecMake (name)
 {
     return { name: name, ips: [], ttl: DNS_TTL_DEF, at: 0, src: '', hits: 0, fails: 0, lastUsed: 0 };
 }
+function dnsFailMigrate (book)   // у старых записей в fail лежала метка времени (её читают выбор адреса и сторож сна); счётчик отказов теперь отдельный -- fails
+{
+    let n = 0;
+    for (const name of Object.keys (book || {}))
+    {
+        const rec = book[name];
+        if (!rec || !Array.isArray (rec.ips)) continue;
+        for (const x of rec.ips)
+            if (x && typeof x.fail === 'number' && x.fail > 1e9 && !(x.fails > 0)) { x.fails = 1; n++; }
+    }
+    return n;
+}
 async function dnsRec (name)
 {
     const book = await dnsBookLoad ();
@@ -8095,7 +8130,7 @@ async function dnsRec (name)
 function dnsIpSlot (rec, ip)
 {
     let r = rec.ips.find (x => x.ip === ip);
-    if (!r) { r = { ip: ip, at: 0, ms: 0, src: '', ok: 0, fail: 0, lastUsed: 0 }; rec.ips.push (r); }
+    if (!r) { r = { ip: ip, at: 0, ms: 0, src: '', ok: 0, fail: 0, fails: 0, lastUsed: 0 }; rec.ips.push (r); }
     return r;
 }
 let dnsTrimAt = 0;
@@ -8451,8 +8486,20 @@ function netBoneTake (bones)           // беру самую сильную з�
 {
     if (!bones || !bones.length) return;
     const b = bones[0];
-    if (netBoneLedger && netBoneLedger.text === b.text) return;      // та же зацепка -- не сбрасываю счёт времени
-    netBoneLedger = { kind: b.kind, ip: b.ip || '', text: b.text, score: b.score || 0, at: Date.now () };
+    // сравниваю по ключу (суть), а не по полному тексту: в тексте есть счётчики (число адресов), и срок не должен сбрасываться из-за них
+    const same = netBoneLedger && ((netBoneLedger.key && b.key) ? netBoneLedger.key === b.key : netBoneLedger.text === b.text);
+    if (same)
+    {
+        if (netBoneLedger.text !== b.text || netBoneLedger.kind !== b.kind || !netBoneLedger.key)
+        {
+            netBoneLedger.text = b.text;                             // обновляю описание (числа), но НЕ время
+            netBoneLedger.kind = b.kind;
+            netBoneLedger.key = b.key || netBoneLedger.key || '';
+            netBoneSave (true);
+        }
+        return;
+    }
+    netBoneLedger = { kind: b.kind, ip: b.ip || '', key: b.key || '', text: b.text, score: b.score || 0, at: Date.now () };
     netBoneSave (true);
 }
 function netBoneVerdict (bone, book, hours)   // держится прежняя зацепка или сломалась
@@ -8465,7 +8512,7 @@ function netBoneVerdict (bone, book, hours)   // держится прежняя
         if (bone.ip)
             for (const nm of Object.keys (book || {}))
                 for (const x of ((book[nm] || {}).ips || []))
-                    if (x.ip === bone.ip) { tot += (x.ok || 0) + (x.fail || 0); fail += (x.fail || 0); }
+                    if (x.ip === bone.ip) { tot += (x.ok || 0) + (x.fails || 0); fail += (x.fails || 0); }
         if (!tot) return 'зацепка держится ' + held + ' ч, по ней пока не ходили: ' + bone.text;
         if (!fail) return 'зацепка держится ' + held + ' ч: ' + bone.ip + ' -- ' + tot + ' обращений, ни одного отказа';
         return 'зацепка сломалась после ' + held + ' ч: ' + bone.ip + ' -- ' + fail + ' отказов из ' + tot + '. Берусь заново: пересчитаю зацепки по свежим данным';
@@ -8535,11 +8582,11 @@ function netAnalyticsLines (book, hours)     // чистая функция: т�
         if ((rec.newAddrs || 0) >= 3) floating.push ([name, rec.newAddrs || 0]);
         for (const x of rec.ips || [])
         {
-            const tot = (x.ok || 0) + (x.fail || 0);
+            const tot = (x.ok || 0) + (x.fails || 0);                 // счётчик отказов -- fails; fail -- только метка времени последнего сбоя
             if (!tot) continue;
             const rate = (x.ok || 0) / tot;
-            if (tot >= 3 && rate <= 0.5) badList.push ([x.ip, name, x.ok || 0, x.fail || 0]);
-            if (tot >= 8 && rate >= 0.95) goodList.push ([x.ip, name, x.ok || 0, Math.round (x.ms || 0)]);
+            if (tot >= 3 && rate <= 0.5) badList.push ([x.ip, name, x.ok || 0, x.fails || 0]);
+            if (tot >= 8 && !(x.fails > 0)) goodList.push ([x.ip, name, x.ok || 0, Math.round (x.ms || 0)]);
         }
     }
     badList.sort ((a, b) => (b[3] - a[3]) || (a[2] - b[2]));
@@ -8700,7 +8747,7 @@ function netBonesFind (book, hours, rev)     // ищу «кость»: за чт
             if (!worst || rate < worst.rate) worst = { h: h, rate: rate, n: e.ok + e.fail };
         }
         if (best && worst && (best.rate - worst.rate) >= 0.5)
-            cand.push ({ kind: 'источник по часам', score: Math.min (25, (best.rate - worst.rate) * Math.min (best.n, worst.n)), ip: '',
+            cand.push ({ kind: 'источник по часам', score: Math.min (25, (best.rate - worst.rate) * Math.min (best.n, worst.n)), ip: '', key: 'источник:' + s,
                 text: s + ': в ' + worst.h + ':00 отвечает в ' + Math.round (worst.rate * 100) + '%, а в ' + best.h + ':00 -- в ' + Math.round (best.rate * 100) +
                     '%. Вывод: в часы ' + worst.h + ':00 он бесполезен, а в ' + best.h + ':00 -- лучший' });
     }
@@ -8720,7 +8767,7 @@ function netBonesFind (book, hours, rev)     // ищу «кость»: за чт
             if (!x.ip) continue;
             const o = ipStat[x.ip] || (ipStat[x.ip] = { ip: x.ip, ok: 0, fail: 0, ms: 0, ad: 0, cnt: 0, names: {}, firstAt: x.firstAt || 0, pre: netPrefixOf (x.ip) });
             o.ok += x.ok || 0;
-            o.fail += x.fail || 0;
+            o.fail += x.fails || 0;
             if (x.ms) o.ms = o.ms ? Math.round (o.ms * 0.7 + x.ms * 0.3) : x.ms;
             if (x.ad) o.ad++;
             if ((Number (x.cnt) || 0) > 1) o.cnt++;
@@ -8733,7 +8780,7 @@ function netBonesFind (book, hours, rev)     // ищу «кость»: за чт
     if (solid.length)
     {
         const x = solid[0], nm = Object.keys (x.names);
-        cand.push ({ kind: 'надёжный адрес', score: Math.min (x.ok, 12) * (1 + nm.length), ip: x.ip,
+        cand.push ({ kind: 'надёжный адрес', score: Math.min (x.ok, 12) * (1 + nm.length), ip: x.ip, key: 'адрес:' + x.ip,
             text: x.ip + ' (' + nm.slice (0, 2).join (', ') + '): ' + x.ok + ' обращений и НИ ОДНОГО отказа' +
                 (x.ms ? ', ~' + Math.round (x.ms) + ' мс' : '') + '. Вывод: держать его первым -- это опора, а не догадка' });
     }
@@ -8742,7 +8789,7 @@ function netBonesFind (book, hours, rev)     // ищу «кость»: за чт
     if (lever.length)
     {
         const x = lever[0], nm = Object.keys (x.names);
-        cand.push ({ kind: 'рычаг', score: 20 + nm.length * 6, ip: x.ip,
+        cand.push ({ kind: 'рычаг', score: 20 + nm.length * 6, ip: x.ip, key: 'рычаг:' + x.ip,
             text: 'один адрес ' + x.ip + ' держит сразу ' + nm.length + ' имён (' + nm.slice (0, 3).join (', ') + ') и ни разу не сбоил. Вывод: пока он жив -- живы все ' + nm.length +
                 (nameOfIp (x.ip) ? '; по обратной таблице это «' + nameOfIp (x.ip) + '»' : '') });
     }
@@ -8760,24 +8807,24 @@ function netBonesFind (book, hours, rev)     // ищу «кость»: за чт
     if (cut.length)
     {
         const p = cut[0];
-        cand.push ({ kind: 'подсеть режется', score: 24 + p.dead * 2, ip: '',
+        cand.push ({ kind: 'подсеть режется', score: 24 + p.dead * 2, ip: '', key: 'подсеть:' + p.pre,
             text: 'подсеть ' + p.pre + '.x: ' + p.dead + ' адресов из ' + p.n + ' с отказами (имена: ' + Object.keys (p.names).slice (0, 3).join (', ') +
                 '). Вывод: режут подсеть целиком -- искать внутри неё другой адрес бесполезно, надо брать из другой подсети' });
     }
     const open = plist.filter (p => p.n >= 3 && !p.dead).sort ((a, b) => b.n - a.n);
     if (open.length)
-        cand.push ({ kind: 'живая подсеть', score: 10 + open[0].n, ip: '',
+        cand.push ({ kind: 'живая подсеть', score: 10 + open[0].n, ip: '', key: 'подсеть:' + open[0].pre,
             text: 'подсеть ' + open[0].pre + '.x: все ' + open[0].n + ' известных адресов работают без отказов. Вывод: отсюда брать запасные' });
     const adList = ips.filter (x => x.ad).sort ((a, b) => b.ad - a.ad);
     if (adList.length)
-        cand.push ({ kind: 'проверенная подпись', score: 22 + adList.length, ip: adList[0].ip,
+        cand.push ({ kind: 'проверенная подпись', score: 22 + adList.length, ip: adList[0].ip, key: 'подпись:' + adList[0].ip,
             text: 'адресов с проверенной подписью (DNSSEC): ' + adList.length + ', первый -- ' + adList[0].ip + ' (' + Object.keys (adList[0].names).slice (0, 2).join (', ') +
                 '). Вывод: подписанный ответ подменить нельзя -- такие адреса ставлю первыми по их именам' });
     const now = Date.now ();
     const fresh = ips.filter (x => x.firstAt && (now - x.firstAt) < 24 * 3600000 && x.ok >= 3 && !x.fail)
         .sort ((a, b) => (b.firstAt || 0) - (a.firstAt || 0));
     if (fresh.length)
-        cand.push ({ kind: 'готовый заменитель', score: 12 + Math.min (fresh[0].ok, 8), ip: fresh[0].ip,
+        cand.push ({ kind: 'готовый заменитель', score: 12 + Math.min (fresh[0].ok, 8), ip: fresh[0].ip, key: 'заменитель:' + fresh[0].ip,
             text: 'новый адрес ' + fresh[0].ip + ' (' + Object.keys (fresh[0].names).slice (0, 2).join (', ') + ') появился меньше суток назад и уже дал ' + fresh[0].ok +
                 ' обращений без отказа. Вывод: готовый заменитель, если старый адрес откажет' });
     const thin = [];
@@ -8786,14 +8833,14 @@ function netBonesFind (book, hours, rev)     // ищу «кость»: за чт
         const list = ((book[name] || {}).ips) || [];
         if (list.length < 4) continue;
         let used = 0;
-        for (const x of list) used += (x.ok || 0) + (x.fail || 0);
+        for (const x of list) used += (x.ok || 0) + (x.fails || 0);
         if (used < 5) continue;                 // по адресам ещё не ходили -- это не узкое место, а пустая графа
-        const live = list.filter (x => x.ok >= 2 && !x.fail);
+        const live = list.filter (x => x.ok >= 2 && !(x.fails > 0));
         if (live.length === 1) thin.push (name + ' (адресов ' + list.length + ', из них живой один: ' + live[0].ip + ')');
         else if (!live.length) thin.push (name + ' (адресов ' + list.length + ', ни один из ' + used + ' обращений не подтвердился)');
     }
     if (thin.length)
-        cand.push ({ kind: 'узкое место', score: 15 + thin.length, ip: '',
+        cand.push ({ kind: 'узкое место', score: 15 + thin.length, ip: '', key: 'узкое:' + String (thin[0]).split (' (')[0],
             text: 'у имени много адресов, а живой один: ' + thin.slice (0, 3).join ('; ') + '. Вывод: запас здесь тонкий -- держать первый и следить' });
     cand.sort ((a, b) => b.score - a.score);
     return cand;
@@ -8872,7 +8919,7 @@ function netMergedLines (book, pools, rev)     // объединяю книгу,
         {
             const rec = book[nm] || {}, list = rec.ips || [];
             let ok = 0, fail = 0, ad = 0, agree = 0;
-            for (const x of list) { ok += x.ok || 0; fail += x.fail || 0; if (x.ad) ad++; if ((Number (x.cnt) || 0) > 1) agree++; }
+            for (const x of list) { ok += x.ok || 0; fail += x.fails || 0; if (x.ad) ad++; if ((Number (x.cnt) || 0) > 1) agree++; }
             return { name: nm, n: list.length, ok: ok, fail: fail, ad: ad, agree: agree, src: rec.src || '--' };
         }).sort ((a, b) => (b.n - a.n) || (b.ok - a.ok));
         lines.push ('одна таблица по именам (топ по числу известных адресов):');
@@ -8903,7 +8950,7 @@ function netLinksFind (book, pools, rev)     // связки: где одна п
             const o = byIp[x.ip] || (byIp[x.ip] = { ip: x.ip, names: {}, ok: 0, fail: 0, ms: 0, played: 0, ad: 0, pre: netPrefixOf (x.ip) });
             o.names[nm] = 1;
             o.ok += x.ok || 0;
-            o.fail += x.fail || 0;
+            o.fail += x.fails || 0;
             o.played += x.played || 0;
             if (x.ad) o.ad++;
             if (x.ms) o.ms = o.ms ? Math.round (o.ms * 0.7 + x.ms * 0.3) : x.ms;
@@ -8987,7 +9034,7 @@ function netPlanLines (book, pools, rev)     // как этим пользова
             if (!x.ip) continue;
             const o = byIp[x.ip] || (byIp[x.ip] = { ip: x.ip, ok: 0, fail: 0, played: 0, ad: 0, named: [], pre: netPrefixOf (x.ip) });
             o.ok += x.ok || 0;
-            o.fail += x.fail || 0;
+            o.fail += x.fails || 0;
             o.played += x.played || 0;
             if (x.ad) o.ad++;
             if (o.named.indexOf (nm) < 0 && o.named.length < 4) o.named.push (nm);
@@ -9027,7 +9074,7 @@ function netPlanLines (book, pools, rev)     // как этим пользова
         lines.push ('выгода: связок ' + links.length + ', самая широкая закрывает ' + maxNames + ' имени сразу -- проверил один адрес, поднял всё имя целиком');
     return lines;
 }
-function netHourDigestLines (book, hours, pools, rev, checks)   // короткая сводка вместо десятка строк: кто отвечает, где запас, что ждать; подробности -- `node . net`
+function netHourDigestLines (book, hours, pools, rev, checks, bonesGiven)   // короткая сводка вместо десятка строк: кто отвечает, где запас, что ждать; подробности -- `node . net`
 {
     const out = [];
     // 1) кто отвечает
@@ -9049,12 +9096,14 @@ function netHourDigestLines (book, hours, pools, rev, checks)   // коротк�
     else out.push ('кто отвечает: за это время замеров ещё нет -- копилка источников пополнится после работы справочников');
     // 2) где запас: сильнейшая зацепка и первый шаг плана
     const parts = [];
-    const bones = netBonesFind (book, hours, rev);
+    const bones = bonesGiven || netBonesFind (book, hours, rev);
     if (bones.length)
     {
         const b = bones[0], short = String (b.text || '').split ('. ')[0];
-        // время беру только у ТОЙ ЖЕ зацепки: если память от другой (или пустая), честнее промолчать, чем показать чужой срок
-        const heldH = (netBoneLedger && netBoneLedger.text === b.text) ? Math.max (0, Math.round ((Date.now () - (netBoneLedger.at || Date.now ())) / 3600000)) : 0;
+        // срок беру только у ТОЙ ЖЕ зацепки (по ключу, а не по полному тексту: в тексте есть счётчики)
+        const lk = netBoneLedger;
+        const sameBone = !!(lk && ((lk.key && b.key) ? lk.key === b.key : lk.text === b.text));
+        const heldH = sameBone ? Math.max (0, Math.round ((Date.now () - (lk.at || Date.now ())) / 3600000)) : 0;
         parts.push (short + ((b.kind || heldH > 0) ? ' (' + (b.kind || 'зацепка') + (heldH > 0 ? ', держится ' + heldH + ' ч' : '') + ')' : ''));
     }
     else
@@ -9220,8 +9269,8 @@ async function ipFailNote (name, ip)
     if (!rec) return;
     rec.fails = (rec.fails || 0) + 1;
     rec.fail = Date.now ();
-    if (ip) { const r = dnsIpSlot (rec, ip); r.fail = Date.now (); }
-    else for (const r of rec.ips) r.fail = Date.now ();
+    if (ip) { const r = dnsIpSlot (rec, ip); r.fails = (r.fails || 0) + 1; r.fail = Date.now (); }
+    else for (const r of rec.ips) { r.fails = (r.fails || 0) + 1; r.fail = Date.now (); }
     dnsBookSave ();
     dohCache.delete (name);
 }

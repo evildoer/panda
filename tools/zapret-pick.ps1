@@ -318,18 +318,43 @@ function ServiceState($name)
 }
 
 # ---------- сторож: вернуть как было, даже если прогон прервут ----------
+# Служба возвращается ТОЛЬКО если рабочего обхода не оставлено: живой хранитель сам разберётся,
+# а запущенный winws.exe -- это намеренно оставленный обход (иначе служба и движок дрались бы за одно).
 function Arm-Watchdog($wasRunning, $seconds)
 {
     $w = Join-Path $Work 'zapret-watchdog.ps1'
     $body = @'
-param([int]$Delay, [string]$Service, [bool]$WasRunning)
+param([int]$Delay, [string]$Service, [bool]$WasRunning, [string]$WorkDir)
 Start-Sleep -Seconds $Delay
+if (-not $WasRunning) { exit 0 }
+if ($WorkDir)
+{
+    $lf = Join-Path $WorkDir 'keeper.lock'
+    if (Test-Path $lf)
+    {
+        $kpid = 0
+        try { $kpid = [int]((Get-Content -Path $lf -ErrorAction SilentlyContinue | Select-Object -First 1)) } catch { $kpid = 0 }
+        if ($kpid -gt 0 -and (Get-Process -Id $kpid -ErrorAction SilentlyContinue)) { exit 0 }
+    }
+}
 $s = Get-Service -Name $Service -ErrorAction SilentlyContinue
-if ($WasRunning -and $s -and $s.Status -ne 'Running') { try { Start-Service -Name $Service } catch { } }
+if (-not $s -or $s.Status -eq 'Running') { exit 0 }
+if (Get-Process -Name 'winws' -ErrorAction SilentlyContinue) { exit 0 }
+try { Start-Service -Name $Service } catch { }
 '@
     Set-Content -Path $w -Value $body -Encoding ASCII
-    Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $w, '-Delay', $seconds, '-Service', 'zapret', '-WasRunning', ([bool]$wasRunning).ToString() | Out-Null
-    W ('сторож поставлен: через ' + $seconds + ' с вернёт службу zapret в прежнее состояние')
+    $p = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $w, '-Delay', $seconds, '-Service', 'zapret', '-WasRunning', ([bool]$wasRunning).ToString(), '-WorkDir', ('"' + $Work + '"') -PassThru
+    W ('сторож поставлен: через ' + $seconds + ' с вернёт службу zapret, если рабочий обход не оставлен (ни хранителя, ни winws.exe)')
+    return $p
+}
+function Disarm-Watchdog($proc)      # рабочий обход оставлен -- одноразовый сторож больше не нужен
+{
+    if (-not $proc) { return }
+    try
+    {
+        if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force; W 'одноразовый сторож снят: рабочий обход оставлен, служба не тронется' }
+    }
+    catch { }
 }
 
 function Restore-Service($wasRunning)
@@ -418,8 +443,8 @@ function Invoke-Pick($Strategies, $Winws, $WasRunning)
 {
     $need = $Strategies.Count * ($Seconds + 34) + 60    # пауза + три проверки с таймаутами по 8 с (на мёртвой сети они истекают целиком)
     W ('пресетов к проверке: ' + $Strategies.Count + ' (по ' + $Seconds + ' с на каждый)')
-    W ('внимание: на время подбора обход останавливается -- youtube и discord будут недоступны примерно ' + $need + ' с, потом сторож вернёт службу сам')
-    Arm-Watchdog $WasRunning $need
+    W ('внимание: на время подбора обход останавливается -- youtube и discord будут недоступны примерно ' + $need + ' с; службу вернёт только одноразовый сторож и только если рабочий обход не оставлен')
+    $watchdog = Arm-Watchdog $WasRunning $need
 
     $results = @()
     $deadStreak = 0
@@ -455,7 +480,7 @@ function Invoke-Pick($Strategies, $Winws, $WasRunning)
     $best = $results | Where-Object { $_.Yt -and ($_.Gw -or $_.Api) } | Select-Object -First 1
     if (-not $best) { $best = $results | Where-Object { $_.Gw -or $_.Api } | Select-Object -First 1 }
     if (-not $best) { $best = $results | Where-Object { $_.Yt } | Select-Object -First 1 }
-    return @{ Best = $best; Results = $results; Abort = $abort }
+    return @{ Best = $best; Results = $results; Abort = $abort; Watchdog = $watchdog }
 }
 
 # ---------- хранитель: держит оба пути рабочими ----------
@@ -476,7 +501,6 @@ function Invoke-Keeper($Winws, $Strategies, $WasRunning)
 {
     W '===== хранитель: держу рабочими и youtube, и discord ====='
     W ('проверка каждые ' + $Every + ' мин; при поломке сам перебираю пресеты и возвращаю рабочий')
-    $first = $true
     while ($true)
     {
         $yt = Test-Youtube
@@ -496,9 +520,11 @@ function Invoke-Keeper($Winws, $Strategies, $WasRunning)
             }
             else
             {
-                $best = Invoke-Pick $Strategies $Winws $svc
+                $pick = Invoke-Pick $Strategies $Winws $svc
+                $best = $pick.Best
                 if ($best)
                 {
+                    Disarm-Watchdog $pick.Watchdog
                     Stop-Bypass
                     Start-Winws $Winws $best.Args | Out-Null
                     Start-Sleep -Seconds 3
@@ -506,7 +532,8 @@ function Invoke-Keeper($Winws, $Strategies, $WasRunning)
                 }
                 else
                 {
-                    W 'рабочей стратегии не нашлось: оставляю как было и проверю снова (набор zapret стоит обновить)'
+                    if ($pick.Abort) { W ('перебор прерван: ' + $pick.Abort) }
+                    W 'рабочей стратегии не нашлось: верну службу, как было, и проверю снова (набор zapret стоит обновить)'
                     Restore-Service $svc
                 }
             }
@@ -735,6 +762,7 @@ if ($best)
     W ('записал готовый запуск: ' + $ChosenBat)
     if (-not $TestOnly)
     {
+        Disarm-Watchdog $pick.Watchdog
         Stop-Bypass
         Start-Winws $winws $best.Args | Out-Null
         Start-Sleep -Seconds 3
