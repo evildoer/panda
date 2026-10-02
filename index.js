@@ -127,6 +127,12 @@
 // оставлен (нет живого хранителя и нет winws.exe), а после успешной замены снимается совсем; заодно
 // починен сам хранитель -- он не разворачивал результат подбора (брал хеш-таблицу вместо Best) и
 // поднимал winws без аргументов, то есть починка не работала вовсе.
+// v2.155 -- по живому вопросу владельца «в плейлисте 177 треков, а /play взял только 50 -- почему?»:
+// причина была не в yt-dlp (он отдаёт список ЦЕЛИКОМ одним ответом -- проверено живьём: 177 записей и
+// playlist_count 177), а в жёстком slice(0, 50) внутри playlistInfo; и о том, что список урезан, бот молчал.
+// Теперь предел настраиваемый (MUSIC.playlist_max, по умолчанию 200, 0 -- без предела) и назван при старте;
+// если треков больше предела, /play честно говорит, сколько их всего и что лимит можно поднять в config.json.
+// Заодно пустые записи (недоступные видео) отбрасываются, а не роняют разбор списка.
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -5728,6 +5734,12 @@ function configSanityIssues ()
     else if (Number (MUSIC_CFG.history_tracks) > 5000)
         out.push ('MUSIC.history_tracks: ' + MUSIC_CFG.history_tracks + ' -- держу 5000 ' +
             '(это запись в базе и текст сообщения, а не архив)');
+    if (MUSIC_CFG.playlist_max !== undefined &&
+        !(Number.isFinite (Number (MUSIC_CFG.playlist_max)) && String (MUSIC_CFG.playlist_max).trim () !== ''))
+        out.push ('MUSIC.playlist_max = "' + MUSIC_CFG.playlist_max + '": ожидается число -- ' +
+            'беру 200 (это предел треков из плейлиста за один /play; 0 -- без предела)');
+    else if (Number (MUSIC_CFG.playlist_max) > 1000)
+        out.push ('MUSIC.playlist_max: ' + MUSIC_CFG.playlist_max + ' -- держу 1000: очередь и /history -- это не архив');
     if (MUSIC_CFG.queue_live_ms !== undefined &&
         !(Number.isFinite (Number (MUSIC_CFG.queue_live_ms)) && String (MUSIC_CFG.queue_live_ms).trim () !== ''))
         out.push ('MUSIC.queue_live_ms = "' + MUSIC_CFG.queue_live_ms + '": ожидается число МИЛЛИСЕКУНД -- ' +
@@ -5922,7 +5934,7 @@ const CONFIG_ORDER = {
         ['channel_status', 'skip_absent_author'],
         ['cache', 'cache_dir', 'cache_short_max_minutes', 'cache_long_sets', 'cache_max_mb', 'cache_keep_played'],
         ['queue_check', 'queue_check_depth', 'queue_check_gap_ms'],
-        ['queue_live_ms', 'history_len', 'history_tracks'],
+        ['queue_live_ms', 'history_len', 'history_tracks', 'playlist_max'],
         ['net_wait_ms'],
     ],
     SERVER: [
@@ -6491,6 +6503,18 @@ const MUSIC_HISTORY_LEN = Math.max (0, Math.min (200,
     Math.round (Number (MUSIC_CFG.history_len === undefined ? 25 : MUSIC_CFG.history_len) || 0)));
 const MUSIC_HISTORY_TRACKS = Math.max (0, Math.min (5000,
     Math.round (Number (MUSIC_CFG.history_tracks === undefined ? 500 : MUSIC_CFG.history_tracks) || 0)));
+// v2.155: сколько треков из плейлиста брать за один заход. Раньше здесь стояло ЖЁСТКОЕ slice(0, 50), и владелец
+// упирался в него на живом плейлисте из 177 треков: yt-dlp отдаёт список ЦЕЛИКОМ одним ответом (то есть запрос
+// и так уже сделан), а в очередь попадали первые 50 -- и ни слова о том, что список урезан. Предел всё же нужен:
+// очередь и /history -- это не архив (MUSIC.playlist_max; 0 -- без предела).
+const MUSIC_PLAYLIST_MAX = (function ()
+{
+    const cfg = MUSIC_CFG.playlist_max;
+    if (cfg === undefined || cfg === null || String (cfg).trim () === '') return 200;
+    const raw = Number (cfg);
+    if (raw === 0) return 0;                              // 0 -- беру все, сколько отдал источник
+    return Number.isFinite (raw) && raw > 0 ? Math.min (1000, Math.floor (raw)) : 200;
+}) ();
 const QUEUE_LIVE_MS = (function ()
 {
     const raw = Number (MUSIC_CFG.queue_live_ms === undefined ? 30000 : MUSIC_CFG.queue_live_ms) || 0;
@@ -6508,6 +6532,9 @@ console.log ('[' + (d()) + '] [music] живые сообщения /queue: ' + 
     ? 'обновляю сам до ' + QUEUE_LIVE_MAX + ' штук, каждые ' + Math.round (QUEUE_LIVE_MS / 1000) +
       ' с, пока их видят (MUSIC.queue_live_ms)'
     : 'самообновление выключено (MUSIC.queue_live_ms: 0) -- освежаются листанием или кнопкой «🔄 Обновить»'));
+console.log ('[' + (d()) + '] [music] плейлист за один /play: ' + (MUSIC_PLAYLIST_MAX > 0
+    ? 'первые ' + MUSIC_PLAYLIST_MAX + ' треков (MUSIC.playlist_max; 0 -- без предела, было бы видно предупреждение в ответе)'
+    : 'все, сколько отдал источник (MUSIC.playlist_max: 0)'));
 console.log ('[' + (d()) + '] [music] YouTube: ' + (MUSIC_PROXY
     ? 'через прокси ' + MUSIC_PROXY +
       (MUSIC_PROXIES.length > 1 ? ' (запасные: ' + MUSIC_PROXIES.slice (1).join (', ') + ')' : '') +
@@ -10334,9 +10361,12 @@ async function playlistInfo (query)
 {
     const info = await ytDlpRun (query, { dumpSingleJson: true, noWarnings: true, flatPlaylist: true });
     if (!info._type || info._type !== 'playlist')
-        return [await trackInfo (query)];
-    let entries = (info.entries || []).slice (0, 50);
-    return entries.map
+        return { tracks: [await trackInfo (query)], total: 1, limit: 0 };
+    // Пустые записи (недоступные видео в списке) отбрасываю, а не падаю на них.
+    const all = (Array.isArray (info.entries) ? info.entries : []).filter (e => e && (e.url || e.webpage_url || e.id));
+    const total = all.length;
+    const entries = (MUSIC_PLAYLIST_MAX > 0 && total > MUSIC_PLAYLIST_MAX) ? all.slice (0, MUSIC_PLAYLIST_MAX) : all;
+    const tracks = entries.map
     (
         e =>
         ({
@@ -10344,11 +10374,23 @@ async function playlistInfo (query)
             streamUrl: e.url || e.webpage_url,
             title: e.title || 'Без названия',
             duration: e.duration || 0,
-            author: e.uploader || '',
+            author: e.uploader || e.channel || '',
             isLive: false,
             thumbnail: e.thumbnail || '',
         })
     );
+    return { tracks: tracks, total: total, limit: MUSIC_PLAYLIST_MAX };
+}
+
+// Список урезан -- говорим об этом прямо, а не молчим: человек должен знать и сколько всего, и где предел.
+function playlistWarnText (info)
+{
+    const total = Number (info && info.total) || 0;
+    const taken = Number (info && info.tracks && info.tracks.length) || 0;
+    if (!(info && Number (info.limit) > 0 && total > taken)) return '';
+    return '\n⚠️ В плейлисте ' + total + ' ' + plural (total, 'трек', 'трека', 'треков') +
+        ' -- за один /play беру первые ' + taken + ' (лимит MUSIC.playlist_max, по умолчанию 200).' +
+        ' Чтобы взять все, подними лимит в config.json (0 -- без предела) и позови /play с этой же ссылкой снова.';
 }
 
 let musicNormalizeReady = false;
@@ -14039,7 +14081,8 @@ function musicAddApply (interaction, guildId, m, tracks, query, where, opts = {}
                         ? (m.tracks.length > tracks.length
                             ? '\n📚 Своих треков в очереди не было -- поставил в конец, как обычно.'
                             : '')
-                        : (ins.blockBefore ? '\n📚 Пачка встала в конец твоего блока в очереди (№' + (ins.insAt + 1) + ').' : '')));
+                        : (ins.blockBefore ? '\n📚 Пачка встала в конец твоего блока в очереди (№' + (ins.insAt + 1) + ').' : ''))) +
+        (opts.warn || '');
     queueMsgRedraw (guildId, 300).catch (() => {});
     if (ins.shouldStart) playNext (guildId);
     return { ins: ins, text: text, askMoveRow: (where && where.askMoveRow) || null };
@@ -15193,7 +15236,7 @@ async function historyReAdd (guildId, at, userId, byName, inCh)
         return { ok: false, text: '🕘 Это пачка с SoundCloud, а адресов в записи нет -- найди её заново '
             + 'поиском в `/play` (кнопка «➕ Ещё: SoundCloud»).' };
     const from = exact.length ? exact[0] : q;
-    let tracks = [];
+    let tracks = [], warn = '';
     try
     {
         if (exact.length)
@@ -15204,7 +15247,13 @@ async function historyReAdd (guildId, at, userId, byName, inCh)
                 if (t) tracks.push (t);
             }
         }
-        else tracks = isUrl (q) ? await playlistInfo (q) : [await trackInfo ('ytsearch1:' + q)];
+        else if (isUrl (q))
+        {
+            const info = await playlistInfo (q);
+            tracks = info.tracks;
+            warn = playlistWarnText (info);
+        }
+        else tracks = [await trackInfo ('ytsearch1:' + q)];
     }
     catch (err)
     {
@@ -15246,7 +15295,8 @@ async function historyReAdd (guildId, at, userId, byName, inCh)
             ? '\n' + QSMALL + 'адресов в записи: ' + exact.length + ', открылось ' + tracks.length +
               ' -- остальные я сейчас взять не смог' : '') +
         '\n' + QSMALL + 'источник: `' + clipped (from, 80) + '`\n' +
-        QSMALL + '_В очередь их поставил ты: бот едет к автору играющего трека, иначе он уехал бы к тому, кого в канале нет._' };
+        QSMALL + '_В очередь их поставил ты: бот едет к автору играющего трека, иначе он уехал бы к тому, кого в канале нет._' +
+        warn };
 }
 
 async function historyReAddOne (guildId, addr, userId, byName, inCh)
@@ -20156,19 +20206,20 @@ client.on ('interactionCreate', async (interaction) =>
                 return playSearchShow (interaction, query, wantTop);  // поиск: сначала показываю варианты
 
             await interaction.deferReply ();
-            let tracks;
+            let info;
             try
             {
-                tracks = await playlistInfo (query);
+                info = await playlistInfo (query);
             }
             catch (e)
             {
                 return interaction.editReply ('❌ Не нашёл: `' + e.message.slice (0, 150) + '`');
             }
-            if (!tracks.length)
+            if (!info.tracks.length)
                 return interaction.editReply ('❌ Пустой результат.');
             const _wh = musicWhereNote (m, guildId, callerVoice);
-            const _done = musicAddApply (interaction, guildId, m, tracks, query, _wh, { top: wantTop });
+            const _done = musicAddApply (interaction, guildId, m, info.tracks, query, _wh,
+                { top: wantTop, warn: playlistWarnText (info) });
             await interaction.editReply ({ content: _done.text, components: _done.askMoveRow ? [_done.askMoveRow] : [] });
         }
         else if (name === 'stop')
