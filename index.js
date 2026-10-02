@@ -63,6 +63,23 @@
 // ещё и в память проверки -- повтор трека не упрётся в тот же молчащий путь. Заодно замер 02.10 показал, зачем
 // в конфиге http-адрес: прямой путь дал 0 байт за 25 с, socks5 -- 203 КБ за 4.8 с, а http://127.0.0.1:10809 --
 // 66 КБ за 4.5 с (живой трек с SoundCloud); ffmpeg на перемотках умеет только HTTP, так что он не мёртвый груз.
+// v2.147 -- по замечаниям владельца (все -- по живым случаям 02.10): 1) перемотка секцией сама пробует свой DoH-маршрут:
+// если http-адрес из конфига молчит и другого живого HTTP-адреса нет, ffmpeg получает http://127.0.0.1:<свой порт> --
+// для него это обычный HTTP-прокси, а имена по нему разрешает сам бот (раньше секция уходила НАПРЯМУЮ и мгновенно
+// получала 403 -- живой замер 02.10), и это видно в логе; 2) /history больше не считает одну песню пачкой: в заголовке
+// отдельно «N пачек + M одиночных треков», а одиночная запись показана собой -- 🎵, названием и адресом (раньше на её
+// месте стоял поисковый запрос, и песню приходилось искать в «Все треки»); 3) найдена причина пропуска трека с
+// SoundCloud -- это DRM-защита самого источника (yt-dlp так и пишет: This video is DRM protected), cookie тут не
+// помогают: такой трек пропускается СРАЗУ (без трёх повторов и без обрыва выравнивания громкости), бот говорит об
+// этом в канал, маршрут не винит, а фоновая SC-проверка не очерняет адреса по DRM-треку; 4) в .gitignore одно
+// универсальное правило cookie*.txt (cookies*.txt -- его частный случай, firefox.txt убрано: файлы называют на «cookie»).
+// v2.148 -- по просьбе владельца: 1) при старте, если YouTube не принимает cookie-файл, хозяину уходит личное письмо
+// (техподробности cookie в журнал сервера не идут): что случилось, что это не авария (очередь, кэш и SoundCloud
+// работают) и что делать -- вернуть свежий бэкап из logs/cookies-backup-*.txt (или прежний файл владельца),
+// пересобрать `node . cookies --save firefox` либо убрать cookie вовсе; 2) yt-dlp больше не переписывает хозяйский
+// файл cookie: после КАЖДОГО запуска он складывает в него свой набор (проверено живьём 02.10 -- файл менялся за
+// секунды, а склейка в него откатывалась), поэтому бот даёт ему свежую КОПИЮ (logs/ytdlp-cookies/cookie-run.txt,
+// обновляется сама при правке оригинала) -- сам файл остаётся таким, каким его положили.
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -6876,6 +6893,22 @@ async function notifyHoster (text, opts = {})
     return sent;
 }
 
+// Письмо хозяину может понадобиться ещё до готовности клиента (проверка cookie идёт на старте,
+// параллельно со входом) -- жду готовности, но не бесконечно: 30 с без ответа -- и я молчу,
+// лучше не прислать письмо, чем подвесить старт.
+function whenClientReady (ms = 30000)
+{
+    if (client.isReady && client.isReady ()) return Promise.resolve (true);
+    return new Promise (res =>
+    {
+        let done = false;
+        const fin = v => { if (!done) { done = true; res (v); } };
+        client.once ('clientReady', () => fin (true));
+        const t = setTimeout (() => fin (false), ms);
+        if (t.unref) t.unref ();
+    });
+}
+
 async function dpiSelfHeal (reason)             // ни один путь не работает -- пробую поднять обход DPI сам
 {
     if (!MUSIC_DPI_HEAL || !BOT_RUN) return false;
@@ -10073,9 +10106,44 @@ const MUSIC_COOKIES_BROWSER = (() =>
         ? '' : MUSIC_CFG.cookies_from_browser).trim ();
     return raw;
 }) ();
+// yt-dlp НЕ читает файл cookie, а берёт и переписывает: после КАЖДОГО запуска он складывает туда свой
+// cookie-набор (проверено живьём 02.10 -- файл менялся за секунды, а склейка в него откатывалась).
+// Файл cookie -- хозяйский: владелец сам хранит варианты и склеивает наборы, а бот не должен его менять.
+// Поэтому даю yt-dlp свежую КОПИЮ исходного файла; оригинал остаётся ровно таким, каким его положили.
+// Копия обновляется сама, когда оригинал изменился (по размеру и времени правки -- хранится в .sig).
+const YTDLP_COOKIES_COPY = MUSIC_COOKIES_FILE
+    ? pathMod.join (LOG_DIR, 'ytdlp-cookies', 'cookie-run.txt') : '';
+const YTDLP_COOKIES_SIG = YTDLP_COOKIES_COPY ? (YTDLP_COOKIES_COPY + '.sig') : '';
+function ytdlpCookieFile ()
+{
+    if (!MUSIC_COOKIES_FILE) return '';
+    try
+    {
+        const st = fsMod.statSync (MUSIC_COOKIES_FILE);
+        const sig = st.size + ':' + Math.round (st.mtimeMs);
+        let old = '', have = false;
+        try { old = fsMod.readFileSync (YTDLP_COOKIES_SIG, 'utf8').trim (); } catch (e) { }
+        try { fsMod.accessSync (YTDLP_COOKIES_COPY); have = true; } catch (e) { }
+        if (old !== sig || !have)
+        {
+            fsMod.mkdirSync (pathMod.dirname (YTDLP_COOKIES_COPY), { recursive: true });
+            fsMod.copyFileSync (MUSIC_COOKIES_FILE, YTDLP_COOKIES_COPY);
+            try { fsMod.writeFileSync (YTDLP_COOKIES_SIG, sig); } catch (e) { }
+            console.log ('[' + (d()) + '] [music] cookie: взял свежую копию файла (yt-dlp переписывает только её, ' +
+                'сам файл бот не трогает): ' + pathMod.basename (MUSIC_COOKIES_FILE));
+        }
+        return YTDLP_COOKIES_COPY;
+    }
+    catch (e)
+    {
+        console.error ('[music] cookie: копию файла сделать не вышло (' + oneLine ((e && e.message) || e, 100) +
+            ') -- отдаю yt-dlp сам файл, как раньше');
+        return MUSIC_COOKIES_FILE;
+    }
+}
 function ytdlpCookieOpts ()
 {
-    if (MUSIC_COOKIES_FILE) return { cookies: MUSIC_COOKIES_FILE };
+    if (MUSIC_COOKIES_FILE) { const f = ytdlpCookieFile (); return f ? { cookies: f } : {}; }
     if (MUSIC_COOKIES_BROWSER) return { cookiesFromBrowser: MUSIC_COOKIES_BROWSER };
     return {};
 }
@@ -10087,7 +10155,7 @@ if (MUSIC_COOKIES_FILE)
     try { _ckThere = fsMod.existsSync (MUSIC_COOKIES_FILE); } catch (e) { }
     if (_ckThere)
         console.log ('[' + (d()) + '] [music] cookie-файл (MUSIC.cookies_file): ' + MUSIC_COOKIES_FILE +
-            ' -- передаю в каждый запуск yt-dlp');
+            ' -- yt-dlp получает его копию: сам файл бот не переписывает, правишь файл -- копия обновится сама');
     else
         console.error ('[config] MUSIC.cookies_file = "' + MUSIC_COOKIES_FILE +
             '": файла нет -- запускаю без cookie (относительный путь считается от папки с ботом)');
@@ -10119,16 +10187,84 @@ async function cookieRealCheck ()
     catch (e) { return { ok: false, verdict: cookieVerdict (e), why: ytDlpErr (e, 200) }; }
     finally { ytDlpQuiet--; }
 }
+// Что предложить хозяину, когда YouTube не принял cookie-файл. Список беру не из головы: свежий бэкап
+// ищется там же, куда его кладёт `node . cookies --save` (logs/cookies-backup-*.txt), а рядом с рабочим
+// файлом называю прежние варианты (владелец хранит их сам, например cookies-firefox-incognito-0.txt).
+function cookieBackupNewest ()
+{
+    try
+    {
+        let best = '', at = 0;
+        for (const f of fsMod.readdirSync (LOG_DIR))
+            if (/^cookies-backup-.*\.txt$/i.test (f))
+            {
+                const st = fsMod.statSync (pathMod.join (LOG_DIR, f));
+                if (st.mtimeMs > at) { at = st.mtimeMs; best = f; }
+            }
+        return best;
+    }
+    catch (e) { return ''; }
+}
+function cookieSideFiles ()
+{
+    if (!MUSIC_COOKIES_FILE) return [];
+    try
+    {
+        const dir = pathMod.dirname (MUSIC_COOKIES_FILE);
+        const base = pathMod.basename (MUSIC_COOKIES_FILE).toLowerCase ();
+        return fsMod.readdirSync (dir)
+            .filter (f => /^cookie.*\.txt$/i.test (f) && f.toLowerCase () !== base)
+            .slice (0, 5);
+    }
+    catch (e) { return []; }
+}
+function cookieWarnText (why)
+{
+    const my = MUSIC_COOKIES_FILE ? pathMod.basename (MUSIC_COOKIES_FILE) : '';
+    const bak = MUSIC_COOKIES_FILE ? cookieBackupNewest () : '';
+    const side = cookieSideFiles ();
+    const lines = [
+        '🍪 **YouTube не принимает cookie**' +
+            (my ? ' (файл `' + my + '`)' : (MUSIC_COOKIES_BROWSER ? ' (из браузера «' + MUSIC_COOKIES_BROWSER + '»)' : '')),
+        'Причина: ' + (why || 'набор протух'),
+        'Что это значит: **музыка играет**, но YouTube-треки могут спотыкаться (обычно «The page needs to be reloaded»).' +
+            ' SoundCloud, кэш и очередь это не задевает.',
+        '',
+        '**Что можно сделать (любой один способ):**',
+    ];
+    if (MUSIC_COOKIES_FILE)
+    {
+        lines.push ('1. **Вернуть рабочий бэкап.** ' + (bak
+            ? 'Свежий в боте: `logs\\' + bak + '` -- скопируй его поверх `' + my + '` (имя файла не меняй).'
+            : (side.length
+                ? 'Готового бэкапа в `logs\\` нет, но рядом лежат: ' + side.map (f => '`' + f + '`').join (', ') +
+                  ' -- если это прежние рабочие файлы, скопируй нужный поверх `' + my + '`.'
+                : 'Бэкапа не нашёл: прежний рабочий файл не сохранён.')));
+        lines.push ('2. **Пересобрать:** в папке бота `node . cookies --save firefox` -- команда сама проверит наборы у YouTube и запишет тот, который он принимает.');
+        lines.push ('3. **Убрать cookie вовсе** (анонимный путь здесь работает): очисти `MUSIC.cookies_file` в `config.json`.');
+    }
+    else
+        lines.push ('1. **Собрать файл:** `node . cookies --save firefox` (на этой машине работает именно файл); 2. **Убрать cookie вовсе**: очисти ключ в `config.json`.',
+            '3. **Вернуть прежний файл**: если рядом лежат `cookie*.txt` -- впиши нужный в `MUSIC.cookies_file`.');
+    lines.push ('_Это напоминание, а не авария: очередь, кэш и SoundCloud работают как обычно._');
+    return lines.join ('\n');
+}
+
 async function cookieStartupCheck ()
 {
     const src = MUSIC_COOKIES_FILE ? ('файл: ' + MUSIC_COOKIES_FILE)
                                    : ('браузер: «' + MUSIC_COOKIES_BROWSER + '»');
     const r = await cookieRealCheck ();
     if (r.verdict === 'stale' || r.verdict === 'anon')
+    {
         console.error ('[' + (d()) + '] [music] ВНИМАНИЕ: YouTube эти cookie НЕ принимает (' + src + '): ' + r.why +
             ' -- каждый трек будет спотыкаться. Проверь `node . cookies`: возьми ФАЙЛ cookie (MUSIC.cookies_file,' +
             ' так делает сам владелец -- этот путь работает) или убери cookie вовсе (анонимный путь работает).' +
             ' Файл можно собрать самому: `node . cookies --save firefox` (только домены музыки, с проверкой у YouTube).');
+        // Хозяин видит лог не всегда -- про эту беду говорю ему лично (и только ему: техподробности
+        // cookie в журнале сервера не нужны). Письмо уходит, когда клиент готов; не дождались -- молчу.
+        whenClientReady ().then (() => notifyHoster (cookieWarnText (r.why)).catch (() => { })).catch (() => { });
+    }
     else if (r.verdict === 'ok')
         console.log ('[' + (d()) + '] [music] cookie приняты YouTube (' + src + ') -- контрольный запрос прошёл');
 }
@@ -10856,6 +10992,9 @@ async function cookiesCli (_args)
     {
         const there = fsMod.existsSync (MUSIC_COOKIES_FILE);
         console.log ('[cookies] файл: ' + MUSIC_COOKIES_FILE + (there ? '' : ' -- ФАЙЛА НЕТ'));
+        if (there && YTDLP_COOKIES_COPY)
+            console.log ('[cookies] yt-dlp читает копию этого файла (' + pathMod.relative (__dirname, YTDLP_COOKIES_COPY) +
+                '): сам файл бот не переписывает -- он остаётся таким, каким ты его положил');
         if (!there) return 1;
         const r = cookiesFileReport ();
         if (!r.ok) { console.error ('[cookies] ' + r.why); return 1; }
