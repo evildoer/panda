@@ -139,6 +139,22 @@
 // ТО ЖЕ сообщение и честно говорит, сколько взято и сколько осталось; взяли всё -- кнопка исчезает. Записи
 // живут в памяти 6 часов (в id -- соль процесса), поэтому кнопка из старого сообщения после перезапуска честно
 // отвечает «меню устарело», а не путает плейлисты; при сбое сети кнопка остаётся, и можно нажать ещё раз.
+// v2.157 -- по просьбе владельца: бот поднимается сам, и закрыты мины из разбора с чистого взгляда.
+// 1) рядом с ботом появился супервизор (node supervisor.js): упавшего бота он поднимает заново
+//    (пауза 2/5/15/30/60 с), а если тот падает пять раз за минуту -- честно останавливается и говорит,
+//    где смотреть (иначе был бы вечный цикл). Ctrl+C гасит обоих: очередь сохраняется, как раньше.
+//    Под супервизором необработанное исключение больше не «делает вид, что ничего не было»:
+//    бот сохраняет очередь и позицию и выходит кодом 1, чтобы супервизор его поднял; без
+//    супервизора поведение прежнее -- бот остаётся жить (музыка важнее).
+// 2) ключ шифрования базы больше не попадает в файл лога: строки с новым db_key (команда /rekey)
+//    печатаются только в консоль, а в файл уходит пометка «ключ скрыт» -- это же закрывает
+//    отчёты о сбоях, которые вклеивают хвост лога.
+// 3) база открывается с busyTimeout (15 с) и throwOnErrors: транзиентный сбой чтения больше не
+//    выглядит как «пустая» книга адресов, часы и прогнозы, которые затем затирали накопленное.
+//    Книга адресов, обратная таблица имён, часы, прогнозы и зацепка пишутся только после успешного
+//    чтения (loaded-флаг), а неудачное чтение повторяется само (не чаще раза в 30 с).
+// 4) у /rekey появился журнал: перед перешифровкой новый ключ записывается запасным (db_key_pending)
+//    в config.json, а брошенная на середине перешифровка доводится до конца сама после перезапуска.
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -197,7 +213,7 @@ const
     GUILD_MEMBERS,
     OWNER, MUSIC,
     owner_mail_in_log_channel,
-    db_key, db_key_prev,
+    db_key, db_key_prev, db_key_pending,
     privacy_url,
     show_privacy_url,
     backup_minutes,
@@ -208,6 +224,7 @@ const
 const space = ' ';
 
 const BOT_RUN = process.argv.slice (2).length === 0;
+const SUPERVISED = BOT_RUN && process.env.PANDAMIA_SUPERVISOR === '1';   // нас запустил supervisor.js: он поднимет после падения
 const utilMod = require ('util');
 const fsLog = require ('fs');
 const pathMod = require ('path');
@@ -248,9 +265,17 @@ function logPruneMonths (keep, now)
     catch (e) {}
     return gone;
 }
+function logRedactSecrets (line)   // ключ шифрования базы в файл лога не попадает: /rekey печатает его только в консоль,
+{                                  // а в файл уходит пометка (иначе ключ лёг бы и в отчёт о сбое с хвостом лога)
+    const s = String (line);
+    if (!/[0-9a-fA-F]{64}/.test (s)) return s;
+    if (!/db_key|ключ|key/i.test (s)) return s;
+    return s.replace (/[0-9a-fA-F]{64}/g, '«ключ скрыт: смотри консоль бота»');
+}
 function logFileWrite (line)
 {
     if ($logWarned) return;
+    line = logRedactSecrets (line);
     try
     {
         const now = new Date ();
@@ -473,6 +498,28 @@ function crashIncident (kind, e, note)
     return crashReport (kind, e, note);
 }
 
+let $crashLeaving = false;
+function crashLeaveOrStay ()          // под супервизором сохраняю очередь и выхожу (он поднимет заново); без него -- живу дальше, как раньше
+{
+    if (!SUPERVISED) return false;
+    if ($crashLeaving) return true;
+    $crashLeaving = true;
+    try { console.error ('[' + (d()) + '] [crash] сохраняю очередь и позицию, затем выхожу: супервизор поднимет бота заново'); } catch (e) {}
+    const hard = setTimeout (() =>
+    {
+        try { console.error ('[' + (d()) + '] [crash] сохранить не успел за 6 с -- выхожу как есть (в базе осталось прошлое сохранение)'); } catch (e) {}
+        consoleRestoreCodePage ();
+        process.exit (1);
+    }, 6000);
+    Promise.resolve ()
+        .then (() => (typeof saveAllMusic === 'function' ? saveAllMusic () : null))
+        .then (() => ($conDrain ? $conDrain (400) : null))
+        .then (drained => { if ($conHalt && drained === false) $conHalt (); })
+        .catch (() => {})
+        .finally (() => { clearTimeout (hard); consoleRestoreCodePage (); process.exit (1); });
+    return true;
+}
+
 process.on ('exit', code =>
 {
     consoleRestoreCodePage ();
@@ -609,9 +656,11 @@ function dbKeyMake (_raw)
     return crypto.scryptSync (_s, DB_ENC_SALT, 32);
 }
 const _key0 = dbKeyMake (db_key);
+const _keyPend0 = dbKeyMake (db_key_pending);       // ключ из перешифровки, которую не довели до конца: лежит в config.json запасным
+let $dbKeyPending = _keyPend0;
 const DB_KEYS = _key0
-    ? [_key0, ...(Array.isArray (db_key_prev) ? db_key_prev : []).map (dbKeyMake).filter (Boolean)]
-    : [];
+    ? [_key0, ...(_keyPend0 ? [_keyPend0] : []), ...(Array.isArray (db_key_prev) ? db_key_prev : []).map (dbKeyMake).filter (Boolean)]
+    : (_keyPend0 ? [_keyPend0] : []);
 let _dbEncWarn = 0;
 const dbRawStr = (_raw) => Buffer.isBuffer (_raw) ? _raw.toString ('utf8')
     : String (_raw === undefined || _raw === null ? '' : _raw);
@@ -2320,10 +2369,13 @@ function dbMake (_server, _namespace)
     const kv = new Keyv
     (
         {
-            store: new KeyvSqlite ({ uri: 'sqlite://' + __dirname + '/' + _server + '.sqlite' }),
+            // busyTimeout: если в ту же базу в этот момент пишет консольная команда, бот подождёт, а не получит SQLITE_BUSY;
+            // throwOnErrors: сбой чтения видно исключением, а не «пустым» значением, которое затирало накопленное
+            store: new KeyvSqlite ({ uri: 'sqlite://' + __dirname + '/' + _server + '.sqlite', busyTimeout: 15000 }),
             namespace: _namespace,
             serialize: dbSerialize,
             deserialize: dbDeserialize,
+            throwOnErrors: true,
         }
     );
     kv.on ('error', e => console.error ('[db] ' + _namespace + ': ' + String ((e && e.message) || e).slice (0, 200)));
@@ -2427,6 +2479,8 @@ if (process.argv.slice (2).some (_a => /^fixauthors$/i.test (_a)))
 console.log ('[' + new Date ().toLocaleString () + '] [db] шифрование записей: ' +
     (DB_KEYS.length ? 'ВКЛЮЧЕНО (db_key), AES-256-GCM -- не потеряй config.json: без ключа записи не прочитаются'
                     : 'выключено (нет db_key в config.json)'));
+if (_keyPend0) console.log ('[' + new Date ().toLocaleString () + '] [db] вижу db_key_pending: перешифровка /rekey не была доведена до конца -- записи читаются, доведу её сама после запуска');
+if (SUPERVISED) console.log ('[' + new Date ().toLocaleString () + '] [bot] запущен супервизором: если упаду, он поднимет меня заново (очередь и позиция сохраняются)');
 
 function dbWarnLocked ()
 {
@@ -2546,7 +2600,27 @@ async function dbRekey (_newKey)
     return res;
 }
 
-function dbKeysSaveToConfig (_primary, _prev)
+const DB_REKEY_JOURNAL = __dirname + '/db_rekey.journal';   // журнал перешифровки: существует, пока она не доведена до конца
+function rekeyJournalWrite (info)
+{
+    try { fsMod.writeFileSync (DB_REKEY_JOURNAL, JSON.stringify (info), 'utf8'); return true; }
+    catch (e)
+    {
+        console.log ('[' + new Date ().toLocaleString () + '] [db] журнал перешифровки не записался: ' + String ((e && e.message) || e));
+        return false;
+    }
+}
+function rekeyJournalRead ()
+{
+    try { return JSON.parse (fsMod.readFileSync (DB_REKEY_JOURNAL, 'utf8')); }
+    catch (e) { return null; }
+}
+function rekeyJournalClear ()
+{
+    try { fsMod.unlinkSync (DB_REKEY_JOURNAL); } catch (e) {}
+}
+
+function dbKeysSaveToConfig (_primary, _prev, _pending)
 {
     try
     {
@@ -2560,6 +2634,11 @@ function dbKeysSaveToConfig (_primary, _prev)
             _src = _src.replace (/("db_key_prev"\s*:\s*)\[[^\]]*\]/, '$1' + _prevJson);
         else
             _src = _src.replace (/"db_key"\s*:\s*"[^"]*"/, '$&,\n  "db_key_prev": ' + _prevJson);
+        const _pendJson = _pending ? '"' + _pending.toString ('hex') + '"' : '""';
+        if (/"db_key_pending"\s*:/.test (_src))
+            _src = _src.replace (/("db_key_pending"\s*:\s*)"[^"]*"/, '$1' + _pendJson);
+        else
+            _src = _src.replace (/"db_key"\s*:\s*"[^"]*"/, '$&,\n  "db_key_pending": ' + _pendJson);
         fsMod.writeFileSync (CONFIG_PATH + '.tmp', _src, 'utf8');
         fsMod.renameSync (CONFIG_PATH + '.tmp', CONFIG_PATH);
         return true;
@@ -2570,6 +2649,57 @@ function dbKeysSaveToConfig (_primary, _prev)
             String ((e && e.message) || e));
         return false;
     }
+}
+
+async function dbRekeyRun (_newKey, _oldKeys)
+{
+    if (!DB_KEYS.some (k => k.equals (_newKey))) DB_KEYS.push (_newKey);   // пока идёт перешифровка, читаю и прежним ключом, и новым
+    const res = await dbRekey (_newKey);
+    const sum = 'перешифровано ' + (res.enc + res.plain) + ' ' +
+        plural (res.enc + res.plain, 'запись', 'записи', 'записей') +
+        ' (открытыми до этого были: ' + res.plain + ')' +
+        (res.bad ? ', пропущено нечитаемых: ' + res.bad : '') + ', неймспейсов: ' + res.ns;
+    if (res.abort) return {ok: false, res: res, sum: sum, saved: false};
+    DB_KEYS.length = 0;
+    DB_KEYS.push (_newKey);
+    for (const k of (_oldKeys || [])) if (k && !k.equals (_newKey)) DB_KEYS.push (k);
+    $dbKeyPending = null;
+    // Прежний ключ оставляю запасным (db_key_prev): если какая-то запись не перешифровалась (res.bad), она всё ещё читается
+    const saved = dbKeysSaveToConfig (_newKey, (_oldKeys || []).filter (k => k && !k.equals (_newKey)), null);
+    if (saved) rekeyJournalClear ();
+    return {ok: true, res: res, sum: sum, saved: saved};
+}
+
+function rekeyRecoverTask ()   // брошенную на середине перешифровку довожу после перезапуска -- без участия владельца
+{
+    const j = rekeyJournalRead ();
+    if (!j) return;
+    if (j.done) { rekeyJournalClear (); return; }
+    if (!BOT_RUN) return;
+    const pend = $dbKeyPending;
+    if (!pend)
+    {
+        console.log ('[' + (d()) + '] [db] журнал перешифровки есть, а ключа db_key_pending нет -- довести не могу. ' +
+            'Если записи не читаются, впиши в config.json прежний ключ (db_key_prev).');
+        return;
+    }
+    console.log ('[' + (d()) + '] [db] перешифровка /rekey не была доведена до конца (' +
+        new Date (j.at || 0).toLocaleString () + '): доведу сама через минуту, музыку не трогаю');
+    const t = setTimeout (async () =>
+    {
+        try
+        {
+            const r = await dbRekeyRun (pend, DB_KEYS.slice ());
+            if (!r.ok)
+                console.log ('[' + (d()) + '] [db] довести перешифровку не вышло (' + oneLine (r.res.why, 150) + '): ' + r.sum +
+                    ' -- журнал остаётся, попробую после следующего запуска');
+            else
+                console.log ('[' + (d()) + '] [db] перешифровка доведена до конца: ' + r.sum +
+                    (r.saved ? ', новый ключ вписан основным' : ', но в config.json вписать не удалось -- ключ лежит в db_key_pending'));
+        }
+        catch (e) { console.log ('[' + (d()) + '] [db] ошибка при доведении перешифровки: ' + oneLine ((e && e.message) || e)); }
+    }, 60000);
+    try { t.unref (); } catch (e) {}
 }
 
 async function db (server, namespace, id, value = undefined, item = undefined)
@@ -2617,8 +2747,11 @@ process.on ('unhandledRejection', e =>
 process.on ('uncaughtException',  e =>
 {
     console.error ('[' + (d()) + '] [uncaughtException] '  + String ((e && e.message) || e).slice (0, 300));
-    const p = crashIncident ('uncaughtException', e, 'бот продолжает работу -- сработала страховка уровня процесса');
+    const p = crashIncident ('uncaughtException', e,
+        SUPERVISED ? 'сохраняю очередь и выхожу, чтобы супервизор поднял бота заново'
+                   : 'бот продолжает работу -- сработала страховка уровня процесса');
     if (p) console.error ('[' + (d()) + '] [crash] отчёт о сбое: ' + p);
+    crashLeaveOrStay ();
 });
 
 // Свой справочник страхует имена Discord.
@@ -7943,6 +8076,9 @@ let ipMem = null;                 // только копилки сервисо�
 let ipMemLoading = null;
 let dnsBook = null;               // имя -> запись
 let dnsBookLoading = null;
+let dnsBookReady = false;         // книга ПРОЧИТАНА из базы: пока нет -- пустую не пишу (иначе сбой чтения затирает накопленное)
+let dnsBookRetryAt = 0;           // неудачное чтение повторяю не чаще раза в 30 с
+let dnsSaveWarned = false;
 let dnsStats = null;              // источник -> { ok, fail, ms, at }
 let dnsSaveTimer = null;
 let dnsSaveBusy = false;
@@ -7978,21 +8114,37 @@ async function ipMemSave ()
 
 let ipNames = null;               // обратная сторона книги: адрес -> имя (чтобы у любого адреса было имя)
 let ipNamesLoading = null;
+let ipNamesReady = false;         // прочитана из базы (см. dnsBookReady)
+let ipNamesRetryAt = 0;
+let ipNamesSaveWarned = false;
 const IP_NAMES_PER_IP = 8;        // у одного адреса бывает несколько имён (общие узлы, хостинги).
                                   // Держу их все, а список чищу только когда он длинный -- и только от древнего
 async function ipNamesLoad ()
 {
-    if (ipNames) return ipNames;
+    if (ipNamesReady) return ipNames;
     if (ipNamesLoading) return ipNamesLoading;
+    if (ipNames && Date.now () < ipNamesRetryAt) return ipNames;
     ipNamesLoading = (async () =>
     {
-        let val = null;
+        let val = null, ok = true;
         try
         {
             const srv = dbServerList ()[0];
             if (srv) val = await db (srv, 'netState', 'ip_names');
         }
-        catch (e) { }
+        catch (e)
+        {
+            ok = false;
+            console.log ('[' + (d()) + '] [music] таблица имён адресов не прочиталась: ' + oneLine ((e && e.message) || e) + ' -- в базу НЕ пишу, повторю чтение');
+        }
+        if (!ok)
+        {
+            ipNames = ipNames || {};
+            ipNamesRetryAt = Date.now () + 30000;
+            ipNamesLoading = null;
+            return ipNames;
+        }
+        ipNamesReady = true;
         ipNames = (val && typeof val === 'object' && !Array.isArray (val)) ? val : {};
         ipNamesLoading = null;
         return ipNames;
@@ -8012,6 +8164,15 @@ async function ipNamesSave (now)                 // пишу не на кажд�
         return;
     }
     if (ipNamesSaveBusy || !ipNames) return;
+    if (!ipNamesReady)
+    {
+        if (!ipNamesSaveWarned)
+        {
+            ipNamesSaveWarned = true;
+            console.log ('[' + (d()) + '] [music] таблицу имён адресов в базу не пишу: она не прочиталась (см. выше) -- так сбой чтения не затрёт накопленное');
+        }
+        return;
+    }
     ipNamesSaveBusy = true;
     try
     {
@@ -8069,17 +8230,32 @@ function ipNameOf (ip) { const list = ipNamesOf (ip); return list.length ? list[
 
 async function dnsBookLoad ()
 {
-    if (dnsBook) return dnsBook;
+    if (dnsBookReady) return dnsBook;
     if (dnsBookLoading) return dnsBookLoading;
+    if (dnsBook && Date.now () < dnsBookRetryAt) return dnsBook;   // в прошлый раз не прочиталось: не долблю базу на каждый запрос
     dnsBookLoading = (async () =>
     {
-        let map = null, st = null;
+        let map = null, st = null, ok = true;
         try
         {
             const srv = dbServerList ()[0];
             if (srv) { map = await db (srv, 'dnsbook', 'map'); st = await db (srv, 'dnsbook', 'stats'); }
         }
-        catch (e) { }
+        catch (e)
+        {
+            ok = false;
+            console.log ('[' + (d()) + '] [music] книга адресов не прочиталась из базы: ' + oneLine ((e && e.message) || e) +
+                ' -- в базу НЕ пишу, данные на диске целы, повторю чтение');
+        }
+        if (!ok)
+        {
+            dnsBook = dnsBook || {};
+            dnsStats = dnsStats || {};
+            dnsBookRetryAt = Date.now () + 30000;
+            dnsBookLoading = null;
+            return dnsBook;
+        }
+        dnsBookReady = true;
         dnsBook = (map && typeof map === 'object' && !Array.isArray (map)) ? map : {};
         dnsStats = (st && typeof st === 'object' && !Array.isArray (st)) ? st : {};
         const _failMig = dnsFailMigrate (dnsBook);       // старые отметки сбоя (в fail лежала метка времени) превращаю в счётчик -- один раз, идемпотентно
@@ -8128,6 +8304,15 @@ async function dnsBookSave (now)
         return;
     }
     if (dnsSaveBusy || !dnsBook) return;
+    if (!dnsBookReady)
+    {
+        if (!dnsSaveWarned)
+        {
+            dnsSaveWarned = true;
+            console.log ('[' + (d()) + '] [music] книгу адресов в базу не пишу: она не прочиталась (см. выше) -- так сбой чтения не затрёт накопленное');
+        }
+        return;
+    }
     dnsSaveBusy = true;
     try
     {
@@ -8272,6 +8457,9 @@ function dnsNoteSrc (src, ok, ms)
 // закономерность не видна: то, что вечером не отвечает, утром может быть лучшим.
 let netHours = null;
 let netHoursLoading = null;
+let netHoursReady = false;
+let netHoursRetryAt = 0;
+let netHoursSaveWarned = false;
 let netHoursSaveTimer = null;
 let netHoursSaveBusy = false;
 function hourKey (t)
@@ -8281,17 +8469,29 @@ function hourKey (t)
 }
 async function netHoursLoad ()
 {
-    if (netHours) return netHours;
+    if (netHoursReady) return netHours;
     if (netHoursLoading) return netHoursLoading;
+    if (netHours && Date.now () < netHoursRetryAt) return netHours;
     netHoursLoading = (async () =>
     {
-        let val = null;
+        let val = null, ok = true;
         try
         {
             const srv = dbServerList ()[0];
             if (srv) val = await db (srv, 'netState', 'hours');
         }
-        catch (e) { }
+        catch (e)
+        {
+            ok = false;
+            console.log ('[' + (d()) + '] [net] часы не прочитались: ' + oneLine ((e && e.message) || e) + ' -- в базу НЕ пишу, повторю чтение');
+        }
+        if (!ok)
+        {
+            netHoursRetryAt = Date.now () + 30000;
+            netHoursLoading = null;
+            return netHours;
+        }
+        netHoursReady = true;
         netHours = (val && typeof val === 'object' && !Array.isArray (val)) ? val : {};
         netHoursLoading = null;
         return netHours;
@@ -8308,6 +8508,15 @@ function netHoursSave (now)
         return;
     }
     if (netHoursSaveBusy || !netHours) return;
+    if (!netHoursReady)
+    {
+        if (!netHoursSaveWarned)
+        {
+            netHoursSaveWarned = true;
+            console.log ('[' + (d()) + '] [net] часы в базу не пишу: они не прочитались (см. выше) -- так сбой чтения не затрёт измерения');
+        }
+        return;
+    }
     netHoursSaveBusy = true;
     (async () =>
     {
@@ -8370,20 +8579,38 @@ function netGuessArchive (lines)            // переезд, а не удал�
     return true;
 }
 let netGuess = null, netGuessScore = null, netGuessLoading = null, netGuessTimer = null, netGuessBusy = false;
+let netGuessReady = false, netGuessRetryAt = 0, netGuessSaveWarned = false;
 let netBoneLedger = null, netBoneLoading = null, netBoneTimer = null, netBoneBusy = false;
+let netBoneReady = false, netBoneRetryAt = 0, netBoneSaveWarned = false;
 async function netGuessLoad ()
 {
-    if (netGuess && netGuessScore) return;
+    if (netGuessReady) return netGuess;
     if (netGuessLoading) return netGuessLoading;
+    if (netGuess && Date.now () < netGuessRetryAt) return netGuess;
     netGuessLoading = (async () =>
     {
-        let g = null, s = null;
+        let g = null, s = null, ok = true;
         try
         {
             const srv = dbServerList ()[0];
             if (srv) { g = await db (srv, 'netState', 'guess'); s = await db (srv, 'netState', 'guess_score'); }
         }
-        catch (e) { }
+        catch (e)
+        {
+            ok = false;
+            console.log ('[' + (d()) + '] [net] прогнозы не прочитались: ' + oneLine ((e && e.message) || e) + ' -- в базу НЕ пишу, повторю чтение');
+        }
+        if (!ok)
+        {
+            netGuess = netGuess || { key: '', items: [], checks: [] };
+            netGuessScore = netGuessScore || {};
+            if (!Array.isArray (netGuess.items)) netGuess.items = [];
+            if (!Array.isArray (netGuess.checks)) netGuess.checks = [];
+            netGuessRetryAt = Date.now () + 30000;
+            netGuessLoading = null;
+            return netGuess;
+        }
+        netGuessReady = true;
         netGuess = (g && typeof g === 'object' && !Array.isArray (g)) ? g : { key: '', items: [], checks: [] };
         netGuessScore = (s && typeof s === 'object' && !Array.isArray (s)) ? s : {};
         if (!Array.isArray (netGuess.items)) netGuess.items = [];
@@ -8403,6 +8630,15 @@ function netGuessSave (now)
         return;
     }
     if (netGuessBusy || !netGuess) return;
+    if (!netGuessReady)
+    {
+        if (!netGuessSaveWarned)
+        {
+            netGuessSaveWarned = true;
+            console.log ('[' + (d()) + '] [net] прогнозы в базу не пишу: они не прочитались (см. выше) -- так сбой чтения не затрёт историю сверок');
+        }
+        return;
+    }
     netGuessBusy = true;
     (async () =>
     {
@@ -8476,17 +8712,29 @@ function netGuessMake (hours)          // прогноз на СЛЕДУЮЩИЙ
 }
 async function netBoneLoad ()
 {
-    if (netBoneLedger) return netBoneLedger;
+    if (netBoneReady) return netBoneLedger;
     if (netBoneLoading) return netBoneLoading;
+    if (netBoneLedger && Date.now () < netBoneRetryAt) return netBoneLedger;
     netBoneLoading = (async () =>
     {
-        let v = null;
+        let v = null, ok = true;
         try
         {
             const srv = dbServerList ()[0];
             if (srv) v = await db (srv, 'netState', 'bone');
         }
-        catch (e) { }
+        catch (e)
+        {
+            ok = false;
+            console.log ('[' + (d()) + '] [net] зацепка не прочиталась: ' + oneLine ((e && e.message) || e) + ' -- в базу НЕ пишу, повторю чтение');
+        }
+        if (!ok)
+        {
+            netBoneRetryAt = Date.now () + 30000;
+            netBoneLoading = null;
+            return netBoneLedger;
+        }
+        netBoneReady = true;
         netBoneLedger = (v && typeof v === 'object' && !Array.isArray (v)) ? v : null;
         netBoneLoading = null;
         return netBoneLedger;
@@ -8503,6 +8751,15 @@ function netBoneSave (now)
         return;
     }
     if (netBoneBusy || !netBoneLedger) return;
+    if (!netBoneReady)
+    {
+        if (!netBoneSaveWarned)
+        {
+            netBoneSaveWarned = true;
+            console.log ('[' + (d()) + '] [net] зацепку в базу не пишу: она не прочиталась (см. выше) -- так сбой чтения не сбросит срок зацепки');
+        }
+        return;
+    }
     netBoneBusy = true;
     (async () =>
     {
@@ -14089,6 +14346,8 @@ for (let sig of ['SIGINT', 'SIGTERM'])
             .catch (() => {})
             .finally (() => { consoleRestoreCodePage (); $cliDone (0); });
     });
+
+if (BOT_RUN) setTimeout (rekeyRecoverTask, 5000);   // хвост прерванной перешифровки довожу после того, как музыка поднялась
 
 const MUSIC_STREAM_RETRIES = 3;
 
@@ -20288,39 +20547,34 @@ client.on ('interactionCreate', async (interaction) =>
         const oldKeys = DB_KEYS.slice ();
         console.log ('[' + (d()) + '] [db] (кто: ' + who + ') /rekey: перешифровываю базу новым ключом');
         const newKey = crypto.randomBytes (32);
-        const res = await dbRekey (newKey);
-        const sum = 'перешифровано ' + (res.enc + res.plain) + ' ' +
-            plural (res.enc + res.plain, 'запись', 'записи', 'записей') +
-            ' (открытыми до этого были: ' + res.plain + ')' +
-            (res.bad ? ', пропущено нечитаемых: ' + res.bad : '') + ', неймспейсов: ' + res.ns;
-        if (res.abort)
+        if (!rekeyJournalWrite ({at: Date.now (), pid: process.pid, from: who}))
+            return interaction.editReply ('⚠️ Перешифровку не начинаю: не удалось записать журнал `db_rekey.journal` в папке бота -- если процесс закрыть в середине, часть записей осталась бы под ключом, которого нет в `config.json`. Проверь права на папку и повтори `/rekey`.');
+        $dbKeyPending = newKey;
+        if (!dbKeysSaveToConfig (oldKeys[0] || null, oldKeys.slice (1), newKey))
         {
-            DB_KEYS.length = 0;
-            for (const k of oldKeys) DB_KEYS.push (k);
-            if (!DB_KEYS.some (k => k.equals (newKey))) DB_KEYS.push (newKey);
-            const saved = dbKeysSaveToConfig (oldKeys[0] || null, [newKey]);
-            console.log ('[' + (d()) + '] [db] /rekey ПРЕРВАН (' + res.why + '): ' + sum +
-                '; основной ключ -- прежний, новый записан запасным (' +
-                (saved ? 'config.json обновлён' : 'config.json НЕ обновлён -- впиши вручную') + ')');
-            return interaction.editReply ('⚠️ Перешифровка прервана: `' + oneLine (res.why, 120) + '`.\n' + sum +
-                '\nНовый ключ **не** стал основным: в `config.json` остался прежний `db_key`, а новый лежит в `db_key_prev` -- данные читаются' +
-                (saved ? ' и переживут перезапуск' : '; в конфиг записать не удалось, возьми ключ из консоли бота') +
-                '.\nПовтори `/rekey`, когда будет время.');
+            $dbKeyPending = null;
+            rekeyJournalClear ();
+            return interaction.editReply ('⚠️ Перешифровку не начинаю: не удалось вписать новый ключ запасным (`db_key_pending`) в `config.json` -- без этой записи закрытие процесса в середине сделало бы часть записей нечитаемыми. Проверь права на файл и повтори.');
         }
-        DB_KEYS.length = 0;
-        DB_KEYS.push (newKey);
-        if (oldKeys[0]) DB_KEYS.push (oldKeys[0]);
-        const saved2 = dbKeysSaveToConfig (newKey, []);
+        const run = await dbRekeyRun (newKey, oldKeys);
+        const sum = run.sum;
+        if (!run.ok)
+        {
+            console.log ('[' + (d()) + '] [db] /rekey ПРЕРВАН (' + run.res.why + '): ' + sum + '; ключ лежит запасным (db_key_pending), журнал оставлен -- доведу после перезапуска');
+            setTimeout (rekeyRecoverTask, 60000);
+            return interaction.editReply ('⚠️ Перешифровка прервана: `' + oneLine (run.res.why, 120) + '`. ' + sum + ' Новый ключ записан запасным (`db_key_pending`) -- данные читаются и переживут перезапуск. Журнал оставлен: бот сам доведёт перешифровку через минуту после перезапуска (или повтори `/rekey`).');
+        }
         console.log ('\n' + '='.repeat (62));
         console.log (' [db] НОВЫЙ КЛЮЧ ШИФРОВАНИЯ БАЗЫ (ключ db_key): ' + newKey.toString ('hex'));
-        console.log (' [db] ' + (saved2 ? 'уже вписан в config.json' : 'ВПИСАТЬ В config.json НЕ УДАЛОСЬ -- сделай вручную'));
+        console.log (' [db] ' + (run.saved ? 'уже вписан в config.json (прежний ключ оставлен запасным в db_key_prev)' : 'ВПИСАТЬ В config.json НЕ УДАЛОСЬ -- сделай вручную (ключ лежит в db_key_pending)'));
         console.log (' [db] сохрани его отдельно: без этого ключа записи базы не читаются.');
+        console.log (' [db] в файл лога ключ не пишу -- он есть только в этом окне консоли.');
         console.log ('='.repeat (62) + '\n');
         console.log ('[' + (d()) + '] [db] (кто: ' + who + ') /rekey готов: ' + sum);
         return interaction.editReply ('🔐 База перешифрована новым ключом.\n' + sum +
-            '\nНовый ключ ' + (saved2 ? 'уже вписан в `config.json` (`db_key`), старый убран'
-                : '**вписать в `config.json` не удалось** -- возьми его из консоли бота') +
-            '; ключ также напечатан **в консоли бота** (в Discord не отправляю: оттуда он ушёл бы на серверы Discord).' +
+            '\nНовый ключ ' + (run.saved ? 'уже вписан в `config.json` (`db_key`), прежний оставлен запасным (`db_key_prev`)'
+                : '**вписать в `config.json` не удалось** -- возьми его из консоли бота (он же лежит в `db_key_pending`)') +
+            '; ключ также напечатан **в консоли бота** (в Discord не отправляю: оттуда он ушёл бы на серверы Discord), а в файл лога он не попадает.' +
             '\nСохрани его отдельно от config.json -- без него записи базы не читаются. Перезапуск не нужен.');
     }
     if (!['play','join','stop','skip','pause','resume','seek','queue','nowplaying','history','health','leave','remove','clear','jump','move','push','repeat','repeat-list','filter'].includes (name)) return;
