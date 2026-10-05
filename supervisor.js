@@ -23,9 +23,18 @@
 // (logs/bot.stop, тот же файл, что у `node . stop`) -- на случай, если сигнал до бота не дошёл, а окно
 // уже закрывают. Правило «сняли няньку жёстко -- бот играет дальше» не тронуто: при жёстком снятии
 // обработчики не выполняются, значит и просьба не пишется.
+//
+// v2.166 -- присмотр возвращается сам. До этого присмотр можно было потерять насовсем: няньку сняли
+// жёстко (taskkill /F), бот играет дальше, но поднять его после падения уже некому, и в логе это никак
+// не видно. Теперь `node .` при живом боте не отказывается, а БЕРЁТ его под присмотр: следит за
+// замком бота по секунде и, если бот исчез, решает по его записке о выходе (logs/bot.exit, её пишет сам
+// бот в обработчике exit) -- вышел сам (код 0) не поднимаю, упал (код не 0) или записки нет (сняли
+// жёстко) -- поднимаю по тем же паузам. Чтобы на одно падение не поднялись две няньки, у няньки свой
+// замок (logs/supervisor.pid): живой чужой pid -- второй запуск просто выходит с подсказкой.
 
 // Как пользоваться (с v2.160 присмотр -- поведение по умолчанию, отдельно звать не нужно):
-//   node .                    -- обычный запуск: сам поднимает супервизор (то же, что этот файл)
+//   node .                    -- обычный запуск: сам поднимает супервизор (то же, что этот файл);
+//                                видит уже работающего бота -- берёт его под присмотр, второго не поднимает
 //   node supervisor.js        -- то же самое, явно (Ctrl+C -- остановить обоих)
 //   npm run supervise         -- то же самое
 //   PANDAMIA_NO_SUPERVISOR=1  -- отключить присмотр: бот живёт один, как раньше
@@ -38,13 +47,17 @@
 //     очередь и выйти (файл-просьба) и ждёт его; вышел -- ухожу за ним; не ответил за 15 с --
 //     выхожу сам, а бот играет дальше; если сигнал пришёл в паузу между перезапусками
 //     (бота сейчас нет), супервизор выходит сразу и нового не поднимает;
-//   - супервизора снимают жёстко (taskkill /F) -- бот этого не замечает и играет дальше (v2.164).
+//   - супервизора снимают жёстко (taskkill /F) -- бот этого не замечает и играет дальше (v2.164),
+//     а следующий `node .` снова берёт его под присмотр (v2.166);
+//   - живой бот и живая нянька -- второй `node .` не поднимает ни бота, ни няньку: у бота уже есть
+//     присмотр (замок logs/supervisor.pid), и говорит об этом одной строкой.
 //
 // Проверочные ручки (только для песочницы, в обычной работе не нужны):
 //   PANDAMIA_BOT_MAIN          -- что запускать вместо '.' (подставной скрипт)
 //   PANDAMIA_SUPERVISOR_LIMIT  -- сколько падений за минуту терпеть (по умолчанию 5)
 //   PANDAMIA_SUPERVISOR_BACKOFF-- список пауз через запятую (по умолчанию 2000,5000,15000,30000,60000)
-//   PANDAMIA_SUPERVISOR_LOG    -- файл, куда дублировать строки няньки (подставляет сам бот; пусто -- только консоль)
+//   PANDAMIA_SUPERVISOR_LOG    -- файл, куда дублировать строки няньки (подставляет сам бот; пусто -- только консоль);
+//                                задаёт и каталог для замков няньки, бота и записки о выходе (песочница)
 'use strict';
 const {spawn} = require ('child_process');
 const fsMod = require ('fs');
@@ -102,6 +115,71 @@ function askBotToStop ()
         log ('не смог положить просьбу остановиться в ' + pathMod.join (LOG_DIR, 'bot.stop') + ': ' + ((e && e.message) || e));
         return false;
     }
+}
+// v2.166 -- нянька и её замок. Двум нянькам нельзя: на одно падение бота каждая подняла бы по боту,
+// и они рвали бы друг другу голос. Замок -- logs/supervisor.pid: живой чужой pid -- второй не встаёт,
+// мёртвый (остался от жёстко снятой няньки) -- перезаписываю своим.
+function supLockFile ()
+{
+    return pathMod.join (LOG_DIR, 'supervisor.pid');
+}
+function readLockPid (file)
+{
+    try { return parseInt (String (fsMod.readFileSync (file, 'utf8')).replace (/\D+/g, ''), 10) || 0; }
+    catch (e) { return 0; }
+}
+function processAlive (pid)
+{
+    if (!pid || pid === process.pid) return false;
+    try { process.kill (pid, 0); return true; }
+    catch (e) { return !!(e && e.code === 'EPERM'); }
+}
+function claimSupervisorLock ()
+{
+    const other = readLockPid (supLockFile ());
+    if (other && processAlive (other))
+        return 'у бота уже есть нянька (pid ' + other + ', замок ' + supLockFile () + ') -- второй не нужен';
+    try
+    {
+        fsMod.mkdirSync (LOG_DIR, {recursive: true});
+        fsMod.writeFileSync (supLockFile (), String (process.pid));
+        process.on ('exit', () =>
+        {
+            try { if (readLockPid (supLockFile ()) === process.pid) fsMod.unlinkSync (supLockFile ()); } catch (e) {}
+        });
+    }
+    catch (e) { log ('не смог записать замок няньки ' + supLockFile () + ': ' + ((e && e.message) || e)); }
+    return '';
+}
+// Записка бота о выходе: «pid код когда» -- её пишет сам бот в обработчике exit (любой выход, и штатный,
+// и аварийный; при жёстком снятии обработчик не выполняется, значит записки не будет). По ней приёмыш-нянька
+// и понимает: код 0 -- закрыли вручную, не поднимать; код не 0 или нет записки -- упал/снят жёстко, поднять.
+function botExitNoteFile ()
+{
+    return pathMod.join (LOG_DIR, 'bot.exit');
+}
+function readBotExitNote ()
+{
+    try
+    {
+        const parts = String (fsMod.readFileSync (botExitNoteFile (), 'utf8')).trim ().split (/\s+/);
+        const pid = parseInt (parts[0], 10) || 0;
+        const code = parseInt (parts[1], 10);
+        if (!pid) return null;
+        return {pid: pid, code: Number.isFinite (code) ? code : 0};
+    }
+    catch (e) { return null; }
+}
+function clearBotExitNote ()
+{
+    try { if (fsMod.existsSync (botExitNoteFile ())) fsMod.unlinkSync (botExitNoteFile ()); }
+    catch (e) {}
+}
+// Замок бота (logs/bot.pid) -- по нему нянька и берёт уже играющего бота под присмотр.
+function botLockPid ()
+{
+    const pid = readLockPid (pathMod.join (LOG_DIR, 'bot.pid'));
+    return processAlive (pid) ? pid : 0;
 }
 // Бот вышел, не прочитав просьбу (например, погас по сигналу сам) -- убираю её, чтобы она не путала
 // следующий запуск (бот, впрочем, и сам убирает чужую-старую просьбу на старте).
@@ -180,20 +258,64 @@ function start ()
             log ('бот вышел сам (код 0, прожил ' + lived + ' с) -- не поднимаю: так закрывают вручную');
             process.exit (0);
         }
-        const now = Date.now ();
-        while (crashes.length && (now - crashes[0]) > WINDOW_MS) crashes.shift ();
-        crashes.push (now);
         log ('бот упал (' + (signal ? 'сигнал ' + signal : 'код ' + code) + ', прожил ' + lived + ' с)');
-        if (crashes.length >= RESTART_LIMIT)
-        {
-            log ('за минуту это падение ' + crashes.length + '-е подряд -- похоже, дело не в случайности, крутиться вслепую не буду.');
-            log ('посмотри последние строки живого лога и logs/crash-*.txt, поправь причину и запусти снова.');
-            process.exit (1);
-        }
-        const wait = BACKOFF_MS[Math.min (crashes.length - 1, BACKOFF_MS.length - 1)];
-        log ('подниму через ' + Math.round (wait / 1000) + ' с (падение ' + crashes.length + ' из ' + RESTART_LIMIT + ')');
-        setTimeout (start, wait);
+        restartAfterCrash ();
     });
+}
+
+// Общий счёт падений для обеих схем -- и когда бота запускал я, и когда подобрал его без няньки.
+function restartAfterCrash ()
+{
+    const now = Date.now ();
+    while (crashes.length && (now - crashes[0]) > WINDOW_MS) crashes.shift ();
+    crashes.push (now);
+    if (crashes.length >= RESTART_LIMIT)
+    {
+        log ('за минуту это падение ' + crashes.length + '-е подряд -- похоже, дело не в случайности, крутиться вслепую не буду.');
+        log ('посмотри последние строки живого лога и logs/crash-*.txt, поправь причину и запусти снова.');
+        process.exit (1);
+    }
+    const wait = BACKOFF_MS[Math.min (crashes.length - 1, BACKOFF_MS.length - 1)];
+    log ('подниму через ' + Math.round (wait / 1000) + ' с (падение ' + crashes.length + ' из ' + RESTART_LIMIT + ')');
+    setTimeout (start, wait);
+}
+
+// v2.166 -- «приёмыш»: бот уже играет, а няньки у него нет (её сняли жёстко, окно закрыли или бота
+// подняли вручную). Тогда второго бота НЕ поднимаю -- слежу за замком приёмыша по секунде и, когда он
+// исчезнет, решаю по записке бота о выходе: вышел сам (код 0) -- не поднимаю, упал или снят жёстко -- поднимаю.
+let adoptedPid = 0;
+function adoptBot (pid)
+{
+    adoptedPid = pid;
+    const since = Date.now ();
+    log ('вижу работающего бота (pid ' + pid + ', замок ' + pathMod.join (LOG_DIR, 'bot.pid') + ') -- беру его под присмотр');
+    const tick = setInterval (() =>
+    {
+        if (processAlive (pid)) return;
+        clearInterval (tick);
+        adoptedPid = 0;
+        const lived = Math.round ((Date.now () - since) / 1000);
+        const note = readBotExitNote ();
+        const mine = note && note.pid === pid ? note : null;
+        if (stopping)
+        {
+            forgetBotStopRequest ();
+            log ('бот остановлен' + (mine ? ' (код ' + mine.code + ')' : '') + ' -- супервизор выходит');
+            process.exit (mine && typeof mine.code === 'number' ? mine.code : 0);
+        }
+        if (mine && mine.code === 0)
+        {
+            log ('бот вышел сам (код 0, под присмотром был ' + lived + ' с) -- не поднимаю: так закрывают вручную');
+            process.exit (0);
+        }
+        log ('бот ' + (mine ? 'упал (код ' + mine.code + ')' : 'пропал без записки о выходе -- значит сняли жёстко') +
+            ', под присмотром был ' + lived + ' с');
+        clearBotExitNote ();
+        restartAfterCrash ();
+    }, 1000);
+    // Отсоединять сторожа НЕЛЬЗЯ: в режиме приёмыша это единственная зацепка, которая держит няньку
+    // живой (бот-то не мой ребёнок) -- с unref нянька вышла бы сразу и присмотр опять потерялся бы.
+    void tick;
 }
 
 // Сигнал консоли (Ctrl+C, а по закрытию окна -- SIGHUP) приходит и боту: он в этом же окне и сохраняет
@@ -204,7 +326,7 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'])
     {
         if (stopping) return;
         stopping = true;
-        if (!child)
+        if (!child && !adoptedPid)
         {
             log ('останавливаюсь по сигналу ' + sig + ': бот сейчас не запущен (ждём паузу перед перезапуском) -- выхожу');
             process.exit (0);
@@ -213,10 +335,11 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'])
         log ('останавливаюсь (' + why + '): прошу бота сохранить очередь и выйти');
         if (askBotToStop ()) log ('просьба положена в ' + pathMod.join (LOG_DIR, 'bot.stop') + ' -- бот прочитает её за секунду');
         // Бот мог не увидеть просьбу (например, ещё стартовал и не написал замок) -- повторяю, пока он жив.
+        // Приёмыша сигнал в этой консоли не касается (его окно -- другое), поэтому действует именно просьба.
         const repeat = setInterval (() =>
         {
-            if (!child) { clearInterval (repeat); return; }
-            askBotToStop ();
+            if (child || (adoptedPid && processAlive (adoptedPid))) { askBotToStop (); return; }
+            clearInterval (repeat);
         }, 3000);
         if (repeat.unref) repeat.unref ();
         const force = setTimeout (() =>
@@ -229,6 +352,14 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'])
         if (force.unref) force.unref ();
     });
 
+const supBusy = claimSupervisorLock ();
+if (supBusy)
+{
+    log (supBusy + ' -- выхожу; бот при этом играет, и останавливать его не нужно');
+    process.exit (0);
+}
 log ('PANDAMIA супервизор: держу бота запущенным. Ctrl+C -- остановить обоих (бот выйдет по-хорошему, очередь и позиция целы).');
-log ('правило: упадёт бот -- подниму его сам (паузы 2, 5, 15, 30, 60 с); закроют вручную (код 0) -- не поднимаю; меня снимут грубо -- бот останется играть (остановить: `node . stop`).');
-start ();
+log ('правило: упадёт бот -- подниму его сам (паузы 2, 5, 15, 30, 60 с); закроют вручную (код 0) -- не поднимаю; меня снимут грубо -- бот доиграет без присмотра, а следующий `node .` вернёт меня к нему (остановить: `node . stop`).');
+const liveBot = botLockPid ();
+if (liveBot) adoptBot (liveBot);
+else start ();

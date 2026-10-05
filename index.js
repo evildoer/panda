@@ -199,6 +199,13 @@
 //    можно -- музыка играет дальше, остановить её: `node . stop`. Бот остаётся в этом же окне (живой лог и
 //    Ctrl+C как раньше); отдельным процессом (detached) его не запускаю: такой отцеплен от консоли, и его
 //    строки в окне не видны (записи в чужой экранный буфер отдают EBADF) -- лог остался бы только в файле.
+// v2.166 -- присмотр возвращается сам (ответ на вопрос владельца «всё ещё возможен случай, когда бот остаётся
+//    без няньки?»): да, был -- жёстко снятая нянька не возвращалась, бот играл до первого падения, и в логе это
+//    никак не было видно. Теперь `node .` при живом боте не отказывается, а берёт его под присмотр: следит за
+//    замком бота и, если бот исчез, решает по его записке о выходе (logs/bot.exit, её пишет сам бот в обработчике
+//    exit): код 0 (закрыли вручную) -- не поднимаю, код не 0 или записки нет (сняли жёстко) -- поднимаю по тем же
+//    паузам. Если у бота уже есть нянька -- второй `node .` выходит одной строкой: у няньки свой замок
+//    (logs/supervisor.pid), иначе на одно падение поднялись бы два бота и рвали бы друг другу голос.
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -570,6 +577,7 @@ process.on ('exit', code =>
 {
     consoleRestoreCodePage ();
     if (actAsSupervisor) return;      // у няньки свои отчёты: её код 1 -- это не «сбой бота», бот живёт ребёнком
+    if (BOT_RUN) botExitNote (code);  // v2.166 -- записка няньке: выхожу сам (код 0) или упал (код не 0)
     if (!code || !BOT_RUN) return;
     const p = crashReport ('аварийный выход (код ' + code + ')', null,
         'бот завершился не сам -- например, упал на старте или его закрыли');
@@ -584,7 +592,7 @@ const DB_ENC_HEX = /^[0-9a-fA-F]{64}$/;
 const CONSOLE_CMDS = ['help', 'config', 'keygen', 'dump', 'net', 'files', 'cache', 'privacy', 'backup', 'compact', 'checkpoint', 'backups', 'restore', 'clearstatus', 'unkey', 'fixauthors', 'cookies', 'ytdlp', 'voice', 'obhod', 'stop'];
 const CONSOLE_HELP =
 [
-    ['node .',                    'запустить бота и смотреть живой лог (Ctrl+C -- выйти)'],
+    ['node .',                    'запустить бота и смотреть живой лог (Ctrl+C -- выйти); бот уже играет -- возьму его под присмотр, второго не поднимаю'],
     ['node . stop',               'остановить работающего бота, сохранив очередь и позицию (то же, что Ctrl+C в окне бота, но из любой консоли)'],
     ['node . help',               'этот список'],
     ['node . keygen',             'напечатать новый ключ шифрования базы (для строки db_key)'],
@@ -634,9 +642,22 @@ function autoSuperviseWanted (runAsBot)
 }
 if (autoSuperviseWanted (BOT_RUN))
 {
-    botBusyExit ();
-    console.log ('[' + (d()) + '] [bot] обычный запуск: поднимаю супервизор -- упаду, он вернёт меня сам ' +
-        '(без присмотра: PANDAMIA_NO_SUPERVISOR=1)');
+    // v2.166 -- три случая вместо прежнего отказа:
+    //   1) бот и так под присмотром -- этот запуск не нужен (второго бота и второй няньки не будет);
+    //   2) бот играет, а няньки нет (её сняли жёстко) -- беру его под присмотр, второго бота не поднимаю;
+    //   3) бота нет -- обычный запуск.
+    const _sup = supervisorLockBusyMsg ();
+    if (_sup)
+    {
+        const _msg = '[' + (d()) + '] [bot] ' + _sup;
+        logFileWrite (_msg);
+        try { process.stderr.write (_msg + '\n'); } catch (e) { }
+        process.exit (0);
+    }
+    const _live = botLockPid ();
+    console.log ('[' + (d()) + '] [bot] ' + (_live
+        ? 'вижу работающего бота (pid ' + _live + ') -- беру его под присмотр, второго бота не поднимаю '
+        : 'обычный запуск: поднимаю супервизор -- упаду, он вернёт меня сам (без присмотра: PANDAMIA_NO_SUPERVISOR=1)'));
     if (!process.env.PANDAMIA_SUPERVISOR_LOG && logFilePath ())
         process.env.PANDAMIA_SUPERVISOR_LOG = logFilePath ();   // нянька продублирует свои строки в этот же файл
     actAsSupervisor = true;
@@ -656,6 +677,7 @@ if (BOT_RUN && !$cliHold)
     if (_busy) botBusyExit (_busy);
     process.on ('exit', botLockRelease);
     botStopFlagClear ();   // v2.162: файл-просьба (bot.stop) мог остаться от прошлой жизни -- этот бот её не писал
+    botExitNoteClear ();   // v2.166: то же про записку о выходе (bot.exit) -- нянька читает только свежую
 }
 {
     const _first = String (process.argv[2] === undefined ? '' : process.argv[2]).trim ();
@@ -2912,19 +2934,46 @@ function botPidAlive (pid)
     try { process.kill (pid, 0); return true; }
     catch (e) { return !!(e && e.code === 'EPERM'); }
 }
+// v2.166 -- pid живого бота из замка (0 -- нет бота / замок мёртвый): по нему `node .` понимает, что
+// бот уже играет, и берёт его под присмотр вместо отказа.
+function botLockPid ()
+{
+    const _f = botLockFile ();
+    try
+    {
+        if (!fsLog.existsSync (_f)) return 0;
+        const _pid = parseInt (String (fsLog.readFileSync (_f, 'utf8')).replace (/\D+/g, ''), 10) || 0;
+        return botPidAlive (_pid) ? _pid : 0;
+    }
+    catch (e) { return 0; }
+}
 function botLockBusyMsg ()
 {
     // только чтение: чужой живой бот -- сообщение о нём, иначе пусто (замок не трогаю)
-    const _f = botLockFile ();
+    const _pid = botLockPid ();
+    if (_pid)
+        return 'бот уже запущен (pid ' + _pid + ', замок ' + botLockFile () + ') -- этот запуск останавливаю. ' +
+            'Закрыть прежний: `node . stop` (он сохранит очередь и позицию); если не отвечает -- ' +
+            '`taskkill /F /PID ' + _pid + '`. Замок снимется сам, когда прежний бот выйдет.';
+    return '';
+}
+// v2.166 -- замок няньки: у бота не может быть двух нянек (на одно падение каждая подняла бы по боту,
+// и они рвали бы друг другу голос). Живой чужой pid -- второй запуск просто выходит с подсказкой.
+function supervisorLockFile ()
+{
+    return pathMod.join (LOG_DIR, 'supervisor.pid');
+}
+function supervisorLockBusyMsg ()
+{
+    const _f = supervisorLockFile ();
     try
     {
         if (fsLog.existsSync (_f))
         {
-            const _pid = parseInt (String (fsLog.readFileSync (_f, 'utf8')).replace (/\D+/g, ''), 10);
+            const _pid = parseInt (String (fsLog.readFileSync (_f, 'utf8')).replace (/\D+/g, ''), 10) || 0;
             if (botPidAlive (_pid))
-                return 'бот уже запущен (pid ' + _pid + ', замок ' + _f + ') -- этот запуск останавливаю. ' +
-                    'Закрыть прежний: `node . stop` (он сохранит очередь и позицию); если не отвечает -- ' +
-                    '`taskkill /F /PID ' + _pid + '`. Замок снимется сам, когда прежний бот выйдет.';
+                return 'у бота уже есть нянька (pid ' + _pid + ', замок ' + _f + ') -- второй не нужен. ' +
+                    'Остановить обоих: Ctrl+C в окне няньки или `node . stop` (бот сохранит очередь и позицию).';
         }
     }
     catch (e)
@@ -2964,6 +3013,33 @@ function botLockRelease ()
         if (!fsLog.existsSync (_f)) return;
         const _pid = parseInt (String (fsLog.readFileSync (_f, 'utf8')).replace (/\D+/g, ''), 10);
         if (_pid === process.pid) fsLog.unlinkSync (_f);
+    }
+    catch (e) { }
+}
+// v2.166 -- записка о выходе: «pid код когда». Её пишет сам бот в обработчике exit (любой выход: штатный
+// код 0, аварийный код 1, по сигналу), и её читает нянька, когда берёт УЖЕ работающего бота под присмотр
+// (`node .` при живом боте): код 0 -- бота закрыли вручную, поднимать не надо; код не 0 -- упал, поднять;
+// записки нет -- бота сняли жёстко (обработчик не выполнился), значит поднять обязательно.
+function botExitNoteFile ()
+{
+    return pathMod.join (LOG_DIR, 'bot.exit');
+}
+function botExitNote (code)
+{
+    try
+    {
+        fsLog.mkdirSync (LOG_DIR, { recursive: true });
+        fsLog.writeFileSync (botExitNoteFile (), process.pid + ' ' + (Number (code) || 0) + ' ' + d ());
+    }
+    catch (e) { }
+}
+// Записка от прошлой жизни не должна путать няньку -- бот убирает её на старте (как и старую просьбу).
+function botExitNoteClear ()
+{
+    try
+    {
+        const _f = botExitNoteFile ();
+        if (fsLog.existsSync (_f)) fsLog.unlinkSync (_f);
     }
     catch (e) { }
 }
