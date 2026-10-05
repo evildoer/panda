@@ -21,8 +21,11 @@
 //   PANDAMIA_BOT_MAIN          -- что запускать вместо '.' (подставной скрипт)
 //   PANDAMIA_SUPERVISOR_LIMIT  -- сколько падений за минуту терпеть (по умолчанию 5)
 //   PANDAMIA_SUPERVISOR_BACKOFF-- список пауз через запятую (по умолчанию 2000,5000,15000,30000,60000)
+//   PANDAMIA_SUPERVISOR_LOG    -- файл, куда дублировать строки няньки (подставляет сам бот; пусто -- только консоль)
 'use strict';
 const {spawn} = require ('child_process');
+const fsMod = require ('fs');
+const pathMod = require ('path');
 
 const NODE = process.execPath;
 const MAIN = process.env.PANDAMIA_BOT_MAIN || '.';
@@ -32,9 +35,36 @@ const BACKOFF_MS = String (process.env.PANDAMIA_SUPERVISOR_BACKOFF || '2000,5000
     .split (',')
     .map (x => Math.max (0, Number (x) || 0));
 
+// Куда дублировать строки няньки в живой лог-файл: путь подставляет сам бот (PANDAMIA_SUPERVISOR_LOG);
+// если супервизор запустили напрямую, беру log_dir (и имя) из config.json -- тот же месячный файл, что пишет бот.
+function supervisorLogFile ()
+{
+    const fromEnv = String (process.env.PANDAMIA_SUPERVISOR_LOG || '').trim ();
+    if (fromEnv) return fromEnv;
+    try
+    {
+        const cfg = JSON.parse (fsMod.readFileSync (pathMod.join (__dirname, 'config.json'), 'utf8'));
+        const dir = String ((cfg && cfg.log_dir) || '').trim () || 'logs';
+        const base = pathMod.isAbsolute (dir) ? pathMod.normalize (dir) : pathMod.join (__dirname, dir);
+        const name = String ((cfg && cfg.PREFIX) || 'panda')
+            .replace (/[^0-9A-Za-zА-Яа-яЁё_-]+/g, '-').replace (/^-+|-+$/g, '') || 'panda';
+        const now = new Date (), two = n => String (n).padStart (2, '0');
+        return pathMod.join (base, name + '-' + now.getFullYear () + '-' + two (now.getMonth () + 1) + '.log');
+    }
+    catch (e) { return ''; }
+}
+const LOG_FILE = supervisorLogFile ();
+function logStamp ()
+{
+    const now = new Date (), two = n => String (n).padStart (2, '0');
+    return two (now.getDate ()) + '.' + two (now.getMonth () + 1) + '.' + now.getFullYear () + ', ' +
+        two (now.getHours ()) + ':' + two (now.getMinutes ()) + ':' + two (now.getSeconds ());
+}
 function log (line)
 {
     try { process.stdout.write ('[' + new Date ().toLocaleTimeString () + '] [supervisor] ' + line + '\n'); } catch (e) {}
+    if (!LOG_FILE) return;
+    try { fsMod.appendFileSync (LOG_FILE, '[' + logStamp () + '] [supervisor] ' + line + '\n'); } catch (e) {}
 }
 
 let child = null;
@@ -105,5 +135,5 @@ for (const sig of ['SIGINT', 'SIGTERM'])
     });
 
 log ('PANDAMIA супервизор: держу бота запущенным. Ctrl+C -- остановить обоих.');
-log ('бот упал -- подниму заново сам; бот вышел кодом 0 (вручную) -- не поднимаю.');
+log ('правило: упадёт бот -- подниму его сам (паузы 2, 5, 15, 30, 60 с); закроют вручную (код 0) -- не поднимаю.');
 start ();
