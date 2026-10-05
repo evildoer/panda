@@ -165,6 +165,11 @@
 //    действительно не чаще раза в 30 с, а часовой разбор не пропускается из-за пустого значения.
 // 4) журнал перешифровки убирается, если доводить нечего (db_key_pending пуст): раньше он висел вечно
 //    и при каждом запуске пугал строкой «довести не могу», хотя перешифровка либо не начиналась, либо уже завершилась.
+// v2.159 -- по живому вопросу владельца «сет не лёг -- не упёрлось ли в лимит кэша?». Разбор показал: дело не в месте
+//    (кэш шёл с запасом, старое убиралось), а в том, что ролика больше нет на YouTube -- yt-dlp отвечает
+//    «Video unavailable» одинаково напрямую, с cookie и через VPN. Чтобы вопрос места не возникал впредь:
+//    под каждую закачку и запись потока место освобождается ЗАРАНЕЕ (для играющего и следующего -- всегда),
+//    ближайший будущий трек из кэша не вытесняется, а пропавший ролик честно говорит о причине без «играю потоком».
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -11924,6 +11929,20 @@ function cacheCleanStale ()
 }
 function fmtMb (bytes) { return Math.max (1, Math.round (Number (bytes || 0) / 1048576)) + ' МБ'; }
 function cachePartSeconds (bytes) { return Math.max (0, Number (bytes || 0) / CACHE_PART_BYTES_PER_SEC); }
+function cacheExpectBytes (track)
+{
+    // сколько примерно займёт файл: живой сет идёт около 16 КБ/с (128 кбит/с), беру четверть запаса;
+    // длительность неизвестна -- прошу 128 МБ, чтобы место нашлось заведомо
+    const dur = Number (track && track.duration) || 0;
+    return dur > 0 ? Math.ceil (dur * CACHE_PART_BYTES_PER_SEC * 1.25) + 2 * 1048576 : 128 * 1048576;
+}
+function cacheMakeRoom (track)
+{
+    // Гарантия владельца: для играющего трека и хотя бы одного следующего место есть всегда.
+    // Поэтому под закачку (или запись потока) место освобождается ДО неё, а не только подчищается после.
+    if (!MUSIC_CACHE_MAX_MB) return 0;
+    return pruneCache ([], cacheExpectBytes (track));
+}
 function cacheKeyOf (track)
 {
     const src = String ((track && (track.url || track.streamUrl)) || '');
@@ -12051,6 +12070,7 @@ async function cacheDownload (track, holder = {})
     const viaProxy = ((await ytRoutesFor (track.url))[0] || {}).proxy || '';
     const key = cacheKeyOf (track);
     cacheDropParts (key);
+    cacheMakeRoom (track);       // место под этот файл готовлю заранее, до закачки
     const proc = ytdlp.exec
     (
         track.url,
@@ -12144,6 +12164,16 @@ function startLongDownload (guildId, track, why = '')
             if (want && longSetCached (want))
                 startLongDownload (guildId, want, 'заранее: предыдущая закачка закончилась');
             if (holder.cancelled) return;
+            if (isGoneError (e))
+            {
+                // ролик пропал с YouTube (или источник больше его не отдаёт): место на диске тут ни при чём,
+                // потоком он тоже не заиграет -- помечаю, чтобы ушёл из очереди сам, когда дойдёт
+                if ((m.tracks || []).includes (track)) track.gone = true;
+                console.error ('[music] ' + goneWords (track) + ' (' + (track.title || 'трек') +
+                    ') -- на диск не лёг, дело не в месте на диске: ' + ytDlpErr (e, 150) +
+                    '; уберу из очереди, когда дойдёт, музыку это не ломает');
+                return;
+            }
             console.error ('[music] сет на диск не лёг (' + (track.title || 'трек') + '): ' + ytDlpErr (e, 150) +
                 ' -- музыку это не ломает, играю потоком');
         }
@@ -12152,6 +12182,7 @@ function startLongDownload (guildId, track, why = '')
 function cacheTeeStart (track)
 {
     if (!MUSIC_CACHE || !track || track.isLive || cacheFind (track) || !cacheDirReady ()) return null;
+    cacheMakeRoom (track);       // запись займёт столько же, сколько файл: место готовлю заранее
     const key = cacheKeyOf (track);
     const part = pathMod.join (MUSIC_CACHE_DIR, key + '.dl.stream');
     let ws;
@@ -12224,10 +12255,12 @@ function cacheQueueRank ()
     for (const k of cacheFillBusy) rank.set (k, { level: 3, order: 0 });
     return rank;
 }
-function pruneCache (keepPaths = [])
+function pruneCache (keepPaths = [], reserveBytes = 0)
 {
-    if (!MUSIC_CACHE_MAX_MB) return;
+    if (!MUSIC_CACHE_MAX_MB) return 0;
     const limit = MUSIC_CACHE_MAX_MB * 1048576;
+    const reserve = Math.max (0, Math.min (Number (reserveBytes) || 0, limit));
+    const target = limit - reserve;      // reserve > 0 -- готовлю место под файл, который вот-вот появится
     let names = [];
     try { names = fsMod.readdirSync (MUSIC_CACHE_DIR); } catch { return; }
     const keep = new Set ((keepPaths || []).filter (Boolean).map (p => pathMod.basename (p)));
@@ -12240,7 +12273,7 @@ function pruneCache (keepPaths = [])
         try { const st = fsMod.statSync (p); if (!st.isFile ()) continue; items.push ({ n, p, size: st.size, at: st.mtimeMs }); total += st.size; }
         catch {}
     }
-    if (total <= limit) return;
+    if (total <= target) return 0;
     for (const it of items)
     {
         const r = rank.get (it.n.split ('.')[0]);
@@ -12253,19 +12286,31 @@ function pruneCache (keepPaths = [])
     let freed = 0;
     for (const it of items)
     {
-        if (total - freed <= limit) break;
+        if (total - freed <= target) break;
         if (it.level >= 3) break;               // дальше только то, что нужно сейчас
+        if (it.level === 2 && it.order === 1) break;   // ближайший будущий трек не трогаю: его место святое
         try
         {
             fsMod.unlinkSync (it.p); freed += it.size;
-            console.log ('[' + (d()) + '] [music] кэш переполнен -- убрал файл (' + fmtMb (it.size) + '): ' + it.why +
+            console.log ('[' + (d()) + '] [music] ' + (reserve > 0
+                ? 'кэш: под новую закачку убрал файл (' + fmtMb (it.size) + '): '
+                : 'кэш переполнен -- убрал файл (' + fmtMb (it.size) + '): ') + it.why +
                 (it.level === 2 ? ' -- догружу, когда подойдёт ближе' : ''));
         }
         catch {}
     }
-    if (freed && total - freed > limit)
+    if (reserve > 0 && freed)
+        console.log ('[' + (d()) + '] [music] кэш: освободил заранее ' + fmtMb (freed) +
+            ' под новую закачку (лимит ' + MUSIC_CACHE_MAX_MB + ' МБ)' +
+            (total - freed > target ? ' -- этого мало, лимит может быть превышен'
+                                    : ' -- играющий трек и то, что впереди, на диске остаются'));
+    else if (reserve > 0 && total > target)
+        console.log ('[' + (d()) + '] [music] кэш: место под новую закачку освободить не из чего -- ' +
+            'всё на диске нужно сейчас или впереди');
+    else if (freed && total - freed > target)
         console.log ('[' + (d()) + '] [music] кэш: лимит ' + MUSIC_CACHE_MAX_MB +
             ' МБ временно превышен -- остальное нужно сейчас или ещё впереди, убирать нечего');
+    return freed;
 }
 function cacheKeysInUse ()
 {
