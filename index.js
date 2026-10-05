@@ -178,6 +178,10 @@
 //    а привычка «Ctrl+C и node .» работает как раньше (сигнал гасит обоих, очередь и позиция сохраняются).
 //    Консольные команды (`node . cache` и прочие) не тронуты: они и так идут без бота. Отключить присмотр
 //    можно переменной PANDAMIA_NO_SUPERVISOR=1 -- тогда бот живёт один, как раньше.
+// v2.162 -- команда `node . stop`: останавливает работающего бота из любой консоли, без Ctrl+C и без окна.
+//    Команда кладёт просьбу с pid бота в logs/bot.stop, а бот замечает её за секунду-две и гаснет сам --
+//    ровно как по Ctrl+C: очередь и позиция сохраняются, выход кодом 0, супервизор уходит за ним по правилу
+//    «вышел сам -- не поднимаю». Просьба с чужим (или старым) pid процесс не трогает.
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -560,10 +564,11 @@ const DB_ENC_PREFIX = 'enc1:';
 const DB_ENC_SALT = 'pandamia-db-v1';
 const DB_ENC_HEX = /^[0-9a-fA-F]{64}$/;
 
-const CONSOLE_CMDS = ['help', 'config', 'keygen', 'dump', 'net', 'files', 'cache', 'privacy', 'backup', 'compact', 'checkpoint', 'backups', 'restore', 'clearstatus', 'unkey', 'fixauthors', 'cookies', 'ytdlp', 'voice', 'obhod'];
+const CONSOLE_CMDS = ['help', 'config', 'keygen', 'dump', 'net', 'files', 'cache', 'privacy', 'backup', 'compact', 'checkpoint', 'backups', 'restore', 'clearstatus', 'unkey', 'fixauthors', 'cookies', 'ytdlp', 'voice', 'obhod', 'stop'];
 const CONSOLE_HELP =
 [
     ['node .',                    'запустить бота и смотреть живой лог (Ctrl+C -- выйти)'],
+    ['node . stop',               'остановить работающего бота, сохранив очередь и позицию (то же, что Ctrl+C в его окне, но из любой консоли)'],
     ['node . help',               'этот список'],
     ['node . keygen',             'напечатать новый ключ шифрования базы (для строки db_key)'],
     ['node . dump [id]',          'посмотреть базу глазами (только чтение, бот не запускается)'],
@@ -632,6 +637,7 @@ if (BOT_RUN && !$cliHold)
     const _busy = botAlreadyRunning ();
     if (_busy) botBusyExit (_busy);
     process.on ('exit', botLockRelease);
+    botStopFlagClear ();   // v2.162: файл-просьба (bot.stop) мог остаться от прошлой жизни -- этот бот её не писал
 }
 {
     const _first = String (process.argv[2] === undefined ? '' : process.argv[2]).trim ();
@@ -674,7 +680,7 @@ if (!BOT_RUN)
     cliCmdName = CONSOLE_CMDS.find (_c => _argv.includes (_c)) || _argv[0] || '';
 }
 const CLI_BUDGET_S = { fixauthors: 600, backup: 300, restore: 300, checkpoint: 300, privacy: 300,
-    cache: 300, ytdlp: 300, cookies: 120, voice: 120, obhod: 3600 };
+    cache: 300, ytdlp: 300, cookies: 120, voice: 120, stop: 60, obhod: 3600 };
 const CLI_BUDGET_DEFAULT_S = 120;
 function $cliDone (_code)
 {
@@ -2942,6 +2948,79 @@ function botLockRelease ()
         if (_pid === process.pid) fsLog.unlinkSync (_f);
     }
     catch (e) { }
+}
+// v2.162 -- `node . stop`: файл-просьба вместо сигнала. Команда кладёт сюда pid работающего бота, а бот сам
+// проверяет файл раз в секунду (botStopWatchTick) и, увидев СВОЙ pid, гаснет как по Ctrl+C: сохраняет
+// очередь и позицию, выходит кодом 0, и супервизор уходит за ним по правилу «вышел сам -- не поднимаю».
+function botStopFile ()
+{
+    return pathMod.join (LOG_DIR, 'bot.stop');
+}
+function botStopFlagPid ()
+{
+    try
+    {
+        const _f = botStopFile ();
+        if (!fsLog.existsSync (_f)) return 0;
+        return parseInt (String (fsLog.readFileSync (_f, 'utf8')).replace (/\D+/g, ''), 10) || 0;
+    }
+    catch (e) { return 0; }
+}
+function botStopFlagClear ()
+{
+    try
+    {
+        const _f = botStopFile ();
+        if (fsLog.existsSync (_f)) fsLog.unlinkSync (_f);
+    }
+    catch (e) { }
+}
+async function stopCli (waitMs)
+{
+    const _waitMs = Math.max (1000, Math.round (Number (waitMs) || 15000));
+    const _lock = botLockFile ();
+    let _pid = 0;
+    try
+    {
+        if (fsLog.existsSync (_lock))
+            _pid = parseInt (String (fsLog.readFileSync (_lock, 'utf8')).replace (/\D+/g, ''), 10) || 0;
+    }
+    catch (e) { }
+    if (!_pid || !botPidAlive (_pid))
+    {
+        console.log ('[stop] останавливать нечего: работающего бота нет (' + _lock + ' -- ' +
+            (_pid ? 'мёртвый pid ' + _pid : 'замок пуст или его нет') + ')');
+        return 0;
+    }
+    const _f = botStopFile ();
+    try
+    {
+        fsLog.mkdirSync (LOG_DIR, { recursive: true });
+        fsLog.writeFileSync (_f, String (_pid));
+    }
+    catch (e)
+    {
+        console.log ('[stop] не смог положить просьбу в ' + _f + ': ' + oneLine ((e && e.message) || e));
+        return 1;
+    }
+    console.log ('[stop] бот работает (pid ' + _pid + ') -- прошу сохранить очередь и выйти (' + _f + ')');
+    const _t0 = Date.now ();
+    while (Date.now () - _t0 < _waitMs)
+    {
+        await new Promise (r => setTimeout (r, 300));
+        if (!botPidAlive (_pid))
+        {
+            botStopFlagClear ();   // бот обычно убирает просьбу сам; это -- если его унесло раньше, чем он её прочитал
+            const _sec = Math.max (1, Math.round ((Date.now () - _t0) / 1000));
+            console.log ('[stop] бот остановился за ' + _sec + ' с -- очередь и позиция сохранены; ' +
+                'окно бота вернулось в консоль (закрыть: exit, запустить снова: node .)');
+            return 0;
+        }
+    }
+    botStopFlagClear ();
+    console.log ('[stop] бот не ответил за ' + Math.round (_waitMs / 1000) + ' с -- просьбу убрал, музыку не трогаю ' +
+        '(занят или завис? его окно подскажет; Ctrl+C там работает как раньше)');
+    return 1;
 }
 
 (async () =>
@@ -12940,6 +13019,15 @@ if (process.argv.slice (2).some (_a => /^ytdlp$/i.test (_a)))
         $cliDone (_code);
     }) ();
 
+if (process.argv.slice (2).some (_a => /^stop$/i.test (_a)))
+    (async () =>
+    {
+        let _code = 1;
+        try { _code = await stopCli (); }
+        catch (e) { console.log ('[stop] ошибка: ' + ((e && e.message) || e)); }
+        $cliDone (_code);
+    }) ();
+
 async function createTrackStream (track, seekSec = 0, seekMode = 'sections', partLoose = false)
 {
     const _cached = MUSIC_CACHE ? cacheFind (track) : null;
@@ -14472,21 +14560,40 @@ async function saveAllMusic ()
         new Promise (r => setTimeout (r, 1500)),
     ]);
 }
+function stopBotNow ()
+{
+    if ($exiting) return;
+    $exiting = true;
+    console.log ('[' + (d()) + '] [music] сохраняю очередь перед выходом...');
+    saveAllMusic ()
+        .then (() => ($conDrain ? $conDrain (400) : null))
+        .then (drained =>
+        {
+            if ($conHalt && drained === false) $conHalt ();
+        })
+        .catch (() => {})
+        .finally (() => { consoleRestoreCodePage (); $cliDone (0); });
+}
 for (let sig of ['SIGINT', 'SIGTERM'])
-    process.on (sig, () =>
-    {
-        if ($exiting) return;
-        $exiting = true;
-        console.log ('[' + (d()) + '] [music] сохраняю очередь перед выходом...');
-        saveAllMusic ()
-            .then (() => ($conDrain ? $conDrain (400) : null))
-            .then (drained =>
-            {
-                if ($conHalt && drained === false) $conHalt ();
-            })
-            .catch (() => {})
-            .finally (() => { consoleRestoreCodePage (); $cliDone (0); });
-    });
+    process.on (sig, () => stopBotNow ());
+
+// v2.162 -- просьба `node . stop`: проверяю файл-просьбу раз в секунду и, увидев СВОЙ pid, гасну как по Ctrl+C
+// (очередь и позиция сохраняются, выход кодом 0 -- супервизор уходит за мной по правилу «вышел сам»).
+function botStopWatchTick ()
+{
+    if ($exiting) return false;
+    const _pid = botStopFlagPid ();
+    if (!_pid || _pid !== process.pid) return false;      // просьба не про нас (чужой или старый pid) -- не трогаю
+    botStopFlagClear ();                                  // убираю просьбу до сохранения: дважды она не сработает
+    console.log ('[' + (d()) + '] [bot] просьба `node . stop` из консоли -- сохраняю очередь и выхожу');
+    stopBotNow ();
+    return true;
+}
+if (BOT_RUN)
+{
+    const _stopWatch = setInterval (botStopWatchTick, 1000);
+    if (_stopWatch.unref) _stopWatch.unref ();
+}
 
 if (BOT_RUN) setTimeout (rekeyRecoverTask, 5000);   // хвост прерванной перешифровки довожу после того, как музыка поднялась
 
