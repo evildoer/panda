@@ -170,6 +170,11 @@
 //    «Video unavailable» одинаково напрямую, с cookie и через VPN. Чтобы вопрос места не возникал впредь:
 //    под каждую закачку и запись потока место освобождается ЗАРАНЕЕ (для играющего и следующего -- всегда),
 //    ближайший будущий трек из кэша не вытесняется, а пропавший ролик честно говорит о причине без «играю потоком».
+// v2.160 -- присмотр по умолчанию: обычный запуск (`node .`, node.cmd, console.bat) больше не идёт без няньки --
+//    процесс сам поднимает супервизор и запускает бота ребёнком, поэтому упавший бот возвращается без хозяина,
+//    а привычка «Ctrl+C и node .» работает как раньше (сигнал гасит обоих, очередь и позиция сохраняются).
+//    Консольные команды (`node . cache` и прочие) не тронуты: они и так идут без бота. Отключить присмотр
+//    можно переменной PANDAMIA_NO_SUPERVISOR=1 -- тогда бот живёт один, как раньше.
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -240,6 +245,8 @@ const space = ' ';
 
 const BOT_RUN = process.argv.slice (2).length === 0;
 const SUPERVISED = BOT_RUN && process.env.PANDAMIA_SUPERVISOR === '1';   // нас запустил supervisor.js: он поднимет после падения
+let actAsSupervisor = false;   // v2.160: процесс сам поднял супервизор и бота ребёнком -- значит, это нянька, а не бот
+                               // (тогда аварийный отчёт о сбое не пишу: его напишет сам бот, иначе на каждый выход няньки был бы лишний файл)
 const utilMod = require ('util');
 const fsLog = require ('fs');
 const pathMod = require ('path');
@@ -538,6 +545,7 @@ function crashLeaveOrStay ()          // под супервизором сох�
 process.on ('exit', code =>
 {
     consoleRestoreCodePage ();
+    if (actAsSupervisor) return;      // у няньки свои отчёты: её код 1 -- это не «сбой бота», бот живёт ребёнком
     if (!code || !BOT_RUN) return;
     const p = crashReport ('аварийный выход (код ' + code + ')', null,
         'бот завершился не сам -- например, упал на старте или его закрыли');
@@ -580,23 +588,44 @@ function printConsoleHelp ()
     console.log ('Команды в папке бота (регистр не важен), пример: node . backup');
     for (const _c of CONSOLE_HELP) console.log ('  ' + _c[0].padEnd (_w) + ' -- ' + _c[1]);
     console.log ('Всё, что открывает ключи и базу, делается ТОЛЬКО здесь, в консоли, а не в Discord.');
+    console.log ('Обычный запуск (`node .`, node.cmd) идёт под супервизором по умолчанию: упавший бот вернётся сам;');
+    console.log ('без присмотра -- PANDAMIA_NO_SUPERVISOR=1; явно -- `node supervisor.js` (то же самое).');
 }
 // Любая консольная команда идёт БЕЗ входа бота: клиент ей не нужен, а вход поднимал бы второго бота рядом
 // с работающим (два бота рвут друг другу голос). Раньше здесь был короткий список команд -- из-за этого
 // `node . obhod` поднимал полноценного бота, и подбор шёл при живом боте, хотя режим --voice требует
 // обратного.
 const $cliHold = !BOT_RUN;
+// v2.160 -- присмотр по умолчанию: обычный запуск (`node .`, node.cmd, console.bat) сам поднимает супервизор
+// и запускает бота ребёнком -- упавший бот возвращается без хозяина, а привычка «Ctrl+C и node .» работает
+// как раньше (сигнал гасит обоих). Консольные команды (`node . cache` и прочие) не трогаю: они и так идут
+// без бота. Отключить присмотр: PANDAMIA_NO_SUPERVISOR=1 -- тогда прежний одиночный запуск.
+function autoSuperviseWanted (runAsBot)
+{
+    if (!runAsBot) return false;                                  // это консольная команда, а не запуск бота
+    if (process.env.PANDAMIA_SUPERVISOR === '1') return false;    // уже под супервизором, второй не нужен
+    return process.env.PANDAMIA_NO_SUPERVISOR !== '1';            // хозяин может отключить присмотр
+}
+if (autoSuperviseWanted (BOT_RUN))
+{
+    botBusyExit ();
+    console.log ('[' + (d()) + '] [bot] обычный запуск: поднимаю супервизор -- упаду, он вернёт меня сам ' +
+        '(без присмотра: PANDAMIA_NO_SUPERVISOR=1)');
+    actAsSupervisor = true;
+    let _supOk = false;
+    try { require ('./supervisor.js'); _supOk = true; }
+    catch (e)
+    {
+        actAsSupervisor = false;    // супервизор не поднялся -- этот процесс снова обычный бот, аварийный отчёт нужен
+        console.error ('[' + (d()) + '] [bot] супервизор не поднялся (' + oneLine ((e && e.message) || e, 100) +
+            ') -- работаю как раньше, без присмотра');
+    }
+    if (_supOk) return;      // дальше в этом процессе ничего не делаю: бот живёт ребёнком супервизора
+}
 if (BOT_RUN && !$cliHold)
 {
     const _busy = botAlreadyRunning ();
-    if (_busy)
-    {
-        const _msg = '[' + (d()) + '] [bot] ' + _busy + ' Два бота рвут друг другу голос '
-            + '(у слушателей тишина, а в логе -- пачки «IP discovery»), поэтому второй запуск не открываю.';
-        logFileWrite (_msg);
-        try { process.stderr.write (_msg + '\n'); } catch (e) { }
-        process.exit (0);
-    }
+    if (_busy) botBusyExit (_busy);
     process.on ('exit', botLockRelease);
 }
 {
@@ -2854,8 +2883,9 @@ function botPidAlive (pid)
     try { process.kill (pid, 0); return true; }
     catch (e) { return !!(e && e.code === 'EPERM'); }
 }
-function botAlreadyRunning ()
+function botLockBusyMsg ()
 {
+    // только чтение: чужой живой бот -- сообщение о нём, иначе пусто (замок не трогаю)
     const _f = botLockFile ();
     try
     {
@@ -2867,8 +2897,30 @@ function botAlreadyRunning ()
                     'Закрыть прежний: Ctrl+C в его окне или `taskkill /PID ' + _pid + ' /F`. ' +
                     'Замок снимется сам, когда прежний бот выйдет.';
         }
+    }
+    catch (e)
+    {
+    }
+    return '';
+}
+function botBusyExit (busy)
+{
+    const _busy = busy || botLockBusyMsg ();
+    if (!_busy) return false;
+    const _msg = '[' + (d()) + '] [bot] ' + _busy + ' Два бота рвут друг другу голос '
+        + '(у слушателей тишина, а в логе -- пачки «IP discovery»), поэтому второй запуск не открываю.';
+    logFileWrite (_msg);
+    try { process.stderr.write (_msg + '\n'); } catch (e) { }
+    process.exit (0);
+}
+function botAlreadyRunning ()
+{
+    const _busy = botLockBusyMsg ();
+    if (_busy) return _busy;
+    try
+    {
         fsLog.mkdirSync (LOG_DIR, { recursive: true });
-        fsLog.writeFileSync (_f, String (process.pid));
+        fsLog.writeFileSync (botLockFile (), String (process.pid));
     }
     catch (e)
     {
