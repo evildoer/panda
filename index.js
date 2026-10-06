@@ -206,6 +206,14 @@
 //    exit): код 0 (закрыли вручную) -- не поднимаю, код не 0 или записки нет (сняли жёстко) -- поднимаю по тем же
 //    паузам. Если у бота уже есть нянька -- второй `node .` выходит одной строкой: у няньки свой замок
 //    (logs/supervisor.pid), иначе на одно падение поднялись бы два бота и рвали бы друг другу голос.
+// v2.167 -- по живому вопросу владельца: переезды между комнатами были в консоли НЕ видны, хотя бот там кое-что
+//    делает. Ограничение по комнате живёт в правах самого канала (Speak: false у человека), а серверный мут бот
+//    ставит и снимает сам -- чтобы в других комнатах можно было говорить, а при заходе обратно мут вернулся.
+//    Теперь каждый такой шаг называется вслух: «мут по комнате: X снова заглушён в «Комната-2» (пришёл из
+//    «Комната-3») -- тут ограничение…» и «… в «Комната-3» мут снят -- ограничение осталось в «Комната-2»…»,
+//    плюс строка, когда заглушённый выходит из голосового совсем. Заодно в личку больше не приходит
+//    периодическое «за обходом никто не следит»: владелец решил сторожа не ставить, напоминание осталось
+//    только в живом логе (про поломку обхода письмо по-прежнему придёт).
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -4258,6 +4266,62 @@ function voiceEditQuiet (p, what)
         console.error ('[' + (d()) + '] [voice] ' + what + ': ' + oneLine ((e && e.message) || e));
     });
 }
+
+// v2.167 -- «мут по комнатам» говорит вслух. Ограничение по комнате живёт в перезаписи самого канала
+// (Speak: false у человека), а серверный мут бот ставит и снимает сам: в других комнатах человек
+// говорит свободно, а при заходе обратно мут возвращается. Раньше эти шаги были молчаливые -- в
+// консоли не было ни строки, и по логу нельзя было понять, что бот вообще что-то делает (живой вопрос
+// владельца: «мут снялся в другой комнате и вернулся, а в логе ничего»).
+function voiceRoomName (ch)
+{
+    return ch ? '«' + code (cc (ch)) + '»' : '';
+}
+
+function voiceRoomRestriction (state, uid)      // комната, где у человека ограничение Speak ('' -- нет такой)
+{
+    try
+    {
+        const ch = state && state.channel;
+        if (!ch || !ch.permissionOverwrites) return '';
+        const ow = ch.permissionOverwrites.cache.get (uid);
+        return (ow && ow.deny.has (PermissionsBitField.Flags.Speak)) ? voiceRoomName (ch) : '';
+    }
+    catch (e) { return ''; }
+}
+
+// Переезд: под ограничением ли комната, куда человек вошёл, и совпадает ли с ней серверный мут.
+function voiceRoomMuteSync (oldState, newState)
+{
+    const uid = newState.id;
+    const who = newState.member ? uuu (newState.member) : String (uid);
+    const here = voiceRoomName (newState.channel) || 'другой комнате';
+    if (voiceRoomRestriction (newState, uid))
+    {
+        if (newState.serverMute) return;               // уже заглушён -- ничего не делаем и не пишем
+        const came = (oldState.channelId && oldState.channelId !== newState.channelId) ? voiceRoomName (oldState.channel) : '';
+        newState.setMute (true)
+        .then (() => console.log ('[' + (d()) + '] [voice] мут по комнате: ' + who + ' снова заглушён в ' + here +
+            (came ? ' (пришёл из ' + came + ')' : '') + ' -- тут ограничение; в других комнатах говорить можно'))
+        .catch (console.error);
+        return;
+    }
+    if (!newState.serverMute) return;                  // тут ограничения нет и снимать нечего
+    const room = voiceRoomRestriction (oldState, uid);
+    newState.setMute (false)
+    .then (() => console.log ('[' + (d()) + '] [voice] мут по комнате: ' + who + ' в ' + here + ' мут снят' +
+        (room ? ' -- ограничение осталось в ' + room + ' и вернётся при заходе туда'
+              : ' -- это был серверный мут без ограничения по комнате')))
+    .catch (console.error);
+}
+
+// Вышел из голосового совсем: серверный мут снимается (Discord отдаёт это как канал без объекта).
+function voiceRoomMuteLeft (oldState, newState)
+{
+    if (!newState.member || newState.member.user.bot) return;
+    const room = voiceRoomRestriction (oldState, newState.id);
+    console.log ('[' + (d()) + '] [voice] мут по комнате: ' + uuu (newState.member) + ' вышел из голосового -- серверный мут снят' +
+        (room ? ', ограничение осталось в ' + room + ' и вернётся при заходе туда' : ''));
+}
 client.on ('voiceStateUpdate', async (oldState, newState) =>
 {
     const server = newState.guild.id;
@@ -4306,7 +4370,12 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
         if (newState.channel === null && newState.channelId)
         {
             if (newState.serverMute)
-                voiceEditQuiet (newState.setMute (false), 'снятие мута при выходе из канала');
+            {
+                const _p = newState.setMute (false);
+                voiceEditQuiet (_p, 'снятие мута при выходе из канала');
+                if (_p && typeof _p.then === 'function')
+                    _p.then (() => voiceRoomMuteLeft (oldState, newState)).catch (() => { });
+            }
             if (newState.serverDeaf)
                 voiceEditQuiet (newState.setDeaf (false), 'снятие глухоты при выходе из канала');
         }
@@ -4660,26 +4729,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                 }
                 else
                 {
-                    if
-                    (
-                        newState.channel.permissionOverwrites.cache.get(newState.id) &&
-                        newState.channel.permissionOverwrites.cache.get(newState.id).deny.has(PermissionsBitField.Flags.Speak)
-                    )
-                    {
-                        if (!newState.serverMute)
-                        {
-                            newState.setMute (true)
-                            .catch (console.error);
-                        }
-                    }
-                    else
-                    {
-                        if (newState.serverMute)
-                        {
-                            newState.setMute (false)
-                            .catch (console.error);
-                        }
-                    }
+                    voiceRoomMuteSync (oldState, newState);   // v2.167: мут по комнатам -- теперь с записью в лог
                     if
                     (
                         newState.channel.permissionOverwrites.cache.get(newState.id) &&
@@ -7859,22 +7909,19 @@ async function dpiWatchTick (why)                // раз в 10 минут: ж�
             dpiStat.verdict = '';                    // про стратегию отдельно писать не надо: только что сказали про сам обход
             await notifyHoster ('✅ **Обход снова работает:** движок `winws.exe` поднялся.');
         }
-        const v = await dpiStrategyHealth (why);
+        await dpiStrategyHealth (why);               // проверка стратегии осталась (у неё своя тревога); её вердикт больше не нужен: письма нет
         const k = await dpiKeeperState ();
         dpiStat.keeper = k;
         if (k.proc) return;
         const told = await netFlagGet ('keeperTold');
         if (told && (Date.now () - (Number (told.at) || 0)) < DPI_KEEPER_TELL_MS) return;
         await netFlagSet ('keeperTold', { at: Date.now () });
+        // v2.167: письма про это больше нет. «За обходом никто не следит» -- не поломка и не просьба:
+        // обход работает, а сторожа владелец решил не ставить (ещё в v2.137 убрали повторную просьбу из
+        // /health). Оставляю строку только в живом логе -- раз в 12 часов, чтобы при разборе было видно,
+        // кто следит за обходом; а если обход встанет, письмо придёт отдельно и по делу.
         console.log ('[' + (d()) + '] [music] сторож обхода: ' + keeperWords (k) +
-            ' -- если обход встанет, я это замечу и напишу, но чинить придётся тебе (сам я прав не спрашиваю)');
-        await notifyHoster ('ℹ️ **За обходом сейчас никто не следит.** Обход работает' +
-            (v === 'ok' ? ' -- ютуб и дискорд отвечают'
-                : (v === 'spare' ? ' -- напрямую ютуб не отвечает, музыку везу запасным путём' : ' (но с путями не всё в порядке)')) + '.' +
-            '\n_Сторож: ' + keeperWords (k) + '._' +
-            '\nЧто это значит: если обход встанет, я это замечу и напишу, но чинить придётся тебе -- сам я прав администратора не спрашиваю.' +
-            '\nЧтобы сторожил и сам чинил: `tools\\obhod.cmd` -- пункт 6 («ХРАНИТЕЛЬ»), потом пункт 7 («хранитель в автозапуск»).' +
-            ' Это единственное, что встаёт в автозапуск, -- и только по твоему решению.');
+            ' -- в личку об этом не пишу (сторожа ты решил не ставить), но если обход встанет, письмо придёт');
         return;
     }
     if ((Date.now () - dpiStat.toldAt) < DPI_STAT_TELL_MS) return;
