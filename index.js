@@ -228,6 +228,10 @@
 //    слала только она, а из вкладки «Права доступа» человек не узнавал ничего). Плюс ссылка на политику в
 //    /mydata больше не разворачивается превью: она прячется в угловые скобки (в /help ссылка лежит в embed,
 //    там превью и не было).
+// v2.170 -- вторая половина той же просьбы: про ручную правку прав канала теперь пишется и в журнал
+//    сервера (log_channel) -- туда же и теми же словами, что пишет кнопка Discord; раньше об этом знал
+//    только живой лог бота, а в журнале сервера (его видят staff) записи не было вовсе. Отметка в записи
+//    говорит, что дело было в правах канала, а не кнопкой; если журнала в конфиге нет -- молча ничего.
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -4357,6 +4361,52 @@ function voiceRoomNoticeText (state, channel, kind, on, owners)
         'Подробности смотрите в журнале аудита.';
 }
 
+// v2.170 -- запись в журнал сервера (log_channel) о ручной правке: до этого кнопка Discord писала и в
+// личку, и в журнал, а ручная правка -- только в живой лог бота. Строки и вид записи -- как у кнопки
+// (в журнале стоит сам человек, а не «вам»), плюс пометка, что это правка прав канала.
+function voiceRoomLogText (state, member, channel, kind, on, owners, note)
+{
+    const about = kind === 'мут'
+        ? (on ? '**запрещено** 🗣️ говорить в канале' : '**разрешено** 🗣️ говорить в канале')
+        : (on ? '**запрещено** 🔌 подключаться в канал' : '**разрешено** 🔌 подключаться в канал');
+    return u (state.id) + ' ' + about + ' `' + code (cc (channel)) + '` ' +
+        (on ? (kind === 'мут' ? '🟨' : '🟥') : '🟩') + (note ? ' ' + note : '') + '\n' +
+        'Владельцы канала: ' + (owners && owners.size ? owners.map (owner => uuu (owner)).join (', ') : '*offline*') + '\n' +
+        'Подробности смотрите в журнале аудита.';
+}
+
+async function voiceRoomLog (state, member, channel, kind, on)
+{
+    try
+    {
+        const server = (channel && channel.guild) ? channel.guild.id : null;
+        const log_channel = (server && SERVERS[server]) ? (SERVERS[server].log_channel || '') : '';
+        if (!log_channel || !member) return;
+        const owners = await ownersOf (channel).catch (() => null);
+        await logTo (log_channel).send
+        ({
+            embeds:
+            [{
+                author:
+                {
+                    name: uuu (member),
+                    icon_url: member.user.displayAvatarURL ({extension: 'png', forceStatic: false, size: 1024}),
+                },
+                color: on ? (kind === 'мут' ? 0xFFFF00 : 0xFF0000) : 0x00FF00,
+                description: voiceRoomLogText (state, member, channel, kind, on, owners, '(права канала изменились)'),
+                footer: { text: SERVERS[server].name },
+                timestamp: dt (),
+            }],
+        });
+        console.log ('[' + (d()) + '] [voice] ' + kind + ' по комнате: запись о правке ушла в журнал сервера «' +
+            code (cc (channel)) + '» -- туда же, куда пишет кнопка');
+    }
+    catch (e)
+    {
+        console.error ('[voice] ' + kind + ' по комнате: в журнал сервера не записалось (' + oneLine (e && e.message) + ')');
+    }
+}
+
 async function voiceRoomNotice (state, channel, kind, on)
 {
     try
@@ -4368,22 +4418,30 @@ async function voiceRoomNotice (state, channel, kind, on)
                 await channel.guild.members.fetch (state.id).catch (() => null);
         if (!member || !member.user || member.user.bot) return;
         const owners = await ownersOf (channel).catch (() => null);
-        await member.send
-        ({
-            embeds:
-            [{
-                color: on ? (kind === 'мут' ? 0xFFFF00 : 0xFF0000) : 0x00FF00,
-                description: voiceRoomNoticeText (state, channel, kind, on, owners),
-            }],
-        });
-        console.log ('[' + (d()) + '] [voice] ' + kind + ' по комнате: написал ' + uuu (member) + ' в личку -- ' +
-            (on ? 'ограничение в «' + code (cc (channel)) + '» выдано правкой прав канала' :
-                  'ограничение в «' + code (cc (channel)) + '» снято правкой прав канала'));
+        try
+        {
+            await member.send
+            ({
+                embeds:
+                [{
+                    color: on ? (kind === 'мут' ? 0xFFFF00 : 0xFF0000) : 0x00FF00,
+                    description: voiceRoomNoticeText (state, channel, kind, on, owners),
+                }],
+            });
+            console.log ('[' + (d()) + '] [voice] ' + kind + ' по комнате: написал ' + uuu (member) + ' в личку -- ' +
+                (on ? 'ограничение в «' + code (cc (channel)) + '» выдано правкой прав канала' :
+                      'ограничение в «' + code (cc (channel)) + '» снято правкой прав канала'));
+        }
+        catch (e)
+        {
+            console.error ('[voice] ' + kind + ' по комнате: в личку не написалось (' + oneLine (e && e.message) +
+                ') -- человек об этом узнает из журнала сервера и журнала аудита');
+        }
+        await voiceRoomLog (state, member, channel, kind, on);
     }
     catch (e)
     {
-        console.error ('[voice] ' + kind + ' по комнате: в личку не написалось (' + oneLine (e && e.message) +
-            ') -- человек об этом узнает только в журнале аудита');
+        console.error ('[voice] ' + kind + ' по комнате: сказать человеку не вышло (' + oneLine (e && e.message) + ')');
     }
 }
 
