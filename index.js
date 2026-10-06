@@ -223,6 +223,11 @@
 //    Connect) -- те же строки в логе и то же согласование серверного состояния с правами комнаты.
 //    3) Ручная правка прав канала (вкладка «Права доступа») больше не расходится с серверным мут/дефом: бот
 //    сводит их у тех, кто в этой комнате сидит, и пишет об этом в лог. Все строки -- русские.
+// v2.169 -- по живой проверке под твинком: ручная правка прав канала теперь не только выравнивает серверный
+//    мут/деф, но и пишет человеку в личку -- теми же словами и цветами, что и кнопка Discord (раньше письмо
+//    слала только она, а из вкладки «Права доступа» человек не узнавал ничего). Плюс ссылка на политику в
+//    /mydata больше не разворачивается превью: она прячется в угловые скобки (в /help ссылка лежит в embed,
+//    там превью и не было).
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -4054,6 +4059,7 @@ client.on ('channelUpdate', async (oldChannel, newChannel) =>
         // (вкладка «Права доступа» у канала). Тогда серверный мут/деф за руками не поспевает: здесь
         // свожу их с правами комнаты у тех, кто в ней сидит, и говорю об этом в живом логе. Чужие
         // правки (имя, порядок) ничего не меняют: пока запреты не менялись, шаг молчит.
+        // v2.169: правка рукой теперь ещё и пишет человеку в личку (tell = true) -- как это делает кнопка.
         if (newChannel.type === ChannelType.GuildVoice)
         {
             for (let [, vs] of guild.voiceStates.cache)
@@ -4064,7 +4070,7 @@ client.on ('channelUpdate', async (oldChannel, newChannel) =>
                 const now = voiceRoomDenyOf (newChannel, vs.id, PermissionsBitField.Flags.Speak) ||
                             voiceRoomDenyOf (newChannel, vs.id, PermissionsBitField.Flags.Connect);
                 if (was === now) continue;
-                voiceRoomMuteSync (vs, vs, 'права канала изменились');
+                voiceRoomMuteSync (vs, vs, 'права канала изменились', true);
             }
         }
     }
@@ -4337,9 +4343,55 @@ const VOICE_ROOM_RULES =
       cur: 'serverDeaf', set: 'setDeaf' },
 ];
 
+// v2.169 -- письмо человеку, когда ограничение выдали или сняли РУКАМИ, в правах самого канала: раньше об
+// этом знал только лог бота, а кнопка Discord письмо шлёт всегда -- теперь приходимые письма не отличаются.
+// Слова и цвета -- те же, что у кнопки (мут: жёлтый/зелёный, деф: красный/зелёный), плюс владельцы комнаты.
+function voiceRoomNoticeText (state, channel, kind, on, owners)
+{
+    const about = kind === 'мут'
+        ? (on ? 'вам **запрещено** 🗣️ говорить в канале' : 'вам **разрешено** 🗣️ говорить в канале')
+        : (on ? 'вам **запрещено** 🔌 подключаться в канал' : 'вам **разрешено** 🔌 подключаться в канал');
+    return u (state.id) + ', ' + about + ' `' + code (cc (channel)) + '` ' +
+        (on ? (kind === 'мут' ? '🟨' : '🟥') : '🟩') + '\n' +
+        'Владельцы канала: ' + (owners && owners.size ? owners.map (owner => uuu (owner)).join (', ') : '*offline*') + '\n' +
+        'Подробности смотрите в журнале аудита.';
+}
+
+async function voiceRoomNotice (state, channel, kind, on)
+{
+    try
+    {
+        if (!channel || !channel.guild) return;
+        let member = state.member;
+        if (!member || member.partial)
+            member = channel.guild.members.cache.get (state.id) ||
+                await channel.guild.members.fetch (state.id).catch (() => null);
+        if (!member || !member.user || member.user.bot) return;
+        const owners = await ownersOf (channel).catch (() => null);
+        await member.send
+        ({
+            embeds:
+            [{
+                color: on ? (kind === 'мут' ? 0xFFFF00 : 0xFF0000) : 0x00FF00,
+                description: voiceRoomNoticeText (state, channel, kind, on, owners),
+            }],
+        });
+        console.log ('[' + (d()) + '] [voice] ' + kind + ' по комнате: написал ' + uuu (member) + ' в личку -- ' +
+            (on ? 'ограничение в «' + code (cc (channel)) + '» выдано правкой прав канала' :
+                  'ограничение в «' + code (cc (channel)) + '» снято правкой прав канала'));
+    }
+    catch (e)
+    {
+        console.error ('[voice] ' + kind + ' по комнате: в личку не написалось (' + oneLine (e && e.message) +
+            ') -- человек об этом узнает только в журнале аудита');
+    }
+}
+
 // Переезд (или ручная правка прав канала): под ограничением ли комната, куда человек попал, и
-// совпадает ли с ней серверный мут/деф. note -- почему это не переезд (пусто -- переезд).
-function voiceRoomMuteSync (oldState, newState, note = '')
+// совпадает ли с ней серверный мут/деф. note -- почему это не переезд (пусто -- переезд);
+// tell -- написать об этом человеку в личку (так делает только ручная правка: при переезде он сам видел,
+// куда заходит, а из вкладки «Права доступа» -- не видел ничего).
+function voiceRoomMuteSync (oldState, newState, note = '', tell = false)
 {
     const uid = newState.id;
     const who = newState.member ? uuu (newState.member) : String (uid);
@@ -4351,18 +4403,26 @@ function voiceRoomMuteSync (oldState, newState, note = '')
             if (newState[r.cur]) continue;             // уже под ограничением -- ничего не делаем и не пишем
             const came = (oldState.channelId && oldState.channelId !== newState.channelId) ? voiceRoomName (oldState.channel) : '';
             newState[r.set] (true)
-            .then (() => console.log ('[' + (d()) + '] [voice] ' + r.kind + ' по комнате: ' + who + ' снова ' + r.step + ' в ' + here +
-                (came ? ' (пришёл из ' + came + ')' : '') + (note ? ' (' + note + ')' : '') + ' -- тут ограничение; ' + r.free))
+            .then (() =>
+            {
+                console.log ('[' + (d()) + '] [voice] ' + r.kind + ' по комнате: ' + who + ' снова ' + r.step + ' в ' + here +
+                    (came ? ' (пришёл из ' + came + ')' : '') + (note ? ' (' + note + ')' : '') + ' -- тут ограничение; ' + r.free);
+                if (tell) voiceRoomNotice (newState, newState.channel, r.kind, true).catch (console.error);
+            })
             .catch (console.error);
             continue;
         }
         if (!newState[r.cur]) continue;                // тут ограничения нет и снимать нечего
         const room = voiceRoomRestriction (oldState, uid, r.flag);
         newState[r.set] (false)
-        .then (() => console.log ('[' + (d()) + '] [voice] ' + r.kind + ' по комнате: ' + who + ' в ' + here + ' ' + r.done +
-            (room ? ' -- ограничение осталось в ' + room + ' и вернётся при заходе туда'
-                  : (note ? ' -- ограничения по комнатам у него нет (' + note + ')'
-                          : ' -- это был серверный ' + r.kind + ' без ограничения по комнате'))))
+        .then (() =>
+        {
+            console.log ('[' + (d()) + '] [voice] ' + r.kind + ' по комнате: ' + who + ' в ' + here + ' ' + r.done +
+                (room ? ' -- ограничение осталось в ' + room + ' и вернётся при заходе туда'
+                      : (note ? ' -- ограничения по комнатам у него нет (' + note + ')'
+                              : ' -- это был серверный ' + r.kind + ' без ограничения по комнате')));
+            if (tell) voiceRoomNotice (newState, newState.channel, r.kind, false).catch (console.error);
+        })
         .catch (console.error);
     }
 }
@@ -6020,7 +6080,10 @@ async function myDataReport (server, target, self)
         '` стирает сразу роли, историю и треки из очереди (авторство играющего трека тоже стирается); ' +
         'либо напиши владельцу бота (контакт есть в `/help`).\n' +
         '_Активное наказание `/forget` не трогает: это уже не хранение данных, а действие модерации -- его снимает `/unban`._');
-    if (privacyUrlOf (server)) out.push ('📄 Полная политика конфиденциальности: ' + privacyUrlOf (server));
+    // v2.169: ссылка в угловых скобках -- Discord такую не разворачивает в превью (отчёт уходит обычным
+    // текстом, а не embed, поэтому без скобок ссылка тянула за собой карточку gist). В /help ссылка лежит в
+    // embed -- там превью и не появлялось, поэтому тут и только тут.
+    if (privacyUrlOf (server)) out.push ('📄 Полная политика конфиденциальности: <' + privacyUrlOf (server) + '>');
     return out.join ('\n');
 }
 
