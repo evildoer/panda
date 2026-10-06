@@ -232,6 +232,17 @@
 //    сервера (log_channel) -- туда же и теми же словами, что пишет кнопка Discord; раньше об этом знал
 //    только живой лог бота, а в журнале сервера (его видят staff) записи не было вовсе. Отметка в записи
 //    говорит, что дело было в правах канала, а не кнопкой; если журнала в конфиге нет -- молча ничего.
+// v2.171 -- по живой находке владельца («повесил наушники твинку -- он вылетел из канала, об этом написали
+//    и в журнал, и в ЛС, а снятие наушников -- нигде ни строчки»): обработчик голосовых событий ходил
+//    только по тем, кто В КАНАЛЕ, а деф человека как раз и выбивает из канала -- поэтому ветка «человек
+//    сейчас вне голосового» была пустой, и снятый мут/деф молчали. Теперь и там тот же путь, что внутри
+//    канала: комната ищется по личному запрету среди всех голосовых каналов, запрет снимается, в лог идёт
+//    строка, человеку уходит письмо, а в журнал сервера -- запись. Явно различаю два случая: у человека
+//    есть личный запрет в комнате (ограничение по комнатам было -- снимаю его вместе с мут/дефом) или
+//    запрета нет (это серверный мут/деф без комнаты -- молчу, как и внутри канала). Выдача мута/дефа
+//    человеку вне голосового видна строкой в логе: ставить ограничение не на что, а при заходе в комнату
+//    бот снимет его сам. Заодно деф перестал молчать там, где мут уже говорил: при выходе из голосового
+//    о снятой глухоте теперь тоже есть строка.
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -4336,6 +4347,24 @@ function voiceRoomRestriction (state, uid, flag)   // комната, где у 
     return voiceRoomDenyOf (ch, uid, flag) ? voiceRoomName (ch) : '';
 }
 
+// v2.171: комната, где у человека этот запрет, -- но искать по ВСЕМ голосовым каналам сервера, а не только
+// по тому, где он сейчас: человек может быть выбит из комнаты (деф его как раз и выкидывает), а запрет
+// остался висеть в ней. Нужна для снятия ограничения у тех, кто сейчас вне голосового.
+function voiceRoomAnyChannel (guild, uid, flag)
+{
+    try
+    {
+        for (const [, ch] of guild.channels.cache)
+        {
+            if (!ch || ch.type !== ChannelType.GuildVoice || !ch.permissionOverwrites) continue;
+            const ow = ch.permissionOverwrites.cache.get (uid);
+            if (ow && ow.deny.has (flag)) return ch;
+        }
+    }
+    catch (e) { }
+    return null;
+}
+
 // Ограничения по комнатам бывают двух видов, и оба живут в правах САМОГО канала: мут -- запрет Speak,
 // деф (наушники) -- запрет Connect. Серверный мут/деф бот держит с ними в согласии, чтобы в других
 // комнатах было можно, а в своей -- нельзя. Правила рядом, чтобы строки в логе были одинаковые.
@@ -4375,7 +4404,7 @@ function voiceRoomLogText (state, member, channel, kind, on, owners, note)
         'Подробности смотрите в журнале аудита.';
 }
 
-async function voiceRoomLog (state, member, channel, kind, on)
+async function voiceRoomLog (state, member, channel, kind, on, note = '(права канала изменились)')
 {
     try
     {
@@ -4393,7 +4422,7 @@ async function voiceRoomLog (state, member, channel, kind, on)
                     icon_url: member.user.displayAvatarURL ({extension: 'png', forceStatic: false, size: 1024}),
                 },
                 color: on ? (kind === 'мут' ? 0xFFFF00 : 0xFF0000) : 0x00FF00,
-                description: voiceRoomLogText (state, member, channel, kind, on, owners, '(права канала изменились)'),
+                description: voiceRoomLogText (state, member, channel, kind, on, owners, note),
                 footer: { text: SERVERS[server].name },
                 timestamp: dt (),
             }],
@@ -4407,7 +4436,9 @@ async function voiceRoomLog (state, member, channel, kind, on)
     }
 }
 
-async function voiceRoomNotice (state, channel, kind, on)
+// what -- чем это сделано (для лога и для журнала), note -- пометка в записи журнала. По умолчанию --
+// ручная правка прав канала; снаружи голосового приходит своя формулировка.
+async function voiceRoomNotice (state, channel, kind, on, what = '', note = '(права канала изменились)')
 {
     try
     {
@@ -4418,6 +4449,7 @@ async function voiceRoomNotice (state, channel, kind, on)
                 await channel.guild.members.fetch (state.id).catch (() => null);
         if (!member || !member.user || member.user.bot) return;
         const owners = await ownersOf (channel).catch (() => null);
+        const why = what || ('ограничение в «' + code (cc (channel)) + '» ' + (on ? 'выдано' : 'снято') + ' правкой прав канала');
         try
         {
             await member.send
@@ -4428,16 +4460,14 @@ async function voiceRoomNotice (state, channel, kind, on)
                     description: voiceRoomNoticeText (state, channel, kind, on, owners),
                 }],
             });
-            console.log ('[' + (d()) + '] [voice] ' + kind + ' по комнате: написал ' + uuu (member) + ' в личку -- ' +
-                (on ? 'ограничение в «' + code (cc (channel)) + '» выдано правкой прав канала' :
-                      'ограничение в «' + code (cc (channel)) + '» снято правкой прав канала'));
+            console.log ('[' + (d()) + '] [voice] ' + kind + ' по комнате: написал ' + uuu (member) + ' в личку -- ' + why);
         }
         catch (e)
         {
             console.error ('[voice] ' + kind + ' по комнате: в личку не написалось (' + oneLine (e && e.message) +
                 ') -- человек об этом узнает из журнала сервера и журнала аудита');
         }
-        await voiceRoomLog (state, member, channel, kind, on);
+        await voiceRoomLog (state, member, channel, kind, on, note);
     }
     catch (e)
     {
@@ -4492,6 +4522,61 @@ function voiceRoomMuteLeft (oldState, newState)
     const room = voiceRoomRestriction (oldState, newState.id, PermissionsBitField.Flags.Speak);
     console.log ('[' + (d()) + '] [voice] мут по комнате: ' + uuu (newState.member) + ' вышел из голосового -- серверный мут снят' +
         (room ? ', ограничение осталось в ' + room + ' и вернётся при заходе туда' : ''));
+}
+
+// v2.171: то же для дефа -- раньше о снятой глухоте при выходе из голосового в логе не было ни строчки,
+// а о снятом муте было. Теперь деф говорит ровно так же.
+function voiceRoomDeafLeft (oldState, newState)
+{
+    if (!newState.member || newState.member.user.bot) return;
+    const room = voiceRoomRestriction (oldState, newState.id, PermissionsBitField.Flags.Connect);
+    console.log ('[' + (d()) + '] [voice] деф по комнате: ' + uuu (newState.member) + ' вышел из голосового -- серверный деф снят' +
+        (room ? ', ограничение осталось в ' + room + ' и вернётся при заходе туда' : ''));
+}
+
+// v2.171 -- человек ВНЕ голосового. Раньше вся эта ветка обработчика была ПУСТОЙ: и мут, и деф ходили
+// только по тем, кто в канале (потому что ограничение по комнате считается по каналу). А снять мут или деф
+// рукой (кнопкой в списке участников или снятием запрета в правах) можно и тогда, когда человек уже вне
+// канала -- деф его как раз и выбивает из канала. Именно поэтому владелец и не видел записей: снятие
+// проходило молча. Теперь такая же дорожка, как внутри канала: комната ищется по личному запрету, запрет
+// снимается, человеку уходит письмо, а в журнал сервера -- запись.
+async function voiceRoomOutside (server, oldState, newState)
+{
+    if (!newState.member || !newState.member.user || newState.member.user.bot) return;
+    const guild = newState.guild;
+    if (!guild) return;
+    for (const r of VOICE_ROOM_RULES)
+    {
+        const was = oldState[r.cur], cur = newState[r.cur];
+        if (was !== true && was !== false) continue;     // прежнее значение неизвестно -- судить не о чем
+        if (was === !!cur) continue;                     // ничего не менялось
+        if (cur)
+        {
+            // выдали мут/деф человеку, которого нет в голосовом: комнаты у нас нет, ставить ограничение
+            // не на что; при заходе в комнату бот снимет его сам -- так и говорим в логе
+            console.log ('[' + (d()) + '] [voice] ' + r.kind + ' по комнате: ' + uuu (newState.member) +
+                ' вне голосового -- ограничение по комнатам не ставлю (комнаты нет), при заходе в комнату сниму сам');
+            continue;
+        }
+        const room = voiceRoomAnyChannel (guild, newState.id, r.flag);
+        if (!room) continue;                             // ограничения по комнатам нет -- это серверный мут/деф без комнаты
+        try
+        {
+            await room.permissionOverwrites.edit (newState.id,
+                r.kind === 'мут' ? { Speak: null } : { Connect: null });
+        }
+        catch (e)
+        {
+            console.error ('[voice] ' + r.kind + ' по комнате: не смог снять запрет в «' + code (cc (room)) + '» (' +
+                oneLine (e && e.message) + ') -- в личку не пишу: ограничение комнаты осталось');
+            continue;
+        }
+        console.log ('[' + (d()) + '] [voice] ' + r.kind + ' по комнате: ' + uuu (newState.member) + ' в «' +
+            code (cc (room)) + '» ' + r.done + ' -- ограничения по комнатам у него нет (снял, пока он был вне голосового)');
+        await voiceRoomNotice (newState, room, r.kind, false,
+            'ограничение в «' + code (cc (room)) + '» снято -- ' + r.kind + ' сняли, пока человека не было в голосовом',
+            '(снято вне голосового)').catch (console.error);
+    }
 }
 client.on ('voiceStateUpdate', async (oldState, newState) =>
 {
@@ -4548,7 +4633,12 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                     _p.then (() => voiceRoomMuteLeft (oldState, newState)).catch (() => { });
             }
             if (newState.serverDeaf)
-                voiceEditQuiet (newState.setDeaf (false), 'снятие глухоты при выходе из канала');
+            {
+                const _pd = newState.setDeaf (false);
+                voiceEditQuiet (_pd, 'снятие глухоты при выходе из канала');
+                if (_pd && typeof _pd.then === 'function')
+                    _pd.then (() => voiceRoomDeafLeft (oldState, newState)).catch (() => { });
+            }
         }
         if (newState.channel && newState.channel.id)
         {
@@ -4906,6 +4996,13 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
             else
             {
             };
+        }
+        else
+        {
+            // v2.171: человек сейчас вне голосового (деф его как раз и выбивает из канала). Раньше здесь
+            // было пусто, и снятие мута/дефа в этот момент не оставляло ни письма, ни записи -- ровно то,
+            // что нашёл владелец, проверяя деф под твинком.
+            await voiceRoomOutside (server, oldState, newState).catch (console.error);
         }
     }
 });
