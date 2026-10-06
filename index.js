@@ -243,6 +243,17 @@
 //    человеку вне голосового видна строкой в логе: ставить ограничение не на что, а при заходе в комнату
 //    бот снимет его сам. Заодно деф перестал молчать там, где мут уже говорил: при выходе из голосового
 //    о снятой глухоте теперь тоже есть строка.
+// v2.172 -- просьба владельца: «сведи разбор мута и дефа в один-единственный слой -- одно место решает,
+//    что сделать и кому сказать, чтобы кнопка, вкладка «Права», переезд, выход и ручная правка больше не
+//    расходились в записях». Разбор собран в два места: `voiceRoomSync` -- единственная точка входа для
+//    всех дорожек (меняет серверный мут/деф и личный запрет в комнате), `voiceRoomTell` -- единственное
+//    место, где о правке узнают человек и staff (письмо в личку, запись в журнал сервера, строка в живом
+//    логе и запись в журнал аудита -- всё вместе), а отличия одного вида от другого (мут от дефа: вид
+//    запрета Speak/Connect, слова, значки, цвета) описаны одной таблицей `VOICE_ROOM_RULES`. Источники
+//    названы явно (`VOICE_ROOM_SOURCES`): «переезд» молчит (человек сам видел, куда зашёл), «права
+//    канала», «кнопка» и «вне голосового» рассказывают. По дороге закрыты три настоящих расхождения:
+//    кнопка не называла свои шаги в живом логе, ручная правка молчала, если полную запись участника
+//    взять негде (а кнопка писала такому напрямую), и о боте ручная правка не оставляла записи в журнале.
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -4367,149 +4378,231 @@ function voiceRoomAnyChannel (guild, uid, flag)
 
 // Ограничения по комнатам бывают двух видов, и оба живут в правах САМОГО канала: мут -- запрет Speak,
 // деф (наушники) -- запрет Connect. Серверный мут/деф бот держит с ними в согласии, чтобы в других
-// комнатах было можно, а в своей -- нельзя. Правила рядом, чтобы строки в логе были одинаковые.
+// комнатах было можно, а в своей -- нельзя. С v2.172 эта таблица -- единственное место, где описано, чем
+// один вид отличается от другого: вид запрета в правах комнаты, слова для письма, значки, цвета и запись
+// в журнале аудита Discord. Раньше это было разбросано по пяти дорожкам, и они расходились.
 const VOICE_ROOM_RULES =
 [
-    { kind: 'мут', flag: PermissionsBitField.Flags.Speak,   step: 'заглушён',        done: 'мут снят', free: 'в других комнатах говорить можно',
+    { kind: 'мут', flag: PermissionsBitField.Flags.Speak,   denyKey: 'Speak',
+      step: 'заглушён',        done: 'мут снят', free: 'в других комнатах говорить можно',
+      say: '🗣️ говорить в канале',   icon: '🟨', iconOff: '🟩', colorOn: 0xFFFF00, colorOff: 0x00FF00,
       cur: 'serverMute', set: 'setMute' },
-    { kind: 'деф', flag: PermissionsBitField.Flags.Connect, step: 'не может войти', done: 'деф снят', free: 'в другие комнаты вход свободен',
+    { kind: 'деф', flag: PermissionsBitField.Flags.Connect, denyKey: 'Connect',
+      step: 'не может войти',  done: 'деф снят', free: 'в другие комнаты вход свободен',
+      say: '🔌 подключаться в канал', icon: '🟥', iconOff: '🟩', colorOn: 0xFF0000, colorOff: 0x00FF00,
       cur: 'serverDeaf', set: 'setDeaf' },
 ];
 
-// v2.169 -- письмо человеку, когда ограничение выдали или сняли РУКАМИ, в правах самого канала: раньше об
-// этом знал только лог бота, а кнопка Discord письмо шлёт всегда -- теперь приходимые письма не отличаются.
-// Слова и цвета -- те же, что у кнопки (мут: жёлтый/зелёный, деф: красный/зелёный), плюс владельцы комнаты.
-function voiceRoomNoticeText (state, channel, kind, on, owners)
+// v2.172 -- ЕДИНЫЙ СЛОЙ мут/дефа (просьба владельца: «одно место решает, что сделать и кому сказать»).
+// Раньше одно и то же действие жило в пяти местах и каждое говорило по-своему: кнопка в списке участников,
+// ручная правка в правах канала, переезд между комнатами, выход из голосового и снятие, когда человека в
+// комнате уже нет. Отсюда и брались расхождения (то письма нет, то записи в журнале) -- за сессию их
+// нашлось три. Теперь так:
+//   * ЧТО МЕНЯТЬ -- решает voiceRoomSync: это единственная точка входа для всех дорожек;
+//   * ЧТО СКАЗАТЬ -- решает voiceRoomTell: письмо в личку, запись в журнал сервера (log_channel), строка
+//     в живом логе и запись в журнал аудита Discord -- всё в одном месте и всегда вместе;
+//   * ЧЕМ ОДИН ВИД ОТЛИЧАЕТСЯ ОТ ДРУГОГО (мут от дефа) -- таблица VOICE_ROOM_RULES: вид запрета (Speak или
+//     Connect), слова для письма, значки, цвета и запись в журнале аудита.
+// Источники (source) и что они значат:
+//   'переезд'        -- человек сам перешёл в другую комнату: серверный мут/деф подгоняем под комнату и
+//                       молчим (он сам видел, куда зашёл);
+//   'права канала'   -- ограничение выдали или сняли руками в правах канала: подгоняем флаг и рассказываем;
+//   'кнопка'         -- мут/деф нажали в списке участников: подгоняем права комнаты и рассказываем;
+//   'вне голосового' -- мут/деф сняли, когда человека в комнате уже не было (деф его как раз и выбивает):
+//                       ищем комнату по личному запрету, снимаем запрет и рассказываем.
+const VOICE_ROOM_SOURCES =
 {
-    const about = kind === 'мут'
-        ? (on ? 'вам **запрещено** 🗣️ говорить в канале' : 'вам **разрешено** 🗣️ говорить в канале')
-        : (on ? 'вам **запрещено** 🔌 подключаться в канал' : 'вам **разрешено** 🔌 подключаться в канал');
-    return u (state.id) + ', ' + about + ' `' + code (cc (channel)) + '` ' +
-        (on ? (kind === 'мут' ? '🟨' : '🟥') : '🟩') + '\n' +
-        'Владельцы канала: ' + (owners && owners.size ? owners.map (owner => uuu (owner)).join (', ') : '*offline*') + '\n' +
-        'Подробности смотрите в журнале аудита.';
+    'переезд':        { tell: false, audit: false, note: '' },
+    'права канала':   { tell: true,  audit: false, note: '(права канала изменились)' },
+    'кнопка':         { tell: true,  audit: true,  note: '' },
+    'вне голосового': { tell: true,  audit: false, note: '(снято вне голосового)' },
+};
+
+function voiceRoomOwnersLine (owners)
+{
+    return 'Владельцы канала: ' + (owners && owners.size ? owners.map (owner => uuu (owner)).join (', ') : '*offline*');
 }
 
-// v2.170 -- запись в журнал сервера (log_channel) о ручной правке: до этого кнопка Discord писала и в
-// личку, и в журнал, а ручная правка -- только в живой лог бота. Строки и вид записи -- как у кнопки
-// (в журнале стоит сам человек, а не «вам»), плюс пометка, что это правка прав канала.
-function voiceRoomLogText (state, member, channel, kind, on, owners, note)
+// Слова одного вида ограничения -- одни и те же для письма и для записи в журнале:
+// «вам **запрещено** 🗣️ говорить в канале `#комната` 🟨» / «... **разрешено** ... 🟩».
+function voiceRoomWords (r, on, room)
 {
-    const about = kind === 'мут'
-        ? (on ? '**запрещено** 🗣️ говорить в канале' : '**разрешено** 🗣️ говорить в канале')
-        : (on ? '**запрещено** 🔌 подключаться в канал' : '**разрешено** 🔌 подключаться в канал');
-    return u (state.id) + ' ' + about + ' `' + code (cc (channel)) + '` ' +
-        (on ? (kind === 'мут' ? '🟨' : '🟥') : '🟩') + (note ? ' ' + note : '') + '\n' +
-        'Владельцы канала: ' + (owners && owners.size ? owners.map (owner => uuu (owner)).join (', ') : '*offline*') + '\n' +
-        'Подробности смотрите в журнале аудита.';
+    return '**' + (on ? 'запрещено' : 'разрешено') + '** ' + r.say + ' `' + code (cc (room)) + '` ' +
+        (on ? r.icon : r.iconOff);
 }
 
-async function voiceRoomLog (state, member, channel, kind, on, note = '(права канала изменились)')
+// Чем это сделано -- для строки в живом логе (одно место на все источники).
+function voiceRoomWhy (source, r, on)
 {
+    if (source === 'кнопка')         return (on ? 'выдано' : 'снято') + ' кнопкой в списке участников';
+    if (source === 'права канала')   return (on ? 'выдано' : 'снято') + ' правкой прав канала';
+    if (source === 'вне голосового') return 'снято -- ' + r.kind + ' сняли, пока человека не было в голосовом';
+    return '';
+}
+
+// Единственное место, где правится личный запрет в комнате: on -- поставить запрет, иначе снять.
+async function voiceRoomDeny (room, uid, r, on)
+{
+    if (!room || !room.permissionOverwrites) return false;
     try
     {
-        const server = (channel && channel.guild) ? channel.guild.id : null;
-        const log_channel = (server && SERVERS[server]) ? (SERVERS[server].log_channel || '') : '';
-        if (!log_channel || !member) return;
-        const owners = await ownersOf (channel).catch (() => null);
-        await logTo (log_channel).send
-        ({
-            embeds:
-            [{
-                author:
-                {
-                    name: uuu (member),
-                    icon_url: member.user.displayAvatarURL ({extension: 'png', forceStatic: false, size: 1024}),
-                },
-                color: on ? (kind === 'мут' ? 0xFFFF00 : 0xFF0000) : 0x00FF00,
-                description: voiceRoomLogText (state, member, channel, kind, on, owners, note),
-                footer: { text: SERVERS[server].name },
-                timestamp: dt (),
-            }],
-        });
-        console.log ('[' + (d()) + '] [voice] ' + kind + ' по комнате: запись о правке ушла в журнал сервера «' +
-            code (cc (channel)) + '» -- туда же, куда пишет кнопка');
+        const patch = {}; patch[r.denyKey] = on ? false : null;
+        await room.permissionOverwrites.edit (uid, patch);
+        return true;
     }
     catch (e)
     {
-        console.error ('[voice] ' + kind + ' по комнате: в журнал сервера не записалось (' + oneLine (e && e.message) + ')');
+        console.error ('[voice] ' + r.kind + ' по комнате: не смог ' + (on ? 'поставить' : 'снять') + ' запрет в «' +
+            code (cc (room)) + '» (' + oneLine (e && e.message) + ') -- ограничение комнаты осталось');
+        return false;
     }
 }
 
-// what -- чем это сделано (для лога и для журнала), note -- пометка в записи журнала. По умолчанию --
-// ручная правка прав канала; снаружи голосового приходит своя формулировка.
-async function voiceRoomNotice (state, channel, kind, on, what = '', note = '(права канала изменились)')
+// Единственное место, где о муте/дефе узнают человек и staff: письмо в личку, запись в журнал сервера,
+// строка в живом логе и (где положено) запись в журнал аудита Discord.
+async function voiceRoomTell (source, state, r, on, room, o)
 {
+    const opt = o || {};
     try
     {
-        if (!channel || !channel.guild) return;
+        if (!room || !room.guild) return;
+        // v2.172: если полной записи участника взять негде (осталась частичная -- v2.168 включил
+        // Partials.GuildMember), всё равно говорим тому, кого видим: в личку можно писать и частичному.
+        // Раньше дорожки расходились именно здесь -- кнопка писала частичному напрямую, а ручная правка
+        // молчала, если не смогла подтянуть полную запись.
         let member = state.member;
         if (!member || member.partial)
-            member = channel.guild.members.cache.get (state.id) ||
-                await channel.guild.members.fetch (state.id).catch (() => null);
-        if (!member || !member.user || member.user.bot) return;
-        const owners = await ownersOf (channel).catch (() => null);
-        const why = what || ('ограничение в «' + code (cc (channel)) + '» ' + (on ? 'выдано' : 'снято') + ' правкой прав канала');
-        try
+            member = room.guild.members.cache.get (state.id) ||
+                await room.guild.members.fetch (state.id).catch (() => null) ||
+                ((state.member && state.member.user) ? state.member : null);
+        if (!member || !member.user) return;
+        const owners = opt.owners || await ownersOf (room).catch (() => null);
+        const src = VOICE_ROOM_SOURCES[source] || {};
+        const words = voiceRoomWords (r, on, room);
+        if (!member.user.bot)
         {
-            await member.send
+            try
+            {
+                await member.send
+                ({
+                    embeds:
+                    [{
+                        color: on ? r.colorOn : r.colorOff,
+                        description: u (state.id) + ', вам ' + words + '\n' + voiceRoomOwnersLine (owners) + '\n' +
+                            'Подробности смотрите в журнале аудита.',
+                    }],
+                });
+                console.log ('[' + (d()) + '] [voice] ' + r.kind + ' по комнате: написал ' + uuu (member) +
+                    ' в личку -- ограничение в «' + code (cc (room)) + '» ' + voiceRoomWhy (source, r, on));
+            }
+            catch (e)
+            {
+                console.error ('[voice] ' + r.kind + ' по комнате: в личку не написалось (' + oneLine (e && e.message) +
+                    ') -- человек об этом узнает из журнала сервера и журнала аудита');
+            }
+        }
+        const server = room.guild.id;
+        const log_channel = SERVERS[server] ? (SERVERS[server].log_channel || '') : '';
+        if (log_channel)
+        {
+            await logTo (log_channel).send
             ({
                 embeds:
                 [{
-                    color: on ? (kind === 'мут' ? 0xFFFF00 : 0xFF0000) : 0x00FF00,
-                    description: voiceRoomNoticeText (state, channel, kind, on, owners),
+                    author:
+                    {
+                        name: uuu (member),
+                        icon_url: member.user.displayAvatarURL ({extension: 'png', forceStatic: false, size: 1024}),
+                    },
+                    color: on ? r.colorOn : r.colorOff,
+                    description: u (state.id) + ' ' + words + (src.note ? ' ' + src.note : '') + '\n' +
+                        voiceRoomOwnersLine (owners) + '\nПодробности смотрите в журнале аудита.',
+                    footer: { text: SERVERS[server].name },
+                    timestamp: dt (),
                 }],
             });
-            console.log ('[' + (d()) + '] [voice] ' + kind + ' по комнате: написал ' + uuu (member) + ' в личку -- ' + why);
+            console.log ('[' + (d()) + '] [voice] ' + r.kind + ' по комнате: запись ушла в журнал сервера «' +
+                code (cc (room)) + '»' + (src.note ? ' ' + src.note : ''));
         }
-        catch (e)
-        {
-            console.error ('[voice] ' + kind + ' по комнате: в личку не написалось (' + oneLine (e && e.message) +
-                ') -- человек об этом узнает из журнала сервера и журнала аудита');
-        }
-        await voiceRoomLog (state, member, channel, kind, on, note);
+        if (src.audit)
+            logAction (room.guild, AuditLogEvent.MemberUpdate, state.id,
+                member.user.username + ' ' + r.kind + (on ? ' в комнате «' : ' снят в комнате «') + room.name + '»');
     }
     catch (e)
     {
-        console.error ('[voice] ' + kind + ' по комнате: сказать человеку не вышло (' + oneLine (e && e.message) + ')');
+        console.error ('[voice] ' + r.kind + ' по комнате: сказать не вышло (' + oneLine (e && e.message) + ')');
     }
 }
 
-// Переезд (или ручная правка прав канала): под ограничением ли комната, куда человек попал, и
-// совпадает ли с ней серверный мут/деф. note -- почему это не переезд (пусто -- переезд);
-// tell -- написать об этом человеку в личку (так делает только ручная правка: при переезде он сам видел,
-// куда заходит, а из вкладки «Права доступа» -- не видел ничего).
+// Единственная точка входа для всех дорожек: здесь меняется состояние (серверный мут/деф и личный запрет в
+// комнате) и отсюда же решается, рассказать ли об этом. opt.line -- строка-подробность источника в живой лог
+// (что именно произошло), opt.beforeTell -- шаг между правкой и рассказом (перенос/кик при дефе),
+// opt.owners -- уже собранные владельцы комнаты. Возвращает true, если что-то действительно изменилось.
+async function voiceRoomSync (source, state, r, on, room, o)
+{
+    const opt = o || {};
+    let changed = false, target = room || null;
+    try
+    {
+        if (source === 'кнопка')
+        {
+            const had = voiceRoomDenyOf (room, state.id, r.flag);
+            if (!!on !== !!had) changed = await voiceRoomDeny (room, state.id, r, on);
+        }
+        else if (source === 'вне голосового')
+        {
+            const found = voiceRoomAnyChannel (state.guild, state.id, r.flag);
+            if (found) { target = found; changed = await voiceRoomDeny (found, state.id, r, false); }
+        }
+        else
+        {
+            if (!!state[r.cur] !== !!on) { await state[r.set] (on); changed = true; }
+        }
+        if (changed && typeof opt.line === 'function') await opt.line (target);
+        if (changed && typeof opt.beforeTell === 'function') await opt.beforeTell (target);
+        if (changed && (VOICE_ROOM_SOURCES[source] || {}).tell)
+            await voiceRoomTell (source, state, r, on, target, opt);
+    }
+    catch (e)
+    {
+        console.error ('[voice] ' + r.kind + ' по комнате: шаг не прошёл (' + oneLine (e && e.message) + ')');
+    }
+    return changed;
+}
+
+// Переезд (или ручная правка прав канала): под ограничением ли комната, куда человек попал, и совпадает ли
+// с ней серверный мут/деф. note -- почему это не переезд (пусто -- переезд); tell -- рассказать об этом
+// человеку и staff (так делает только ручная правка: при переезде он сам видел, куда заходит, а из вкладки
+// «Права доступа» -- не видел ничего). Сам разбор и все слова -- в едином слое (voiceRoomSync/voiceRoomTell),
+// здесь остаются подробности события -- они разные у переезда и у ручной правки.
 function voiceRoomMuteSync (oldState, newState, note = '', tell = false)
 {
     const uid = newState.id;
     const who = newState.member ? uuu (newState.member) : String (uid);
     const here = voiceRoomName (newState.channel) || 'другой комнате';
+    const source = tell ? 'права канала' : 'переезд';
     for (const r of VOICE_ROOM_RULES)
     {
         if (voiceRoomRestriction (newState, uid, r.flag))
         {
             if (newState[r.cur]) continue;             // уже под ограничением -- ничего не делаем и не пишем
             const came = (oldState.channelId && oldState.channelId !== newState.channelId) ? voiceRoomName (oldState.channel) : '';
-            newState[r.set] (true)
-            .then (() =>
+            voiceRoomSync (source, newState, r, true, newState.channel,
             {
-                console.log ('[' + (d()) + '] [voice] ' + r.kind + ' по комнате: ' + who + ' снова ' + r.step + ' в ' + here +
-                    (came ? ' (пришёл из ' + came + ')' : '') + (note ? ' (' + note + ')' : '') + ' -- тут ограничение; ' + r.free);
-                if (tell) voiceRoomNotice (newState, newState.channel, r.kind, true).catch (console.error);
+                line: () => console.log ('[' + (d()) + '] [voice] ' + r.kind + ' по комнате: ' + who + ' снова ' + r.step + ' в ' + here +
+                    (came ? ' (пришёл из ' + came + ')' : '') + (note ? ' (' + note + ')' : '') + ' -- тут ограничение; ' + r.free),
             })
             .catch (console.error);
             continue;
         }
         if (!newState[r.cur]) continue;                // тут ограничения нет и снимать нечего
         const room = voiceRoomRestriction (oldState, uid, r.flag);
-        newState[r.set] (false)
-        .then (() =>
+        voiceRoomSync (source, newState, r, false, newState.channel,
         {
-            console.log ('[' + (d()) + '] [voice] ' + r.kind + ' по комнате: ' + who + ' в ' + here + ' ' + r.done +
+            line: () => console.log ('[' + (d()) + '] [voice] ' + r.kind + ' по комнате: ' + who + ' в ' + here + ' ' + r.done +
                 (room ? ' -- ограничение осталось в ' + room + ' и вернётся при заходе туда'
                       : (note ? ' -- ограничения по комнатам у него нет (' + note + ')'
-                              : ' -- это был серверный ' + r.kind + ' без ограничения по комнате')));
-            if (tell) voiceRoomNotice (newState, newState.channel, r.kind, false).catch (console.error);
+                              : ' -- это был серверный ' + r.kind + ' без ограничения по комнате'))),
         })
         .catch (console.error);
     }
@@ -4534,17 +4627,15 @@ function voiceRoomDeafLeft (oldState, newState)
         (room ? ', ограничение осталось в ' + room + ' и вернётся при заходе туда' : ''));
 }
 
-// v2.171 -- человек ВНЕ голосового. Раньше вся эта ветка обработчика была ПУСТОЙ: и мут, и деф ходили
-// только по тем, кто в канале (потому что ограничение по комнате считается по каналу). А снять мут или деф
-// рукой (кнопкой в списке участников или снятием запрета в правах) можно и тогда, когда человек уже вне
-// канала -- деф его как раз и выбивает из канала. Именно поэтому владелец и не видел записей: снятие
-// проходило молча. Теперь такая же дорожка, как внутри канала: комната ищется по личному запрету, запрет
+// v2.171/172 -- человек ВНЕ голосового. Раньше эта ветка обработчика была ПУСТОЙ: и мут, и деф ходили только
+// по тем, кто в канале, а снять мут или деф рукой (кнопкой в списке участников) можно и тогда, когда человека
+// в комнате уже нет -- деф его как раз и выбивает из канала. Поэтому такая правка и проходила молча. Теперь
+// это обычная дорожка в единый слой: комната ищется по личному запрету среди всех голосовых каналов, запрет
 // снимается, человеку уходит письмо, а в журнал сервера -- запись.
 async function voiceRoomOutside (server, oldState, newState)
 {
     if (!newState.member || !newState.member.user || newState.member.user.bot) return;
-    const guild = newState.guild;
-    if (!guild) return;
+    if (!newState.guild) return;
     for (const r of VOICE_ROOM_RULES)
     {
         const was = oldState[r.cur], cur = newState[r.cur];
@@ -4552,32 +4643,20 @@ async function voiceRoomOutside (server, oldState, newState)
         if (was === !!cur) continue;                     // ничего не менялось
         if (cur)
         {
-            // выдали мут/деф человеку, которого нет в голосовом: комнаты у нас нет, ставить ограничение
-            // не на что; при заходе в комнату бот снимет его сам -- так и говорим в логе
+            // выдали мут/деф человеку, которого нет в голосовом: комнаты у нас нет, ставить ограничение не на
+            // что; при заходе в комнату бот снимет его сам -- так и говорим в логе
             console.log ('[' + (d()) + '] [voice] ' + r.kind + ' по комнате: ' + uuu (newState.member) +
                 ' вне голосового -- ограничение по комнатам не ставлю (комнаты нет), при заходе в комнату сниму сам');
             continue;
         }
-        const room = voiceRoomAnyChannel (guild, newState.id, r.flag);
-        if (!room) continue;                             // ограничения по комнатам нет -- это серверный мут/деф без комнаты
-        try
+        await voiceRoomSync ('вне голосового', newState, r, false, null,
         {
-            await room.permissionOverwrites.edit (newState.id,
-                r.kind === 'мут' ? { Speak: null } : { Connect: null });
-        }
-        catch (e)
-        {
-            console.error ('[voice] ' + r.kind + ' по комнате: не смог снять запрет в «' + code (cc (room)) + '» (' +
-                oneLine (e && e.message) + ') -- в личку не пишу: ограничение комнаты осталось');
-            continue;
-        }
-        console.log ('[' + (d()) + '] [voice] ' + r.kind + ' по комнате: ' + uuu (newState.member) + ' в «' +
-            code (cc (room)) + '» ' + r.done + ' -- ограничения по комнатам у него нет (снял, пока он был вне голосового)');
-        await voiceRoomNotice (newState, room, r.kind, false,
-            'ограничение в «' + code (cc (room)) + '» снято -- ' + r.kind + ' сняли, пока человека не было в голосовом',
-            '(снято вне голосового)').catch (console.error);
+            line: room => console.log ('[' + (d()) + '] [voice] ' + r.kind + ' по комнате: ' + uuu (newState.member) + ' в «' +
+                code (cc (room)) + '» ' + r.done + ' -- ограничения по комнатам у него нет (снял, пока он был вне голосового)'),
+        });
     }
 }
+
 client.on ('voiceStateUpdate', async (oldState, newState) =>
 {
     const server = newState.guild.id;
@@ -4668,329 +4747,60 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                     }
                     return;
                 }
-                if (!oldState.serverMute && newState.serverMute)
+                // v2.172: все четыре случая «мут/деф поменяли в списке участников» идут в единый слой -- раньше
+                // каждый был написан своими словами и своими записями, и они расходились с остальными дорожками.
+                // Здесь остаются только порядки сервера: общий канал (выше), освобождение от дефа и боты.
+                let _voiceRoomHandled = false;
+                for (const r of VOICE_ROOM_RULES)
                 {
-                    if
-                    (
-                        !newState.channel.permissionOverwrites.cache.get(newState.id) ||
-                        !newState.channel.permissionOverwrites.cache.get(newState.id).deny.has(PermissionsBitField.Flags.Speak)
-                    )
+                    const was = oldState[r.cur], cur = newState[r.cur];
+                    if (was === cur) continue;
+                    const grant = !was && !!cur;
+                    _voiceRoomHandled = true;
+                    if (r.kind === 'деф' && grant)
                     {
+                        const skipDeaf = Array.isArray (SERVERS[server].deaf_exempt) ? SERVERS[server].deaf_exempt : [];
+                        if (skipDeaf.some (x => x === newState.channel.id || x === newState.channel.name)) continue;
+                        if (_botMember)
                         {
-                            newState.channel.permissionOverwrites.edit
-                            (
-                                newState.id,
-                                {
-                                    Speak: false,
-                                }
-                            )
-                            .then
-                            (
-                                channel =>
-                                {
-                                    let notify_text =                                    `${newState.member}, вам **запрещено** 🗣️ говорить в канале \`${code(cc(channel))}\` 🟨\n` +
-                                    `Владельцы канала: ` + (owners.size ? owners.map (owner => uuu (owner)).join (', ') : '*offline*') + `\n` +
-                                    `Подробности смотрите в журнале аудита.`;
-                                    if (!_botMember)
-                                    newState.member.send
-                                    (
-                                        {
-                                            embeds:
-                                            [
-                                                {
-                                                    color: 0xFFFF00,
-                                                    description: notify_text,
-                                                },
-                                            ]
-                                        }
-                                    )
-                                    .catch (e => console.error ('[voiceStateUpdate] ошибка ЛС участнику: ' + e.message));
-                                    if (log_channel)
-                                    {
-                                        let log_text =
-                                            `${newState.member} **запрещено** 🗣️ говорить в канале \`${code(cc(channel))}\` 🟨\n` +
-                                            `Владельцы канала: ` + (owners.size ? owners.map (owner => uuu (owner)).join (', ') : '*offline*') + `\n` +
-                                            `Подробности смотрите в журнале аудита.`;
-                                        logTo (log_channel).send
-                                        (
-                                            {
-                                                embeds:
-                                                [
-                                                    {
-                                                        author:
-                                                        {
-                                                            name: uuu (newState.member),
-                                                            icon_url: newState.member.user.displayAvatarURL ({extension: 'png', forceStatic: false, size: 1024}),
-                                                        },
-                                                        color: 0xFFFF00,
-                                                        description: log_text,
-                                                        footer:
-                                                        {
-                                                            text: SERVERS[server].name,
-                                                        },
-                                                        timestamp: dt(),
-                                                    },
-                                                ]
-                                            }
-                                        )
-                                        .catch (console.error);
-                                    }
-                                    logAction (newState.guild, AuditLogEvent.MemberUpdate, newState.id, newState.member.user.username + ' мут в комнате «' + channel.name + '»');
-                                }
-                            )
-                            .catch (console.error);
+                            console.log ('[' + (d()) + '] [voice] деф боту ' + uuu (newState.member) + ' в «' +
+                                code (cc (newState.channel)) + '»: запомнил, но запрет Connect ботам не пишу' + ' (в общий канал не переношу)');
+                            logAction (newState.guild, AuditLogEvent.MemberUpdate, newState.id,
+                                newState.member.user.username + ' деф в комнате «' + newState.channel.name + '»');
+                            continue;
                         }
                     }
-                }
-                else if (!oldState.serverDeaf && newState.serverDeaf)
-                {
-                    const skipDeaf = Array.isArray (SERVERS[server].deaf_exempt) ? SERVERS[server].deaf_exempt : [];
-                    if (skipDeaf.some (x => x === newState.channel.id || x === newState.channel.name)) return;
-                    if (_botMember)
+                    await voiceRoomSync ('кнопка', newState, r, grant, newState.channel,
                     {
-                        console.log ('[' + (d()) + '] [voice] деф боту ' + uuu (newState.member) + ' в «' +
-                            code (cc (newState.channel)) + '»: запомнил, но запрет Connect ботам не пишу' + ' (в общий канал не переношу)');
-                        logAction (newState.guild, AuditLogEvent.MemberUpdate, newState.id,
-                            newState.member.user.username + ' деф в комнате «' + newState.channel.name + '»');
-                    }
-                    else if
-                    (
-                        !newState.channel.permissionOverwrites.cache.get(newState.id) ||
-                        !newState.channel.permissionOverwrites.cache.get(newState.id).deny.has(PermissionsBitField.Flags.Connect)
-                    )
-                    {
-                        newState.channel.permissionOverwrites.edit
-                        (
-                            newState.id,
+                        owners: owners,
+                        // деф выкидывает человека из комнаты: сперва запрет в правах, потом перенос в общий канал
+                        // (или кик), и только затем письмо и записи -- порядок как был
+                        beforeTell: (r.kind === 'деф' && grant) ? async () =>
+                        {
+                            if (channel_common && newState.channel.id !== channel_common)
                             {
-                                Connect: false,
+                                if (await moveToVoice (newState, channel_common, 'Запрещённый канал (deaf)'))
+                                {
+                                    if (SERVERS[server].temp_lobby === channel_common)
+                                        setTimeout
+                                        (
+                                            () => tempCreateFor (server, newState.member)
+                                                .catch (e => console.error ('[temp] ' + e.message)),
+                                            1500
+                                        );
+                                }
                             }
-                        )
-                        .then
-                        (
-                            async channel =>
+                            else
                             {
-                                if (channel_common && channel.id !== channel_common)
-                                {
-                                    if (await moveToVoice (newState, channel_common, 'Запрещённый канал (deaf)'))
-                                    {
-                                        if (SERVERS[server].temp_lobby === channel_common)
-                                            setTimeout
-                                            (
-                                                () => tempCreateFor (server, newState.member)
-                                                    .catch (e => console.error ('[temp] ' + e.message)),
-                                                1500
-                                            );
-                                    }
-                                }
-                                else
-                                {
-                                    newState.kick()
-                                    .catch (e => console.error ('[voiceStateUpdate] ошибка кика: ' + e.message));
-                                }
-                                let notify_text =
-                                    `${newState.member}, вам **запрещено** 🔌 подключаться в канал \`${code(cc(channel))}\` 🟥\n` +
-                                    `Владельцы канала: ` + (owners.size ? owners.map (owner => uuu (owner)).join (', ') : '*offline*') + `\n` +
-                                    `Подробности смотрите в журнале аудита.`;
-                                if (!_botMember)
-                                newState.member.send
-                                (
-                                    {
-                                        embeds:
-                                        [
-                                            {
-                                                color: 0xFF0000,
-                                                description: notify_text,
-                                            },
-                                        ]
-                                    }
-                                )
-                                .catch (e => console.error ('[voiceStateUpdate] ошибка ЛС участнику: ' + e.message));
-                                if (log_channel)
-                                {
-                                    let log_text =
-                                        `${newState.member}, **запрещено** 🔌 подключаться в канал \`${code(cc(channel))}\` 🟥\n` +
-                                        `Владельцы канала: ` + (owners.size ? owners.map (owner => uuu (owner)).join (', ') : '*offline*') + `\n` +
-                                        `Подробности смотрите в журнале аудита.`;
-                                    logTo (log_channel).send
-                                    (
-                                        {
-                                            embeds:
-                                            [
-                                                {
-                                                    author:
-                                                    {
-                                                        name: uuu (newState.member),
-                                                        icon_url: newState.member.user.displayAvatarURL ({extension: 'png', forceStatic: false, size: 1024}),
-                                                    },
-                                                    color: 0xFF0000,
-                                                    description: log_text,
-                                                    footer:
-                                                    {
-                                                        text: SERVERS[server].name,
-                                                    },
-                                                    timestamp: dt(),
-                                                },
-                                            ]
-                                        }
-                                    )
-                                    .catch (console.error);
-                                }
-                                logAction (newState.guild, AuditLogEvent.MemberUpdate, newState.id, newState.member.user.username + ' деф в комнате «' + channel.name + '»');
+                                newState.kick()
+                                .catch (e => console.error ('[voiceStateUpdate] ошибка кика: ' + e.message));
                             }
-                        )
-                        .catch (console.error);
-                    }
+                        } : null,
+                    });
                 }
-                else if (oldState.serverMute && !newState.serverMute)
+                if (!_voiceRoomHandled)
                 {
-                    if
-                    (
-                        newState.channel.permissionOverwrites.cache.get(newState.id) &&
-                        newState.channel.permissionOverwrites.cache.get(newState.id).deny.has(PermissionsBitField.Flags.Speak)
-                    )
-                    {
-                        newState.channel.permissionOverwrites.edit
-                        (
-                            newState.id,
-                            {
-                                Speak: null,
-                            }
-                        )
-                        .then
-                        (
-                            channel =>
-                            {
-                                let notify_text =
-                                    `${newState.member}, вам **разрешено** 🗣️ говорить в канале \`${code(cc(channel))}\` 🟩\n` +
-                                    `Владельцы канала: ` + (owners.size ? owners.map (owner => uuu (owner)).join (', ') : '*offline*') + `\n` +
-                                    `Подробности смотрите в журнале аудита.`;
-                                if (!_botMember)
-                                newState.member.send
-                                (
-                                    {
-                                        embeds:
-                                        [
-                                            {
-                                                color: 0x00FF00,
-                                                description: notify_text,
-                                            },
-                                        ]
-                                    }
-                                )
-                                .catch (e => console.error ('[voiceStateUpdate] ошибка ЛС участнику: ' + e.message));
-                                if (log_channel)
-                                {
-                                    let log_text =
-                                        `${newState.member} **разрешено** 🗣️ говорить в канале \`${code(cc(channel))}\` 🟩\n` +
-                                        `Владельцы канала: ` + (owners.size ? owners.map (owner => uuu (owner)).join (', ') : '*offline*') + `\n` +
-                                        `Подробности смотрите в журнале аудита.`;
-                                    logTo (log_channel).send
-                                    (
-                                        {
-                                            embeds:
-                                            [
-                                                {
-                                                    author:
-                                                    {
-                                                        name: uuu (newState.member),
-                                                        icon_url: newState.member.user.displayAvatarURL ({extension: 'png', forceStatic: false, size: 1024}),
-                                                    },
-                                                    color: 0x00FF00,
-                                                    description: log_text,
-                                                    footer:
-                                                    {
-                                                        text: SERVERS[server].name,
-                                                    },
-                                                    timestamp: dt(),
-                                                },
-                                            ]
-                                        }
-                                    )
-                                    .catch (console.error);
-                                }
-                                logAction (newState.guild, AuditLogEvent.MemberUpdate, newState.id, newState.member.user.username + ' мут снят в комнате «' + channel.name + '»');
-                            }
-                        )
-                        .catch (console.error);
-                    }
-                }
-                else if (oldState.serverDeaf && !newState.serverDeaf)
-                {
-                    if
-                    (
-                        newState.channel.permissionOverwrites.cache.get(newState.id) &&
-                        newState.channel.permissionOverwrites.cache.get(newState.id).deny.has(PermissionsBitField.Flags.Connect)
-                    )
-                    {
-                        newState.channel.permissionOverwrites.edit
-                        (
-                            newState.id,
-                            {
-                                Connect: null,
-                            }
-                        )
-                        .then
-                        (
-                            channel =>
-                            {
-                                let notify_text =
-                                    `${newState.member}, вам **разрешено** 🔌 подключаться в канал \`${code(cc(channel))}\` 🟩\n` +
-                                    `Владельцы канала: ` + (owners.size ? owners.map (owner => uuu (owner)).join (', ') : '*offline*') + `\n` +
-                                    `Подробности смотрите в журнале аудита.`;
-                                if (!_botMember)
-                                newState.member.send
-                                (
-                                    {
-                                        embeds:
-                                        [
-                                            {
-                                                color: 0x00FF00,
-                                                description: notify_text,
-                                            },
-                                        ]
-                                    }
-                                )
-                                .catch (e => console.error ('[voiceStateUpdate] ошибка ЛС участнику: ' + e.message));
-                                if (log_channel)
-                                {
-                                    let log_text =
-                                        `${newState.member}, **разрешено** 🔌 подключаться в канал \`${code(cc(channel))}\` 🟩\n` +
-                                        `Владельцы канала: ` + (owners.size ? owners.map (owner => uuu (owner)).join (', ') : '*offline*') + `\n` +
-                                        `Подробности смотрите в журнале аудита.`;
-                                    logTo (log_channel).send
-                                    (
-                                        {
-                                            embeds:
-                                            [
-                                                {
-                                                    author:
-                                                    {
-                                                        name: uuu (newState.member),
-                                                        icon_url: newState.member.user.displayAvatarURL ({extension: 'png', forceStatic: false, size: 1024}),
-                                                    },
-                                                    color: 0x00FF00,
-                                                    description: log_text,
-                                                    footer:
-                                                    {
-                                                        text: SERVERS[server].name,
-                                                    },
-                                                    timestamp: dt(),
-                                                },
-                                            ]
-                                        }
-                                    )
-                                    .catch (console.error);
-                                }
-                                logAction (newState.guild, AuditLogEvent.MemberUpdate, newState.id, newState.member.user.username + ' деф снят в комнате «' + channel.name + '»');
-                            }
-                        )
-                        .catch (console.error);
-                    }
-                }
-                else
-                {
-                    voiceRoomMuteSync (oldState, newState);   // v2.167/168: мут и деф по комнатам -- с записью в лог
+                    voiceRoomMuteSync (oldState, newState);   // v2.167/168/172: переезд -- мут и деф по комнатам -- с записью в лог
                 }
             }
             else
