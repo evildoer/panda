@@ -214,6 +214,15 @@
 //    плюс строка, когда заглушённый выходит из голосового совсем. Заодно в личку больше не приходит
 //    периодическое «за обходом никто не следит»: владелец решил сторожа не ставить, напоминание осталось
 //    только в живом логе (про поломку обхода письмо по-прежнему придёт).
+// v2.168 -- по просьбе владельца: выход из сервера больше не теряется для тех, кого бот ещё не видел, и «по
+//    комнатам» говорят не только мут, но и деф. 1) В discord.js включена часть GuildMember: без неё событие
+//    выхода не приходило, если участника нет в кэше бота (а списком бот никого не тянет), и выход ловил
+//    запасной опрос раз в 45 секунд; теперь событие приходит всем (в логе это видно по пометке «(мгновенно)»),
+//    а дозапрос вышедшего не делается -- его уже нет; modNick для таких участников молчит: без ролей и
+//    голосового состояния судить о правах нельзя. 2) У мута по комнатам появился близнец: деф (запрет
+//    Connect) -- те же строки в логе и то же согласование серверного состояния с правами комнаты.
+//    3) Ручная правка прав канала (вкладка «Права доступа») больше не расходится с серверным мут/дефом: бот
+//    сводит их у тех, кто в этой комнате сидит, и пишет об этом в лог. Все строки -- русские.
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -1763,6 +1772,8 @@ const client = new Client
         partials:
         [
             Partials.Channel,
+            Partials.GuildMember,               // v2.168: без него Discord-событие выхода теряется,
+                                                // если участника нет в кэше бота (спасал опрос раз в 45 с)
         ],
     }
 );
@@ -3729,6 +3740,10 @@ async function setNickLogged (member, newNick, server)
 
 async function modNick (server, member)
 {
+    // v2.168: с частью GuildMember события обновления приходят и о тех, кого бот ещё не видел: у такого
+    // участника нет ни ролей, ни голосового состояния -- судить о правах нельзя. Поэтому молча ждём,
+    // когда бот увидит его целиком (вход, голос, команда) и позовёт modNick снова.
+    if (!member || member.partial) return;
     const tag = tagOf (server);
     if (tag && tagEnabled (server))
     {
@@ -4035,6 +4050,23 @@ client.on ('channelUpdate', async (oldChannel, newChannel) =>
                 }
             }
         }
+        // v2.168: ограничение по комнате можно выдать или снять и руками -- правкой прав самого канала
+        // (вкладка «Права доступа» у канала). Тогда серверный мут/деф за руками не поспевает: здесь
+        // свожу их с правами комнаты у тех, кто в ней сидит, и говорю об этом в живом логе. Чужие
+        // правки (имя, порядок) ничего не меняют: пока запреты не менялись, шаг молчит.
+        if (newChannel.type === ChannelType.GuildVoice)
+        {
+            for (let [, vs] of guild.voiceStates.cache)
+            {
+                if (vs.channelId !== newChannel.id) continue;
+                const was = voiceRoomDenyOf (oldChannel, vs.id, PermissionsBitField.Flags.Speak) ||
+                            voiceRoomDenyOf (oldChannel, vs.id, PermissionsBitField.Flags.Connect);
+                const now = voiceRoomDenyOf (newChannel, vs.id, PermissionsBitField.Flags.Speak) ||
+                            voiceRoomDenyOf (newChannel, vs.id, PermissionsBitField.Flags.Connect);
+                if (was === now) continue;
+                voiceRoomMuteSync (vs, vs, 'права канала изменились');
+            }
+        }
     }
 });
 
@@ -4277,48 +4309,69 @@ function voiceRoomName (ch)
     return ch ? '«' + code (cc (ch)) + '»' : '';
 }
 
-function voiceRoomRestriction (state, uid)      // комната, где у человека ограничение Speak ('' -- нет такой)
+function voiceRoomDenyOf (channel, uid, flag)   // стоит ли у человека в этом канале запрет (Speak/Connect)
 {
     try
     {
-        const ch = state && state.channel;
-        if (!ch || !ch.permissionOverwrites) return '';
-        const ow = ch.permissionOverwrites.cache.get (uid);
-        return (ow && ow.deny.has (PermissionsBitField.Flags.Speak)) ? voiceRoomName (ch) : '';
+        if (!channel || !channel.permissionOverwrites) return false;
+        const ow = channel.permissionOverwrites.cache.get (uid);
+        return !!(ow && ow.deny.has (flag));
     }
-    catch (e) { return ''; }
+    catch (e) { return false; }
 }
 
-// Переезд: под ограничением ли комната, куда человек вошёл, и совпадает ли с ней серверный мут.
-function voiceRoomMuteSync (oldState, newState)
+function voiceRoomRestriction (state, uid, flag)   // комната, где у человека этот запрет ('' -- нет такой)
+{
+    const ch = state && state.channel;
+    return voiceRoomDenyOf (ch, uid, flag) ? voiceRoomName (ch) : '';
+}
+
+// Ограничения по комнатам бывают двух видов, и оба живут в правах САМОГО канала: мут -- запрет Speak,
+// деф (наушники) -- запрет Connect. Серверный мут/деф бот держит с ними в согласии, чтобы в других
+// комнатах было можно, а в своей -- нельзя. Правила рядом, чтобы строки в логе были одинаковые.
+const VOICE_ROOM_RULES =
+[
+    { kind: 'мут', flag: PermissionsBitField.Flags.Speak,   step: 'заглушён',        done: 'мут снят', free: 'в других комнатах говорить можно',
+      cur: 'serverMute', set: 'setMute' },
+    { kind: 'деф', flag: PermissionsBitField.Flags.Connect, step: 'не может войти', done: 'деф снят', free: 'в другие комнаты вход свободен',
+      cur: 'serverDeaf', set: 'setDeaf' },
+];
+
+// Переезд (или ручная правка прав канала): под ограничением ли комната, куда человек попал, и
+// совпадает ли с ней серверный мут/деф. note -- почему это не переезд (пусто -- переезд).
+function voiceRoomMuteSync (oldState, newState, note = '')
 {
     const uid = newState.id;
     const who = newState.member ? uuu (newState.member) : String (uid);
     const here = voiceRoomName (newState.channel) || 'другой комнате';
-    if (voiceRoomRestriction (newState, uid))
+    for (const r of VOICE_ROOM_RULES)
     {
-        if (newState.serverMute) return;               // уже заглушён -- ничего не делаем и не пишем
-        const came = (oldState.channelId && oldState.channelId !== newState.channelId) ? voiceRoomName (oldState.channel) : '';
-        newState.setMute (true)
-        .then (() => console.log ('[' + (d()) + '] [voice] мут по комнате: ' + who + ' снова заглушён в ' + here +
-            (came ? ' (пришёл из ' + came + ')' : '') + ' -- тут ограничение; в других комнатах говорить можно'))
+        if (voiceRoomRestriction (newState, uid, r.flag))
+        {
+            if (newState[r.cur]) continue;             // уже под ограничением -- ничего не делаем и не пишем
+            const came = (oldState.channelId && oldState.channelId !== newState.channelId) ? voiceRoomName (oldState.channel) : '';
+            newState[r.set] (true)
+            .then (() => console.log ('[' + (d()) + '] [voice] ' + r.kind + ' по комнате: ' + who + ' снова ' + r.step + ' в ' + here +
+                (came ? ' (пришёл из ' + came + ')' : '') + (note ? ' (' + note + ')' : '') + ' -- тут ограничение; ' + r.free))
+            .catch (console.error);
+            continue;
+        }
+        if (!newState[r.cur]) continue;                // тут ограничения нет и снимать нечего
+        const room = voiceRoomRestriction (oldState, uid, r.flag);
+        newState[r.set] (false)
+        .then (() => console.log ('[' + (d()) + '] [voice] ' + r.kind + ' по комнате: ' + who + ' в ' + here + ' ' + r.done +
+            (room ? ' -- ограничение осталось в ' + room + ' и вернётся при заходе туда'
+                  : (note ? ' -- ограничения по комнатам у него нет (' + note + ')'
+                          : ' -- это был серверный ' + r.kind + ' без ограничения по комнате'))))
         .catch (console.error);
-        return;
     }
-    if (!newState.serverMute) return;                  // тут ограничения нет и снимать нечего
-    const room = voiceRoomRestriction (oldState, uid);
-    newState.setMute (false)
-    .then (() => console.log ('[' + (d()) + '] [voice] мут по комнате: ' + who + ' в ' + here + ' мут снят' +
-        (room ? ' -- ограничение осталось в ' + room + ' и вернётся при заходе туда'
-              : ' -- это был серверный мут без ограничения по комнате')))
-    .catch (console.error);
 }
 
 // Вышел из голосового совсем: серверный мут снимается (Discord отдаёт это как канал без объекта).
 function voiceRoomMuteLeft (oldState, newState)
 {
     if (!newState.member || newState.member.user.bot) return;
-    const room = voiceRoomRestriction (oldState, newState.id);
+    const room = voiceRoomRestriction (oldState, newState.id, PermissionsBitField.Flags.Speak);
     console.log ('[' + (d()) + '] [voice] мут по комнате: ' + uuu (newState.member) + ' вышел из голосового -- серверный мут снят' +
         (room ? ', ограничение осталось в ' + room + ' и вернётся при заходе туда' : ''));
 }
@@ -4474,7 +4527,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                                         )
                                         .catch (console.error);
                                     }
-                                    logAction (newState.guild, AuditLogEvent.MemberUpdate, newState.id, newState.member.user.username + ' get mute in ' + channel.name);
+                                    logAction (newState.guild, AuditLogEvent.MemberUpdate, newState.id, newState.member.user.username + ' мут в комнате «' + channel.name + '»');
                                 }
                             )
                             .catch (console.error);
@@ -4490,7 +4543,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                         console.log ('[' + (d()) + '] [voice] деф боту ' + uuu (newState.member) + ' в «' +
                             code (cc (newState.channel)) + '»: запомнил, но запрет Connect ботам не пишу' + ' (в общий канал не переношу)');
                         logAction (newState.guild, AuditLogEvent.MemberUpdate, newState.id,
-                            newState.member.user.username + ' get deaf in ' + newState.channel.name);
+                            newState.member.user.username + ' деф в комнате «' + newState.channel.name + '»');
                     }
                     else if
                     (
@@ -4575,7 +4628,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                                     )
                                     .catch (console.error);
                                 }
-                                logAction (newState.guild, AuditLogEvent.MemberUpdate, newState.id, newState.member.user.username + ' get deaf in ' + channel.name);
+                                logAction (newState.guild, AuditLogEvent.MemberUpdate, newState.id, newState.member.user.username + ' деф в комнате «' + channel.name + '»');
                             }
                         )
                         .catch (console.error);
@@ -4648,7 +4701,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                                     )
                                     .catch (console.error);
                                 }
-                                logAction (newState.guild, AuditLogEvent.MemberUpdate, newState.id, newState.member.user.username + ' get unmute in ' + channel.name);
+                                logAction (newState.guild, AuditLogEvent.MemberUpdate, newState.id, newState.member.user.username + ' мут снят в комнате «' + channel.name + '»');
                             }
                         )
                         .catch (console.error);
@@ -4721,7 +4774,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                                     )
                                     .catch (console.error);
                                 }
-                                logAction (newState.guild, AuditLogEvent.MemberUpdate, newState.id, newState.member.user.username + ' get undeaf in ' + channel.name);
+                                logAction (newState.guild, AuditLogEvent.MemberUpdate, newState.id, newState.member.user.username + ' деф снят в комнате «' + channel.name + '»');
                             }
                         )
                         .catch (console.error);
@@ -4729,27 +4782,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
                 }
                 else
                 {
-                    voiceRoomMuteSync (oldState, newState);   // v2.167: мут по комнатам -- теперь с записью в лог
-                    if
-                    (
-                        newState.channel.permissionOverwrites.cache.get(newState.id) &&
-                        newState.channel.permissionOverwrites.cache.get(newState.id).deny.has(PermissionsBitField.Flags.Connect)
-                    )
-                    {
-                        if (!newState.serverDeaf)
-                        {
-                            newState.setDeaf (true)
-                            .catch (console.error);
-                        }
-                    }
-                    else
-                    {
-                        if (newState.serverDeaf)
-                        {
-                            newState.setDeaf (false)
-                            .catch (console.error);
-                        }
-                    }
+                    voiceRoomMuteSync (oldState, newState);   // v2.167/168: мут и деф по комнатам -- с записью в лог
                 }
             }
             else
@@ -4806,7 +4839,10 @@ function rawOfMember (member)
 {
     return {
         user: { id: member.id, username: (member.user && member.user.username) || member.id },
-        roles: member.roles ? [...member.roles.cache.keys ()] : null,
+        // v2.168: у частичного участника ролей нет -- это значит «НЕИЗВЕСТНЫ», а не «пусто»: иначе
+        // выход незакэшированного участника стёр бы сохранённые о нём роли (saveMemberRoles удаляет
+        // запись, когда ролей у человека не осталось).
+        roles: (!member.partial && member.roles) ? [...member.roles.cache.keys ()] : null,
         nick: member.nickname || null,
     };
 }
@@ -4821,12 +4857,19 @@ async function handleMemberEvent (member, isJoin)
         const uid = member.id;
         if (memberEventFresh (server, uid, isJoin)) return;
         memberEventMark (server, uid, isJoin);
-        if (member.partial)
+        // v2.168: событие о выходе теперь приходит и о тех, кого бот ещё не видел (часть GuildMember).
+        // Дозапрашивать ВЫШЕДШЕГО бессмысленно -- Discord ответит «не найден»: в событии о выходе ролей
+        // нет вовсе (и это НЕ значит «ролей не было»), поэтому беру запись о нём из последнего списка
+        // участников (опрос раз в 45 с держит роли) -- иначе выход такого участника стёр бы то, что бот
+        // сохранил раньше (живой пример: roleSavingOn). Таймаут за выход считается по id и от ролей не
+        // зависит, поэтому он срабатывает сразу, не дожидаясь опроса.
+        if (member.partial && isJoin)
         {
             try { await member.fetch (); }
             catch (e) {  }
         }
-        const raw = rawOfMember (member);
+        const snapRaw = (member.partial && $membersSnapshot[server]) ? $membersSnapshot[server].get (uid) : null;
+        const raw = snapRaw || rawOfMember (member);
         const who = (member.user && member.user.username) ? member.user : await resolveUser (uid, raw);
         console.log ('[' + (d()) + '] участник ' + who.username + (isJoin ? ' ЗАШЁЛ на ' : ' ВЫШЕЛ с ') +
             SERVERS[server].name + ' (мгновенно)');
