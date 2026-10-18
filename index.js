@@ -301,6 +301,11 @@
 //    кроме пропавшего медиа-пути и мёртвого служебного канала, он берётся за дело, когда пинг служебного
 //    канала три СВЕЖИХ ответа подряд держится от 3 секунд -- это уже почти тишина у слушателей; одиночные
 //    всплески на 2-4 с (VPN + обход DPI) сюда не попадают. Место в треке и очередь при этом целы.
+// v2.177 -- просьба владельца: в /health видно, шумит ли сторож. Сторож ведёт свой короткий список за
+//    двое суток (лежит рядом со счётом обрывов, в netState/voice, поле watch): «переподключился» и
+//    «заметил, но связь выправилась сама». В /health одна строка: переподключений за сутки и когда было
+//    последнее (с причиной), рядом -- сколько раз проходило само. Так видно, где настоящая беда, а где
+//    шум сети, и не надо читать журнал с начала. Записи переживают перезапуск бота (лежат в базе).
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -14697,12 +14702,13 @@ function mediaProbeState (m, now)               // мое состояние с�
     if (v && v.sock === sock) return v;
     const old = v || null;
     v = m.vprobe = { sock: sock, counter: MEDIA_COUNTER_START, at: now, misses: 0, high: 0, sentAt: 0,
-        ping: null, lastOkAt: 0, trouble: false, troubleAt: 0, good: 0, warned: 0, warnedAt: 0,
+        ping: null, lastOkAt: 0, trouble: false, troubleAt: 0, troubleWhy: '', good: 0, warned: 0, warnedAt: 0,
         healAt: 0, heals: 0, gaveUp: 0, wsHigh: 0, wsPing: null, wsMissed: 0, wsSeenPing: 0, wsSeenAt: 0, gotOk: 0 };
     if (old)
     {
         v.trouble = old.trouble;
         v.troubleAt = old.troubleAt;
+        v.troubleWhy = old.troubleWhy;
         v.good = old.good;
         v.warned = old.warned;
         v.warnedAt = old.warnedAt;
@@ -14867,6 +14873,7 @@ function mediaWatchRun (now)
             {
                 v.good = (v.good || 0) + 1;
                 if (v.good < MEDIA_GOOD_TICKS_N) continue;      // отбой -- только когда связь чиста несколько замеров подряд
+                if (!v.heals) voiceWatchNote ('noise', v.troubleWhy);   // заметил, но прошло само: это шум, не беда
                 v.trouble = false;
                 v.good = 0;
                 console.log ('[' + (d()) + '] [music] голосовой канал снова в норме' +
@@ -14892,6 +14899,7 @@ function mediaWatchRun (now)
         {
             v.trouble = true;
             v.troubleAt = now;
+            v.troubleWhy = why;
             console.log ('[' + (d()) + '] [music] ' + why + ' -- музыка вот-вот оборвётся' +
                 (willHeal ? ', пробую переподключиться сам (место в треке помню)' : '; пока слежу, вдруг выправится сама'));
         }
@@ -14919,6 +14927,7 @@ function mediaWatchRun (now)
             const notice = mediaHealText (m, why, v);           // место в треке -- до переподключения
             mediaReconnect (g);
             notifyHoster (notice).catch (() => { });             // одно письмо вместо пары «заметил / отбой»
+            voiceWatchNote ('heal', why);                      // в /health: настоящая беда, а не шум
             v.warned = 0;
             v.warnedAt = now;
         }
@@ -18364,9 +18373,11 @@ async function voiceLogLoad ()
         let val = null;
         try { const srv = dbServerList ()[0]; if (srv) val = await db (srv, 'netState', 'voice'); }
         catch (e) { }
-        const base = { n: 0, back: 0, kicked: 0, waitMs: 0, tries: 0, net: 0, netBack: 0, netWaitMs: 0, netFromCopy: 0, list: [] };
+        const base = { n: 0, back: 0, kicked: 0, waitMs: 0, tries: 0, net: 0, netBack: 0, netWaitMs: 0, netFromCopy: 0,
+            list: [], watch: [] };
         voiceLog = (val && typeof val === 'object') ? Object.assign (base, val) : base;
         if (!Array.isArray (voiceLog.list)) voiceLog.list = [];
+        if (!Array.isArray (voiceLog.watch)) voiceLog.watch = [];
         voiceLogLoading = null;
         return voiceLog;
     }) ();
@@ -18413,6 +18424,29 @@ async function voiceLogNote (rec)
     }
     catch (e) { }
 }
+// Сторож голоса ведёт свой короткий список за двое суток: «переподключился» и «заметил, но связь
+// выправилась сама» (шум). Это отдельно от счёта обрывов: обрыв -- связь пропала сама, а переподключение
+// сторожа -- моё решение; владельцу в /health важно видеть, сколько было одного и другого, чтобы не
+// принимать частые переподключения за шум и наоборот.
+const VOICE_WATCH_KEEP_MS = 48 * 60 * 60 * 1000;
+function voiceWatchNote (what, why)
+{
+    return (async () =>
+    {
+        try
+        {
+            const log = await voiceLogLoad ();
+            if (!Array.isArray (log.watch)) log.watch = [];
+            log.watch.unshift ({ at: Date.now (), what: what, why: String (why || '').slice (0, 160) });
+            const cut = Date.now () - VOICE_WATCH_KEEP_MS;
+            while (log.watch.length && (log.watch.length > 200 || (log.watch[log.watch.length - 1].at || 0) < cut))
+                log.watch.pop ();
+            voiceLogSave ();
+        }
+        catch (e) { }
+    }) ();
+}
+
 function voiceOutageStart (guildId, why)
 {
     const m = $music[guildId];
@@ -18672,12 +18706,34 @@ function voiceRealText (r, chName)
         (r.wasIn ? '\n_Музыка вернулась в канал и ждёт._' : '');
 }
 
+// Строка о стороже голоса в /health: сколько было НАСТОЯЩИХ бед (переподключений) и сколько простоев,
+// которые прошли сами. Так видно, шумит ли сеть или дело действительно плохо.
+function voiceWatchLine (watch, now = Date.now ())
+{
+    const day = 24 * 60 * 60 * 1000;
+    const list = (Array.isArray (watch) ? watch : []).filter (x => x && typeof x.at === 'number' && (now - x.at) <= day);
+    const heals = list.filter (x => x.what === 'heal');
+    const noise = list.filter (x => x.what === 'noise');
+    return '🕵 Сторож голоса за сутки: ' +
+        (heals.length
+            ? 'переподключений ' + heals.length + ' (последнее ' + fmtAgo (now - heals[0].at) + ' назад' +
+                (heals[0].why ? ': ' + clipWords (heals[0].why, 60) : '') + ')'
+            : 'переподключений не было') +
+        '; ' + (noise.length
+            ? 'прошло само (переподключаться не пришлось): ' + noise.length +
+                ', последний раз ' + fmtAgo (now - noise[0].at) + ' назад'
+            : 'само по себе не проходило') +
+        '\n_Переподключение -- настоящая беда; «прошло само» -- связь выправилась без него, это шум сети._';
+}
+
 async function netHealthText (m, guildId, viewerId)      // ответ на /health: как живёт связь и чем идёт звук
 {
     const owner = isBotOwner (viewerId);
     const lines = ['🩺 **Связь и музыка** -- что бот помнит и что видит сейчас'];
-    for (const l of await netVoiceLines (await voiceLogLoad ()))
+    const vlog = await voiceLogLoad ();
+    for (const l of await netVoiceLines (vlog))
         lines.push (/^  /.test (l) ? l : '• ' + l);
+    lines.push ('• ' + voiceWatchLine (vlog.watch));
     if (m)
     {
         const way = playWayShort (m, guildId);
