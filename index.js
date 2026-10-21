@@ -7145,8 +7145,11 @@ const QUEUE_CHECK_GAP_MS = Math.max (1000, Math.min (60000,
 const QUEUE_CHECK_STRICT = 3;
 const MUSIC_HISTORY_LEN = Math.max (0, Math.min (200,
     Math.round (Number (MUSIC_CFG.history_len === undefined ? 25 : MUSIC_CFG.history_len) || 0)));
+// v2.182: по умолчанию 500 было мало: две пачки-плейлиста по 178 треков съедали 355 и следующее
+// добавление молча выкидывало всю остальную историю. Теперь 2000 (и не меньше 8 свежих пачек
+// остаются даже при превышении -- см. historyTrim).
 const MUSIC_HISTORY_TRACKS = Math.max (0, Math.min (5000,
-    Math.round (Number (MUSIC_CFG.history_tracks === undefined ? 500 : MUSIC_CFG.history_tracks) || 0)));
+    Math.round (Number (MUSIC_CFG.history_tracks === undefined ? 2000 : MUSIC_CFG.history_tracks) || 0)));
 // v2.155: сколько треков из плейлиста брать за один заход. Раньше здесь стояло ЖЁСТКОЕ slice(0, 50), и владелец
 // упирался в него на живом плейлисте из 177 треков: yt-dlp отдаёт список ЦЕЛИКОМ одним ответом (то есть запрос
 // и так уже сделан), а в очередь попадали первые 50 -- и ни слова о том, что список урезан. Предел всё же нужен:
@@ -13254,7 +13257,7 @@ function configCli ()
     row ('queue_check_depth', QUEUE_CHECK_DEPTH + ' треков (первые ' + QUEUE_CHECK_STRICT + ' -- yt-dlp)', hasM ('queue_check_depth') ? 'config.json' : 'по умолчанию (20)');
     row ('queue_check_gap_ms', QUEUE_CHECK_GAP_MS + ' мс', hasM ('queue_check_gap_ms') ? 'config.json' : 'по умолчанию (5000)');
     row ('history_len', MUSIC_HISTORY_LEN + ' пачек', hasM ('history_len') ? 'config.json' : 'по умолчанию (25)');
-    row ('history_tracks', MUSIC_HISTORY_TRACKS + ' треков', hasM ('history_tracks') ? 'config.json' : 'по умолчанию (500)');
+    row ('history_tracks', MUSIC_HISTORY_TRACKS + ' треков', hasM ('history_tracks') ? 'config.json' : 'по умолчанию (2000)');
     row ('queue_live_ms', QUEUE_LIVE_MS ? QUEUE_LIVE_MS + ' мс (миллисекунды)' : '0 (сам не обновляю)', hasM ('queue_live_ms') ? 'config.json' : 'по умолчанию (30000)');
     row ('net_wait_ms', NET_WAIT_MS + ' мс (до ' + NET_WAIT_MAX_MS + ' мс)', hasM ('net_wait_ms') ? 'config.json' : 'по умолчанию (10000)');
 
@@ -16179,18 +16182,22 @@ const HISTORY_TITLE_CLIP = 70;
 const HISTORY_TITLES_STORE = 100;
 const HISTORY_TITLES_PAGE = 20;
 const HISTORY_EXPAND_CLIP = 60;
-function historyTrim (list)
+// Сколько самых свежих записей не трогаю даже при превышении предела по трекам. Предел по трекам нужен,
+// чтобы база и текст не пухли, но пачка-гигант (плейлист на 178 треков) не должна стирать всю память:
+// раньше две такие пачки съедали 355 из 500 треков и при следующем добавлении история теряла всё
+// остальное молча -- теперь старые записи забываются только сверх этого запаса и с записью в лог.
+const HISTORY_MIN_PACKS = 8;
+function historyTrim (list, lenLimit = MUSIC_HISTORY_LEN, trackLimit = MUSIC_HISTORY_TRACKS)
 {
     const out = (Array.isArray (list) ? list : []).slice ();
-    if (out.length > MUSIC_HISTORY_LEN) out.length = MUSIC_HISTORY_LEN;
-    if (MUSIC_HISTORY_TRACKS)
+    if (out.length > lenLimit) out.length = Math.max (0, lenLimit);
+    if (!trackLimit || !out.length) return out;
+    const keep = Math.min (out.length, Math.min (HISTORY_MIN_PACKS, Math.max (1, lenLimit)));
+    let total = 0;
+    for (let i = 0; i < out.length; i++)
     {
-        let total = 0;
-        for (let i = 0; i < out.length; i++)
-        {
-            total += historyTracksOf (out[i]);
-            if (total > MUSIC_HISTORY_TRACKS && i > 0) { out.length = i; break; }
-        }
+        total += historyTracksOf (out[i]);
+        if (total > trackLimit && i >= keep) { out.length = i; break; }
     }
     return out;
 }
@@ -16373,7 +16380,15 @@ async function historyAdd (guildId, entry)
         ids: (entry.ids || []).slice (0, 500).map (s => String (s || '').slice (0, 200)).filter (Boolean),
         src: entry.src || historySrcOfIds (entry.ids),
     });
+    const had = m.history.length;
     m.history = historyTrim (m.history);
+    // Забывание больше не молчит: если предел вытеснил старые записи, это видно в логе (раньше история
+    // просто становилась короче, и со стороны это выглядело как пропажа).
+    if (m.history.length < had)
+        console.log ('[' + (d()) + '] [music] история добавлений: помню последние ' + m.history.length + ' ' +
+            plural (m.history.length, 'пачку', 'пачки', 'пачек') + ' (предел ' + MUSIC_HISTORY_TRACKS + ' треков / ' +
+            MUSIC_HISTORY_LEN + ' пачек, свежие ' + HISTORY_MIN_PACKS + ' остаются всегда) -- ' +
+            (had - m.history.length) + ' старых забыто');
     await historySave (guildId);
 }
 
@@ -16474,6 +16489,8 @@ function historyText (guildId, page = 1)
         (withX ? ' «×N» -- столько раз подряд ставили одну и ту же ссылку.' : '') +
         ' Одиночная песня -- своей строкой с 🎵 (сразу с названием и адресом).' +
         ' Весь состав -- кнопкой «📜 Все треки»._' +
+        '\n_Помню до ' + MUSIC_HISTORY_LEN + ' пачек и до ' + MUSIC_HISTORY_TRACKS + ' треков; ' +
+        'самые свежие ' + HISTORY_MIN_PACKS + ' остаются всегда, более старые забываются._' +
         (pages > 1 ? '\n_Дальше -- кнопками листания под сообщением._' : '');
     const budget = HISTORY_MSG_LIMIT - head.length - 2 - tail.length;
     // У пачки в начале строки стоит то, что вводили в /play -- и запрос, и адрес уходят в код (`...`):
