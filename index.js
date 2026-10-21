@@ -1998,6 +1998,9 @@ function gwOn (kind, info)
         if (!logged) { $gwDown = now; $gwDrops++; }
         const text = gwDropText (logged, $gwDrops, info.id, kind === 'hard' ? info.code : null, info.reason);
         if (text) (kind === 'hard' ? console.error : console.log) ('[' + gwWhen (now) + '] ' + text);
+        gwEventAdd (kind === 'hard' ? 'hard' : 'drop',
+            (info.reason ? oneLine (info.reason, 100) : '') || ('шард ' + info.id + (info.code ? ', код ' + info.code : '')),
+            gwAddrNow ());
         return;
     }
     const gap = $gwDown ? now - $gwDown : 0;
@@ -2063,6 +2066,8 @@ const WS_QUIET_REPEAT_MS = 10 * 60 * 1000;
 let $wsQuietAt = 0;              // когда последний раз сокет пожаловался без слушателя
 let $wsQuietTotal = 0;           // сколько таких ошибок было за запуск (для /health)
 let $netCrashN = 0;              // сколько сетевых сбоев пережили на уровне процесса (для /health)
+let $gwEvents = null;            // последние сбои связи: время, вид, причина, адрес (живут и после перезапуска)
+let $gwLastAddr = '';            // последний известный адрес шлюза -- для записи, когда сокет уже закрыт
 let $wsQuietN = 0;               // сколько таких же повторов я не печатал
 let $wsQuietKey = '';
 let $wsQuietLoggedAt = 0;
@@ -2086,6 +2091,7 @@ function wsQuietNote (e)
     const key = String (msg).replace (/\d+/g, '#');
     $wsQuietAt = now;
     $wsQuietTotal++;
+    gwEventAdd ('socket', msg);
     if (key === $wsQuietKey && (now - $wsQuietLoggedAt) < WS_QUIET_REPEAT_MS) { $wsQuietN++; return; }
     const tail = $wsQuietN > 0
         ? ' (такая же приходила ещё ' + $wsQuietN + ' ' + plural ($wsQuietN, 'раз', 'раза', 'раз') + ' -- больше не повторяю)'
@@ -2136,6 +2142,7 @@ function forceRelogin (why)
     if ($gwReloginning) return;
     $gwReloginning = true;
     $gwRelogins++;
+    gwEventAdd ('relogin', why);
     console.log ('[' + gwWhen (Date.now ()) + '] [gw] перезапускаю подключение к Discord (' + why +
         ') -- то же, что раньше делал руками, но без остановки музыки');
     (async () =>
@@ -2193,6 +2200,91 @@ setInterval (() =>
     $wsQuietAt = 0;
     forceRelogin ('gateway не встал за ' + fmtAgo (_stale) + ' после ошибки сокета, состояние: ' + (WS_STATUS[_st] || _st));
 }, 30000);
+
+// v2.188 -- история сбоев связи на 20 записей: время, вид, причина и адрес шлюза. Хранится в logs/gw-events.json,
+// поэтому видна в /health и после перезапуска (а не только пока процесс жив). Пишется только по событиям -- редко.
+const GW_EVENT_KEEP = 20;
+function gwEventsFile () { return pathMod.join (LOG_DIR, 'gw-events.json'); }
+function gwEventsLoad ()
+{
+    if ($gwEvents) return $gwEvents;
+    $gwEvents = [];
+    try
+    {
+        const arr = JSON.parse (String (fsLog.readFileSync (gwEventsFile (), 'utf8')));
+        if (Array.isArray (arr))
+            $gwEvents = arr.filter (x => x && typeof x === 'object' && Number (x.at) > 0).slice (-GW_EVENT_KEEP);
+    }
+    catch (e) { }
+    return $gwEvents;
+}
+function gwEventsSave ()
+{
+    try { fsLog.writeFileSync (gwEventsFile (), JSON.stringify (($gwEvents || []).slice (-GW_EVENT_KEEP))); }
+    catch (e) { }
+}
+function gwAddrNow ()
+{
+    const out = new Set ();
+    try
+    {
+        const shards = (client && client.ws && client.ws.shards) ? client.ws.shards : null;
+        if (shards && typeof shards.values === 'function')
+            for (const s of shards.values ())
+            {
+                const c = s && s.connection;
+                const ip = (c && c._socket && c._socket.remoteAddress) || '';
+                if (ip) out.add (String (ip).replace (/^::ffff:/, ''));
+            }
+    }
+    catch (e) { }
+    if (out.size) $gwLastAddr = [...out].join (', ');
+    return out.size ? [...out].join (', ') : $gwLastAddr;
+}
+const GW_EVENT_KINDS =
+{
+    drop: 'обрыв связи',
+    hard: 'связь потеряна',
+    socket: 'ошибка сокета',
+    net: 'сетевой сбой',
+    relogin: 'поднимал подключение',
+};
+function gwEventAdd (kind, why, addr)
+{
+    try
+    {
+        gwEventsLoad ();
+        $gwEvents.push
+        ({
+            at: Date.now (),
+            kind: String (kind || 'net'),
+            why: oneLine (why || '', 160),
+            addr: String (addr === undefined ? gwAddrNow () : (addr || '')).slice (0, 80),
+        });
+        if ($gwEvents.length > GW_EVENT_KEEP) $gwEvents = $gwEvents.slice (-GW_EVENT_KEEP);
+        gwEventsSave ();
+    }
+    catch (e) { }
+}
+function gwEventsLines (n = 5)
+{
+    const ev = gwEventsLoad ().slice (-n).reverse ();
+    if (!ev.length) return [];
+    const two = x => String (x).padStart (2, '0');
+    const when = t =>
+    {
+        const x = new Date (t);
+        return two (x.getDate ()) + '.' + two (x.getMonth () + 1) + ' ' + two (x.getHours ()) + ':' + two (x.getMinutes ());
+    };
+    const bootAt = Date.now () - Math.round (process.uptime () * 1000) - 5000;
+    const out = ['📡 Последние сбои связи (свежие сверху, помню ' + GW_EVENT_KEEP + '):'];
+    for (const e of ev)
+        out.push ('• ' + when (e.at) + ' — ' + (GW_EVENT_KINDS[e.kind] || e.kind) +
+            (e.why ? ': ' + oneLine (e.why, 80) : '') +
+            (e.addr ? ' — ' + e.addr : '') +
+            (e.at < bootAt ? ' — было до перезапуска' : ' — пережил сам'));
+    return out;
+}
 
 function dbFileOf (_srv)   { return __dirname + '/' + _srv + '.sqlite'; }
 function dbBackupStampOf (_srv) { return __dirname + '/' + _srv + '.backup-' + dbCheckStamp (); }
@@ -3149,6 +3241,7 @@ process.on ('uncaughtException',  e =>
         $wsQuietAt = Date.now ();
         $wsQuietTotal++;
         $netCrashN++;
+        gwEventAdd ('net', String ((e && e.message) || e));
         console.error ('[' + (d()) + '] [gw] это сбой связи, а не поломка бота -- продолжаю работу' +
             (/^Unexpected server response: 5\d\d/i.test (String ((e && e.message) || e))
                 ? ' (Cloudflare не смог договориться с Discord при рукопожатии: 5xx -- сеть или шлюз)'
@@ -14500,7 +14593,11 @@ const $voiceStatus = {};
 function fmtAgo (ms)
 {
     let s = Math.max (0, Math.round (ms / 1000));
-    let h = s / 3600 | 0, mi = (s % 3600) / 60 | 0;
+    // v2.188: у длинной очереди были сотни часов («220 ч 27 мин») -- человеку приходилось делить в уме.
+    // Теперь от суток и больше сначала сутки: «9 сут 4 ч 27 мин».
+    let d = s / 86400 | 0;
+    let h = (s % 86400) / 3600 | 0, mi = (s % 3600) / 60 | 0;
+    if (d) return d + ' сут' + (h ? ' ' + h + ' ч' : '') + (mi ? ' ' + mi + ' мин' : '');
     if (h) return h + ' ч ' + mi + ' мин';
     if (mi) return mi + ' мин';
     return s + ' сек';
@@ -16648,6 +16745,14 @@ function historySrcText (e)
     if (s === 'other') return ' · не YouTube';
     return '';
 }
+// Кто поставил: имя, а если его в записи нет -- обращение (Discord сам покажет имя).
+function historyByText (e)
+{
+    const by = String ((e && e.byName) || '').trim ();
+    if (by) return by;
+    const id = String ((e && e.byId) || '');
+    return /^\d{17,20}$/.test (id) ? '<@' + id + '>' : 'без автора';
+}
 
 // Одинаковые записи больше не склеиваю: раньше две подряд одинаковые ссылки (один и тот же плейлист
 // или одна и та же песня) становились одной строкой с «×N», и владелец попросил так не делать --
@@ -16763,18 +16868,22 @@ function historyText (guildId, page = 1, f = null)
         ', всего ' + sum + ' ' + plural (sum, 'трек', 'трека', 'треков') +
         (pages > 1 ? ' -- страница ' + cur + ' из ' + pages : '') + ':\n' +
         (f ? historyFilterLine (f, list.length) + '\n' : '') + QSEP;
-    const tail = '\n' + QSEP + '\n_Строка -- одна пачка: время, ссылка и первые треки списком.' +
+    const tail = '\n' + QSEP + '\n_Строка -- одна пачка: время, автор, ссылка и первые треки списком.' +
         ' Одиночная песня -- своей строкой с 🎵 (сразу с названием и адресом).' +
         ' Весь состав -- кнопкой «📜 Все треки»._' +
         '\n_Помню до ' + MUSIC_HISTORY_LEN + ' пачек и до ' + MUSIC_HISTORY_TRACKS + ' треков; ' +
         'самые свежие ' + HISTORY_MIN_PACKS + ' остаются всегда, более старые забываются._' +
-        (pages > 1 ? '\n_Дальше -- кнопками листания под сообщением._' : '');
+        '\n_Фильтры -- под сообщением: автор и период списками, поиск по слову -- кнопкой «🔎 Поиск…»._' +
+        (pages > 1 ? '\n_Дальше -- кнопками листания._' : '');
     const budget = HISTORY_MSG_LIMIT - head.length - 2 - tail.length;
     // У пачки в начале строки стоит то, что вводили в /play -- и запрос, и адрес уходят в код (`...`):
     // Discord превью на код не рисует, а адрес-запуск иначе превращался бы в карточку.
+    // v2.188: автор виден в каждой строке, а не только в меню «Все треки» -- раньше на главной странице
+    // истории было непонятно, кто это поставил (владелец спросил именно об этом).
+    const byLine = e => ' · 👤 ' + historyByText (e);
     const linkLine = b => '`' + stamp (b.at) + '` ' +
         (b.key ? '`' + b.key.slice (0, 90) + '`' : (historyTitlesOf (b.e)[0] || 'без названия')) +
-        historySrcText (b.e);
+        historySrcText (b.e) + byLine (b.e);
     const titleLine = (n, t) => n + '. ' + (String (t).length > HISTORY_TITLE_CLIP
         ? String (t).slice (0, HISTORY_TITLE_CLIP - 1).trimEnd () + '…' : String (t));
     const previewOf = (b, per) =>
@@ -16805,7 +16914,7 @@ function historyText (guildId, page = 1, f = null)
         return '`' + stamp (b.at) + '` 🎵 ' +
             (t.length > HISTORY_TITLE_CLIP ? t.slice (0, HISTORY_TITLE_CLIP - 1).trimEnd () + '…' : t) +
             (link ? ' — ' + angle (clipped (link, 100)) : '') +
-            historySrcText (b.e);
+            historySrcText (b.e) + byLine (b.e);
     };
     const rowOf = (b, per) =>
     {
@@ -16836,9 +16945,79 @@ function historyText (guildId, page = 1, f = null)
     return text.length <= HISTORY_MSG_LIMIT ? text : fitMsgText (text, HISTORY_MSG_LIMIT);
 }
 
+// v2.188 -- фильтры истории теперь не только параметрами команды: под сообщением есть списки автора и периода
+// и кнопка поиска с окном ввода. Раньше, чтобы найти человека или сузить период, надо было помнить синтаксис
+// команды; теперь это видно и нажимается мышкой.
+const HISTORY_PERIODS = [[0, 'Всё время'], [1, 'Последние сутки'], [7, 'Последние 7 дней'], [30, 'Последние 30 дней'], [365, 'Последний год']];
+function historyPeriodLabel (days)
+{
+    const d = Math.max (0, Math.round (Number (days) || 0));
+    const row = HISTORY_PERIODS.find (x => x[0] === d);
+    return row ? row[1] : 'последние ' + d + ' ' + plural (d, 'день', 'дня', 'дней');
+}
+function historyAuthorOptions (guildId)
+{
+    const m = musicOf (guildId);
+    const map = new Map ();
+    for (const e of (Array.isArray (m.history) ? m.history : []))
+    {
+        const id = String ((e && e.byId) || '');
+        if (!/^\d{17,20}$/.test (id)) continue;
+        const cur = map.get (id);
+        if (cur) { cur.n++; cur.at = Math.max (cur.at, Number (e.at) || 0); }
+        else map.set (id, {id: id, name: String ((e && e.byName) || '').trim () || id, n: 1, at: Number (e.at) || 0});
+    }
+    return [...map.values ()].sort ((a, b) => b.at - a.at).slice (0, 24);
+}
+function historyAuthorName (guildId, id)
+{
+    const m = musicOf (guildId);
+    for (const e of (Array.isArray (m.history) ? m.history : []))
+        if (String ((e && e.byId) || '') === String (id) && String ((e && e.byName) || '').trim ())
+            return String (e.byName).trim ();
+    return '';
+}
+function historyFilterModal (f)
+{
+    return new ModalBuilder ().setCustomId ('q:hfm' + ((f && f.token) ? ':' + f.token : ''))
+        .setTitle ('Поиск в истории')
+        .addComponents
+        (
+            new ActionRowBuilder ().addComponents
+            (
+                new TextInputBuilder ().setCustomId ('text')
+                    .setLabel ('Слово: название, запрос, адрес, автор')
+                    .setPlaceholder ('например: marsh или dQw4w9WgXcQ')
+                    .setStyle (TextInputStyle.Short).setRequired (false).setMaxLength (100)
+                    .setValue (f && f.text ? String (f.text).slice (0, 100) : '')
+            ),
+            new ActionRowBuilder ().addComponents
+            (
+                new TextInputBuilder ().setCustomId ('days')
+                    .setLabel ('Дней назад (пусто -- всё время)')
+                    .setPlaceholder ('7')
+                    .setStyle (TextInputStyle.Short).setRequired (false).setMaxLength (4)
+                    .setValue (f && f.days ? String (f.days) : '')
+            )
+        );
+}
+function historyShowResult (interaction, guildId, page, f, useUpdate = true)
+{
+    const payload =
+    {
+        content: historyText (guildId, page, f),
+        components: historyComponents (guildId, page, f),
+        flags: MessageFlags.SuppressEmbeds,
+    };
+    const quiet = Object.assign ({}, payload, {flags: MessageFlags.Ephemeral | MessageFlags.SuppressEmbeds});
+    if (!useUpdate) return interaction.reply (quiet).catch (() => {});
+    return Promise.resolve (interaction.update (payload)).catch (() => interaction.reply (quiet).catch (() => {}));
+}
+
 function historyComponents (guildId, page = 1, f = null)
 {
     const m = musicOf (guildId);
+    if (!Array.isArray (m.history) || !m.history.length) return [];   // фильтровать нечего -- и кнопок не надо
     const list = historyFiltered (m.history, f);
     const pages = historyPagesOf (list);
     const cur = Math.min (Math.max (1, Math.floor (Number (page) || 1)), pages);
@@ -16855,16 +17034,34 @@ function historyComponents (guildId, page = 1, f = null)
             new ButtonBuilder ().setCustomId ('q:hg:last:' + pages + token).setLabel ('В конец ⏭')
                 .setStyle (ButtonStyle.Secondary).setDisabled (cur >= pages)
         ));
+    // Автор: список тех, кто вообще есть в истории (а не только в отобранных строках), -- иначе после
+    // выбора одного человека список сузился бы до него и сменить автора было бы нечем.
+    const authors = historyAuthorOptions (guildId);
+    if (authors.length)
+    {
+        const sel = new StringSelectMenuBuilder ()
+            .setCustomId ('q:hfa' + token)
+            .setPlaceholder (('👤 Автор: ' + (f && f.userId
+                ? (historyAuthorName (guildId, f.userId) || 'выбран')
+                : 'любой')).slice (0, 150));
+        sel.addOptions ([{label: 'Все авторы', value: 'all', description: 'Не отбирать по человеку'}]
+            .concat (authors.map (a => ({label: clipped (a.name + ' · ' + a.n, 90), value: 'u:' + a.id}))));
+        rows.push (new ActionRowBuilder ().addComponents (sel));
+    }
+    const psel = new StringSelectMenuBuilder ()
+        .setCustomId ('q:hfp' + token)
+        .setPlaceholder (('⏱ Период: ' + historyPeriodLabel (f && f.days)).slice (0, 150));
+    psel.addOptions (HISTORY_PERIODS.map (([d, label]) =>
+        ({label: label, value: 'p:' + d, default: (Math.max (0, Number (f && f.days) || 0) === d)})));
+    rows.push (new ActionRowBuilder ().addComponents (psel));
+    const btns = [new ButtonBuilder ().setCustomId ('q:hfm' + token).setLabel ('🔎 Поиск…').setStyle (ButtonStyle.Secondary)];
     if (list.some (e => historyTitlesOf (e).length > 3))
-        rows.push (new ActionRowBuilder ().addComponents (
-            new ButtonBuilder ().setCustomId ('q:hi' + token).setLabel ('📜 Все треки')
-                .setStyle (ButtonStyle.Secondary)
-        ));
+        btns.push (new ButtonBuilder ().setCustomId ('q:hi' + token).setLabel ('📜 Все треки')
+            .setStyle (ButtonStyle.Secondary));
     if (f)
-        rows.push (new ActionRowBuilder ().addComponents (
-            new ButtonBuilder ().setCustomId ('q:hgf').setLabel ('✖ Сбросить фильтр')
-                .setStyle (ButtonStyle.Secondary)
-        ));
+        btns.push (new ButtonBuilder ().setCustomId ('q:hgf').setLabel ('✖ Сбросить фильтр')
+            .setStyle (ButtonStyle.Secondary));
+    rows.push (new ActionRowBuilder ().addComponents (...btns));
     return rows;
 }
 
@@ -19561,6 +19758,7 @@ async function netHealthText (m, guildId, viewerId)      // ответ на /hea
         lines.push (/^  /.test (l) ? l : '• ' + l);
     lines.push ('• ' + voiceWatchLine (vlog.watch));
     lines.push ('• ' + gwHealthLine ());
+    for (const l of gwEventsLines (5)) lines.push (l);
     if (m)
     {
         const way = playWayShort (m, guildId);
@@ -21086,6 +21284,9 @@ const QUEUE_ACTIONS =
     [/^q:n:last:/, 'В конец ⏭'],
     [/^q:[pn]:/, 'листание очереди'],
     [/^q:rf:/, '🔄 Обновить'],
+    [/^q:hfa/, '👤 автор в истории'],
+    [/^q:hfp/, '⏱ период в истории'],
+    [/^q:hfm/, '🔎 поиск в истории'],
     [/^q:hg:first:/, '⏮ В начало (история)'],
     [/^q:hg:prev:/, '◀ Влево (история)'],
     [/^q:hg:next:/, 'Вправо ▶ (история)'],
@@ -21168,6 +21369,19 @@ client.on ('interactionCreate', async (interaction) =>
         const guildId = interaction.guildId;
         if (!(guildId in SERVERS)) return;
         logQueueAction (interaction, interaction.member ? uuu (interaction.member) : interaction.user.username);
+        // Окно поиска истории: слово и период. Условия складываются с уже выбранными автором и периодом.
+        const mHfmod = /^q:hfm(?::([a-z0-9]{4,12}))?$/.exec (interaction.customId || '');
+        if (mHfmod)
+        {
+            await historyLoad (guildId);
+            const oldF = mHfmod[1] ? historyFilterByToken (mHfmod[1]) : null;
+            const text = String (interaction.fields.getTextInputValue ('text') || '').trim ();
+            const days = Math.max (0, Math.min (3650,
+                parseInt (String (interaction.fields.getTextInputValue ('days') || '').replace (/\D+/g, ''), 10) || 0));
+            const f2 = historyFilterMake (guildId,
+                {text: text, userId: oldF ? oldF.userId : '', days: days});
+            return historyShowResult (interaction, guildId, 1, f2);
+        }
         if (/^q:skt:(\d+)$/.test (interaction.customId || ''))
         {
             const page0 = parseInt (/^q:skt:(\d+)$/.exec (interaction.customId)[1], 10) || 1;
@@ -21381,6 +21595,39 @@ client.on ('interactionCreate', async (interaction) =>
             return interaction.update
             ({ content: historyText (guildId, 1, null), components: historyComponents (guildId, 1, null),
                flags: MessageFlags.SuppressEmbeds });
+        }
+        // Списки фильтра: автор и период. Каждый меняет только своё условие, остальные остаются.
+        const mHfa = /^q:hfa(?::([a-z0-9]{4,12}))?$/.exec (cid);
+        if (mHfa)
+        {
+            await historyLoad (guildId);
+            const oldF = mHfa[1] ? historyFilterByToken (mHfa[1]) : null;
+            const v = String ((interaction.values || [])[0] || '');
+            const f2 = historyFilterMake (guildId,
+            {
+                text: oldF ? oldF.text : '',
+                userId: /^u:\d{17,20}$/.test (v) ? v.slice (2) : '',
+                days: oldF ? oldF.days : 0,
+            });
+            return historyShowResult (interaction, guildId, 1, f2);
+        }
+        const mHfp = /^q:hfp(?::([a-z0-9]{4,12}))?$/.exec (cid);
+        if (mHfp)
+        {
+            await historyLoad (guildId);
+            const oldF = mHfp[1] ? historyFilterByToken (mHfp[1]) : null;
+            const v = String ((interaction.values || [])[0] || '');
+            const days = /^p:(\d+)$/.test (v) ? Math.max (0, Math.min (3650, parseInt (v.slice (2), 10) || 0)) : 0;
+            const f2 = historyFilterMake (guildId,
+                {text: oldF ? oldF.text : '', userId: oldF ? oldF.userId : '', days: days});
+            return historyShowResult (interaction, guildId, 1, f2);
+        }
+        const mHfm = /^q:hfm(?::([a-z0-9]{4,12}))?$/.exec (cid);
+        if (mHfm)
+        {
+            await historyLoad (guildId);
+            const oldF = mHfm[1] ? historyFilterByToken (mHfm[1]) : null;
+            return interaction.showModal (historyFilterModal (oldF));
         }
         const mHi = /^q:hi(?::([a-z0-9]{4,12}))?$/.exec (cid);
         if (mHi)
