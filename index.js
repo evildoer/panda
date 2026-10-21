@@ -7143,8 +7143,10 @@ const QUEUE_CHECK_DEPTH = Math.max (0, Math.min (200,
 const QUEUE_CHECK_GAP_MS = Math.max (1000, Math.min (60000,
     Math.round (Number (MUSIC_CFG.queue_check_gap_ms === undefined ? 5000 : MUSIC_CFG.queue_check_gap_ms) || 5000)));
 const QUEUE_CHECK_STRICT = 3;
+// v2.184: по умолчанию держу максимум, который сам же разрешаю (200 пачек): меню «какую пачку раскрыть»
+// стало постраничным, а по трекам история и так ограничена 5000 -- историю снова не обрезает по 25.
 const MUSIC_HISTORY_LEN = Math.max (0, Math.min (200,
-    Math.round (Number (MUSIC_CFG.history_len === undefined ? 25 : MUSIC_CFG.history_len) || 0)));
+    Math.round (Number (MUSIC_CFG.history_len === undefined ? 200 : MUSIC_CFG.history_len) || 0)));
 // v2.182: по умолчанию 500 было мало: две пачки-плейлиста по 178 треков съедали 355 и следующее
 // добавление молча выкидывало всю остальную историю. v2.183: держу максимум, который сам же и
 // разрешаю (5000) -- история хранит только адреса и названия, показывается постранично, поэтому
@@ -13257,7 +13259,7 @@ function configCli ()
     row ('queue_check (заранее)', YN (MUSIC_QUEUE_CHECK), hasM ('queue_check') ? 'config.json' : 'по умолчанию (вкл)');
     row ('queue_check_depth', QUEUE_CHECK_DEPTH + ' треков (первые ' + QUEUE_CHECK_STRICT + ' -- yt-dlp)', hasM ('queue_check_depth') ? 'config.json' : 'по умолчанию (20)');
     row ('queue_check_gap_ms', QUEUE_CHECK_GAP_MS + ' мс', hasM ('queue_check_gap_ms') ? 'config.json' : 'по умолчанию (5000)');
-    row ('history_len', MUSIC_HISTORY_LEN + ' пачек', hasM ('history_len') ? 'config.json' : 'по умолчанию (25)');
+    row ('history_len', MUSIC_HISTORY_LEN + ' пачек', hasM ('history_len') ? 'config.json' : 'по умолчанию (200)');
     row ('history_tracks', MUSIC_HISTORY_TRACKS + ' треков', hasM ('history_tracks') ? 'config.json' : 'по умолчанию (5000)');
     row ('queue_live_ms', QUEUE_LIVE_MS ? QUEUE_LIVE_MS + ' мс (миллисекунды)' : '0 (сам не обновляю)', hasM ('queue_live_ms') ? 'config.json' : 'по умолчанию (30000)');
     row ('net_wait_ms', NET_WAIT_MS + ' мс (до ' + NET_WAIT_MAX_MS + ' мс)', hasM ('net_wait_ms') ? 'config.json' : 'по умолчанию (10000)');
@@ -16625,33 +16627,69 @@ function historySizeOf (e)
     return Math.max (Number (e && e.n) || 0, historyTitlesOf (e).length);
 }
 
+// Discord не принимает в списке больше 25 вариантов, поэтому меню «какую пачку раскрыть» листается
+// страницами: раньше в нём были только 25 самых свежих, и до состава более старых было не добраться.
 const HISTORY_PICK_COUNT = 25;
-function historyPickRows (list)
+function historyPickEntries (list)
 {
-    const opts = [], used = new Set ();
+    const out = [], used = new Set ();
     for (const e of (Array.isArray (list) ? list : []))
     {
-        if (opts.length >= HISTORY_PICK_COUNT) break;
         const at = String (Number (e && e.at) || 0);
         if (at === '0' || used.has (at)) continue;
         used.add (at);
+        out.push (e);
+    }
+    return out;
+}
+function historyPickPages (list)
+{
+    return Math.max (1, Math.ceil (historyPickEntries (list).length / HISTORY_PICK_COUNT));
+}
+function historyPickRows (list, page = 0)
+{
+    const entries = historyPickEntries (list);
+    const pages = Math.max (1, Math.ceil (entries.length / HISTORY_PICK_COUNT));
+    const p = Math.min (Math.max (0, Math.floor (Number (page) || 0)), pages - 1);
+    const opts = entries.slice (p * HISTORY_PICK_COUNT, (p + 1) * HISTORY_PICK_COUNT).map (e =>
+    {
         const n = historySizeOf (e);
         const opt =
         {
             label: (historyStamp (e.at) + ' · ' + (e.byName || 'без автора') + ' · ' + n + ' ' +
                 plural (n, 'трек', 'трека', 'треков')).slice (0, 100),
-            value: at,
+            value: String (Number (e.at) || 0),
         };
         if (e.q) opt.description = clipped ('запуск: ' + String (e.q), 90);
-        opts.push (opt);
-    }
+        return opt;
+    });
     if (!opts.length) return null;
+    const rows = [];
     const sel = new StringSelectMenuBuilder ()
-        .setCustomId ('q:hsel').setPlaceholder ('📜 Какую пачку раскрыть?');
+        .setCustomId ('q:hsel')
+        .setPlaceholder ('📜 Какую пачку раскрыть?' + (pages > 1 ? ' (стр. ' + (p + 1) + ' из ' + pages + ')' : ''));
     sel.addOptions (opts);
-    return [new ActionRowBuilder ().addComponents (sel),
-            new ActionRowBuilder ().addComponents
-            (new ButtonBuilder ().setCustomId ('q:hclose').setLabel ('✖ Закрыть').setStyle (ButtonStyle.Secondary))];
+    rows.push (new ActionRowBuilder ().addComponents (sel));
+    if (pages > 1)
+        rows.push (new ActionRowBuilder ().addComponents
+        (
+            new ButtonBuilder ().setCustomId ('q:hpk:' + (p - 1)).setLabel ('◀ Свежее')
+                .setStyle (ButtonStyle.Secondary).setDisabled (p <= 0),
+            new ButtonBuilder ().setCustomId ('q:hpk:' + (p + 1)).setLabel ('Старее ▶')
+                .setStyle (ButtonStyle.Secondary).setDisabled (p >= pages - 1)
+        ));
+    rows.push (new ActionRowBuilder ().addComponents
+        (new ButtonBuilder ().setCustomId ('q:hclose').setLabel ('✖ Закрыть').setStyle (ButtonStyle.Secondary)));
+    return rows;
+}
+function historyPickText (list, page = 0)
+{
+    const total = historyPickEntries (list).length;
+    const pages = Math.max (1, Math.ceil (total / HISTORY_PICK_COUNT));
+    const p = Math.min (Math.max (0, Math.floor (Number (page) || 0)), pages - 1);
+    return '📜 **Состав пачки** -- выбери, какую раскрыть (в истории ' + total + ' ' +
+        plural (total, 'запись', 'записи', 'записей') +
+        (pages > 1 ? ', страница ' + (p + 1) + ' из ' + pages : '') + '):';
 }
 function clipped (s, n = 90)
 {
@@ -20650,6 +20688,7 @@ const QUEUE_ACTIONS =
     [/^q:hg:last:/, 'В конец ⏭ (история)'],
     [/^q:hi$/, '📜 Все треки'],
     [/^q:hsel$/, '📜 Какую пачку раскрыть?'],
+    [/^q:hpk:/, '📜 страницы меню пачек'],
     [/^q:hp:/, '📜 листание состава пачки'],
     [/^q:hre:/, '▶ Поставить заново'],
     [/^q:hget$/, '⤓ Взять в очередь один трек'],
@@ -20928,16 +20967,28 @@ client.on ('interactionCreate', async (interaction) =>
         if (cid === 'q:hi')
         {
             await historyLoad (guildId);
-            const rows = historyPickRows (m.history);
+            const rows = historyPickRows (m.history, 0);
             if (!rows)
                 return interaction.reply
                 ({ content: '🕘 Раскрывать нечего -- истории добавлений пока нет.', flags: MessageFlags.Ephemeral });
             return interaction.reply
             ({
-                content: '📜 **Состав пачки** -- выбери, какую раскрыть (последние ' + m.history.length + '):',
+                content: historyPickText (m.history, 0),
                 components: rows,
                 flags: MessageFlags.Ephemeral,
             });
+        }
+        // Листание самого меню «какую пачку раскрыть»: в списке Discord помещается 25 вариантов, а в
+        // истории их может быть до 200 -- без этих кнопок старые пачки было не открыть.
+        const mHpk = /^q:hpk:(\d+)$/.exec (cid);
+        if (mHpk)
+        {
+            await historyLoad (guildId);
+            const page = parseInt (mHpk[1], 10) || 0;
+            const rows = historyPickRows (m.history, page);
+            if (!rows)
+                return interaction.update ({ content: '🕘 Раскрывать нечего -- истории добавлений пока нет.', components: [] });
+            return interaction.update ({ content: historyPickText (m.history, page), components: rows });
         }
         if (cid === 'q:hclose')
             return interaction.update ({ content: '✖ Закрыто.', components: [] });
