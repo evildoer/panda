@@ -306,6 +306,17 @@
 //    «заметил, но связь выправилась сама». В /health одна строка: переподключений за сутки и когда было
 //    последнее (с причиной), рядом -- сколько раз проходило само. Так видно, где настоящая беда, а где
 //    шум сети, и не надо читать журнал с начала. Записи переживают перезапуск бота (лежат в базе).
+// v2.178 -- живой случай 21.10: «зашёл в канал -- тишина, нажал /queue -- сразу заиграло». В логе за эти
+//    минуты НЕТ ни паузы, ни переподключения, ни оборванного потока: бот был уверен, что играет (плеер
+//    читал звук, медиа-пинг отвечал, сторожа молчали), а слушатели не слышали ничего -- ломается не
+//    музыка, а шифрование голоса (DAVE): сессия шифрования расходится с группой канала (кто-то зашёл или
+//    вышел, а смена ключей до бота не дошла) и сама не сходится, пока состав не сменится снова. Это
+//    известная беда @discordjs/voice 0.19.x (наша версия), и по состоянию плеера её не видно. Поэтому
+//    бот смотрит на саму сессию: ждёт смену ключей после каждой смены состава канала (не дошла за 12 с)
+//    и следит за её состоянием (смена ключей не завершилась, сессия не готова, шифрование снизилось) --
+//    и, если это не выправилось, пересобирает голосовое подключение сам, с того же места в треке.
+//    В /health видно, включено ли шифрование и когда последний раз менялись ключи, а пересборки
+//    попадают в тот же счёт сторожа, что и остальные настоящие беды (шум -- отдельно).
 // v2.124 -- запасной путь: YouTube недоступен -- трек играет со своей копии (проигранное остаётся на диске), в лог идёт путь; об обрыве и возвращении бот говорит в текстовый канал
 // v2.134 -- беда видна до обрыва: пока музыка играет, бот сам меряет медиа-путь голоса (шлёт медиа-адресу служебный udp-пинг и ждёт ответ тем же числом) и, если ответы пропали или пинг вырос, пишет владельцу лично и переподключается сам с того же места (не чаще раза в 10 минут и не больше трёх раз за беду); в журнал идут только смены состояния, а /health стал личной командой владельца и отвечает тайно -- там адреса прокси и обхода
 // v2.125 -- запас вперёд: пока играет музыка, бот сам догружает на диск очередь (по одному треку, до 20 вперёд) -- один трек это один файл, дважды одно и то же не качается; место кончилось -- первым уходит давно проигранное, а то, что впереди, в последнюю очередь; `node . cache` говорит, чего ещё не хватает
@@ -4812,6 +4823,7 @@ client.on ('voiceStateUpdate', async (oldState, newState) =>
         }
         scheduleVoiceStatus (server);
         checkListeners (server);
+        daveWatchMembers (server, oldState, newState);   // смена состава: жду смену ключей шифрования
         await modNick
         (
             server, newState.member
@@ -11066,6 +11078,12 @@ function musicOf (guildId)
             lastErrorAt: 0,
             playerWired: false,
             streamHandle: null,
+            daveWant: 0,                 // жду смену ключей шифрования: когда в канале сменился состав
+            daveWantWhy: '',
+            daveKeyAt: 0,                // когда последний раз ключи шифрования действительно менялись
+            daveBad: null,               // сбой шифрования: { why, at, healed }
+            daveHealAt: 0,
+            daveWarnAt: 0,
             guildId: guildId,
             history: null,
             historyFromDb: false,
@@ -14945,6 +14963,239 @@ const mediaWatchTick = setInterval
 );
 if (mediaWatchTick.unref) mediaWatchTick.unref ();
 
+// Шифрование голоса (DAVE): та самая тишина, которую не видно по плееру.
+// Живой случай 21.10 -- музыка шла, плеер читал звук, сторож медиа-пути молчал, а слушатели не слышали
+// ничего; в логе ни паузы, ни переподключения, ни зависания потока (нажатие /queue к звуку отношения не
+// имеет -- оно только читает очередь). Так ломается шифрование: сессия расходится с группой канала на
+// смене состава (кто-то зашёл/вышел) и сама не сходится, пока состав не сменится снова.
+const DAVE_WATCH_STEP_MS = 5000;
+const DAVE_KEY_WAIT_MS = 12000;           // смена состава -> жду от Discord смену ключей столько
+const DAVE_TROUBLE_MS = 15000;            // столько держится сбой шифрования -- уже не мелочь
+const DAVE_HEAL_GAP_MS = 10 * 60 * 1000;  // пересобираю подключение не чаще раза в 10 минут
+const DAVE_WARN_GAP_MS = 30 * 60 * 1000;  // письмо владельцу -- не чаще раза в 30 минут
+
+function daveSessionOf (m)
+{
+    try
+    {
+        const st = m && m.connection && m.connection.state &&
+            m.connection.state.networking && m.connection.state.networking.state;
+        return (st && st.dave) || null;
+    }
+    catch (e) { return null; }
+}
+
+// Что не так с шифрованием: пустая строка -- всё в порядке.
+function daveTroubleOf (dave)
+{
+    if (!dave) return '';
+    let proto = 0, pending = 0, reinit = false, degraded = false, ready = true;
+    try { proto = Number (dave.protocolVersion) || 0; } catch (e) { }
+    try { pending = (dave.pendingTransitions && dave.pendingTransitions.size) || 0; } catch (e) { }
+    try { reinit = !!dave.reinitializing; } catch (e) { }
+    try { degraded = !!dave.downgraded; } catch (e) { }
+    try { if (dave.session) ready = !!dave.session.ready; } catch (e) { }
+    if (degraded) return 'шифрование голоса снизилось до обычного';
+    if (!proto) return '';                 // канал без шифрования -- смотреть нечего
+    if (reinit) return 'шифрование голоса пересобирается и не может';
+    if (pending) return 'смена ключей шифрования не завершилась';
+    if (!ready) return 'сессия шифрования голоса не готова';
+    return '';
+}
+
+// Решение сторожа шифрования: причина (null -- всё в порядке) и сколько она должна продержаться.
+// Смену ключей после смены состава я уже подождал (keyWaitMs), а состояние сессии видно прямо сейчас.
+// seen = { wantAt: когда заметил смену состава, wantWhy: кто именно, keyAt: когда ключи менялись }
+function daveTroubleAt (dave, seen, now, keyWaitMs)
+{
+    const st = daveTroubleOf (dave);
+    if (st) return { why: st, wait: DAVE_TROUBLE_MS };
+    const wantAt = Number (seen && seen.wantAt) || 0;
+    const keyAt = Number (seen && seen.keyAt) || 0;
+    if (wantAt && (now - wantAt) >= keyWaitMs && keyAt < wantAt)
+        return {
+            why: 'смена ключей шифрования не дошла до бота (' + ((seen && seen.wantWhy) || 'в канале сменился состав') + ')',
+            wait: 0,
+        };
+    return null;
+}
+
+// Смена состава в комнате, где играет музыка: Discord присылает вместе с ней смену ключей шифрования.
+// Если она до бота не дойдёт, музыка будет идти в тишину -- поэтому запоминаю саму смену, а сторож
+// шифрования сверит, пришли ли ключи.
+function daveWatchMembers (server, oldState, newState)
+{
+    const m = $music[server];
+    if (!m || !m.connection || !m.current || m.pausedByNobody || m.leaving) return;
+    const chId = (m.connection.joinConfig && m.connection.joinConfig.channelId) || m.savedChannelId;
+    if (!chId) return;
+    const was = oldState.channelId === chId, nowHere = newState.channelId === chId;
+    if (was === nowHere) return;                     // смена мимо нашей комнаты
+    if (newState.id === client.user.id) return;      // сам бот -- не в счёт
+    const guild = newState.guild || oldState.guild;
+    if (voiceIsBot (guild, newState) || voiceIsBot (guild, oldState)) return;
+    m.daveWant = Date.now ();
+    m.daveWantWhy = nowHere ? 'в канал зашёл слушатель' : 'из канала ушёл слушатель';
+}
+
+// Служебные строки самой библиотеки: только они говорят правду о шифровании (плееру это не видно).
+function daveWireDebug (m)
+{
+    const c = m && m.connection;
+    if (!c || c.__pandaDave) return;
+    c.__pandaDave = true;
+    c.on ('debug', msg =>
+    {
+        const line = String (msg || '');
+        if (line.indexOf ('[DAVE]') < 0) return;     // WS и UDP не нужны: они шумят на каждый пакет
+        try
+        {
+            const what = line.replace (/^\[NW\]\s*/, '').replace (/^\[DAVE\]\s*/, '').slice (0, 120);
+            if (!m.daveSaid)                    // одна строка на подключение: видно, что шифрование под присмотром
+            {
+                m.daveSaid = 1;
+                const ver = /protocol version (\d+)/.exec (what);
+                let proto = ver ? Number (ver[1]) : 0;
+                if (!ver)
+                {
+                    try { proto = Number (daveSessionOf (m).protocolVersion) || 0; } catch (e) { proto = 0; }
+                }
+                if (proto)
+                    console.log ('[' + (d()) + '] [music] шифрование голоса: включено (DAVE v' + proto +
+                        ') -- ключи меняются вместе с составом канала, за этим слежу; когда менялись -- видно в /health');
+                else
+                    console.log ('[' + (d()) + '] [music] шифрование голоса: выключено (канал без шифрования)');
+            }
+            if (/MLS (commit|welcome) processed|Transition executed|Preparing for epoch/.test (what))
+            {
+                m.daveKeyAt = Date.now ();
+                m.daveKeyWhat = what;
+                return;
+            }
+            if (/MLS (commit|welcome) errored|Invalidating transition|Session downgraded|No session available/.test (what))
+            {
+                m.daveKeyAt = 0;
+                m.daveBadWhat = what;
+                console.error ('[' + (d()) + '] [music] шифрование голоса: ' + what);
+            }
+        }
+        catch (e) { }
+    });
+}
+
+// Пересборка голосового подключения: выйти и войти заново -- это и есть новое рукопожатие шифрования.
+// Место в треке и очередь помню (destroyMusic кладёт текущий трек в seekTrack), в счёт обрывов не пишу:
+// сеть тут ни при чём.
+function daveRejoin (g, why, now)
+{
+    const m = $music[g];
+    if (!m || !m.connection) return false;
+    const chId = (m.connection.joinConfig && m.connection.joinConfig.channelId) || m.savedChannelId;
+    const ch = chId ? client.channels.cache.get (chId) : null;
+    const guild = (ch && ch.guild) || client.guilds.cache.get (g);
+    const track = m.seekTrack || m.current || null;
+    const atSec = Math.round (playedMsOf (m) / 1000);
+    console.error ('[' + (d()) + '] [music] ' + why + ' -- играю, а слушатели могут не слышать: ' +
+        'пересобираю голосовое подключение сам' +
+        (track ? ' («' + (track.title || 'трек') + '»' + (atSec ? ' с ' + fmtDur (atSec) : '') + ')' : '') +
+        ' -- очередь и место в треке целы');
+    m.daveWant = 0;
+    m.daveWantWhy = '';
+    m.daveBad = null;
+    m.daveKeyAt = 0;
+    if (!m.daveWarnAt || (now - m.daveWarnAt) >= DAVE_WARN_GAP_MS)
+    {
+        m.daveWarnAt = now;
+        notifyHoster ('🔐 **Шифрование голоса сбилось** (' + why + ').\n' +
+            'Музыка шла, а в канале могла быть тишина: плеер считает, что всё в порядке, а слушатели не слышат -- ' +
+            'так ломается шифрование голоса, когда в канале меняется состав.\n' +
+            'Пересобрал голосовое подключение сам' + (atSec ? ', продолжаю с ' + fmtDur (atSec) : '') +
+            ' -- очередь и счёт целы.\n_Если так бывает часто -- это известная беда библиотеки голоса 0.19.x, её лечит обновление._')
+            .catch (() => { });
+    }
+    try { destroyMusic (g, {}); }
+    catch (e) { console.error ('[music] шифрование голоса: выйти не вышло: ' + oneLine ((e && e.message) || e)); }
+    if (ch && guild)
+    {
+        try { startRestored (g, ch, guild); }
+        catch (e) { console.error ('[music] шифрование голоса: войти заново не вышло: ' + oneLine ((e && e.message) || e)); }
+    }
+    if (!m.connection)
+    {
+        // войти не вышло: не притворяюсь, что всё хорошо -- вернусь сам, когда связь ответит
+        m.leftByUser = false;
+        m.pending = true;
+        m.netWait = { tries: 0, at: Date.now (), rejoinAt: 0, rejoinLogged: false,
+                      lastWhy: 'голос: не поднялся после пересборки шифрования' };
+        console.error ('[' + (d()) + '] [music] шифрование голоса: войти заново не вышло -- вернусь сам, ' +
+            'как только связь ответит (место в треке и очередь помню)');
+    }
+    return true;
+}
+
+// Строка о шифровании голоса в /health: та тишина, которую не видно по плееру.
+function daveHealthLine (m, now = Date.now ())
+{
+    if (!m || !m.connection) return '';
+    const dave = daveSessionOf (m);
+    if (!dave) return '🔐 Шифрование голоса: не включено (канал без шифрования)';
+    let proto = 0, degraded = false, ready = true;
+    try { proto = Number (dave.protocolVersion) || 0; } catch (e) { }
+    try { degraded = !!dave.downgraded; } catch (e) { }
+    try { if (dave.session) ready = !!dave.session.ready; } catch (e) { }
+    if (degraded) return '⚠️ Шифрование голоса: сбилось (снизилось до обычного) -- пересоберу подключение сам';
+    if (!proto) return '🔐 Шифрование голоса: не включено (канал без шифрования)';
+    const trouble = daveTroubleAt (dave, { wantAt: m.daveWant, wantWhy: m.daveWantWhy, keyAt: m.daveKeyAt },
+        now, DAVE_KEY_WAIT_MS);
+    if (trouble)
+        return '⚠️ Шифрование голоса: ' + trouble.why + ' -- музыка идёт, а слушатели могут не слышать; ' +
+            'если не выправится, пересоберу подключение сам';
+    return '🔐 Шифрование голоса: включено (DAVE v' + proto + ')' +
+        (m.daveKeyAt ? ', ключи менялись ' + fmtAgo (now - m.daveKeyAt) + ' назад' : ', ключи ещё не менялись') +
+        (ready ? ' -- сессия в порядке' : ' -- сессия не готова');
+}
+
+function daveWatchRun (now)
+{
+    for (const g of Object.keys ($music))
+    {
+        const m = $music[g];
+        if (!m) continue;
+        const live = !!(m.connection && m.current && !m.pausedByNobody && !m.leaving && !voiceRealBusy);
+        if (!live) { m.daveBad = null; continue; }
+        const st = m.connection.state;
+        if (!st || st.status !== VoiceConnectionStatus.Ready) { m.daveBad = null; continue; }
+        const seen = { wantAt: m.daveWant, wantWhy: m.daveWantWhy, keyAt: m.daveKeyAt };
+        const trouble = daveTroubleAt (daveSessionOf (m), seen, now, DAVE_KEY_WAIT_MS);
+        if (!trouble)
+        {
+            if (m.daveBad && !m.daveBad.healed && (now - m.daveBad.at) >= DAVE_TROUBLE_MS)
+                voiceWatchNote ('noise', m.daveBad.why);      // сбилось и само выправилось
+            m.daveBad = null;
+            continue;
+        }
+        if (!m.daveBad || m.daveBad.why !== trouble.why)
+            m.daveBad = { why: trouble.why, at: now, healed: false };
+        if ((now - m.daveBad.at) < trouble.wait) continue;
+        if ((now - (m.daveHealAt || 0)) < DAVE_HEAL_GAP_MS) continue;
+        m.daveHealAt = now;
+        m.daveBad.healed = true;
+        voiceWatchNote ('heal', trouble.why);                 // в /health: настоящая беда, а не шум
+        daveRejoin (g, trouble.why, now);
+    }
+}
+
+const daveWatchTick = setInterval
+(
+    () =>
+    {
+        try { daveWatchRun (Date.now ()); }
+        catch (e) { console.error ('[music] сторож шифрования голоса: ' + oneLine ((e && e.message) || e)); }
+    },
+    DAVE_WATCH_STEP_MS
+);
+if (daveWatchTick.unref) daveWatchTick.unref ();
+
 let $exiting = false;
 async function saveAllMusic ()
 {
@@ -18753,6 +19004,11 @@ async function netHealthText (m, guildId, viewerId)      // ответ на /hea
                     (m.vprobe && m.vprobe.trouble ? '; голосовой канал нездоров (сторож заметил) -- вот-вот может оборваться' :
                         '; медиа-путь сейчас не измерен (замеряю сам, пока играет музыка)')) +
                 (owner ? ' -- кнопка ниже проверит его по-настоящему' : ''));
+        if (m.connection)
+        {
+            const daveLine = daveHealthLine (m);
+            if (daveLine) lines.push (daveLine);
+        }
         if (owner && m.vprobe)
         {
             const my = m.vprobe;
@@ -18911,6 +19167,9 @@ async function musicHealthCommand (interaction)
         hText += '\n_Кнопки про обход делают то, где нужны права: Windows спросит разрешение' +
             (hr.canStart ? '; «поднять» вернёт сохранённую стратегию за пару секунд, «подобрать» -- переберёт все (на это время обход останавливается)' : ', на время подбора обход останавливается') + '._';
     }
+    // Ответ не должен падать из-за лимита Discord (2000): отчёт растёт с каждой новой строкой
+    // (шифрование голоса, маршруты, запасные пути) -- режу по границе строки, а не получаю 400.
+    hText = fitMsgText (hText, DISCORD_CONTENT_MAX - 10);
     return interaction.editReply (rows.length ? { content: hText, components: rows } : { content: hText });
 }
 
@@ -19494,6 +19753,7 @@ function joinVoiceNow (guildId, voiceChannel, guild, reason = '')
                 guildId: guildId,
                 adapterCreator: guild.voiceAdapterCreator,
                 selfDeaf: false,
+                debug: true,          // нужны только строки [DAVE]: по ним видно, пришли ли ключи шифрования
             }
         );
         console.log ('[' + (d()) + '] [music] подключился к «' + voiceChannel.name + '»');
@@ -19591,6 +19851,13 @@ function joinVoiceNow (guildId, voiceChannel, guild, reason = '')
             m.player.on ('error', e => console.error ('[music] ошибка плеера: ' + oneLine (e.message)));
         }
         m.connection.subscribe (m.player);
+        m.daveWant = 0;
+        m.daveWantWhy = '';
+        m.daveBad = null;
+        m.daveKeyAt = 0;
+        m.daveSaid = 0;
+        daveWireDebug (m);                    // слушаю строки библиотеки о шифровании (только [DAVE])
+
         m.connection.on (VoiceConnectionStatus.Disconnected, async (oldState, newState) =>
         {
             const closeCode = (newState && typeof newState.closeCode === 'number') ? newState.closeCode : 0;
