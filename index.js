@@ -7146,10 +7146,11 @@ const QUEUE_CHECK_STRICT = 3;
 const MUSIC_HISTORY_LEN = Math.max (0, Math.min (200,
     Math.round (Number (MUSIC_CFG.history_len === undefined ? 25 : MUSIC_CFG.history_len) || 0)));
 // v2.182: по умолчанию 500 было мало: две пачки-плейлиста по 178 треков съедали 355 и следующее
-// добавление молча выкидывало всю остальную историю. Теперь 2000 (и не меньше 8 свежих пачек
-// остаются даже при превышении -- см. historyTrim).
+// добавление молча выкидывало всю остальную историю. v2.183: держу максимум, который сам же и
+// разрешаю (5000) -- история хранит только адреса и названия, показывается постранично, поэтому
+// лимит Discord тут ни при чём; и не меньше 8 свежих пачек остаются даже при превышении.
 const MUSIC_HISTORY_TRACKS = Math.max (0, Math.min (5000,
-    Math.round (Number (MUSIC_CFG.history_tracks === undefined ? 2000 : MUSIC_CFG.history_tracks) || 0)));
+    Math.round (Number (MUSIC_CFG.history_tracks === undefined ? 5000 : MUSIC_CFG.history_tracks) || 0)));
 // v2.155: сколько треков из плейлиста брать за один заход. Раньше здесь стояло ЖЁСТКОЕ slice(0, 50), и владелец
 // упирался в него на живом плейлисте из 177 треков: yt-dlp отдаёт список ЦЕЛИКОМ одним ответом (то есть запрос
 // и так уже сделан), а в очередь попадали первые 50 -- и ни слова о том, что список урезан. Предел всё же нужен:
@@ -13257,7 +13258,7 @@ function configCli ()
     row ('queue_check_depth', QUEUE_CHECK_DEPTH + ' треков (первые ' + QUEUE_CHECK_STRICT + ' -- yt-dlp)', hasM ('queue_check_depth') ? 'config.json' : 'по умолчанию (20)');
     row ('queue_check_gap_ms', QUEUE_CHECK_GAP_MS + ' мс', hasM ('queue_check_gap_ms') ? 'config.json' : 'по умолчанию (5000)');
     row ('history_len', MUSIC_HISTORY_LEN + ' пачек', hasM ('history_len') ? 'config.json' : 'по умолчанию (25)');
-    row ('history_tracks', MUSIC_HISTORY_TRACKS + ' треков', hasM ('history_tracks') ? 'config.json' : 'по умолчанию (2000)');
+    row ('history_tracks', MUSIC_HISTORY_TRACKS + ' треков', hasM ('history_tracks') ? 'config.json' : 'по умолчанию (5000)');
     row ('queue_live_ms', QUEUE_LIVE_MS ? QUEUE_LIVE_MS + ' мс (миллисекунды)' : '0 (сам не обновляю)', hasM ('queue_live_ms') ? 'config.json' : 'по умолчанию (30000)');
     row ('net_wait_ms', NET_WAIT_MS + ' мс (до ' + NET_WAIT_MAX_MS + ' мс)', hasM ('net_wait_ms') ? 'config.json' : 'по умолчанию (10000)');
 
