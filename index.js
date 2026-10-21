@@ -655,6 +655,86 @@ function crashReport (kind, e, note)
     return path;
 }
 
+// v2.187 -- владелец должен узнавать о сбое сам. При автоматическом подъёме после падения шлём короткое
+// письмо «упал и поднялся» -- с причиной, временем и тем, что сохранилось; инструкция тут не нужна и шла бы
+// пачкой при частых сбоях (она по-прежнему приходит при обычном запуске).
+function crashPosText (sec)
+{
+    const t = Math.max (0, Math.round (Number (sec) || 0));
+    const h = Math.floor (t / 3600), m = Math.floor ((t % 3600) / 60), s = t % 60;
+    const two = n => String (n).padStart (2, '0');
+    return (h ? h + ':' + two (m) + ':' + two (s) : m + ':' + two (s));
+}
+function lastCrashInfo (maxAgeMs = 30 * 60 * 1000, minAt = 0)
+{
+    try
+    {
+        let best = null;
+        for (const f of fsLog.readdirSync (LOG_DIR))
+        {
+            if (!/^crash-.*\.txt$/.test (f)) continue;
+            const p = pathMod.join (LOG_DIR, f);
+            let st = null;
+            try { st = fsLog.statSync (p); } catch (e) { continue; }
+            if (!st || (Date.now () - st.mtimeMs) > maxAgeMs) continue;
+            if (minAt && st.mtimeMs < minAt) continue;      // отчёт от прошлой жизни бота -- не наш
+            if (!best || st.mtimeMs > best.mtimeMs) best = {file: f, path: p, at: st.mtimeMs};
+        }
+        if (!best) return null;
+        const head = String (fsLog.readFileSync (best.path, 'utf8')).split ('\n').slice (0, 10);
+        const get = (name) =>
+        {
+            const l = head.find (x => x.indexOf (name) === 0);
+            return l ? l.slice (name.length).trim () : '';
+        };
+        return {file: best.file, at: best.at, kind: get ('что:'), reason: get ('причина:'), when: get ('когда:')};
+    }
+    catch (e) { return null; }
+}
+async function sendCrashNotice (server)
+{
+    if (!STARTUP_DMS.length) return 0;
+    // Только отчёт ЭТОГО падения: файл, написанный до старта процесса, -- от прошлой жизни (иначе после
+    // перезапуска можно было бы прислать причину вчерашнего сбоя).
+    const bootAt = Date.now () - Math.round (process.uptime () * 1000) - 5000;
+    const info = lastCrashInfo (30 * 60 * 1000, bootAt);
+    let saved = null;
+    try { saved = await db (server, 'musicState', 'queue'); } catch (e) { }
+    const tracks = (saved && Array.isArray (saved.tracks)) ? saved.tracks.length : 0;
+    const cur = (saved && saved.current && (saved.current.title || saved.current.url)) || '';
+    const at = saved ? Math.max (0, Math.round (saved.elapsed || 0)) : 0;
+    const lines = ['⚠️ **Бот упал и поднялся сам**'];
+    if (info)
+    {
+        lines.push ('Причина: `' + oneLine (info.reason || 'не записана', 160) + '`' + wsQuietHint (info.reason || ''));
+        if (info.when) lines.push ('Когда: ' + info.when);
+        if (info.kind && info.kind !== 'uncaughtException') lines.push ('Что: ' + info.kind);
+    }
+    else
+        lines.push ('Отчёта о сбое нет: процесс сняли жёстко, поэтому точной причины не знаю.');
+    lines.push (cur || tracks
+        ? 'На момент сбоя: в очереди ' + tracks + ' ' + plural (tracks, 'трек', 'трека', 'треков') +
+            (cur ? ', играл «' + oneLine (cur, 70) + '»' + (at ? ' с ' + crashPosText (at) : '') : '')
+        : 'На момент сбоя очередь была пуста.');
+    lines.push ('Очередь и место в треке не пострадали -- музыку продолжаю сам.' +
+        (info ? '\nОтчёт: `logs/' + info.file + '`' : '') +
+        '\n_Это письмо приходит только после настоящего сбоя; при обычном запуске вместо него -- инструкция._');
+    const text = lines.join ('\n');
+    let sent = 0;
+    for (const uid of STARTUP_DMS)
+    {
+        try
+        {
+            const user = await client.users.fetch (uid);
+            await user.send (text);
+            sent++;
+            console.log ('[' + (d()) + '] [crash] письмо о сбое отправлено ' + uid);
+        }
+        catch (e) { console.error ('[' + (d()) + '] [crash] письмо о сбое не ушло ' + uid + ': ' + oneLine ((e && e.message) || e, 100)); }
+    }
+    return sent;
+}
+
 function crashIncident (kind, e, note)
 {
     $crashCount++;
@@ -1981,6 +2061,8 @@ client.on ('error', e =>
 // ставлю на ws постоянного слушателя: ошибка уходит одной строкой в лог, а не в uncaughtException.
 const WS_QUIET_REPEAT_MS = 10 * 60 * 1000;
 let $wsQuietAt = 0;              // когда последний раз сокет пожаловался без слушателя
+let $wsQuietTotal = 0;           // сколько таких ошибок было за запуск (для /health)
+let $netCrashN = 0;              // сколько сетевых сбоев пережили на уровне процесса (для /health)
 let $wsQuietN = 0;               // сколько таких же повторов я не печатал
 let $wsQuietKey = '';
 let $wsQuietLoggedAt = 0;
@@ -2003,6 +2085,7 @@ function wsQuietNote (e)
     const now = Date.now ();
     const key = String (msg).replace (/\d+/g, '#');
     $wsQuietAt = now;
+    $wsQuietTotal++;
     if (key === $wsQuietKey && (now - $wsQuietLoggedAt) < WS_QUIET_REPEAT_MS) { $wsQuietN++; return; }
     const tail = $wsQuietN > 0
         ? ' (такая же приходила ещё ' + $wsQuietN + ' ' + plural ($wsQuietN, 'раз', 'раза', 'раз') + ' -- больше не повторяю)'
@@ -3064,6 +3147,8 @@ process.on ('uncaughtException',  e =>
         // Сеть, а не бот: выходить и дёргать супервизор незачем (музыка, очередь и база целы), а отчёт о
         // сбое тут был бы ложной тревогой -- пишу причину и живу дальше.
         $wsQuietAt = Date.now ();
+        $wsQuietTotal++;
+        $netCrashN++;
         console.error ('[' + (d()) + '] [gw] это сбой связи, а не поломка бота -- продолжаю работу' +
             (/^Unexpected server response: 5\d\d/i.test (String ((e && e.message) || e))
                 ? ' (Cloudflare не смог договориться с Discord при рукопожатии: 5xx -- сеть или шлюз)'
@@ -3435,8 +3520,11 @@ client.on
             console.log ('[' + (d()) + '] [gw] страховка сокета включена: ошибка соединения без слушателя попадёт в лог,' +
                 ' а не в падение процесса');
         if (BOOT_AFTER_CRASH)
+        {
             console.log ('[' + (d()) + '] [bot] меня подняли после сбоя (' + (SUPERVISED ? 'супервизор' : 'как обычно') +
-                ') -- стартовую инструкцию в личку не шлю: она уже есть, а письма на каждый перезапуск выглядели как спам');
+                ') -- вместо инструкции шлю владельцу короткое письмо о сбое: причина, время и что сохранено');
+            await sendCrashNotice (Object.keys (SERVERS)[0]);
+        }
         else
         for (const uid of STARTUP_DMS)
         {
@@ -19441,6 +19529,29 @@ function voiceWatchLine (watch, now = Date.now ())
         '\n_Переподключение -- настоящая беда; «прошло само» -- связь выправилась без него, это шум сети._';
 }
 
+// v2.187 -- короткая строка про связь с Discord: сколько раз она пропадала за запуск, сколько раз сокет
+// жалуется без слушателя, и когда был последний настоящий сбой бота. Это те числа, по которым видно, что
+// проблема повторяется, -- без чтения лога.
+function gwHealthLine ()
+{
+    const bits = [$gwDrops ? 'обрывов за запуск: ' + $gwDrops : 'обрывов за запуск не было'];
+    if ($wsQuietTotal)
+        bits.push ('ошибок сокета: ' + $wsQuietTotal +
+            ($wsQuietAt ? ', последняя ' + fmtAgo (Date.now () - $wsQuietAt) + ' назад' : '') +
+            ' -- пережиты без перезапуска' +
+            ($netCrashN ? ', сетевых сбоев уровня процесса: ' + $netCrashN : ''));
+    else if ($netCrashN)
+        bits.push ('сетевых сбоев уровня процесса: ' + $netCrashN + ' -- пережиты без перезапуска');
+    if ($gwRelogins)
+        bits.push ('подключение поднимал сам: ' + $gwRelogins + ' ' + plural ($gwRelogins, 'раз', 'раза', 'раз'));
+    const last = lastCrashInfo (7 * 24 * 60 * 60 * 1000);
+    bits.push (last
+        ? 'последний сбой бота: ' + (last.when || new Date (last.at).toLocaleString ()) +
+          ' (' + oneLine (last.reason || 'без причины', 60) + ')' + (BOOT_AFTER_CRASH ? ' -- поднялся сам' : '')
+        : 'сбоев бота в отчётах нет (последние 7 дней)');
+    return '📡 Связь Discord: ' + bits.join ('; ');
+}
+
 async function netHealthText (m, guildId, viewerId)      // ответ на /health: как живёт связь и чем идёт звук
 {
     const owner = isBotOwner (viewerId);
@@ -19449,6 +19560,7 @@ async function netHealthText (m, guildId, viewerId)      // ответ на /hea
     for (const l of await netVoiceLines (vlog))
         lines.push (/^  /.test (l) ? l : '• ' + l);
     lines.push ('• ' + voiceWatchLine (vlog.watch));
+    lines.push ('• ' + gwHealthLine ());
     if (m)
     {
         const way = playWayShort (m, guildId);
@@ -20196,6 +20308,77 @@ function schedulePresence (immediate = false)
     $presenceTimer = setTimeout (() => { $presenceTimer = null; writePresence (); }, wait);
 }
 
+// v2.187 -- вход в голосовой канал возможен только при живом gateway. Раньше бот звал joinVoiceChannel сразу
+// после перезапуска, когда шарда ещё не было, и получал RangeError «Shard 0 not found» прямо из недр
+// библиотеки (в живом логе 21.10 в 04:03 именно это и случилось -- очередь и музыка были целы, упал только
+// сам вызов). Теперь такой вход откладывается до готовности связи, а не падает.
+function gwShardOf (guild)
+{
+    try
+    {
+        const shards = (client.ws && client.ws.shards) ? client.ws.shards : null;
+        if (!shards) return null;
+        const id = (guild && typeof guild.shardId === 'number') ? guild.shardId : 0;
+        return (typeof shards.get === 'function') ? (shards.get (id) || null) : (shards[id] || null);
+    }
+    catch (e) { return null; }
+}
+function gwStateWords ()
+{
+    const st = (client.ws && typeof client.ws.status === 'number') ? client.ws.status : -1;
+    return WS_STATUS[st] || String (st);
+}
+function gwVoiceReady (guild)
+{
+    try
+    {
+        if (!client.isReady ()) return false;
+        if (client.ws && typeof client.ws.status === 'number' && client.ws.status !== 0) return false;
+        const shard = gwShardOf (guild);
+        if (!shard) return false;
+        return (typeof shard.status !== 'number') || shard.status === 0;
+    }
+    catch (e) { return false; }
+}
+const $voiceJoinLater = new Map ();          // guildId -> таймер отложенного входа
+const VOICE_JOIN_WAIT_MS = 3000;             // как часто пробую снова
+const VOICE_JOIN_TRIES = 40;                 // 40 x 3 с = 2 минуты; дольше -- только лог (вернусь при следующем событии)
+function voiceJoinLater (guildId, voiceChannel, guild, reason, tries = 0)
+{
+    if ($voiceJoinLater.has (guildId)) return;
+    const m = musicOf (guildId);
+    if (m.connection || m.leftByUser || m.leaving) return;
+    if (tries && !gwVoiceReady (guild) && tries >= VOICE_JOIN_TRIES)
+    {
+        console.log ('[' + (d()) + '] [music] в голосовой так и не вошёл: gateway не готов (' + gwStateWords () +
+            ') больше 2 мин -- очередь и место в треке целы, войду при следующем событии');
+        return;
+    }
+    const t = setTimeout (() =>
+    {
+        $voiceJoinLater.delete (guildId);
+        const mm = musicOf (guildId);
+        if (mm.connection || mm.leftByUser || mm.leaving) return;
+        if (!gwVoiceReady (guild))
+        {
+            if (!tries)
+                console.log ('[' + (d()) + '] [music] вход в голосовой отложен: gateway ещё не готов (' +
+                    gwStateWords () + ') -- подключусь, как только связь вернётся (музыка и очередь целы)');
+            voiceJoinLater (guildId, voiceChannel, guild, reason, tries + 1);
+            return;
+        }
+        try { joinVoice (guildId, voiceChannel, guild, reason); }
+        catch (e)
+        {
+            console.error ('[' + (d()) + '] [music] войти в голосовой не вышло: ' + oneLine ((e && e.message) || e, 120) +
+                ' -- очередь и место в треке целы, попробую позже');
+            if (tries < 5) voiceJoinLater (guildId, voiceChannel, guild, reason, tries + 1);
+        }
+    }, VOICE_JOIN_WAIT_MS);
+    $voiceJoinLater.set (guildId, t);
+    if (typeof t.unref === 'function') t.unref ();
+}
+
 function joinVoice (guildId, voiceChannel, guild, reason = '')
 {
     const m = joinVoiceNow (guildId, voiceChannel, guild, reason);
@@ -20210,16 +20393,32 @@ function joinVoiceNow (guildId, voiceChannel, guild, reason = '')
     m.justJoinedAt = Date.now ();
     if (!m.connection)
     {
-        m.connection = joinVoiceChannel
-        (
-            {
-                channelId: voiceChannel.id,
-                guildId: guildId,
-                adapterCreator: guild.voiceAdapterCreator,
-                selfDeaf: false,
-                debug: true,          // нужны только строки [DAVE]: по ним видно, пришли ли ключи шифрования
-            }
-        );
+        if (!gwVoiceReady (guild))
+        {
+            voiceJoinLater (guildId, voiceChannel, guild, reason);
+            return m;
+        }
+        try
+        {
+            m.connection = joinVoiceChannel
+            (
+                {
+                    channelId: voiceChannel.id,
+                    guildId: guildId,
+                    adapterCreator: guild.voiceAdapterCreator,
+                    selfDeaf: false,
+                    debug: true,          // нужны только строки [DAVE]: по ним видно, пришли ли ключи шифрования
+                }
+            );
+        }
+        catch (e)
+        {
+            m.connection = null;
+            console.error ('[' + (d()) + '] [music] войти в голосовой не вышло: ' + oneLine ((e && e.message) || e, 120) +
+                ' -- очередь и место в треке целы, попробую позже');
+            voiceJoinLater (guildId, voiceChannel, guild, reason);
+            return m;
+        }
         console.log ('[' + (d()) + '] [music] подключился к «' + voiceChannel.name + '»');
         m.since = Date.now ();
         m.leaving = false;

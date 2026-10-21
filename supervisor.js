@@ -232,7 +232,7 @@ function start (afterCrash)
     if (stopping) return;        // сигнал пришёл, пока ждали паузу между перезапусками -- бота не поднимаю
     startedAt = Date.now ();
     log ('запускаю бота: ' + botCommandLine () + ' (через cmd, супервизор: pid ' + process.pid + ')' +
-        (afterCrash ? ' -- после сбоя, стартовую инструкцию он не шлёт' : ''));
+        (afterCrash ? ' -- после сбоя: вместо инструкции он шлёт владельцу короткое письмо о сбое' : ''));
     const childEnv = Object.assign ({}, process.env, {PANDAMIA_SUPERVISOR: '1'});
     if (afterCrash) childEnv.PANDAMIA_RESTART_AFTER_CRASH = '1';
     else delete childEnv.PANDAMIA_RESTART_AFTER_CRASH;   // чужое значение из окружения не должно врать боту
