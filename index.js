@@ -15031,11 +15031,17 @@ function daveWatchMembers (server, oldState, newState)
     if (!chId) return;
     const was = oldState.channelId === chId, nowHere = newState.channelId === chId;
     if (was === nowHere) return;                     // смена мимо нашей комнаты
+    // Жду смену ключей только на ВХОД человека: зашедшего Discord обязан добавить в группу канала
+    // (без этого он не расшифрует ни звука), поэтому если ключи не пришли -- это точно потеря.
+    // На выход ключей может не быть вовсе (человек в группу не входил, если только слушал), и живой
+    // прогон 21.10 это показал: уход единственного слушателя ключей не принёс, а сторож зря пересобрал
+    // подключение (в логе даже мелькнуло «бота выкинули», хотя никто его не выкидывал).
+    if (!nowHere) return;
     if (newState.id === client.user.id) return;      // сам бот -- не в счёт
     const guild = newState.guild || oldState.guild;
     if (voiceIsBot (guild, newState) || voiceIsBot (guild, oldState)) return;
     m.daveWant = Date.now ();
-    m.daveWantWhy = nowHere ? 'в канал зашёл слушатель' : 'из канала ушёл слушатель';
+    m.daveWantWhy = 'в канал зашёл слушатель';
 }
 
 // Служебные строки самой библиотеки: только они говорят правду о шифровании (плееру это не видно).
@@ -15119,6 +15125,14 @@ function daveRejoin (g, why, now)
     {
         try { startRestored (g, ch, guild); }
         catch (e) { console.error ('[music] шифрование голоса: войти заново не вышло: ' + oneLine ((e && e.message) || e)); }
+    }
+    if (m.connection)
+    {
+        // свой выход-вход не должен выглядеть как «бота выкинули»: событие об этом приходит уже ПОСЛЕ
+        // нового входа (joinVoiceNow сбрасывает selfLeftAt), поэтому ставлю отметку заново -- обработчик
+        // голосовых состояний видит её и молчит (в живом прогоне 21.10 на пересборке мелькнуло ложное
+        // «бота выключили/выкинули из голосового канала»).
+        m.selfLeftAt = Date.now ();
     }
     if (!m.connection)
     {
