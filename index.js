@@ -15089,6 +15089,186 @@ function daveWireDebug (m)
     });
 }
 
+// Настоящая проверка шифрования -- не по строкам библиотеки, а по двум вещам, которые видно на месте:
+//   1) что реально лежит в группе ключей (участники и эпоха) против того, кто реально в канале: человек
+//      в канале, но не в группе ключей, не расшифрует ни одного кадра;
+//   2) что реально уходит в эфир: каждый кадр плеера проходит через DAVESession.encrypt, и в пасстхру
+//      библиотека отдаёт его КАК ЕСТЬ -- такие кадры слушатели выбрасывают, это и есть тишина.
+const DAVE_PLAIN_TROUBLE_MS = 15000;   // столько подряд открытых кадров = уже точно тишина, а не окно смены ключей
+
+// Что сейчас в группе ключей: готовность, эпоха, участники (members = null -- сессия не отвечает).
+function daveGroupOf (dave)
+{
+    const out = { ready: false, epoch: -1, members: null };
+    try
+    {
+        const s = dave && dave.session;
+        if (!s) return out;
+        // каждое поле читаю отдельно: сломанное свойство одного не должно ослепить остальные
+        try { out.ready = !!s.ready; } catch (e) { out.ready = false; }
+        try
+        {
+            const e = s.epoch;
+            out.epoch = (e === null || e === undefined) ? -1 : Number (e);
+        }
+        catch (e) { }
+        try
+        {
+            if (typeof s.getUserIds === 'function')
+            {
+                const ids = s.getUserIds ();
+                if (Array.isArray (ids)) out.members = ids.map (String);
+            }
+        }
+        catch (e) { }
+    }
+    catch (e) { }
+    return out;
+}
+
+// Люди в нашей комнате (боты не в счёт): их и должна знать группа ключей.
+function daveRoomPeople (m)
+{
+    const chId = (m && m.connection && m.connection.joinConfig && m.connection.joinConfig.channelId) ||
+        (m && m.savedChannelId);
+    if (!chId) return [];
+    let ch = null;
+    try { ch = client.channels.cache.get (chId) || null; } catch (e) { ch = null; }
+    if (!ch) return [];
+    const out = [];
+    try
+    {
+        const people = (ch.members && typeof ch.members.values === 'function') ? ch.members :
+            ((ch.guild && ch.guild.voiceStates && ch.guild.voiceStates.cache) || null);
+        if (!people) return out;
+        for (const who of people.values ())
+        {
+            const u = (who && who.user) || who;
+            if (!u || !u.id || u.bot) continue;                 // боты не слушают -- их в группе может и не быть
+            const id = String (u.id);
+            if (client.user && id === String (client.user.id)) continue;
+            out.push (id);
+        }
+    }
+    catch (e) { return out; }
+    return out;
+}
+
+// Кто в канале, но не в группе ключей: этот человек не расшифрует ни одного кадра.
+// null -- проверить нельзя (группа не отвечает или в комнате никого); [] -- все на месте.
+function daveMissingPeople (m)
+{
+    const dave = daveSessionOf (m);
+    if (!dave) return null;
+    const grp = daveGroupOf (dave);
+    if (!grp.members || !grp.members.length) return null;
+    const room = daveRoomPeople (m);
+    if (!room.length) return [];
+    const has = new Set (grp.members);
+    return room.filter (id => !has.has (id));
+}
+
+// Тишину-кадр (f8 ff fe) библиотека не шифрует по замыслу -- её не считаю.
+function daveSilenceFrame (p)
+{
+    return !!p && p.length === 3 && p[0] === 0xf8 && p[1] === 0xff && p[2] === 0xfe;
+}
+
+// Сторож на самом пути отправки: считаю кадры, которые ушли ОТКРЫТЫМИ в канал с шифрованием, и говорю
+// об этом сразу -- с этого кадра слушатели слышат тишину, а плеер и сеть при этом в полном порядке.
+function daveGuardWire (m)
+{
+    const dave = daveSessionOf (m);
+    if (!dave || typeof dave.encrypt !== 'function' || dave.__pandaGuard) return;
+    dave.__pandaGuard = true;
+    if (typeof m.daveFrames !== 'number') m.daveFrames = 0;
+    if (typeof m.daveSentPlain !== 'number') m.daveSentPlain = 0;
+    const enc = dave.encrypt;
+    dave.encrypt = function (packet)
+    {
+        let out;
+        try { out = enc.call (dave, packet); }
+        catch (e)
+        {
+            m.daveEncErr = oneLine ((e && e.message) || e);
+            throw e;
+        }
+        try
+        {
+            let proto = 0;
+            try { proto = Number (dave.protocolVersion) || 0; } catch (e) { proto = 0; }
+            if (!proto || daveSilenceFrame (packet)) return out;      // шифрование не нужно (или это тишина)
+            m.daveFrames = (m.daveFrames || 0) + 1;
+            // в пасстхру библиотека отдаёт тот же кадр; MLS-шифр всегда длиннее и другой
+            const plain = !Buffer.isBuffer (out) || out === packet ||
+                (out.length === packet.length && out.equals (packet));
+            const now = Date.now ();
+            if (plain)
+            {
+                m.davePlainFrames = (m.davePlainFrames || 0) + 1;
+                m.daveSentPlain = (m.daveSentPlain || 0) + 1;
+                if (!m.davePlainSince)
+                {
+                    m.davePlainSince = now;
+                    const bad = daveTroubleOf (dave) || 'сессия шифрования не готова';
+                    console.error ('[' + (d()) + '] [music] шифрование голоса: звук пошёл БЕЗ шифрования (' + bad +
+                        ') -- слушатели такой кадр не расшифруют, для них это тишина');
+                }
+                return out;
+            }
+            if (m.davePlainSince)
+            {
+                const forMs = Math.max (1, now - m.davePlainSince);
+                console.log ('[' + (d()) + '] [music] шифрование голоса: вернулось -- ' + (m.davePlainFrames || 0) +
+                    ' кадров за ' + Math.max (1, Math.round (forMs / 1000)) + ' с уходили открытым текстом' +
+                    (forMs >= DAVE_TROUBLE_MS ? ' (для слушателей это была тишина)' : ' (успело само, без пересборки)'));
+                m.davePlainSince = 0;
+                m.davePlainFrames = 0;
+            }
+            if (!m.daveFrameSaid)
+            {
+                m.daveFrameSaid = 1;                                  // одна строка на подключение
+                const grp = daveGroupOf (dave);
+                console.log ('[' + (d()) + '] [music] шифрование голоса: кадры уходят зашифрованными' +
+                    (grp.members ? ' (группа ключей: ' + grp.members.length + ', в канале: ' + daveRoomPeople (m).length + ')' : '') +
+                    ' -- проверяю каждый кадр');
+            }
+            return out;
+        }
+        catch (e) { return out; }
+    };
+}
+
+// Проверка «прямо сейчас, перед отправкой»: что уйдёт слушателям и смогут ли они это взять.
+// Формат как у daveTroubleAt: wait -- сколько причина должна продержаться, прежде чем лечить.
+function daveSendTrouble (m, now)
+{
+    const dave = daveSessionOf (m);
+    if (!dave) return null;
+    let proto = 0;
+    try { proto = Number (dave.protocolVersion) || 0; } catch (e) { return null; }
+    if (!proto) return null;
+
+    // 1) кадры уходят открытыми подряд: смена ключей бывает короткой, а вот 15 секунд тишины -- уже беда
+    const since = Number (m.davePlainSince) || 0;
+    if (since)
+    {
+        if ((now - since) < DAVE_PLAIN_TROUBLE_MS) return null;
+        return { why: 'звук уходит без шифрования (' + (m.davePlainFrames || 0) +
+            ' кадров подряд) -- слушатели его не расшифруют', wait: 0 };
+    }
+
+    // 2) человек в канале, а в группе ключей его нет -- он не расшифрует ничего
+    const missing = daveMissingPeople (m);
+    if (!missing || !missing.length) { m.daveMissingAt = 0; return null; }
+    if (!m.daveMissingAt) m.daveMissingAt = now;            // заметил впервые -- даю ключам дойти
+    if ((now - m.daveMissingAt) < DAVE_KEY_WAIT_MS) return null;
+    const grp = daveGroupOf (dave);
+    return { why: 'в канале ' + daveRoomPeople (m).length + ' человек, а в группе ключей ' +
+        ((grp.members && grp.members.length) || 0) + ' -- в группе нет: ' + missing.slice (0, 3).join (', '),
+        wait: 0 };
+}
+
 // Пересборка голосового подключения: выйти и войти заново -- это и есть новое рукопожатие шифрования.
 // Место в треке и очередь помню (destroyMusic кладёт текущий трек в seekTrack), в счёт обрывов не пишу:
 // сеть тут ни при чём.
@@ -15109,6 +15289,10 @@ function daveRejoin (g, why, now)
     m.daveWantWhy = '';
     m.daveBad = null;
     m.daveKeyAt = 0;
+    m.davePlainSince = 0;                    // новое подключение -- новый счёт открытых кадров
+    m.davePlainFrames = 0;
+    m.daveMissingAt = 0;
+    m.daveFrameSaid = 0;
     if (!m.daveWarnAt || (now - m.daveWarnAt) >= DAVE_WARN_GAP_MS)
     {
         m.daveWarnAt = now;
@@ -15160,13 +15344,19 @@ function daveHealthLine (m, now = Date.now ())
     if (degraded) return '⚠️ Шифрование голоса: сбилось (снизилось до обычного) -- пересоберу подключение сам';
     if (!proto) return '🔐 Шифрование голоса: не включено (канал без шифрования)';
     const trouble = daveTroubleAt (dave, { wantAt: m.daveWant, wantWhy: m.daveWantWhy, keyAt: m.daveKeyAt },
-        now, DAVE_KEY_WAIT_MS);
+        now, DAVE_KEY_WAIT_MS) || daveSendTrouble (m, now);
     if (trouble)
         return '⚠️ Шифрование голоса: ' + trouble.why + ' -- музыка идёт, а слушатели могут не слышать; ' +
             'если не выправится, пересоберу подключение сам';
+    const grp = daveGroupOf (dave);
     return '🔐 Шифрование голоса: включено (DAVE v' + proto + ')' +
         (m.daveKeyAt ? ', ключи менялись ' + fmtAgo (now - m.daveKeyAt) + ' назад' : ', ключи ещё не менялись') +
-        (ready ? ' -- сессия в порядке' : ' -- сессия не готова');
+        (ready ? ' -- сессия в порядке' : ' -- сессия не готова') +
+        (grp.members ? '; группа ключей: ' + grp.members.length +
+            (grp.epoch >= 0 ? ' (epoch ' + grp.epoch + ')' : '') +
+            ', в канале: ' + daveRoomPeople (m).length : '') +
+        (m.daveFrames ? '; кадров отправлено: ' + m.daveFrames +
+            ' (открытых: ' + (m.daveSentPlain || 0) + ')' : '');
 }
 
 function daveWatchRun (now)
@@ -15176,11 +15366,21 @@ function daveWatchRun (now)
         const m = $music[g];
         if (!m) continue;
         const live = !!(m.connection && m.current && !m.pausedByNobody && !m.leaving && !voiceRealBusy);
-        if (!live) { m.daveBad = null; continue; }
+        if (!live)
+        {
+            // звук не идёт -- счёт открытых кадров и расхождений не коплю через паузу
+            m.daveBad = null;
+            m.davePlainSince = 0;
+            m.davePlainFrames = 0;
+            m.daveMissingAt = 0;
+            continue;
+        }
         const st = m.connection.state;
         if (!st || st.status !== VoiceConnectionStatus.Ready) { m.daveBad = null; continue; }
+        daveGuardWire (m);                                    // сторож на пути отправки (идемпотентно)
         const seen = { wantAt: m.daveWant, wantWhy: m.daveWantWhy, keyAt: m.daveKeyAt };
-        const trouble = daveTroubleAt (daveSessionOf (m), seen, now, DAVE_KEY_WAIT_MS);
+        const trouble = daveTroubleAt (daveSessionOf (m), seen, now, DAVE_KEY_WAIT_MS) ||
+            daveSendTrouble (m, now);
         if (!trouble)
         {
             if (m.daveBad && !m.daveBad.healed && (now - m.daveBad.at) >= DAVE_TROUBLE_MS)
@@ -19870,7 +20070,14 @@ function joinVoiceNow (guildId, voiceChannel, guild, reason = '')
         m.daveBad = null;
         m.daveKeyAt = 0;
         m.daveSaid = 0;
+        m.daveFrames = 0;
+        m.daveSentPlain = 0;
+        m.davePlainSince = 0;
+        m.davePlainFrames = 0;
+        m.daveMissingAt = 0;
+        m.daveFrameSaid = 0;
         daveWireDebug (m);                    // слушаю строки библиотеки о шифровании (только [DAVE])
+        daveGuardWire (m);                    // и смотрю на каждый уходящий кадр: зашифрован ли он
 
         m.connection.on (VoiceConnectionStatus.Disconnected, async (oldState, newState) =>
         {
