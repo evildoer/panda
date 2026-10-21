@@ -387,6 +387,9 @@ const space = ' ';
 
 const BOT_RUN = process.argv.slice (2).length === 0;
 const SUPERVISED = BOT_RUN && process.env.PANDAMIA_SUPERVISOR === '1';   // нас запустил supervisor.js: он поднимет после падения
+// v2.186 -- нянька говорит, что поднимает нас после сбоя. Тогда стартовую инструкцию в личку не шлю: это не
+// новость, а след перезапуска (при частых падениях такие письма шли пачкой и выглядели как спам).
+const BOOT_AFTER_CRASH = BOT_RUN && process.env.PANDAMIA_RESTART_AFTER_CRASH === '1';
 let actAsSupervisor = false;   // v2.160: процесс сам поднял супервизор и бота ребёнком -- значит, это нянька, а не бот
                                // (тогда аварийный отчёт о сбое не пишу: его напишет сам бот, иначе на каждый выход няньки был бы лишний файл)
 const utilMod = require ('util');
@@ -1941,6 +1944,9 @@ function gwErrHint (msg)
     if (/ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test (msg))
         return ' -- имя Discord не переводится в адрес: обычный (нешифрованный) справочник имён молчит.' +
             ' Бот повторит сам; если повторяется часто -- смотри VPN и обход DPI';
+    if (/Unexpected server response: 5\d\d/i.test (msg))
+        return ' -- шлюз ответил ошибкой Cloudflare (5xx): не сошлось рукопожатие, это сеть или сам шлюз,' +
+            ' а не поломка бота; переподключится сам';
     if (/timed out|timeout|ETIMEDOUT|ECONNRESET|ECONNREFUSED/i.test (msg))
         return ' -- Discord не отвечает в срок: похоже на сеть или обход DPI';
     return '';
@@ -1966,6 +1972,81 @@ client.on ('error', e =>
 {
     console.error ('[' + gwWhen (Date.now ()) + '] [gw] ошибка клиента: ' + oneLine ((e && e.message) || e));
 });
+
+// v2.186 -- «тихая» ошибка сокета не должна ронять бота. ws выбрасывает 'error' обычным emit: если в этот
+// момент слушателей нет, Node считает это необработанным исключением, и под супервизором бот выходит --
+// так и случилось 21.10 в 16:41: при переподключении к gateway Discord ответил 525, а discord.js к этому
+// моменту уже снял свой обработчик с этого сокета (при закрытии шарда он делает connection.onerror = null).
+// Поломки в боте тут нет: очередь, музыка и база целы, а соединение всё равно поднимается заново. Поэтому
+// ставлю на ws постоянного слушателя: ошибка уходит одной строкой в лог, а не в uncaughtException.
+const WS_QUIET_REPEAT_MS = 10 * 60 * 1000;
+let $wsQuietAt = 0;              // когда последний раз сокет пожаловался без слушателя
+let $wsQuietN = 0;               // сколько таких же повторов я не печатал
+let $wsQuietKey = '';
+let $wsQuietLoggedAt = 0;
+function wsQuietHint (msg)
+{
+    if (/^Unexpected server response: 5\d\d/i.test (msg))
+        return ' -- так отвечает Cloudflare на рукопожатие (5xx: у него не сошлось с Discord): это сеть или шлюз,' +
+            ' а не поломка бота';
+    if (/Opening handshake has timed out/i.test (msg))
+        return ' -- Discord не ответил на рукопожатие в срок: сеть';
+    if (/ECONNRESET|EPIPE|socket hang up|closed before the connection was established/i.test (msg))
+        return ' -- соединение оборвалось на полуслове: сеть';
+    if (/ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test (msg))
+        return ' -- имя Discord не переводится в адрес: справочник имён молчит';
+    return '';
+}
+function wsQuietNote (e)
+{
+    const msg = oneLine ((e && e.message) || e, 200);
+    const now = Date.now ();
+    const key = String (msg).replace (/\d+/g, '#');
+    $wsQuietAt = now;
+    if (key === $wsQuietKey && (now - $wsQuietLoggedAt) < WS_QUIET_REPEAT_MS) { $wsQuietN++; return; }
+    const tail = $wsQuietN > 0
+        ? ' (такая же приходила ещё ' + $wsQuietN + ' ' + plural ($wsQuietN, 'раз', 'раза', 'раз') + ' -- больше не повторяю)'
+        : '';
+    $wsQuietN = 0;
+    $wsQuietKey = key;
+    $wsQuietLoggedAt = now;
+    console.error ('[' + gwWhen (now) + '] [gw] сокет: ошибка без слушателя -- «' + msg + '»' + wsQuietHint (msg) + tail +
+        '; бот из-за этого не падает -- соединение поднимется само');
+}
+function wsQuietInstall ()
+{
+    let WS = null;
+    try { WS = require ('ws'); } catch (e) { return false; }
+    if (!WS || !WS.prototype || WS.__pandamiaQuiet) return false;
+    const origEmit = WS.prototype.emit;
+    WS.prototype.emit = function (type, ...args)
+    {
+        if (type === 'error' && this.listenerCount ('error') === 0)
+        {
+            try { wsQuietNote (args[0]); } catch (e) { }
+            return false;
+        }
+        return origEmit.apply (this, [type, ...args]);
+    };
+    WS.__pandamiaQuiet = true;
+    return true;
+}
+const WS_QUIET_ON = wsQuietInstall ();
+
+// Сбой связи не должен считаться поломкой бота. Такие ошибки приходят из сети (и из ws), состояние бота
+// при них целое: очередь, музыка, база. Поэтому процесс по ним не выходит, а пишет строку и живёт дальше;
+// если после этого gateway не вернулся в строй, его поднимет сторож ниже.
+function crashIsNetwork (e)
+{
+    if (!e) return false;
+    const code = String ((e && e.code) || '');
+    if (/^(ECONNRESET|EPIPE|ETIMEDOUT|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|EAI_AGAIN|ENOTFOUND)$/.test (code)) return true;
+    const msg = String ((e && e.message) || e);
+    if (/^Unexpected server response: \d{3}\b/i.test (msg)) return true;
+    if (/Opening handshake has timed out|Invalid Upgrade header|socket hang up|closed before the connection was established/i.test (msg)) return true;
+    if (/\b(ECONNRESET|EPIPE|ETIMEDOUT|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|EAI_AGAIN|ENOTFOUND)\b/.test (msg)) return true;
+    return false;
+}
 
 function forceRelogin (why)
 {
@@ -2009,6 +2090,25 @@ setInterval (() =>
     const _st = (client.ws && typeof client.ws.status === 'number') ? client.ws.status : -1;
     const _why = gwShouldRelogin (_gap, _st, $gwReloginning);
     if (_why) forceRelogin (_why);
+}, 30000);
+
+// v2.186 -- сторож «тихих» ошибок сокета: если после такой ошибки discord.js посчитал шард живым, а на деле
+// связи нет (событие обрыва не пришло), бот молчал бы, продолжая играть музыку. Поэтому смотрю на состояние
+// gateway: не «готов» дольше 90 с после ошибки сокета -- поднимаю подключение тем же путём, что и обычный сторож.
+let $gwNotReadySince = 0;
+const GW_STALE_AFTER_MS = 90 * 1000;
+setInterval (() =>
+{
+    if (!$bootOnce || $gwReloginning) return;
+    const _st = (client.ws && typeof client.ws.status === 'number') ? client.ws.status : -1;
+    if (_st === 0) { $gwNotReadySince = 0; $wsQuietAt = 0; return; }
+    if (!$wsQuietAt || (Date.now () - $wsQuietAt) > 15 * 60 * 1000) { $gwNotReadySince = 0; return; }
+    if (!$gwNotReadySince) { $gwNotReadySince = Date.now (); return; }
+    const _stale = Date.now () - $gwNotReadySince;
+    if (_stale < GW_STALE_AFTER_MS) return;
+    $gwNotReadySince = 0;
+    $wsQuietAt = 0;
+    forceRelogin ('gateway не встал за ' + fmtAgo (_stale) + ' после ошибки сокета, состояние: ' + (WS_STATUS[_st] || _st));
 }, 30000);
 
 function dbFileOf (_srv)   { return __dirname + '/' + _srv + '.sqlite'; }
@@ -2959,6 +3059,18 @@ process.on ('unhandledRejection', e =>
 process.on ('uncaughtException',  e =>
 {
     console.error ('[' + (d()) + '] [uncaughtException] '  + String ((e && e.message) || e).slice (0, 300));
+    if (crashIsNetwork (e))
+    {
+        // Сеть, а не бот: выходить и дёргать супервизор незачем (музыка, очередь и база целы), а отчёт о
+        // сбое тут был бы ложной тревогой -- пишу причину и живу дальше.
+        $wsQuietAt = Date.now ();
+        console.error ('[' + (d()) + '] [gw] это сбой связи, а не поломка бота -- продолжаю работу' +
+            (/^Unexpected server response: 5\d\d/i.test (String ((e && e.message) || e))
+                ? ' (Cloudflare не смог договориться с Discord при рукопожатии: 5xx -- сеть или шлюз)'
+                : '') +
+            '; если связь не вернётся сама, сторож поднимет подключение');
+        return;
+    }
     const p = crashIncident ('uncaughtException', e,
         SUPERVISED ? 'сохраняю очередь и выхожу, чтобы супервизор поднял бота заново'
                    : 'бот продолжает работу -- сработала страховка уровня процесса');
@@ -3319,6 +3431,13 @@ client.on
                 ? 'включено -- ' + MUSIC_NORMALIZE_FILTER
                 : (MUSIC_NORMALIZE ? 'НЕДОСТУПНО (ffmpeg не осилил фильтр) -- играю как есть' : 'выключено в конфиге')));
         schedulePresence (true);
+        if (WS_QUIET_ON)
+            console.log ('[' + (d()) + '] [gw] страховка сокета включена: ошибка соединения без слушателя попадёт в лог,' +
+                ' а не в падение процесса');
+        if (BOOT_AFTER_CRASH)
+            console.log ('[' + (d()) + '] [bot] меня подняли после сбоя (' + (SUPERVISED ? 'супервизор' : 'как обычно') +
+                ') -- стартовую инструкцию в личку не шлю: она уже есть, а письма на каждый перезапуск выглядели как спам');
+        else
         for (const uid of STARTUP_DMS)
         {
             await client.users.fetch (uid)

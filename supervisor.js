@@ -225,18 +225,24 @@ let stopping = false;
 let startedAt = 0;
 const crashes = [];
 
-function start ()
+// v2.186 -- afterCrash: бота поднимаю после падения, а не впервые. Бот по этой метке не шлёт стартовую
+// инструкцию в личку (иначе при частых перезапусках она приходила пачкой и выглядела как спам).
+function start (afterCrash)
 {
     if (stopping) return;        // сигнал пришёл, пока ждали паузу между перезапусками -- бота не поднимаю
     startedAt = Date.now ();
-    log ('запускаю бота: ' + botCommandLine () + ' (через cmd, супервизор: pid ' + process.pid + ')');
+    log ('запускаю бота: ' + botCommandLine () + ' (через cmd, супервизор: pid ' + process.pid + ')' +
+        (afterCrash ? ' -- после сбоя, стартовую инструкцию он не шлёт' : ''));
+    const childEnv = Object.assign ({}, process.env, {PANDAMIA_SUPERVISOR: '1'});
+    if (afterCrash) childEnv.PANDAMIA_RESTART_AFTER_CRASH = '1';
+    else delete childEnv.PANDAMIA_RESTART_AFTER_CRASH;   // чужое значение из окружения не должно врать боту
     child = spawn (COMSPEC, ['/d', '/s', '/c', '"' + botCommandLine () + '"'],
     {
         cwd: __dirname,
         stdio: 'inherit',
         // v2.164: кавычки расставляю сам (windowsVerbatimArguments), иначе cmd разберёт строку по-своему
         windowsVerbatimArguments: true,
-        env: Object.assign ({}, process.env, {PANDAMIA_SUPERVISOR: '1'}),
+        env: childEnv,
     });
     child.on ('error', e =>
     {
@@ -277,7 +283,7 @@ function restartAfterCrash ()
     }
     const wait = BACKOFF_MS[Math.min (crashes.length - 1, BACKOFF_MS.length - 1)];
     log ('подниму через ' + Math.round (wait / 1000) + ' с (падение ' + crashes.length + ' из ' + RESTART_LIMIT + ')');
-    setTimeout (start, wait);
+    setTimeout (() => start (true), wait);
 }
 
 // v2.166 -- «приёмыш»: бот уже играет, а няньки у него нет (её сняли жёстко, окно закрыли или бота
@@ -362,4 +368,4 @@ log ('PANDAMIA супервизор: держу бота запущенным. C
 log ('правило: упадёт бот -- подниму его сам (паузы 2, 5, 15, 30, 60 с); закроют вручную (код 0) -- не поднимаю; меня снимут грубо -- бот доиграет без присмотра, а следующий `node .` вернёт меня к нему (остановить: `node . stop`).');
 const liveBot = botLockPid ();
 if (liveBot) adoptBot (liveBot);
-else start ();
+else start (false);
