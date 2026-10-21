@@ -16,8 +16,11 @@
   ],
   "author": "",
   "license": "ISC",
+  "engines": {
+    "node": ">=24.17.0"
+  },
   "dependencies": {
-    "@discordjs/voice": "^0.19.2",
+    "@discordjs/voice": "1.0.0-dev.1792497873-5050a3b54",
     "@keyv/sqlite": "^4.0.8",
     "discord.js": "^14.27.0",
     "ffmpeg-static": "^5.3.0",
