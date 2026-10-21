@@ -16442,37 +16442,105 @@ function historySrcText (e)
     return '';
 }
 
+// Одинаковые записи больше не склеиваю: раньше две подряд одинаковые ссылки (один и тот же плейлист
+// или одна и та же песня) становились одной строкой с «×N», и владелец попросил так не делать --
+// одинаковые строки и так видно, а «×N» теряет восприятие: когда именно ставили, уже не понятно.
+// Теперь каждое добавление -- своя строка со своим временем.
 function historyBlocksOf (list)
 {
-    const blocks = [];
-    for (const e of (Array.isArray (list) ? list : []))
-    {
-        const key = String (e.q || (Array.isArray (e.urls) ? e.urls[0] : '') || '').trim ();
-        const last = blocks[blocks.length - 1];
-        if (last && key && last.key === key) { last.times++; last.to = Number (e.at) || 0; continue; }
-        blocks.push ({ key: key, at: Number (e.at) || 0, times: 1, e: e });
-    }
-    return blocks;
+    return (Array.isArray (list) ? list : []).map (e =>
+    ({
+        key: String (e.q || (Array.isArray (e.urls) ? e.urls[0] : '') || '').trim (),
+        at: Number (e.at) || 0,
+        times: 1,
+        e: e,
+    }));
 }
 function historyPagesOf (list)
 {
     return Math.max (1, Math.ceil (historyBlocksOf (list).length / HISTORY_PAGE_BLOCKS));
 }
 
-function historyText (guildId, page = 1)
+// Фильтры истории: поиск по тексту, по тому, кто поставил, и по последним N дням. Сами условия
+// живут в памяти под коротким кодом, и код едет в кнопках листания -- поэтому фильтр не слетает,
+// когда листаешь страницы (а в id кнопки не лезут адреса и русские слова).
+const HISTORY_VIEW_TTL_MS = 6 * 60 * 60 * 1000;
+const $historyViews = new Map ();
+function historyViewClean (now)
+{
+    for (const [k, v] of $historyViews) if (!v || (now - v.at) > HISTORY_VIEW_TTL_MS) $historyViews.delete (k);
+    while ($historyViews.size > 300) $historyViews.delete ($historyViews.keys ().next ().value);
+}
+function historyFilterMake (guildId, opts = {})
+{
+    const text = String (opts.text || '').trim ().slice (0, 100);
+    const userId = /^\d{17,20}$/.test (String (opts.userId || '')) ? String (opts.userId) : '';
+    const days = Math.max (0, Math.min (3650, Math.round (Number (opts.days) || 0)));
+    if (!text && !userId && !days) return null;
+    const now = Date.now ();
+    historyViewClean (now);
+    let code = '';
+    while (!code || $historyViews.has (code)) code = Math.random ().toString (36).slice (2, 8);
+    $historyViews.set (code, { at: now, guildId: String (guildId), text: text, userId: userId, days: days });
+    return { text: text, userId: userId, days: days, token: code };
+}
+function historyFilterByToken (code)
+{
+    const f = code ? $historyViews.get (String (code)) : null;
+    if (!f || (Date.now () - f.at) > HISTORY_VIEW_TTL_MS) return null;
+    return { text: f.text, userId: f.userId, days: f.days, token: String (code) };
+}
+function historyMatchEntry (e, f)
+{
+    if (!f) return true;
+    if (f.days && (Number (e && e.at) || 0) < Date.now () - f.days * 86400000) return false;
+    if (f.userId && String ((e && e.byId) || '') !== f.userId) return false;
+    if (f.text)
+    {
+        const hay = [(e && e.q) || '', (e && e.byName) || '']
+            .concat (Array.isArray (e && e.titles) ? e.titles : [])
+            .concat (Array.isArray (e && e.urls) ? e.urls : [])
+            .concat (Array.isArray (e && e.ids) ? e.ids : [])
+            .join (' ').toLowerCase ();
+        if (hay.indexOf (f.text.toLowerCase ()) < 0) return false;
+    }
+    return true;
+}
+function historyFiltered (list, f)
+{
+    if (!f) return Array.isArray (list) ? list : [];
+    return (Array.isArray (list) ? list : []).filter (e => historyMatchEntry (e, f));
+}
+function historyFilterLine (f, found)
+{
+    if (!f) return '';
+    const parts = [];
+    if (f.text) parts.push ('«' + f.text + '»');
+    if (f.userId) parts.push ('автор: <@' + f.userId + '>');
+    if (f.days) parts.push ('за ' + f.days + ' ' + plural (f.days, 'день', 'дня', 'дней'));
+    return '🔎 Фильтр: ' + parts.join (' · ') + ' -- нашлось ' + found + ' ' +
+        plural (found, 'запись', 'записи', 'записей');
+}
+
+function historyText (guildId, page = 1, f = null)
 {
     const m = musicOf (guildId);
-    const list = Array.isArray (m.history) ? m.history : [];
+    const all = Array.isArray (m.history) ? m.history : [];
+    const list = historyFiltered (all, f);
     const two = n => String (n).padStart (2, '0');
     const stamp = t => { const x = new Date (t); return two (x.getDate ()) + '.' + two (x.getMonth () + 1) +
         ' ' + two (x.getHours ()) + ':' + two (x.getMinutes ()); };
     if (!MUSIC_HISTORY_LEN)
         return '🕘 История добавлений сейчас выключена -- веду только очередь.\n_' +
             'Включить её может владелец бота._';
-    if (!list.length)
+    if (!all.length)
         return '🕘 Истории добавлений пока нет -- её начнут писать новые `/play`.\n_' +
             'Помню последние ' + MUSIC_HISTORY_LEN + ' ' + plural (MUSIC_HISTORY_LEN, 'пачку', 'пачки', 'пачек') +
             '; очередь -- отдельно: `/queue`._';
+    if (!list.length)
+        return '🕘 ' + historyFilterLine (f, 0) + '.\n_' +
+            'Попробуй другое слово, другого автора или больше дней. Сбросить -- кнопкой ниже ' +
+            'или `/history` без условий._';
     const blocks = historyBlocksOf (list);
     const pages = Math.max (1, Math.ceil (blocks.length / HISTORY_PAGE_BLOCKS));
     const cur = Math.min (Math.max (1, Math.floor (Number (page) || 1)), pages);
@@ -16486,10 +16554,9 @@ function historyText (guildId, page = 1)
         (packs ? packs + ' ' + plural (packs, 'пачка', 'пачки', 'пачек') : 'пачек нет') +
         (singles ? ' + ' + singles + ' ' + plural (singles, 'одиночный трек', 'одиночных трека', 'одиночных треков') : '') +
         ', всего ' + sum + ' ' + plural (sum, 'трек', 'трека', 'треков') +
-        (pages > 1 ? ' -- страница ' + cur + ' из ' + pages : '') + ':\n' + QSEP;
-    const withX = slice.some (b => b.times > 1);
+        (pages > 1 ? ' -- страница ' + cur + ' из ' + pages : '') + ':\n' +
+        (f ? historyFilterLine (f, list.length) + '\n' : '') + QSEP;
     const tail = '\n' + QSEP + '\n_Строка -- одна пачка: время, ссылка и первые треки списком.' +
-        (withX ? ' «×N» -- столько раз подряд ставили одну и ту же ссылку.' : '') +
         ' Одиночная песня -- своей строкой с 🎵 (сразу с названием и адресом).' +
         ' Весь состав -- кнопкой «📜 Все треки»._' +
         '\n_Помню до ' + MUSIC_HISTORY_LEN + ' пачек и до ' + MUSIC_HISTORY_TRACKS + ' треков; ' +
@@ -16498,7 +16565,7 @@ function historyText (guildId, page = 1)
     const budget = HISTORY_MSG_LIMIT - head.length - 2 - tail.length;
     // У пачки в начале строки стоит то, что вводили в /play -- и запрос, и адрес уходят в код (`...`):
     // Discord превью на код не рисует, а адрес-запуск иначе превращался бы в карточку.
-    const linkLine = b => '`' + stamp (b.at) + '`' + (b.times > 1 ? ' ×' + b.times : '') + ' ' +
+    const linkLine = b => '`' + stamp (b.at) + '` ' +
         (b.key ? '`' + b.key.slice (0, 90) + '`' : (historyTitlesOf (b.e)[0] || 'без названия')) +
         historySrcText (b.e);
     const titleLine = (n, t) => n + '. ' + (String (t).length > HISTORY_TITLE_CLIP
@@ -16528,7 +16595,7 @@ function historyText (guildId, page = 1)
     {
         const t = String (historyTitlesOf (b.e)[0] || b.key || 'без названия');
         const link = linkOfEntry (b.e);
-        return '`' + stamp (b.at) + '`' + (b.times > 1 ? ' ×' + b.times : '') + ' 🎵 ' +
+        return '`' + stamp (b.at) + '` 🎵 ' +
             (t.length > HISTORY_TITLE_CLIP ? t.slice (0, HISTORY_TITLE_CLIP - 1).trimEnd () + '…' : t) +
             (link ? ' — ' + angle (clipped (link, 100)) : '') +
             historySrcText (b.e);
@@ -16562,27 +16629,33 @@ function historyText (guildId, page = 1)
     return text.length <= HISTORY_MSG_LIMIT ? text : fitMsgText (text, HISTORY_MSG_LIMIT);
 }
 
-function historyComponents (guildId, page = 1)
+function historyComponents (guildId, page = 1, f = null)
 {
     const m = musicOf (guildId);
-    const list = Array.isArray (m.history) ? m.history : [];
+    const list = historyFiltered (m.history, f);
     const pages = historyPagesOf (list);
     const cur = Math.min (Math.max (1, Math.floor (Number (page) || 1)), pages);
+    const token = (f && f.token) ? ':' + f.token : '';       // фильтр едет в кнопках, иначе слетит при листании
     const rows = [];
     if (pages > 1)
         rows.push (new ActionRowBuilder ().addComponents (
-            new ButtonBuilder ().setCustomId ('q:hg:first:1').setLabel ('⏮ В начало')
+            new ButtonBuilder ().setCustomId ('q:hg:first:1' + token).setLabel ('⏮ В начало')
                 .setStyle (ButtonStyle.Secondary).setDisabled (cur <= 1),
-            new ButtonBuilder ().setCustomId ('q:hg:prev:' + Math.max (1, cur - 1)).setLabel ('◀ Влево')
+            new ButtonBuilder ().setCustomId ('q:hg:prev:' + Math.max (1, cur - 1) + token).setLabel ('◀ Влево')
                 .setStyle (ButtonStyle.Secondary).setDisabled (cur <= 1),
-            new ButtonBuilder ().setCustomId ('q:hg:next:' + Math.min (pages, cur + 1)).setLabel ('Вправо ▶')
+            new ButtonBuilder ().setCustomId ('q:hg:next:' + Math.min (pages, cur + 1) + token).setLabel ('Вправо ▶')
                 .setStyle (ButtonStyle.Secondary).setDisabled (cur >= pages),
-            new ButtonBuilder ().setCustomId ('q:hg:last:' + pages).setLabel ('В конец ⏭')
+            new ButtonBuilder ().setCustomId ('q:hg:last:' + pages + token).setLabel ('В конец ⏭')
                 .setStyle (ButtonStyle.Secondary).setDisabled (cur >= pages)
         ));
     if (list.some (e => historyTitlesOf (e).length > 3))
         rows.push (new ActionRowBuilder ().addComponents (
-            new ButtonBuilder ().setCustomId ('q:hi').setLabel ('📜 Все треки')
+            new ButtonBuilder ().setCustomId ('q:hi' + token).setLabel ('📜 Все треки')
+                .setStyle (ButtonStyle.Secondary)
+        ));
+    if (f)
+        rows.push (new ActionRowBuilder ().addComponents (
+            new ButtonBuilder ().setCustomId ('q:hgf').setLabel ('✖ Сбросить фильтр')
                 .setStyle (ButtonStyle.Secondary)
         ));
     return rows;
@@ -16630,6 +16703,7 @@ function historySizeOf (e)
 // Discord не принимает в списке больше 25 вариантов, поэтому меню «какую пачку раскрыть» листается
 // страницами: раньше в нём были только 25 самых свежих, и до состава более старых было не добраться.
 const HISTORY_PICK_COUNT = 25;
+function historyPickToken (f) { return (f && f.token) ? ':' + f.token : ''; }
 function historyPickEntries (list)
 {
     const out = [], used = new Set ();
@@ -16646,8 +16720,9 @@ function historyPickPages (list)
 {
     return Math.max (1, Math.ceil (historyPickEntries (list).length / HISTORY_PICK_COUNT));
 }
-function historyPickRows (list, page = 0)
+function historyPickRows (list, page = 0, f = null)
 {
+    const tail = historyPickToken (f);
     const entries = historyPickEntries (list);
     const pages = Math.max (1, Math.ceil (entries.length / HISTORY_PICK_COUNT));
     const p = Math.min (Math.max (0, Math.floor (Number (page) || 0)), pages - 1);
@@ -16673,9 +16748,9 @@ function historyPickRows (list, page = 0)
     if (pages > 1)
         rows.push (new ActionRowBuilder ().addComponents
         (
-            new ButtonBuilder ().setCustomId ('q:hpk:' + (p - 1)).setLabel ('◀ Свежее')
+            new ButtonBuilder ().setCustomId ('q:hpk:' + (p - 1) + tail).setLabel ('◀ Свежее')
                 .setStyle (ButtonStyle.Secondary).setDisabled (p <= 0),
-            new ButtonBuilder ().setCustomId ('q:hpk:' + (p + 1)).setLabel ('Старее ▶')
+            new ButtonBuilder ().setCustomId ('q:hpk:' + (p + 1) + tail).setLabel ('Старее ▶')
                 .setStyle (ButtonStyle.Secondary).setDisabled (p >= pages - 1)
         ));
     rows.push (new ActionRowBuilder ().addComponents
@@ -20587,7 +20662,18 @@ const musicCommands =
     // серверную и общую. Общая видна и на сервере, так что серверная копия не нужна.
     new SlashCommandBuilder ()
         .setName ('history')
-        .setDescription ('История добавлений: кто, когда и что поставил (треки, эфиры, плейлисты)'),
+        .setDescription ('История добавлений: кто, когда и что поставил (треки, эфиры, плейлисты)')
+        .addStringOption (o =>
+            o.setName ('text')
+             .setDescription ('Поиск по названию, запросу или адресу (без него -- вся история)')
+             .setMaxLength (100))
+        .addUserOption (o =>
+            o.setName ('user')
+             .setDescription ('Только добавления этого человека'))
+        .addIntegerOption (o =>
+            o.setName ('days')
+             .setDescription ('Только за последние N дней (без него -- всё время)')
+             .setMinValue (1).setMaxValue (3650)),
     new SlashCommandBuilder ()
         .setName ('repeat')
         .setDescription ('Повтор треков автора: не убирать после проигрывания (админы/модеры)')
@@ -20689,6 +20775,7 @@ const QUEUE_ACTIONS =
     [/^q:hi$/, '📜 Все треки'],
     [/^q:hsel$/, '📜 Какую пачку раскрыть?'],
     [/^q:hpk:/, '📜 страницы меню пачек'],
+    [/^q:hgf$/, '✖ Сбросить фильтр истории'],
     [/^q:hp:/, '📜 листание состава пачки'],
     [/^q:hre:/, '▶ Поставить заново'],
     [/^q:hget$/, '⤓ Взять в очередь один трек'],
@@ -20947,9 +21034,15 @@ client.on ('interactionCreate', async (interaction) =>
             if (res.ok) queueMsgRedraw (guildId, 1500).catch (() => {});
             return interaction.update ({ content: (res.ok ? '' : '⚠️ ') + res.text, components: [] });
         }
-        const mHg = /^q:hg:(?:first|prev|next|last):(\d+)$/.exec (cid);
+        const mHg = /^q:hg:(?:first|prev|next|last):(\d+)(?::([a-z0-9]{4,12}))?$/.exec (cid);
         if (mHg)
         {
+            const hF = mHg[2] ? historyFilterByToken (mHg[2]) : null;   // фильтр не слетает при листании
+            if (mHg[2] && !hF)
+                return interaction.update
+                ({ content: '🕘 Фильтр устарел (он живёт 6 часов) -- показываю историю целиком. ' +
+                    'Вызови `/history` с условиями заново.\n\n' + historyText (guildId, 1, null),
+                   components: historyComponents (guildId, 1, null), flags: MessageFlags.SuppressEmbeds });
             const opener = interaction.message && interaction.message.interaction && interaction.message.interaction.user
                 ? interaction.message.interaction.user.id
                 : null;
@@ -20961,34 +21054,46 @@ client.on ('interactionCreate', async (interaction) =>
             await historyLoad (guildId);
             const at = parseInt (mHg[1], 10) || 1;
             return interaction.update
-            ({ content: historyText (guildId, at), components: historyComponents (guildId, at),
+            ({ content: historyText (guildId, at, hF), components: historyComponents (guildId, at, hF),
                flags: MessageFlags.SuppressEmbeds });
         }
-        if (cid === 'q:hi')
+        if (cid === 'q:hgf')
         {
             await historyLoad (guildId);
-            const rows = historyPickRows (m.history, 0);
+            return interaction.update
+            ({ content: historyText (guildId, 1, null), components: historyComponents (guildId, 1, null),
+               flags: MessageFlags.SuppressEmbeds });
+        }
+        const mHi = /^q:hi(?::([a-z0-9]{4,12}))?$/.exec (cid);
+        if (mHi)
+        {
+            await historyLoad (guildId);
+            const hF = mHi[1] ? historyFilterByToken (mHi[1]) : null;
+            const hList = historyFiltered (m.history, hF);
+            const rows = historyPickRows (hList, 0, hF);
             if (!rows)
                 return interaction.reply
                 ({ content: '🕘 Раскрывать нечего -- истории добавлений пока нет.', flags: MessageFlags.Ephemeral });
             return interaction.reply
             ({
-                content: historyPickText (m.history, 0),
+                content: historyPickText (hList, 0),
                 components: rows,
                 flags: MessageFlags.Ephemeral,
             });
         }
         // Листание самого меню «какую пачку раскрыть»: в списке Discord помещается 25 вариантов, а в
         // истории их может быть до 200 -- без этих кнопок старые пачки было не открыть.
-        const mHpk = /^q:hpk:(\d+)$/.exec (cid);
+        const mHpk = /^q:hpk:(\d+)(?::([a-z0-9]{4,12}))?$/.exec (cid);
         if (mHpk)
         {
             await historyLoad (guildId);
+            const hF = mHpk[2] ? historyFilterByToken (mHpk[2]) : null;
+            const hList = historyFiltered (m.history, hF);
             const page = parseInt (mHpk[1], 10) || 0;
-            const rows = historyPickRows (m.history, page);
+            const rows = historyPickRows (hList, page, hF);
             if (!rows)
                 return interaction.update ({ content: '🕘 Раскрывать нечего -- истории добавлений пока нет.', components: [] });
-            return interaction.update ({ content: historyPickText (m.history, page), components: rows });
+            return interaction.update ({ content: historyPickText (hList, page), components: rows });
         }
         if (cid === 'q:hclose')
             return interaction.update ({ content: '✖ Закрыто.', components: [] });
@@ -22062,8 +22167,15 @@ client.on ('interactionCreate', async (interaction) =>
         else if (name === 'history')
         {
             await historyLoad (guildId);
-            const hRows = historyComponents (guildId, 1);
-            const hText = historyText (guildId, 1);
+            // Необязательные условия: поиск по тексту, кто поставил, за сколько последних дней.
+            const hFilter = historyFilterMake (guildId,
+            {
+                text: interaction.options.getString ('text') || '',
+                userId: (interaction.options.getUser ('user') || {}).id || '',
+                days: interaction.options.getInteger ('days') || 0,
+            });
+            const hRows = historyComponents (guildId, 1, hFilter);
+            const hText = historyText (guildId, 1, hFilter);
             // Превью-карточки в истории ни к чему (и мало ли какой адрес попадёт в название трека):
             // гашу их для всего сообщения.
             return interaction.reply (hRows.length
