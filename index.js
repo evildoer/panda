@@ -14095,6 +14095,7 @@ async function playNext (guildId)
             console.log ('[' + (d()) + '] [music] очередь доиграна до конца -- вычеркиваю её из памяти');
             m.playedToSomeone = false;
             await clearMusicState (guildId);
+            queueMsgFinish (guildId).catch (() => {});   // живая /queue закрывается сразу, а не через полминуты
         }
         scheduleVoiceStatus (guildId);
         schedulePresence ();
@@ -19136,6 +19137,30 @@ async function queueLiveTick (guildId)
     if (!m || !Array.isArray (m.qMsgs) || !m.qMsgs.length) return;
     for (const w of m.qMsgs.slice ())
         await queueLiveOne (m, w);
+}
+
+// v2.189 -- Финал живой очереди: плейлист доиграл, одна последняя правка, чтобы в сообщении не осталось
+// «⏳ До конца очереди: 3 сек» от прохода, случившегося за пару секунд до конца трека (живой случай
+// 04.11 в 19:21: старое /queue показывало остаток времени, когда музыка уже кончилась, а новое,
+// вызванное вручную, честно говорило «очередь пуста»). Заодно снимаю сообщение с живого обновления.
+async function queueMsgFinish (guildId)
+{
+    const m = $music[guildId];
+    if (!m || !Array.isArray (m.qMsgs) || !m.qMsgs.length) return;
+    const text = '🏁 **Очередь доиграна** -- треков больше нет.\n' +
+        'Поставить ещё: `/play` · вернуть пачку из истории: `/history`.';
+    for (const w of m.qMsgs.slice ())
+    {
+        queueWatchForget (m, w.id);                  // сначала снимаю: живое обновление не должно гоняться за этой правкой
+        try
+        {
+            const ch = client.channels.cache.get (w.ch) || await client.channels.fetch (w.ch).catch (() => null);
+            if (!ch) continue;
+            const msg = await ch.messages.fetch (w.id);
+            await msg.edit (fitPayload ({ content: text, components: [], allowedMentions: { parse: [] } }));
+        }
+        catch (e) { }
+    }
 }
 
 async function queueMsgRedraw (guildId, delayMs = 0)
