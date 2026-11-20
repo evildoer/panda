@@ -8894,6 +8894,13 @@ let dnsStats = null;              // источник -> { ok, fail, ms, at }
 let dnsSaveTimer = null;
 let dnsSaveBusy = false;
 
+// v2.190 -- БЕРЕЖНАЯ ЗАПИСЬ В БАЗУ. Сетевые книги (книга имя<->адрес, таблица адрес->имя, почасовые
+// замеры) раньше уходили на диск через 2-3 секунды после каждого изменения: 7 МБ несколько раз в минуту,
+// по замеру -- около 52 ГБ записи в сутки при работе 24/7. Теперь изменения копятся в памяти и пишутся
+// одной записью раз в 10 минут, а при выходе -- сразу (см. netFlushToDb ниже). Данные те же, реже только
+// момент записи: при аварийном падении теряется не больше 10 минут истории замеров сети.
+const NET_SAVE_EVERY_MS = 10 * 60 * 1000;
+
 async function ipMemLoad ()
 {
     if (ipMemReady) return ipMem;
@@ -8992,7 +8999,7 @@ async function ipNamesSave (now)                 // пишу не на кажд�
     if (!now)
     {
         if (ipNamesSaveTimer) return;
-        ipNamesSaveTimer = setTimeout (() => { ipNamesSaveTimer = null; ipNamesSave (true); }, 2000);
+        ipNamesSaveTimer = setTimeout (() => { ipNamesSaveTimer = null; ipNamesSave (true); }, NET_SAVE_EVERY_MS);
         try { ipNamesSaveTimer.unref (); } catch (e) { }
         return;
     }
@@ -9132,7 +9139,7 @@ async function dnsBookSave (now)
     if (!now)
     {
         if (dnsSaveTimer) return;
-        dnsSaveTimer = setTimeout (() => { dnsSaveTimer = null; dnsBookSave (true); }, 2000);
+        dnsSaveTimer = setTimeout (() => { dnsSaveTimer = null; dnsBookSave (true); }, NET_SAVE_EVERY_MS);
         try { dnsSaveTimer.unref (); } catch (e) { }
         return;
     }
@@ -9337,7 +9344,7 @@ function netHoursSave (now)
     if (!now)
     {
         if (netHoursSaveTimer) return;
-        netHoursSaveTimer = setTimeout (() => { netHoursSaveTimer = null; netHoursSave (true); }, 3000);
+        netHoursSaveTimer = setTimeout (() => { netHoursSaveTimer = null; netHoursSave (true); }, NET_SAVE_EVERY_MS);
         try { netHoursSaveTimer.unref (); } catch (e) { }
         return;
     }
@@ -9362,6 +9369,28 @@ function netHoursSave (now)
         catch (e) { }
         netHoursSaveBusy = false;
     }) ();
+}
+
+// v2.190 -- при выходе (Ctrl+C, SIGTERM, закрытое окно) дописываю накопленное, чтобы 10-минутное окно
+// не терять: жду окончания текущей записи, если она идёт, и пишу финальное состояние. Жёсткий предел --
+// 4 секунды на саму запись, чтобы остановка бота не подвисала, даже если база занята.
+let netFlushBusy = false;
+async function netFlushToDb ()
+{
+    if (netFlushBusy) return;
+    netFlushBusy = true;
+    try
+    {
+        for (let i = 0; i < 20 && (dnsSaveBusy || ipNamesSaveBusy || netHoursSaveBusy); i++)
+            await new Promise (r => setTimeout (r, 150));
+        await Promise.race
+        ([
+            Promise.allSettled ([dnsBookSave (true), ipNamesSave (true), netHoursSave (true)]),
+            new Promise (r => setTimeout (r, 4000)),      // жёсткий предел: выход не должен висеть на занятой базе
+        ]);
+    }
+    catch (e) { }
+    netFlushBusy = false;
 }
 function hoursBucket (key)
 {
@@ -14903,6 +14932,9 @@ const voiceStatusTick = setInterval
 );
 if (voiceStatusTick.unref) voiceStatusTick.unref ();
 
+// v2.190 -- очередь на диск раз в 30 секунд, а не каждые 5: при живом треке это было 12 записей
+// в минуту по 57 КБ. По событиям (старт и конец трека, добавление, очистка, пауза) saveMusicState
+// по-прежнему вызывается сразу, так что после перезапуска трек продолжается с точностью до 30 секунд.
 const musicSaveTick = setInterval
 (
     () =>
@@ -14913,7 +14945,7 @@ const musicSaveTick = setInterval
             if (m && m.current && m.playingSince) saveMusicState (g);
         }
     },
-    5 * 1000
+    30 * 1000
 );
 if (musicSaveTick.unref) musicSaveTick.unref ();
 
@@ -15740,6 +15772,7 @@ function stopBotNow ()
     $exiting = true;
     console.log ('[' + (d()) + '] [music] сохраняю очередь перед выходом...');
     saveAllMusic ()
+        .then (() => netFlushToDb ())      // v2.190 -- вместе с очередью дописываю книги адресов и часы (окно 10 минут не теряется)
         .then (() => ($conDrain ? $conDrain (400) : null))
         .then (drained =>
         {
