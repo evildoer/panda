@@ -783,7 +783,7 @@ const DB_ENC_PREFIX = 'enc1:';
 const DB_ENC_SALT = 'pandamia-db-v1';
 const DB_ENC_HEX = /^[0-9a-fA-F]{64}$/;
 
-const CONSOLE_CMDS = ['help', 'config', 'keygen', 'dump', 'net', 'files', 'cache', 'privacy', 'backup', 'compact', 'checkpoint', 'backups', 'restore', 'clearstatus', 'unkey', 'fixauthors', 'cookies', 'ytdlp', 'voice', 'obhod', 'stop'];
+const CONSOLE_CMDS = ['help', 'config', 'keygen', 'dump', 'net', 'selftest', 'files', 'cache', 'privacy', 'backup', 'compact', 'checkpoint', 'backups', 'restore', 'clearstatus', 'unkey', 'fixauthors', 'cookies', 'ytdlp', 'voice', 'obhod', 'stop'];
 const CONSOLE_HELP =
 [
     ['node .',                    'запустить бота и смотреть живой лог (Ctrl+C -- выйти); бот уже играет -- возьму его под присмотр, второго не поднимаю'],
@@ -792,6 +792,7 @@ const CONSOLE_HELP =
     ['node . keygen',             'напечатать новый ключ шифрования базы (для строки db_key)'],
     ['node . dump [id]',          'посмотреть базу глазами (только чтение, бот не запускается)'],
     ['node . net',                'разбор сети: сколько знаем имён и адресов, кто отвечает, что подписано, что давно'],
+    ['node . selftest',           'самопроверка сетевых книг на синтетике (база не трогается, бот не запускается): писатель, чистка, сокращение'],
     ['node . config',             'чем бот РЕАЛЬНО работает: все ключи, их значения и откуда взяты (бот не запускается)'],
     ['node . files',              'что за каждый файл в папке и что можно удалять'],
     ['node . cache [--clear]',    'кэш музыки: что скачано, сколько занимает, чего ещё не хватает в запасе по очереди, что удалять (--clear -- стереть всё)'],
@@ -1294,11 +1295,23 @@ function netCli ()       // разбор собранного: что знаем
         catch (e) { console.log ('[net] не смог прочитать базу: ' + ((e && e.message) || e)); }
         try { if (_db) _db.close (); } catch (e) { }
         const _get = name => dbPeekValue (_rows, name);
-        const book = _get ('dnsbook:map') || {};
+        let book = _get ('dnsbook:map') || {};
+        if (!Object.keys (book).length)                   // v2.197: книга разложена по кускам
+            for (let _i = 0; _i < 32; _i++)
+            {
+                const _p = _get ('dnsbook:map:' + _i) || {};
+                for (const _k of Object.keys (_p)) book[_k] = _p[_k];
+            }
         dnsFailMigrate (book);      // в консоли база читается напрямую: старые метки сбоя привожу к счётчикам тем же правилом, что и бот при загрузке
         const stats = _get ('dnsbook:stats') || {};
         const pools = _get ('netState:ip_map') || {};
-        const rev = _get ('netState:ip_names') || {};
+        let rev = _get ('netState:ip_names') || {};
+        if (!Object.keys (rev).length)                    // v2.197: обратная таблица тоже по кускам
+            for (let _i = 0; _i < 32; _i++)
+            {
+                const _p = _get ('netState:ip:' + _i) || {};
+                for (const _k of Object.keys (_p)) rev[_k] = _p[_k];
+            }
         const route = _get ('netState:route_memory') || null;
         const guess = _get ('netState:guess') || null;
         const gscore = _get ('netState:guess_score') || null;
@@ -2289,6 +2302,54 @@ function gwEventsLines (n = 5)
 }
 
 function dbFileOf (_srv)   { return __dirname + '/' + _srv + '.sqlite'; }
+// v2.198 -- ЖУРНАЛ WAL. Раньше каждая запись переписывала страницы базы на месте через журнал отката:
+// 1 МБ книги -- это десятки МБ записи на диск, а на выходе журнал доходил до 3,8 МБ. В режиме WAL новые
+// страницы дописываются в отдельный файл <база>-wal и переносятся в базу при контрольной точке, читатели
+// писателю больше не мешают. Режим хранится в заголовке базы: включили раз -- держится сам.
+// Плата: свежее может лежать в -wal, поэтому перед копией и проверкой журнал сливаю (dbWalCheckpoint).
+function dbWalFile (_file) { return _file + '-wal'; }
+function dbWalSize (_file)
+{
+    try { return require ('fs').statSync (dbWalFile (_file)).size; } catch (e) { return 0; }
+}
+function dbWalCheckpoint (_file)
+{
+    if (!dbWalSize (_file)) return { ok: true, why: 'журнал пуст' };
+    let DatabaseSync = null;
+    try { ({ DatabaseSync } = require ('node:sqlite')); } catch (e) { }
+    if (!DatabaseSync) return { ok: false, why: 'нет node:sqlite -- журнал не слить' };
+    let _db = null;
+    try
+    {
+        _db = new DatabaseSync (_file);
+        _db.exec ('PRAGMA busy_timeout=5000');
+        const _r = _db.prepare ('PRAGMA wal_checkpoint(TRUNCATE)').all ();
+        const _busy = Number ((_r && _r[0] ? Object.values (_r[0])[0] : 0) || 0);
+        return { ok: !_busy, why: _busy ? 'журнал занят: идёт запись' : 'ok' };
+    }
+    catch (e) { return { ok: false, why: String ((e && e.message) || e) }; }
+    finally { try { if (_db) _db.close (); } catch (e) { } }
+}
+function dbWalEnable (_file)
+{
+    if (!require ('fs').existsSync (_file)) return { ok: false, why: 'базы ещё нет' };
+    let DatabaseSync = null;
+    try { ({ DatabaseSync } = require ('node:sqlite')); } catch (e) { }
+    if (!DatabaseSync) return { ok: false, why: 'нет node:sqlite' };
+    let _db = null;
+    try
+    {
+        _db = new DatabaseSync (_file);
+        _db.exec ('PRAGMA busy_timeout=5000');
+        const _r = _db.prepare ('PRAGMA journal_mode=WAL').all ();
+        const _mode = String ((_r && _r[0] ? Object.values (_r[0])[0] : '') || '').toLowerCase ();
+        if (_mode !== 'wal') return { ok: false, why: 'режим не переключился: ' + (_mode || '?') };
+        try { _db.exec ('PRAGMA wal_autocheckpoint=1000'); } catch (e) { }
+        return { ok: true, why: 'wal' };
+    }
+    catch (e) { return { ok: false, why: String ((e && e.message) || e) }; }
+    finally { try { if (_db) _db.close (); } catch (e) { } }
+}
 function dbBackupStampOf (_srv) { return __dirname + '/' + _srv + '.backup-' + dbCheckStamp (); }
 function dbBrokenOf (_srv) { return __dirname + '/' + _srv + '.broken.sqlite'; }
 function dbServerList ()   { return Object.keys (SERVERS).filter (_k => /^\d{17,20}$/.test (_k)); }
@@ -2300,6 +2361,11 @@ function dbIntegrity (_file)
 {
     const _f = require ('fs');
     if (!_f.existsSync (_file)) return { exists: false, ok: true, rows: 0, why: 'файла нет' };
+    if (dbWalSize (_file))      // v2.198: часть свежего может лежать в -wal -- сначала переношу в базу
+    {
+        const _cp = dbWalCheckpoint (_file);
+        if (!_cp.ok) return { exists: true, ok: false, rows: 0, why: 'журнал WAL не слить: ' + _cp.why };
+    }
     let DatabaseSync = null;
     try { ({ DatabaseSync } = require ('node:sqlite')); } catch (e) {  }
     if (!DatabaseSync) return { exists: true, ok: true, rows: 0, why: 'нет node:sqlite' };
@@ -2329,6 +2395,8 @@ function dbCopyAndVerify (_src, _dst, _expectRows)
     const _tmp = _dst + '.tmp';
     try
     {
+        const _cp = dbWalCheckpoint (_src);      // v2.198: без этого копия потеряет то, что ещё в журнале
+        if (!_cp.ok) return { ok: false, why: 'журнал WAL не слить перед копией: ' + _cp.why };
         _f.copyFileSync (_src, _tmp);
         const _chk = dbIntegrity (_tmp);
         if (!_chk.ok) { _f.rmSync (_tmp, { force: true }); return { ok: false, why: 'копия не читается: ' + _chk.why }; }
@@ -2796,6 +2864,12 @@ if (process.argv.slice (2).some (_a => /^compact$/i.test (_a)))
     $cliDone (_code);
 }
 dbStartupGuard ();
+if (BOT_RUN)      // v2.198: включаю WAL только боту -- консольные команды базу не переключают
+    for (const _srv of dbServerListOn ())
+    {
+        const _r = dbWalEnable (dbFileOf (_srv));
+        if (!_r.ok) console.log ('[' + (d()) + '] [db] WAL не включил (' + _srv + '): ' + _r.why + ' -- работаю на обычном журнале');
+    }
 
 const BACKUP_EVERY_MINUTES = (() =>
 {
@@ -8993,7 +9067,40 @@ async function ipMemSave ()
     catch (e) { }
 }
 
+// v2.197 -- ОБЕ КНИГИ РАЗЛОЖЕНЫ ПО 32 КУСКАМ. Раньше каждое сохранение переписывало книгу и обратную
+// таблицу целиком (1 МБ + 1,3 МБ, раз в 10 минут), хотя меняется за это время десяток имён. Теперь
+// пишутся только те куски, где что-то поменялось (обычно 20–60 КБ). Номер куска -- от самого имени/адреса,
+// поэтому переезд при загрузке идемпотентен, а два экземпляра бота не разъедутся по разным кускам.
+const NET_SHARDS = 32;
+function netShardOf (key)
+{
+    const s = String (key);
+    let h = 0;
+    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt (i)) >>> 0;
+    return h % NET_SHARDS;
+}
+function netShardsSplit (map)
+{
+    const out = [];
+    for (let i = 0; i < NET_SHARDS; i++) out.push ({});
+    for (const k of Object.keys (map || {})) out[netShardOf (k)][k] = map[k];
+    return out;
+}
+function netShardsJoin (parts)
+{
+    const map = {};
+    for (const p of parts)
+        if (p && typeof p === 'object' && !Array.isArray (p)) for (const k of Object.keys (p)) map[k] = p[k];
+    return map;
+}
+async function netShardsRead (srv, ns, prefix)
+{
+    const parts = new Array (NET_SHARDS).fill (null);
+    await Promise.all (parts.map (async (_, i) => { parts[i] = await db (srv, ns, prefix + i); }));
+    return parts.map (p => (p && typeof p === 'object' && !Array.isArray (p)) ? p : {});
+}
 let ipNames = null;               // обратная сторона книги: адрес -> имя (чтобы у любого адреса было имя)
+let ipDirtyShards = new Set (), ipAllDirty = false, ipAllDirtySeq = 0;
 let ipNamesLoading = null;
 let ipNamesReady = false;         // прочитана из базы (см. dnsBookReady)
 let ipNamesRetryAt = 0;
@@ -9010,7 +9117,21 @@ async function ipNamesLoad ()
         try
         {
             const srv = dbServerList ()[0];
-            if (srv) val = await db (srv, 'netState', 'ip_names');
+            if (srv)
+            {
+                const one = await db (srv, 'netState', 'ip_names');     // таблица до v2.197: один большой ключ
+                let parts = await netShardsRead (srv, 'netState', 'ip:');
+                if (one && typeof one === 'object' && !Array.isArray (one) && Object.keys (one).length)
+                {
+                    parts = netShardsSplit (one);
+                    for (let i = 0; i < NET_SHARDS; i++)
+                        if (Object.keys (parts[i]).length) await db (srv, 'netState', 'ip:' + i, parts[i]);
+                    await db (srv, 'netState', 'ip_names', null);
+                    console.log ('[' + (d()) + '] [music] обратная таблица разложена по ' + NET_SHARDS + ' кускам: ' +
+                        Object.keys (one).length + ' адресов, прежний ключ удалён');
+                }
+                val = netShardsJoin (parts);
+            }
         }
         catch (e)
         {
@@ -9041,10 +9162,25 @@ async function ipNamesLoad ()
 const ipNamesSaver = bookSaver
 ({
     tag: 'music', what: 'таблицу имён адресов',
-    data: () => ipNames, ready: () => ipNamesReady,
-    write: async () => { const srv = dbServerList ()[0]; if (srv) await db (srv, 'netState', 'ip_names', ipNames); },
+    data: () => ipNames, ready: () => !selfTestOn && ipNamesReady,
+    write: async () =>
+    {
+        const srv = dbServerList ()[0];
+        if (!srv) return;
+        const allNow = ipAllDirty, seq = ipAllDirtySeq;
+        const parts = netShardsSplit (ipNames);
+        const list = allNow ? parts.map ((_, i) => i) : [...ipDirtyShards];
+        for (const i of list) await db (srv, 'netState', 'ip:' + i, parts[i]);
+        if (allNow) { if (ipAllDirtySeq === seq) ipAllDirty = false; }
+        else for (const i of list) ipDirtyShards.delete (i);
+    },
 });
-const ipNamesChanged = ipNamesSaver.changed;
+function ipNamesChanged (ip)
+{
+    if (typeof ip === 'string' && ip) ipDirtyShards.add (netShardOf (ip));
+    else { ipAllDirty = true; ipAllDirtySeq++; }
+    ipNamesSaver.changed ();
+}
 const ipNamesSave = ipNamesSaver.save;
 async function ipNamesNote (name, ips)
 {
@@ -9064,8 +9200,8 @@ async function ipNamesNote (name, ips)
         }
         rec.names[name] = now;    // НИЧЕГО НЕ УДАЛЯЮ: держу все имена адреса, древнее -- только помечаю
         rec.at = now;
+        ipNamesChanged (key);     // v2.197: пишу только тот кусок, где лежит этот адрес
     }
-    ipNamesChanged ();
     ipNamesSave ();
 }
 function ipNamesOf (ip)                   // свежие имена вперёд, древние -- в конец, но никуда не пропадают
@@ -9125,7 +9261,25 @@ async function dnsBookLoad ()
         try
         {
             const srv = dbServerList ()[0];
-            if (srv) { map = await db (srv, 'dnsbook', 'map'); st = await db (srv, 'dnsbook', 'stats'); }
+            if (srv)
+            {
+                st = await db (srv, 'dnsbook', 'stats');
+                // Книга до v2.197 -- один большой ключ. Читаю его ПЕРВЫМ и удаляю только после того, как
+                // все куски записаны: если процесс упадёт посередине, в следующий раз перенос повторится
+                // с того же источника, а не останется наполовину разложенным.
+                const one = await db (srv, 'dnsbook', 'map');
+                let parts = await netShardsRead (srv, 'dnsbook', 'map:');
+                if (one && typeof one === 'object' && !Array.isArray (one) && Object.keys (one).length)
+                {
+                    parts = netShardsSplit (one);
+                    for (let i = 0; i < NET_SHARDS; i++)
+                        if (Object.keys (parts[i]).length) await db (srv, 'dnsbook', 'map:' + i, parts[i]);
+                    await db (srv, 'dnsbook', 'map', null);
+                    console.log ('[' + (d()) + '] [music] книга адресов разложена по ' + NET_SHARDS + ' кускам: ' +
+                        Object.keys (one).length + ' имён, прежний ключ удалён');
+                }
+                map = netShardsJoin (parts);
+            }
         }
         catch (e)
         {
@@ -9187,17 +9341,34 @@ async function dnsBookLoad ()
     return dnsBookLoading;
 }
 
+let dnsDirtyShards = new Set (), dnsAllDirty = false, dnsAllDirtySeq = 0;
 const dnsBookSaver = bookSaver
 ({
     tag: 'music', what: 'книгу адресов',
-    data: () => dnsBook, ready: () => dnsBookReady,
+    data: () => dnsBook, ready: () => !selfTestOn && dnsBookReady,
     write: async () =>
     {
         const srv = dbServerList ()[0];
-        if (srv) { await db (srv, 'dnsbook', 'map', dnsBook); await db (srv, 'dnsbook', 'stats', dnsStats || {}); }
+        if (!srv) return;
+        const allNow = dnsAllDirty, seq = dnsAllDirtySeq;
+        const parts = netShardsSplit (dnsBook);
+        const list = allNow ? parts.map ((_, i) => i) : [...dnsDirtyShards];
+        for (const i of list) await db (srv, 'dnsbook', 'map:' + i, parts[i]);
+        if (allNow) { if (dnsAllDirtySeq === seq) dnsAllDirty = false; }
+        else for (const i of list) dnsDirtyShards.delete (i);
+        await db (srv, 'dnsbook', 'stats', dnsStats || {});
     },
 });
-const dnsChanged = dnsBookSaver.changed;
+function dnsChanged (name)      // v2.197: с именем -- пишу только его кусок, без -- всю книгу
+{
+    if (typeof name === 'string' && name) dnsDirtyShards.add (netShardOf (name));
+    else { dnsAllDirty = true; dnsAllDirtySeq++; }
+    dnsBookSaver.changed ();
+}
+function dnsStatsChanged ()     // поменялись только цифры источников: куски не трогаю, пишутся вместе с книгой
+{
+    dnsBookSaver.changed ();
+}
 const dnsBookSave = dnsBookSaver.save;
 
 function dnsRecMake (name)
@@ -9267,7 +9438,7 @@ async function dnsNote (name, ips, ms, src, ttlSec, secure)     // secure: ад�
     rec.src = src;
     rec.ttl = Math.max (DNS_TTL_MIN, Math.min (DNS_TTL_MAX, ttlSec ? ttlSec * 1000 : (rec.ttl || DNS_TTL_DEF)));
     dnsAgeMark ();
-    dnsChanged ();
+    dnsChanged (name);
     dnsBookSave ();
     return rec;
 }
@@ -9319,7 +9490,7 @@ function dnsNoteSrc (src, ok, ms)
     if (ok) { s.ok++; s.ms = s.ms ? Math.round (s.ms * 0.7 + ms * 0.3) : ms; s.at = Date.now (); }
     else s.fail++;
     hoursTouch (src, ok, ms, 0);
-    dnsChanged ();
+    dnsStatsChanged ();
     dnsBookSave ();
 }
 
@@ -9370,7 +9541,7 @@ async function netHoursLoad ()
 const netHoursSaver = bookSaver
 ({
     tag: 'net', what: 'часы замеров',
-    data: () => netHours, ready: () => netHoursReady,
+    data: () => netHours, ready: () => !selfTestOn && netHoursReady,
     write: async () => { const srv = dbServerList ()[0]; if (srv) await db (srv, 'netState', 'hours', netHours); },
 });
 const netHoursChanged = netHoursSaver.changed;
@@ -9406,8 +9577,13 @@ function netIpHistory (x)        // 3 -- по нему играли, 2 -- отв
 {
     return ((x.played || 0) > 0 ? 3 : 0) + ((x.ok || 0) > 0 ? 2 : 0) + ((x.fails || 0) > 0 ? 1 : 0);
 }
-function netBookTrim ()
+async function netBookTrim ()
 {
+    // Книги должны быть прочитаны ДО чистки: иначе первая же чистка проходит по пустой обратной таблице
+    // и ничего в ней не сокращает (так и вышло на живом прогоне 23.11: ip_names осталась 1,74 МБ).
+    await dnsBookLoad ();
+    await ipNamesLoad ();
+    await ipMemLoad ();
     const now = Date.now ();
     let ipsGone = 0, linksGone = 0;
     const keep = new Set ();
@@ -9427,7 +9603,7 @@ function netBookTrim ()
         }
         for (const x of rec.ips) keep.add (x.ip);
     }
-    const poolsLoaded = !!ipMem;                 // копилки ещё не прочитаны -- имена у их адресов не трогаю
+    const poolsLoaded = ipMemReady;              // копилки не прочитались -- имена у их адресов не трогаю
     for (const k of Object.keys (ipMem || {}))   // адреса из копилок тоже должны помнить имя
         if (k.indexOf ('pool:') === 0)
             for (const ip of Object.keys ((ipMem[k] || {}).ips || {})) keep.add (ip);
@@ -9545,13 +9721,123 @@ function netBookPrune ()
     }
     return touched;
 }
-function netPruneTick ()
+async function netPruneTick ()
 {
     const now = Date.now ();
     if (netPruneAt && (now - netPruneAt) < NET_PRUNE_EVERY_MS) return;
     netPruneAt = now;
-    try { netBookPrune (); netBookTrim (); }
+    try { netBookPrune (); await netBookTrim (); }
     catch (e) { console.log ('[' + (d()) + '] [net] чистка книги не удалась: ' + oneLine ((e && e.message) || e)); }
+}
+
+// v2.196 -- `node . selftest`: самопроверка на синтетике, без бота и без базы. Гоняю ТЕ ЖЕ функции,
+// что работают в бою (писатель, "древний", выбор адреса, чистка, сокращение, миграция), поэтому поломка
+// видна сразу после правки, а не через неделю на живой книге. База не читается и не пишется: книги
+// подменяются на игрушечные и возвращаются назад.
+let selfTestFail = 0, selfTestOk = 0, selfTestOn = false;   // selfTestOn -- писатели не трогают базу
+function selfCheck (name, ok, info)
+{
+    if (ok) { selfTestOk++; console.log ('  ок   ' + name); }
+    else { selfTestFail++; console.log ('  СБОЙ ' + name + (info === undefined ? '' : '  (' + JSON.stringify (info) + ')')); }
+}
+async function runSelfTest ()
+{
+    const real = { dnsBook, ipNames, netHours, ipMem, dnsBookReady, ipNamesReady, ipMemReady, netPruneAt };
+    selfTestOn = true;
+    try
+    {
+        const now = Date.now (), day = 86400000;
+        selfCheck ('куски: номер куска всегда один и тот же',
+            netShardOf ('a.b') === netShardOf ('a.b') && netShardOf ('a.b') < NET_SHARDS && netShardOf ('a.b') >= 0);
+        {
+            const sample = { 'x.test': { a: 1 }, 'y.test': { b: 2 }, 'z.test': { c: 3 } };
+            const back = netShardsJoin (netShardsSplit (sample));
+            selfCheck ('куски: разложил и собрал без потерь', Object.keys (back).length === 3 && back['y.test'].b === 2 && back['x.test'].a === 1);
+        }
+        let writes = 0, ready = true;
+        const s = bookSaver ({ tag: 'selftest', what: 'игрушка', data: () => ({ a: 1 }), ready: () => ready, write: async () => { writes++; } });
+        await s.save (true);
+        selfCheck ('писатель: без изменений не пишет', writes === 0, writes);
+        s.changed ();
+        await s.save (true);
+        selfCheck ('писатель: после изменения пишет', writes === 1, writes);
+        await s.save (true);
+        selfCheck ('писатель: второй раз подряд не пишет', writes === 1, writes);
+        s.changed (); ready = false;
+        await s.save (true);
+        selfCheck ('писатель: книга не готова -- записи нет', writes === 1, writes);
+        ready = true;
+        s.changed ();
+        await s.save (true);
+        selfCheck ('писатель: готовность вернулась -- пишет', writes === 2, writes);
+
+        selfCheck ('древность: час назад -- не древний', netIsOld ({ at: now - 3600000 }, now) === false);
+        selfCheck ('древность: 181 день -- древний', netIsOld ({ at: now - 181 * day }, now) === true);
+
+        const cmp = dnsIpCmp (now);
+        selfCheck ('выбор: где играли -- первым', cmp ({ ip: '1', played: 1, at: now - day }, { ip: '2', at: now }) < 0);
+        selfCheck ('выбор: подпись важнее свежести', cmp ({ ip: '1', ad: true, at: now - day }, { ip: '2', at: now }) < 0);
+        selfCheck ('выбор: свежий важнее древнего', cmp ({ ip: '1', at: now }, { ip: '2', at: now - 200 * day }) < 0);
+
+        dnsBookReady = ipNamesReady = ipMemReady = true;
+        netPruneAt = 0;
+        const d50 = new Date (now - 50 * day), d400 = new Date (now - 400 * day);
+        netHours = {};
+        netHours[netDayKeyOf (d50.getTime ()) + 'T03'] = { ok: 3, fail: 1, ms: 100, ips: 2, bySrc: {} };
+        dnsBook = {
+            'fresh.test': { at: now - day, ips: [{ ip: '1.1.1.1', at: now - day }] },
+            'old.test': { at: d400.getTime (), lastUsed: d400.getTime (), ips: [{ ip: '1.1.1.2', at: d400.getTime () }] },
+            'used.test': { at: d400.getTime (), lastPlayedAt: now - day, ips: [{ ip: '1.1.1.3', at: d400.getTime (), played: 2, lastPlayedAt: now - day }] },
+        };
+        ipNames = {
+            '1.1.1.1': { at: d400.getTime (), names: { 'fresh.test': d400.getTime () } },
+            '9.9.9.9': { at: now - day, names: { 'pool.only': 1 } },
+            '9.9.9.8': { at: d400.getTime (), names: { 'pool.old': 1 } },
+        };
+        ipMem = { 'pool:youtube': { ips: { '9.9.9.9': 1, '9.9.9.8': 1 } } };
+        netBookPrune ();
+        selfCheck ('чистка: свежее имя осталось', !!dnsBook['fresh.test']);
+        selfCheck ('чистка: древнее без следов ушло', !dnsBook['old.test']);
+        selfCheck ('чистка: имя с историей осталось', !!dnsBook['used.test']);
+        selfCheck ('чистка: адрес, о котором помнит книга, не потерял имя', !!ipNames['1.1.1.1']);
+        selfCheck ('чистка: молодой адрес из копилки не потерял имя', !!ipNames['9.9.9.9']);
+        selfCheck ('чистка: древний адрес из копилки ушёл', !ipNames['9.9.9.8']);
+        selfCheck ('чистка: 50-дневный час свёрнут в суточный',
+            !netHours[netDayKeyOf (d50.getTime ()) + 'T03'] && !!netHours[netDayKeyOf (d50.getTime ())]);
+
+        const many = [];
+        for (let i = 0; i < 40; i++) many.push ({ ip: '2.2.2.' + i, at: now - i * 1000, ok: i === 39 ? 1 : 0, played: i === 39 ? 1 : 0 });
+        dnsBook = { 'big.test': { at: now, hits: 5, ips: many } };
+        ipNames = {};
+        for (let i = 0; i < 40; i++) ipNames['2.2.2.' + i] = { at: now, names: { 'big.test': now } };
+        ipNames['2.2.2.39'].names = { a: 1, b: 2, c: 3, d: 4, e: 5 };
+        ipMem = {};
+        await netBookTrim ();
+        selfCheck ('сокращение: у нужного имени не больше 16 адресов', dnsBook['big.test'].ips.length === 16, dnsBook['big.test'].ips.length);
+        selfCheck ('сокращение: адрес с историей удержался', dnsBook['big.test'].ips.some (x => x.ip === '2.2.2.39'));
+        selfCheck ('сокращение: на адресе не больше 3 имён', Object.keys (ipNames['2.2.2.39'].names).length === 3,
+            Object.keys (ipNames['2.2.2.39'].names).length);
+        {
+            const lastIp = ipNames['2.2.2.39'] ? '2.2.2.0' : '2.2.2.39';
+            const goneOk = !dnsBook['big.test'].ips.some (x => x.ip === lastIp);
+            selfCheck ('сокращение: у выброшенного из книги адреса имя тоже не остаётся', !goneOk || !ipNames[lastIp], lastIp);
+        }
+
+        const m = { a: { old: true, ips: [{ ip: '1', old: true, firstAt: 5 }] } }, mm = { '1.1.1.1': { old: true, names: { a: 1 } } };
+        const goneBook = dnsFieldsMigrate (m), goneNames = ipNamesFieldsMigrate (mm);
+        selfCheck ('миграция убрала old/firstAt', goneBook === 3 && !('old' in m.a) && !('old' in m.a.ips[0]) && !('firstAt' in m.a.ips[0]), goneBook);
+        selfCheck ('миграция обратной таблицы убрала old', goneNames === 1 && !('old' in mm['1.1.1.1']), goneNames);
+    }
+    catch (e) { selfTestFail++; console.log ('  СБОЙ исключение: ' + oneLine ((e && e.message) || e)); }
+    finally
+    {
+        dnsBook = real.dnsBook; ipNames = real.ipNames; netHours = real.netHours; ipMem = real.ipMem;
+        dnsBookReady = real.dnsBookReady; ipNamesReady = real.ipNamesReady; ipMemReady = real.ipMemReady;
+        netPruneAt = real.netPruneAt;
+        selfTestOn = false;
+    }
+    console.log ('\nСАМОПРОВЕРКА: ок ' + selfTestOk + ', сбой ' + selfTestFail);
+    return selfTestFail;
 }
 
 // v2.190 -- при выходе (Ctrl+C, SIGTERM, закрытое окно) дописываю накопленное, чтобы 10-минутное окно
@@ -10601,7 +10887,7 @@ async function ipFailNote (name, ip)
     rec.fail = Date.now ();
     if (ip) { const r = dnsIpSlot (rec, ip); r.fails = (r.fails || 0) + 1; r.fail = Date.now (); }
     else for (const r of rec.ips) { r.fails = (r.fails || 0) + 1; r.fail = Date.now (); }
-    dnsChanged ();
+    dnsChanged (name);
     dnsBookSave ();
     dohCache.delete (name);
 }
@@ -10624,7 +10910,7 @@ async function dnsPlayNote (name, ip)      // по этому адресу му�
         r.played = (r.played || 0) + 1;
         r.lastPlayedAt = Date.now ();
     }
-    dnsChanged ();
+    dnsChanged (name);
     dnsBookSave ();
 }
 async function ipOkNote (name, ip)
@@ -10643,7 +10929,7 @@ async function ipOkNote (name, ip)
         r.lastUsed = Date.now ();
     }
     else for (const r of rec.ips) r.fail = 0;
-    dnsChanged ();
+    dnsChanged (name);
     dnsBookSave ();
 }
 
@@ -10807,7 +11093,7 @@ function dnsHelpCount (ok, ms, name)              // счёт для владе�
             h.last = name;
         }
         else h.fail++;
-        dnsChanged ();
+        dnsStatsChanged ();
         dnsBookSave ();
     }
     catch (e) { }
@@ -15126,8 +15412,8 @@ const musicSaveTick = setInterval
             if (m && m.current && m.playingSince) saveMusicState (g);
         }
     },
-    30 * 1000
-);
+    5 * 60 * 1000      // v2.196 -- страховка, а не основной путь: очередь пишется на событиях (старт/конец
+);                     // трека, добавление, пауза), а таймер -- раз в 5 минут вместо 30 с (было ~0,3 ГБ/сутки)
 if (musicSaveTick.unref) musicSaveTick.unref ();
 
 const musicNetTick = setInterval
@@ -23112,3 +23398,8 @@ for (const _cfgDrift of (BOT_RUN ? configDriftIssues () : []))
 
 for (const _cfgTmpl of (BOT_RUN ? configTemplateIssues ().hard : []))
     console.log ('[' + (d()) + '] [config] ШАБЛОНЫ: ' + _cfgTmpl);
+
+// v2.196 -- `node . selftest` гоняю в самом конце файла: раньше функции и константы ещё не готовы
+// (одна команда -- одно место, где точно объявлено всё).
+if (!BOT_RUN && cliCmdName === 'selftest')
+    runSelfTest ().then (_fail => $cliDone (_fail ? 1 : 0), _e => { console.error ('[selftest] ' + ((_e && _e.message) || _e)); $cliDone (1); });
