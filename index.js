@@ -8996,8 +8996,8 @@ let ipNames = null;               // обратная сторона книги:
 let ipNamesLoading = null;
 let ipNamesReady = false;         // прочитана из базы (см. dnsBookReady)
 let ipNamesRetryAt = 0;
-const IP_NAMES_PER_IP = 8;        // у одного адреса бывает несколько имён (общие узлы, хостинги).
-                                  // Держу их все, а список чищу только когда он длинный -- и только от древнего
+const IP_NAMES_PER_IP = 3;        // у одного адреса бывает несколько имён (общие узлы, хостинги), но не больше трёх:
+                                  // лишние не несут ничего, а весят больше всего (см. netBookTrim)
 async function ipNamesLoad ()
 {
     if (ipNamesReady) return ipNames;
@@ -9365,6 +9365,69 @@ const NET_HOURS_KEEP_DAYS = 45;
 const NET_HOURS_DAY_KEEP_DAYS = 3 * 365;
 const NET_PRUNE_EVERY_MS = 6 * 60 * 60 * 1000;
 const NET_PRUNE_MAX = 20000;             // больше стольких записей за проход не трогаю, чтобы не подвесить бота
+
+// v2.194 -- ОГРАНИЧЕНИЕ ЧИСЛА АДРЕСОВ У ИМЕНИ. Книга росла не от нужных адресов, а от копилки системы:
+// на один assets1.xboxlive.com накопилось 3250 адресов, на ctldl.windowsupdate.com -- 1931, при этом из
+// 17 889 адресов историю (хоть один ответ или проигранный трек) имели 75. Держу:
+//   * имя, которое мы правда спрашивали -- до NET_IPS_USED адресов (с запасом: рабочих у любого имени не
+//     больше 16, проверено на живых данных, так что ни один рабочий адрес не теряется);
+//   * имя, которое только пришло из кэша системы и ни разу не спрашивалось -- до NET_IPS_CACHE;
+//   * адрес из копилки сервиса (pool:youtube и др.) -- помню всегда, даже если имени нет в книге.
+// Выбывшие адреса возвращаются сами при следующем обращении или сборе кэша -- это не потеря, а отказ
+// хранить тысячи неиспользованных.
+const NET_IPS_USED = 16;
+const NET_IPS_CACHE = 4;
+function netNameUsed (rec)
+{
+    return !!rec && ((rec.hits || 0) > 0 || (rec.played || 0) > 0 || (rec.lastUsed || 0) > 0);
+}
+function netIpHistory (x)        // 3 -- по нему играли, 2 -- отвечал, 1 -- сбоил: такие адреса не выбрасываю
+{
+    return ((x.played || 0) > 0 ? 3 : 0) + ((x.ok || 0) > 0 ? 2 : 0) + ((x.fails || 0) > 0 ? 1 : 0);
+}
+function netBookTrim ()
+{
+    const now = Date.now ();
+    let ipsGone = 0, linksGone = 0;
+    const keep = new Set ();
+    for (const name of Object.keys (dnsBook || {}))
+    {
+        const rec = dnsBook[name];
+        if (!rec || !rec.ips) continue;
+        const cap = netNameUsed (rec) ? NET_IPS_USED : NET_IPS_CACHE;
+        if (rec.ips.length > cap)
+        {
+            // Сначала адреса с историей (играли, отвечали, сбоили), потом -- обычный порядок выбора адреса.
+            // Сам по себе dnsIpCmp историю ответов не смотрит: без этого рабочие адреса вылетали (видно на
+            // живой книге: у manifest.googlevideo.com их вытесняли свежие из кэша).
+            rec.ips.sort ((a, b) => (netIpHistory (b) - netIpHistory (a)) || dnsIpCmp (now) (a, b));
+            ipsGone += rec.ips.length - cap;
+            rec.ips.length = cap;
+        }
+        for (const x of rec.ips) keep.add (x.ip);
+    }
+    const poolsLoaded = !!ipMem;                 // копилки ещё не прочитаны -- имена у их адресов не трогаю
+    for (const k of Object.keys (ipMem || {}))   // адреса из копилок тоже должны помнить имя
+        if (k.indexOf ('pool:') === 0)
+            for (const ip of Object.keys ((ipMem[k] || {}).ips || {})) keep.add (ip);
+    if (ipNames)
+        for (const ip of Object.keys (ipNames))
+        {
+            if (!keep.has (ip)) { if (poolsLoaded) { delete ipNames[ip]; linksGone++; } continue; }
+            const rec = ipNames[ip];
+            const ks = Object.keys ((rec && rec.names) || {});
+            if (ks.length <= IP_NAMES_PER_IP) continue;
+            ks.sort ((a, b) => (rec.names[b] || 0) - (rec.names[a] || 0));   // свежие имена -- вперёд
+            for (const k of ks.slice (IP_NAMES_PER_IP)) { delete rec.names[k]; linksGone++; }
+        }
+    if (ipsGone) dnsChanged ();
+    if (linksGone) ipNamesChanged ();
+    if (ipsGone || linksGone)
+        console.log ('[' + (d()) + '] [net] книга сокращена: у имён убрано ' + ipsGone + ' лишних адресов, ' +
+            'в обратной таблице -- ' + linksGone + ' записей (до ' + NET_IPS_USED + ' адресов у нужного имени, ' +
+            'до ' + NET_IPS_CACHE + ' у неспрошенного, до ' + IP_NAMES_PER_IP + ' имён на адрес)');
+    return ipsGone + linksGone > 0;
+}
 function netDayKeyOf (t)
 {
     const d = new Date (t), p = n => String (n).padStart (2, '0');
@@ -9466,7 +9529,7 @@ function netPruneTick ()
     const now = Date.now ();
     if (netPruneAt && (now - netPruneAt) < NET_PRUNE_EVERY_MS) return;
     netPruneAt = now;
-    try { netBookPrune (); }
+    try { netBookPrune (); netBookTrim (); }
     catch (e) { console.log ('[' + (d()) + '] [net] чистка книги не удалась: ' + oneLine ((e && e.message) || e)); }
 }
 
