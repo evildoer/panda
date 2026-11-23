@@ -1306,6 +1306,8 @@ function netCli ()       // разбор собранного: что знаем
         const keys = Object.keys (book);
         const now = Date.now ();
         let ips = 0, signed = 0, agree = 0, oldNames = 0, oldIps = 0, asleep = 0, newest = 0, oldest = 0, newestName = '', oldestName = '';
+        // Тот же срок, что NET_KEEP_MS в работе бота (здесь он ещё не объявлен: это консольная команда).
+        const _netOld = (x, t) => (t - Math.max ((x && x.lastUsed) || 0, (x && x.at) || 0, (x && x.lastPlayedAt) || 0)) > 180 * 86400000;
         const many = [];
         for (const k of keys)
         {
@@ -1316,12 +1318,12 @@ function netCli ()       // разбор собранного: что знаем
             const at = rec.at || 0;
             if (at > newest) { newest = at; newestName = k; }
             if (at && (!oldest || at < oldest)) { oldest = at; oldestName = k; }
-            if (rec.old) oldNames++;
+            if (_netOld (rec, now)) oldNames++;
             for (const x of list)
             {
                 if (x.ad) signed++;
                 if ((Number (x.cnt) || 0) > 1) agree++;
-                if (x.old) oldIps++;
+                if (_netOld (x, now)) oldIps++;
                 if (x.fail && (now - x.fail) < 120000) asleep++;
             }
         }
@@ -8875,7 +8877,6 @@ function ipViaFailLog (via, extra, name)        // «адрес не ответ�
 // Полгода -- это не срок хранения, а только порог пометки «древнее»: такие адреса уходят в конец
 // списка выбора, но остаются в книге и продолжают использоваться, когда свежие не ответили.
 const NET_KEEP_MS = 180 * 24 * 60 * 60 * 1000;
-const NET_TRIM_EVERY_MS = 5 * 60 * 1000;   // чистку от древностей делаю редко: книга большая
 const DNS_TTL_DEF = 10 * 60 * 1000;
 const DNS_TTL_MIN = 60 * 1000;
 const DNS_TTL_MAX = 24 * 60 * 60 * 1000;
@@ -9025,12 +9026,18 @@ async function ipNamesLoad ()
         }
         ipNamesReady = true;
         ipNames = (val && typeof val === 'object' && !Array.isArray (val)) ? val : {};
+        const _oldGone = ipNamesFieldsMigrate (ipNames);   // v2.195 -- отметки «древний» больше не хранятся
+        if (_oldGone)
+        {
+            ipNamesChanged ();
+            await ipNamesSave (true);
+            console.log ('[' + (d()) + '] [music] обратная таблица: убрал ' + _oldGone + ' старых отметок «древний» -- они считаются на месте');
+        }
         ipNamesLoading = null;
         return ipNames;
     }) ();
     return ipNamesLoading;
 }
-let ipNamesTrimAt = 0;
 const ipNamesSaver = bookSaver
 ({
     tag: 'music', what: 'таблицу имён адресов',
@@ -9058,16 +9065,6 @@ async function ipNamesNote (name, ips)
         rec.names[name] = now;    // НИЧЕГО НЕ УДАЛЯЮ: держу все имена адреса, древнее -- только помечаю
         rec.at = now;
     }
-    if ((now - ipNamesTrimAt) >= NET_TRIM_EVERY_MS)
-    {
-        ipNamesTrimAt = now;
-        for (const _k of Object.keys (ipNames))
-        {
-            const _r = ipNames[_k];
-            const _o = ((now - (_r.at || 0)) > NET_KEEP_MS);
-            if (_r.old !== _o) { _r.old = _o; ipNamesChanged (); }   // отметка без смены -- не изменение
-        }
-    }
     ipNamesChanged ();
     ipNamesSave ();
 }
@@ -9086,6 +9083,36 @@ function ipNamesOf (ip)                   // свежие имена вперё�
     return rec.name ? [rec.name] : [];     // запись прежнего вида
 }
 function ipNameOf (ip) { const list = ipNamesOf (ip); return list.length ? list[0] : ''; }
+
+// v2.195 -- old и firstAt больше не хранятся в базе: old считается на месте (netIsOld), firstAt никому, кроме
+// «готового заменителя» в netBonesFind, не был нужен, а весили они ~0,6 МБ (firstAt 429 КБ, old 215 КБ).
+// Из старой книги вычищаю их при загрузке -- один раз, идемпотентно.
+function dnsFieldsMigrate (book)
+{
+    let n = 0;
+    for (const name of Object.keys (book || {}))
+    {
+        const rec = book[name];
+        if (!rec) continue;
+        if ('old' in rec) { delete rec.old; n++; }
+        for (const x of rec.ips || [])
+        {
+            if ('old' in x) { delete x.old; n++; }
+            if ('firstAt' in x) { delete x.firstAt; n++; }
+        }
+    }
+    return n;
+}
+function ipNamesFieldsMigrate (map)
+{
+    let n = 0;
+    for (const ip of Object.keys (map || {}))
+    {
+        const rec = map[ip];
+        if (rec && 'old' in rec) { delete rec.old; n++; }
+    }
+    return n;
+}
 
 async function dnsBookLoad ()
 {
@@ -9117,6 +9144,13 @@ async function dnsBookLoad ()
         dnsBookReady = true;
         dnsBook = (map && typeof map === 'object' && !Array.isArray (map)) ? map : {};
         dnsStats = (st && typeof st === 'object' && !Array.isArray (st)) ? st : {};
+        const _fieldsGone = dnsFieldsMigrate (dnsBook);   // v2.195 -- убираю old и firstAt из старой книги
+        if (_fieldsGone)
+        {
+            dnsChanged ();
+            await dnsBookSave (true);
+            console.log ('[' + (d()) + '] [music] книга адресов: убрал ' + _fieldsGone + ' служебных отметок (old/firstAt) -- они считаются на месте');
+        }
         const _failMig = dnsFailMigrate (dnsBook);       // старые отметки сбоя (в fail лежала метка времени) превращаю в счётчик -- один раз, идемпотентно
         if (_failMig)
         {
@@ -9194,26 +9228,14 @@ function dnsIpSlot (rec, ip)
     if (!r) { r = { ip: ip, at: 0, ms: 0, src: '', ok: 0, fail: 0, fails: 0, lastUsed: 0 }; rec.ips.push (r); }
     return r;
 }
-let dnsTrimAt = 0;
-function dnsAgeMark ()            // НИЧЕГО НЕ УДАЛЯЮ. Только помечаю старое, чтобы знать, что брать первым
+function netIsOld (x, now)      // v2.195 -- «древний» считается на месте: в базе эта отметка больше не лежит
+{
+    return (now - Math.max ((x && x.lastUsed) || 0, (x && x.at) || 0, (x && x.lastPlayedAt) || 0)) > NET_KEEP_MS;
+}
+function dnsAgeMark ()            // будит чистку книги: сверить возраст и, если надо, свернуть/убрать старое
 {
     if (!dnsBook) return;
-    const now = Date.now ();
-    if ((now - dnsTrimAt) < NET_TRIM_EVERY_MS) return;    // не чаще раза в 5 минут: книга большая
-    dnsTrimAt = now;
-    for (const name of Object.keys (dnsBook))
-    {
-        const rec = dnsBook[name];
-        const ro = ((now - Math.max (rec.lastUsed || 0, rec.at || 0)) > NET_KEEP_MS);   // имя давно не спрашивали
-        if (rec.old !== ro) { rec.old = ro; dnsChanged (); }   // v2.192 -- сама отметка ещё не повод писать книгу
-        if (!rec.ips) continue;
-        for (const x of rec.ips)
-        {
-            const xo = ((now - Math.max (x.lastUsed || 0, x.at || 0)) > NET_KEEP_MS);    // адрес давно не отвечал
-            if (x.old !== xo) { x.old = xo; dnsChanged (); }
-        }
-    }
-    netPruneTick ();          // v2.191 -- раз в 6 часов: старое свернуть и убрать, чтобы книга не росла вечно
+    netPruneTick ();          // внутри свой срок: раз в 6 часов
 }
 async function dnsNote (name, ips, ms, src, ttlSec, secure)     // secure: адрес -> { ad, cnt }
 {
@@ -9228,7 +9250,6 @@ async function dnsNote (name, ips, ms, src, ttlSec, secure)     // secure: ад�
         const had = rec.ips.some (x => x.ip === ip);
         const r = dnsIpSlot (rec, ip);
         r.at = now;
-        if (!r.firstAt) r.firstAt = now;                              // когда адрес впервые увидели
         r.src = src;
         r.ms = r.ms ? Math.round (r.ms * 0.6 + ms * 0.4) : ms;
         const _i = secure && secure[ip];
@@ -9260,7 +9281,7 @@ function dnsIpCmp (now)         // один порядок выбора и дл�
         if (pa !== pb) return pb - pa;                                   // по нему уже качалась музыка -- он первый
         const ca = Number (a.cnt) || 0, cb = Number (b.cnt) || 0;
         if (ca !== cb) return cb - ca;                                    // что подтвердили больше справочников -- вперёд
-        const oa = a.old ? 1 : 0, ob = b.old ? 1 : 0;
+        const oa = netIsOld (a, now) ? 1 : 0, ob = netIsOld (b, now) ? 1 : 0;
         if (oa !== ob) return oa - ob;                                    // свежие (не древние) -- вперёд
         const da = (a.fail > 0 && (now - a.fail) < 600000) ? 1 : 0;      // кто не сбоил -- вперёд
         const db = (b.fail > 0 && (now - b.fail) < 600000) ? 1 : 0;
@@ -10082,13 +10103,12 @@ function netBonesFind (book, hours, rev)     // ищу «кость»: за чт
         for (const x of rec.ips || [])
         {
             if (!x.ip) continue;
-            const o = ipStat[x.ip] || (ipStat[x.ip] = { ip: x.ip, ok: 0, fail: 0, ms: 0, ad: 0, cnt: 0, names: {}, firstAt: x.firstAt || 0, pre: netPrefixOf (x.ip) });
+            const o = ipStat[x.ip] || (ipStat[x.ip] = { ip: x.ip, ok: 0, fail: 0, ms: 0, ad: 0, cnt: 0, names: {}, pre: netPrefixOf (x.ip) });
             o.ok += x.ok || 0;
             o.fail += x.fails || 0;
             if (x.ms) o.ms = o.ms ? Math.round (o.ms * 0.7 + x.ms * 0.3) : x.ms;
             if (x.ad) o.ad++;
             if ((Number (x.cnt) || 0) > 1) o.cnt++;
-            if (!o.firstAt && x.firstAt) o.firstAt = x.firstAt;
             o.names[name] = 1;
         }
     }
@@ -10137,13 +10157,6 @@ function netBonesFind (book, hours, rev)     // ищу «кость»: за чт
         cand.push ({ kind: 'проверенная подпись', score: 22 + adList.length, ip: adList[0].ip, key: 'подпись:' + adList[0].ip,
             text: 'адресов с проверенной подписью (DNSSEC): ' + adList.length + ', первый -- ' + adList[0].ip + ' (' + Object.keys (adList[0].names).slice (0, 2).join (', ') +
                 '). Вывод: подписанный ответ подменить нельзя -- такие адреса ставлю первыми по их именам' });
-    const now = Date.now ();
-    const fresh = ips.filter (x => x.firstAt && (now - x.firstAt) < 24 * 3600000 && x.ok >= 3 && !x.fail)
-        .sort ((a, b) => (b.firstAt || 0) - (a.firstAt || 0));
-    if (fresh.length)
-        cand.push ({ kind: 'готовый заменитель', score: 12 + Math.min (fresh[0].ok, 8), ip: fresh[0].ip, key: 'заменитель:' + fresh[0].ip,
-            text: 'новый адрес ' + fresh[0].ip + ' (' + Object.keys (fresh[0].names).slice (0, 2).join (', ') + ') появился меньше суток назад и уже дал ' + fresh[0].ok +
-                ' обращений без отказа. Вывод: готовый заменитель, если старый адрес откажет' });
     const thin = [];
     for (const name of Object.keys (book || {}))
     {
@@ -10830,7 +10843,7 @@ async function dnsHelpIps (name)                  // сперва книга (м
         {
             const now = Date.now ();
             const ttl = Math.max (DNS_TTL_MIN, Math.min (DNS_TTL_MAX, rec.ttl || DNS_TTL_DEF));
-            const fresh = rec.ips.filter (x => x && typeof x.ip === 'string' && !dohBadIp (x.ip) && !x.old &&
+            const fresh = rec.ips.filter (x => x && typeof x.ip === 'string' && !dohBadIp (x.ip) && !netIsOld (x, now) &&
                 !(x.fail > 0 && (now - x.fail) < DNS_FAIL_ASLEEP) && (now - (x.at || 0)) < ttl);
             if (fresh.length)
             {
