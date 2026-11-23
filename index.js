@@ -8627,7 +8627,7 @@ if (BOT_RUN)
         poolHarvest ();
         netCacheHarvest ();        // живой справочник системы меняется постоянно -- беру заново
         dnsWarm ();
-        dnsBookLoad ().then (() => { dnsAgeMark (); dnsBookSave (); }).catch (() => { });   // v2.191: без force -- писатель сам решит, когда (раз в 10 минут), а не каждые 5 минут
+        dnsBookLoad ().then (() => { dnsAgeMark (); dnsBookSave (); }).catch (() => { });   // v2.192: пишу только если книга правда изменилась
         netHoursSave ();
     }, 5 * 60 * 1000);
     try { poolTimer.unref (); } catch (e) { }
@@ -8893,6 +8893,12 @@ let dnsSaveWarned = false;
 let dnsStats = null;              // источник -> { ok, fail, ms, at }
 let dnsSaveTimer = null;
 let dnsSaveBusy = false;
+// v2.192 -- пишу книгу ТОЛЬКО когда она правда изменилась. Десятиминутного интервала мало: вызовов
+// dnsBookSave() много (ответ, обновление записи, отказ, отказ источника), и почти каждый таймер
+// переписывал 7 МБ, ничего не добавив. dnsSaveRev растёт на каждом изменении, dnsSavedRev -- ревизия,
+// которая уже на диске; запись идёт, только когда они разошлись.
+let dnsSaveRev = 0;
+let dnsSavedRev = 0;
 
 // v2.190 -- БЕРЕЖНАЯ ЗАПИСЬ В БАЗУ. Сетевые книги (книга имя<->адрес, таблица адрес->имя, почасовые
 // замеры) раньше уходили на диск через 2-3 секунды после каждого изменения: 7 МБ несколько раз в минуту,
@@ -8995,15 +9001,23 @@ async function ipNamesLoad ()
 let ipNamesSaveTimer = null;
 let ipNamesSaveBusy = false;
 let ipNamesTrimAt = 0;
+let ipNamesSaveRev = 0;        // v2.192 -- как у книги адресов: пишу только реально изменённое
+let ipNamesSavedRev = 0;
 function ipNamesSaveLater (ms)                  // v2.191 -- единая отложенная запись: и обычная, и повтор
 {
     if (ipNamesSaveTimer) return;
     ipNamesSaveTimer = setTimeout (() => { ipNamesSaveTimer = null; ipNamesSave (true); }, ms);
     try { ipNamesSaveTimer.unref (); } catch (e) { }
 }
+function ipNamesChanged () { ipNamesSaveRev++; }
 async function ipNamesSave (now)                 // пишу не на каждую запись, а по таймеру: иначе на одну
 {                                               // порцию из справочника уходило бы до сотни записей в базу
-    if (!now) { ipNamesSaveLater (NET_SAVE_EVERY_MS); return; }
+    if (!now)
+    {
+        if (ipNamesSaveRev === ipNamesSavedRev) return;   // ничего нового -- писать нечего
+        ipNamesSaveLater (NET_SAVE_EVERY_MS);
+        return;
+    }
     if (ipNamesSaveBusy) { ipNamesSaveLater (NET_SAVE_RETRY_MS); return; }   // запись уже идёт -- не теряю просьбу
     if (!ipNames) return;
     if (!ipNamesReady)
@@ -9015,14 +9029,18 @@ async function ipNamesSave (now)                 // пишу не на кажд�
         }
         return;
     }
+    if (ipNamesSaveRev === ipNamesSavedRev) return;   // на диске уже всё -- лишней записи не делаю
+    const rev = ipNamesSaveRev;
     ipNamesSaveBusy = true;
     try
     {
         const srv = dbServerList ()[0];
         if (srv) await db (srv, 'netState', 'ip_names', ipNames);
+        ipNamesSavedRev = rev;
     }
     catch (e) { }
     ipNamesSaveBusy = false;
+    if (ipNamesSaveRev !== ipNamesSavedRev) ipNamesSaveLater (NET_SAVE_RETRY_MS);
 }
 async function ipNamesNote (name, ips)
 {
@@ -9049,9 +9067,11 @@ async function ipNamesNote (name, ips)
         for (const _k of Object.keys (ipNames))
         {
             const _r = ipNames[_k];
-            _r.old = ((now - (_r.at || 0)) > NET_KEEP_MS);
+            const _o = ((now - (_r.at || 0)) > NET_KEEP_MS);
+            if (_r.old !== _o) { _r.old = _o; ipNamesChanged (); }   // отметка без смены -- не изменение
         }
     }
+    ipNamesChanged ();
     ipNamesSave ();
 }
 function ipNamesOf (ip)                   // свежие имена вперёд, древние -- в конец, но никуда не пропадают
@@ -9104,6 +9124,7 @@ async function dnsBookLoad ()
         if (_failMig)
         {
             dnsSaveTimer = null;
+            dnsChanged ();
             await dnsBookSave (true);
             console.log ('[' + (d()) + '] [music] книга адресов: у ' + _failMig + ' адресов старая отметка сбоя стала счётчиком (fail -- когда сбоил, fails -- сколько раз)');
         }
@@ -9125,6 +9146,7 @@ async function dnsBookLoad ()
             {
                 await ipMemSave ();
                 dnsSaveTimer = null;
+                dnsChanged ();
                 await dnsBookSave (true);
                 console.log ('[' + (d()) + '] [music] книгу адресов перенёс в отдельную таблицу: ' + moved + ' имён');
             }
@@ -9142,9 +9164,15 @@ function dnsBookSaveLater (ms)                  // v2.191 -- единая отл
     dnsSaveTimer = setTimeout (() => { dnsSaveTimer = null; dnsBookSave (true); }, ms);
     try { dnsSaveTimer.unref (); } catch (e) { }
 }
+function dnsChanged () { dnsSaveRev++; }        // v2.192 -- зову там, где книга правда изменилась
 async function dnsBookSave (now)
 {
-    if (!now) { dnsBookSaveLater (NET_SAVE_EVERY_MS); return; }
+    if (!now)
+    {
+        if (dnsSaveRev === dnsSavedRev) return;   // с прошлой записи ничего не менялось -- и таймер не нужен
+        dnsBookSaveLater (NET_SAVE_EVERY_MS);
+        return;
+    }
     if (dnsSaveBusy) { dnsBookSaveLater (NET_SAVE_RETRY_MS); return; }   // запись уже идёт -- не теряю просьбу
     if (!dnsBook) return;
     if (!dnsBookReady)
@@ -9156,14 +9184,18 @@ async function dnsBookSave (now)
         }
         return;
     }
+    if (dnsSaveRev === dnsSavedRev) return;       // на диске уже ровно то, что в памяти -- лишний раз не пишу
+    const rev = dnsSaveRev;                        // что изменится во время записи -- догоню после неё
     dnsSaveBusy = true;
     try
     {
         const srv = dbServerList ()[0];
         if (srv) { await db (srv, 'dnsbook', 'map', dnsBook); await db (srv, 'dnsbook', 'stats', dnsStats || {}); }
+        dnsSavedRev = rev;
     }
     catch (e) { }
     dnsSaveBusy = false;
+    if (dnsSaveRev !== dnsSavedRev) dnsBookSaveLater (NET_SAVE_RETRY_MS);   // пока писал, книга изменилась -- допишу
 }
 
 function dnsRecMake (name)
@@ -9204,10 +9236,14 @@ function dnsAgeMark ()            // НИЧЕГО НЕ УДАЛЯЮ. Тольк�
     for (const name of Object.keys (dnsBook))
     {
         const rec = dnsBook[name];
-        rec.old = ((now - Math.max (rec.lastUsed || 0, rec.at || 0)) > NET_KEEP_MS);   // имя давно не спрашивали
+        const ro = ((now - Math.max (rec.lastUsed || 0, rec.at || 0)) > NET_KEEP_MS);   // имя давно не спрашивали
+        if (rec.old !== ro) { rec.old = ro; dnsChanged (); }   // v2.192 -- сама отметка ещё не повод писать книгу
         if (!rec.ips) continue;
         for (const x of rec.ips)
-            x.old = ((now - Math.max (x.lastUsed || 0, x.at || 0)) > NET_KEEP_MS);    // адрес давно не отвечал
+        {
+            const xo = ((now - Math.max (x.lastUsed || 0, x.at || 0)) > NET_KEEP_MS);    // адрес давно не отвечал
+            if (x.old !== xo) { x.old = xo; dnsChanged (); }
+        }
     }
     netPruneTick ();          // v2.191 -- раз в 6 часов: старое свернуть и убрать, чтобы книга не росла вечно
 }
@@ -9242,6 +9278,7 @@ async function dnsNote (name, ips, ms, src, ttlSec, secure)     // secure: ад�
     rec.src = src;
     rec.ttl = Math.max (DNS_TTL_MIN, Math.min (DNS_TTL_MAX, ttlSec ? ttlSec * 1000 : (rec.ttl || DNS_TTL_DEF)));
     dnsAgeMark ();
+    dnsChanged ();
     dnsBookSave ();
     return rec;
 }
@@ -9293,6 +9330,7 @@ function dnsNoteSrc (src, ok, ms)
     if (ok) { s.ok++; s.ms = s.ms ? Math.round (s.ms * 0.7 + ms * 0.3) : ms; s.at = Date.now (); }
     else s.fail++;
     hoursTouch (src, ok, ms, 0);
+    dnsChanged ();
     dnsBookSave ();
 }
 
@@ -9306,6 +9344,8 @@ let netHoursRetryAt = 0;
 let netHoursSaveWarned = false;
 let netHoursSaveTimer = null;
 let netHoursSaveBusy = false;
+let netHoursSaveRev = 0;       // v2.192 -- пишу только реально изменённые часы
+let netHoursSavedRev = 0;
 function hourKey (t)
 {
     const d = new Date (t || Date.now ()), p = n => String (n).padStart (2, '0');
@@ -9349,9 +9389,15 @@ function netHoursSaveLater (ms)      // v2.191 -- единая отложенн�
     netHoursSaveTimer = setTimeout (() => { netHoursSaveTimer = null; netHoursSave (true); }, ms);
     try { netHoursSaveTimer.unref (); } catch (e) { }
 }
+function netHoursChanged () { netHoursSaveRev++; }
 async function netHoursSave (now)     // v2.190.1 -- возвращаю промис: на выходе netFlushToDb должен
 {                                     // дождаться именно этой записи, а не «отправил и забыл»
-    if (!now) { netHoursSaveLater (NET_SAVE_EVERY_MS); return; }
+    if (!now)
+    {
+        if (netHoursSaveRev === netHoursSavedRev) return;   // новых замеров нет -- писать нечего
+        netHoursSaveLater (NET_SAVE_EVERY_MS);
+        return;
+    }
     if (netHoursSaveBusy) { netHoursSaveLater (NET_SAVE_RETRY_MS); return; }   // запись уже идёт -- не теряю просьбу
     if (!netHours) return;
     if (!netHoursReady)
@@ -9363,14 +9409,18 @@ async function netHoursSave (now)     // v2.190.1 -- возвращаю пром
         }
         return;
     }
+    if (netHoursSaveRev === netHoursSavedRev) return;   // на диске уже всё -- лишней записи не делаю
+    const rev = netHoursSaveRev;
     netHoursSaveBusy = true;
     try
     {
         const srv = dbServerList ()[0];
         if (srv) await db (srv, 'netState', 'hours', netHours);
+        netHoursSavedRev = rev;
     }
     catch (e) { }
     netHoursSaveBusy = false;
+    if (netHoursSaveRev !== netHoursSavedRev) netHoursSaveLater (NET_SAVE_RETRY_MS);
 }
 
 // v2.191 -- ОГРАНИЧЕНИЕ СЕТЕВОЙ КНИГИ. Это было единственное хранилище, которое росло без предела: книга
@@ -9452,6 +9502,9 @@ function netBookPrune ()
         }
     if (touched)
     {
+        if (namesGone) dnsChanged ();
+        if (ipsGone) ipNamesChanged ();
+        if (hoursIn || daysGone) netHoursChanged ();
         console.log ('[' + (d()) + '] [net] чистка книги: в суточные свёрнуто ' + hoursIn + ' почасовых, убрано ' +
             daysGone + ' суточных старше ' + Math.round (NET_HOURS_DAY_KEEP_DAYS / 365) + ' лет, имён без обращений ' +
             namesGone + ', адресов ' + ipsGone);
@@ -9510,6 +9563,7 @@ function hoursTouch (src, ok, ms, ips)
         if (ok) { s.ok++; s.ms = s.ms ? Math.round (s.ms * 0.7 + ms * 0.3) : ms; b.ok++; b.ms = b.ms ? Math.round (b.ms * 0.7 + ms * 0.3) : ms; }
         else { s.fail++; b.fail++; }
     }
+    netHoursChanged ();
     netHoursSave ();
 }
 // --- Мои прогнозы и проверка зацепки --------------------------------------------
@@ -10523,6 +10577,7 @@ async function ipFailNote (name, ip)
     rec.fail = Date.now ();
     if (ip) { const r = dnsIpSlot (rec, ip); r.fails = (r.fails || 0) + 1; r.fail = Date.now (); }
     else for (const r of rec.ips) { r.fails = (r.fails || 0) + 1; r.fail = Date.now (); }
+    dnsChanged ();
     dnsBookSave ();
     dohCache.delete (name);
 }
@@ -10545,6 +10600,7 @@ async function dnsPlayNote (name, ip)      // по этому адресу му�
         r.played = (r.played || 0) + 1;
         r.lastPlayedAt = Date.now ();
     }
+    dnsChanged ();
     dnsBookSave ();
 }
 async function ipOkNote (name, ip)
@@ -10563,6 +10619,7 @@ async function ipOkNote (name, ip)
         r.lastUsed = Date.now ();
     }
     else for (const r of rec.ips) r.fail = 0;
+    dnsChanged ();
     dnsBookSave ();
 }
 
@@ -10726,6 +10783,7 @@ function dnsHelpCount (ok, ms, name)              // счёт для владе�
             h.last = name;
         }
         else h.fail++;
+        dnsChanged ();
         dnsBookSave ();
     }
     catch (e) { }
@@ -16578,7 +16636,15 @@ function saveMusicState (guildId)
     const key = String (guildId);
     const prev = $musicSaveChain.get (key) || Promise.resolve ();
     const next = prev.catch (() => { }).then (() => saveMusicStateNow (guildId));
-    $musicSaveChain.set (key, next.catch (() => { }));
+    const tail = next.catch (() => { });
+    $musicSaveChain.set (key, tail);
+    // v2.192 -- хвост держу только пока по нему идёт запись. Раньше строка на каждый сервер оставалась
+    // в карте навсегда: за серверами, откуда бот давно ушёл, копились отработавшие цепочки, и каждая
+    // следующая запись вставала в конец давно пустой очереди. Убираю, когда очередь опустела.
+    tail.then (() =>
+    {
+        if ($musicSaveChain.get (key) === tail) $musicSaveChain.delete (key);
+    });
     return next;
 }
 async function saveMusicStateNow (guildId)
