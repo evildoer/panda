@@ -9339,8 +9339,8 @@ async function netHoursLoad ()
     }) ();
     return netHoursLoading;
 }
-function netHoursSave (now)
-{
+async function netHoursSave (now)     // v2.190.1 -- возвращаю промис: на выходе netFlushToDb должен
+{                                     // дождаться именно этой записи, а не «отправил и забыл»
     if (!now)
     {
         if (netHoursSaveTimer) return;
@@ -9359,16 +9359,13 @@ function netHoursSave (now)
         return;
     }
     netHoursSaveBusy = true;
-    (async () =>
+    try
     {
-        try
-        {
-            const srv = dbServerList ()[0];
-            if (srv) await db (srv, 'netState', 'hours', netHours);
-        }
-        catch (e) { }
-        netHoursSaveBusy = false;
-    }) ();
+        const srv = dbServerList ()[0];
+        if (srv) await db (srv, 'netState', 'hours', netHours);
+    }
+    catch (e) { }
+    netHoursSaveBusy = false;
 }
 
 // v2.190 -- при выходе (Ctrl+C, SIGTERM, закрытое окно) дописываю накопленное, чтобы 10-минутное окно
