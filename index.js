@@ -8627,8 +8627,8 @@ if (BOT_RUN)
         poolHarvest ();
         netCacheHarvest ();        // живой справочник системы меняется постоянно -- беру заново
         dnsWarm ();
-        dnsBookLoad ().then (() => { dnsAgeMark (); dnsBookSave (true); }).catch (() => { });
-        netHoursSave (true);
+        dnsBookLoad ().then (() => { dnsAgeMark (); dnsBookSave (); }).catch (() => { });   // v2.191: без force -- писатель сам решит, когда (раз в 10 минут), а не каждые 5 минут
+        netHoursSave ();
     }, 5 * 60 * 1000);
     try { poolTimer.unref (); } catch (e) { }
     const reportTimer = setInterval (async () =>                       // разбор собранного -- раз в час: три строки (кто отвечает, где запас, что ждать); подробности -- `node . net`
@@ -8900,6 +8900,7 @@ let dnsSaveBusy = false;
 // одной записью раз в 10 минут, а при выходе -- сразу (см. netFlushToDb ниже). Данные те же, реже только
 // момент записи: при аварийном падении теряется не больше 10 минут истории замеров сети.
 const NET_SAVE_EVERY_MS = 10 * 60 * 1000;
+const NET_SAVE_RETRY_MS = 30 * 1000;     // база занята чужой записью -- вернусь через полминуты, а не через 10 минут
 
 async function ipMemLoad ()
 {
@@ -8994,16 +8995,17 @@ async function ipNamesLoad ()
 let ipNamesSaveTimer = null;
 let ipNamesSaveBusy = false;
 let ipNamesTrimAt = 0;
+function ipNamesSaveLater (ms)                  // v2.191 -- единая отложенная запись: и обычная, и повтор
+{
+    if (ipNamesSaveTimer) return;
+    ipNamesSaveTimer = setTimeout (() => { ipNamesSaveTimer = null; ipNamesSave (true); }, ms);
+    try { ipNamesSaveTimer.unref (); } catch (e) { }
+}
 async function ipNamesSave (now)                 // пишу не на каждую запись, а по таймеру: иначе на одну
 {                                               // порцию из справочника уходило бы до сотни записей в базу
-    if (!now)
-    {
-        if (ipNamesSaveTimer) return;
-        ipNamesSaveTimer = setTimeout (() => { ipNamesSaveTimer = null; ipNamesSave (true); }, NET_SAVE_EVERY_MS);
-        try { ipNamesSaveTimer.unref (); } catch (e) { }
-        return;
-    }
-    if (ipNamesSaveBusy || !ipNames) return;
+    if (!now) { ipNamesSaveLater (NET_SAVE_EVERY_MS); return; }
+    if (ipNamesSaveBusy) { ipNamesSaveLater (NET_SAVE_RETRY_MS); return; }   // запись уже идёт -- не теряю просьбу
+    if (!ipNames) return;
     if (!ipNamesReady)
     {
         if (!ipNamesSaveWarned)
@@ -9134,16 +9136,17 @@ async function dnsBookLoad ()
     return dnsBookLoading;
 }
 
+function dnsBookSaveLater (ms)                  // v2.191 -- единая отложенная запись: и обычная, и повтор
+{
+    if (dnsSaveTimer) return;
+    dnsSaveTimer = setTimeout (() => { dnsSaveTimer = null; dnsBookSave (true); }, ms);
+    try { dnsSaveTimer.unref (); } catch (e) { }
+}
 async function dnsBookSave (now)
 {
-    if (!now)
-    {
-        if (dnsSaveTimer) return;
-        dnsSaveTimer = setTimeout (() => { dnsSaveTimer = null; dnsBookSave (true); }, NET_SAVE_EVERY_MS);
-        try { dnsSaveTimer.unref (); } catch (e) { }
-        return;
-    }
-    if (dnsSaveBusy || !dnsBook) return;
+    if (!now) { dnsBookSaveLater (NET_SAVE_EVERY_MS); return; }
+    if (dnsSaveBusy) { dnsBookSaveLater (NET_SAVE_RETRY_MS); return; }   // запись уже идёт -- не теряю просьбу
+    if (!dnsBook) return;
     if (!dnsBookReady)
     {
         if (!dnsSaveWarned)
@@ -9206,6 +9209,7 @@ function dnsAgeMark ()            // НИЧЕГО НЕ УДАЛЯЮ. Тольк�
         for (const x of rec.ips)
             x.old = ((now - Math.max (x.lastUsed || 0, x.at || 0)) > NET_KEEP_MS);    // адрес давно не отвечал
     }
+    netPruneTick ();          // v2.191 -- раз в 6 часов: старое свернуть и убрать, чтобы книга не росла вечно
 }
 async function dnsNote (name, ips, ms, src, ttlSec, secure)     // secure: адрес -> { ad, cnt }
 {
@@ -9339,16 +9343,17 @@ async function netHoursLoad ()
     }) ();
     return netHoursLoading;
 }
+function netHoursSaveLater (ms)      // v2.191 -- единая отложенная запись: и обычная, и повтор
+{
+    if (netHoursSaveTimer) return;
+    netHoursSaveTimer = setTimeout (() => { netHoursSaveTimer = null; netHoursSave (true); }, ms);
+    try { netHoursSaveTimer.unref (); } catch (e) { }
+}
 async function netHoursSave (now)     // v2.190.1 -- возвращаю промис: на выходе netFlushToDb должен
 {                                     // дождаться именно этой записи, а не «отправил и забыл»
-    if (!now)
-    {
-        if (netHoursSaveTimer) return;
-        netHoursSaveTimer = setTimeout (() => { netHoursSaveTimer = null; netHoursSave (true); }, NET_SAVE_EVERY_MS);
-        try { netHoursSaveTimer.unref (); } catch (e) { }
-        return;
-    }
-    if (netHoursSaveBusy || !netHours) return;
+    if (!now) { netHoursSaveLater (NET_SAVE_EVERY_MS); return; }
+    if (netHoursSaveBusy) { netHoursSaveLater (NET_SAVE_RETRY_MS); return; }   // запись уже идёт -- не теряю просьбу
+    if (!netHours) return;
     if (!netHoursReady)
     {
         if (!netHoursSaveWarned)
@@ -9368,6 +9373,103 @@ async function netHoursSave (now)     // v2.190.1 -- возвращаю пром
     netHoursSaveBusy = false;
 }
 
+// v2.191 -- ОГРАНИЧЕНИЕ СЕТЕВОЙ КНИГИ. Это было единственное хранилище, которое росло без предела: книга
+// имён, таблица адрес->имя и часы только пополняются (старое лишь помечалось), а каждое сохранение
+// переписывает их целиком (7,4 МБ, 97% базы). Теперь раз в 6 часов: почасовые замеры старше 45 дней
+// сворачиваются в СУТОЧНЫЕ (данные не пропадают, их становится в 24 раза меньше), суточные старше трёх лет
+// убираются, имена и адреса без обращений дольше NET_KEEP_MS (180 дней) удаляются. Всё посчитано и сказано
+// в логе: не молча.
+const NET_HOURS_KEEP_DAYS = 45;
+const NET_HOURS_DAY_KEEP_DAYS = 3 * 365;
+const NET_PRUNE_EVERY_MS = 6 * 60 * 60 * 1000;
+const NET_PRUNE_MAX = 20000;             // больше стольких записей за проход не трогаю, чтобы не подвесить бота
+function netDayKeyOf (t)
+{
+    const d = new Date (t), p = n => String (n).padStart (2, '0');
+    return d.getFullYear () + '-' + p (d.getMonth () + 1) + '-' + p (d.getDate ());
+}
+function netBucketMerge (dst, src)       // суточный бакет: суммы складываю, среднее время -- взвешенно по замерам
+{
+    if (!dst || !src) return dst || src;
+    const w1 = (dst.ok || 0) + (dst.fail || 0), w2 = (src.ok || 0) + (src.fail || 0);
+    dst.ok = (dst.ok || 0) + (src.ok || 0);
+    dst.fail = (dst.fail || 0) + (src.fail || 0);
+    dst.ips = (dst.ips || 0) + (src.ips || 0);
+    if (w1 + w2) dst.ms = Math.round (((dst.ms || 0) * w1 + (src.ms || 0) * w2) / (w1 + w2));
+    if (src.bySrc && typeof src.bySrc === 'object')
+    {
+        if (!dst.bySrc) dst.bySrc = {};
+        for (const s of Object.keys (src.bySrc))
+        {
+            const b = src.bySrc[s] || {}, a = dst.bySrc[s] || (dst.bySrc[s] = { ok: 0, fail: 0, ms: 0 });
+            const v1 = (a.ok || 0) + (a.fail || 0), v2 = (b.ok || 0) + (b.fail || 0);
+            a.ok = (a.ok || 0) + (b.ok || 0);
+            a.fail = (a.fail || 0) + (b.fail || 0);
+            if (v1 + v2) a.ms = Math.round (((a.ms || 0) * v1 + (b.ms || 0) * v2) / (v1 + v2));
+        }
+    }
+    return dst;
+}
+let netPruneAt = 0;
+function netBookPrune ()
+{
+    const now = Date.now ();
+    let hoursIn = 0, daysGone = 0, namesGone = 0, ipsGone = 0, touched = false;
+    const hourCut = netDayKeyOf (now - NET_HOURS_KEEP_DAYS * 86400000);
+    const dayCut = netDayKeyOf (now - NET_HOURS_DAY_KEEP_DAYS * 86400000);
+    if (netHours)
+        for (const k of Object.keys (netHours))
+        {
+            if (hoursIn + daysGone >= NET_PRUNE_MAX) break;
+            const m = /^(\d{4}-\d{2}-\d{2})T\d{2}$/.exec (k);
+            if (m)
+            {
+                if (m[1] >= hourCut) continue;                       // свежие почасовые не трогаю
+                if (m[1] < dayCut) { delete netHours[k]; daysGone++; touched = true; continue; }
+                netBucketMerge (netHours[m[1]] || (netHours[m[1]] = { ok: 0, fail: 0, ms: 0, ips: 0, bySrc: {} }), netHours[k]);
+                delete netHours[k];
+                hoursIn++;
+                touched = true;
+                continue;
+            }
+            if (/^\d{4}-\d{2}-\d{2}$/.test (k) && k < dayCut) { delete netHours[k]; daysGone++; touched = true; }
+        }
+    if (dnsBook)
+        for (const name of Object.keys (dnsBook))
+        {
+            if (namesGone >= NET_PRUNE_MAX) break;
+            const rec = dnsBook[name];
+            const last = rec ? Math.max (rec.lastUsed || 0, rec.at || 0) : 0;
+            if (!rec || !last || (now - last) > NET_KEEP_MS) { delete dnsBook[name]; namesGone++; touched = true; }
+        }
+    if (ipNames)
+        for (const ip of Object.keys (ipNames))
+        {
+            if (ipsGone >= NET_PRUNE_MAX) break;
+            const rec = ipNames[ip];
+            const last = rec ? (rec.at || 0) : 0;
+            if (!rec || !last || (now - last) > NET_KEEP_MS) { delete ipNames[ip]; ipsGone++; touched = true; }
+        }
+    if (touched)
+    {
+        console.log ('[' + (d()) + '] [net] чистка книги: в суточные свёрнуто ' + hoursIn + ' почасовых, убрано ' +
+            daysGone + ' суточных старше ' + Math.round (NET_HOURS_DAY_KEEP_DAYS / 365) + ' лет, имён без обращений ' +
+            namesGone + ', адресов ' + ipsGone);
+        dnsBookSave (true);
+        ipNamesSave (true);
+        netHoursSave (true);
+    }
+    return touched;
+}
+function netPruneTick ()
+{
+    const now = Date.now ();
+    if (netPruneAt && (now - netPruneAt) < NET_PRUNE_EVERY_MS) return;
+    netPruneAt = now;
+    try { netBookPrune (); }
+    catch (e) { console.log ('[' + (d()) + '] [net] чистка книги не удалась: ' + oneLine ((e && e.message) || e)); }
+}
+
 // v2.190 -- при выходе (Ctrl+C, SIGTERM, закрытое окно) дописываю накопленное, чтобы 10-минутное окно
 // не терять: жду окончания текущей записи, если она идёт, и пишу финальное состояние. Жёсткий предел --
 // 4 секунды на саму запись, чтобы остановка бота не подвисала, даже если база занята.
@@ -9383,7 +9485,7 @@ async function netFlushToDb ()
         await Promise.race
         ([
             Promise.allSettled ([dnsBookSave (true), ipNamesSave (true), netHoursSave (true)]),
-            new Promise (r => setTimeout (r, 4000)),      // жёсткий предел: выход не должен висеть на занятой базе
+            new Promise (r => setTimeout (r, 5000)),      // жёсткий предел: выход не должен висеть на занятой базе
         ]);
     }
     catch (e) { }
@@ -15760,7 +15862,7 @@ async function saveAllMusic ()
     await Promise.race
     ([
         Promise.all (ids.map (g => saveMusicState (g).catch (() => {}))),
-        new Promise (r => setTimeout (r, 1500)),
+        new Promise (r => setTimeout (r, 3000)),
     ]);
 }
 function stopBotNow ()
@@ -15792,7 +15894,7 @@ for (let sig of ['SIGINT', 'SIGTERM', 'SIGHUP'])
         stopBotNow ();
     });
 
-// v2.162 -- просьба `node . stop`: проверяю файл-просьбу раз в секунду и, увидев СВОЙ pid, гасну как по Ctrl+C
+// v2.162 -- просьба `node . stop`: проверяю файл-просьбу раз в 3 секунды и, увидев СВОЙ pid, гасну как по Ctrl+C
 // (очередь и позиция сохраняются, выход кодом 0 -- супервизор уходит за мной по правилу «вышел сам»).
 function botStopWatchTick ()
 {
@@ -15806,7 +15908,7 @@ function botStopWatchTick ()
 }
 if (BOT_RUN)
 {
-    const _stopWatch = setInterval (botStopWatchTick, 1000);
+    const _stopWatch = setInterval (botStopWatchTick, 3000);
     if (_stopWatch.unref) _stopWatch.unref ();
 }
 
@@ -16468,7 +16570,18 @@ function playedMsOf (m)
     return (m.playedMs || 0) + (m.playingSince ? Date.now () - m.playingSince : 0);
 }
 
-async function saveMusicState (guildId)
+// v2.191 -- записи очереди одного сервера идут строго по очереди: при частых событиях и тике две записи
+// могли завершиться не в том порядке, и старый снимок затирал новый (позиция откатывалась назад).
+const $musicSaveChain = new Map ();
+function saveMusicState (guildId)
+{
+    const key = String (guildId);
+    const prev = $musicSaveChain.get (key) || Promise.resolve ();
+    const next = prev.catch (() => { }).then (() => saveMusicStateNow (guildId));
+    $musicSaveChain.set (key, next.catch (() => { }));
+    return next;
+}
+async function saveMusicStateNow (guildId)
 {
     try
     {
@@ -18963,7 +19076,7 @@ function nowPlayingText (m, guildId, viewerId)
     const paused = !!(m.player && m.player.state && m.player.state.status === AudioPlayerStatus.Paused);
     if (!t)
         return m.connection
-            ? '🎧 В канале тишина -- играть нечего. Поставить трек: `/play`, позвать меня: `/join`.'
+            ? '🎧 В канале тишина -- играть нечего. Поставить трек: `/play`.'      // v2.191: бот уже в канале, /join тут незачем
             : '🈳 Ничего не играет, и я не в канале.';
     const live = !!t.isLive;
     const dur = Number (t.duration) > 0 ? Number (t.duration) : 0;
