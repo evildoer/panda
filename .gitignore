@@ -5,6 +5,8 @@ config.json
 config.json.*
 *.sqlite
 *.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
 logs/
 # заявка на интенты и шпаргалка к ней: там id и цифры реального сервера,
 # публиковать не нужно

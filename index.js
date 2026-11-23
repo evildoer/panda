@@ -2405,6 +2405,21 @@ function dbCopyAndVerify (_src, _dst, _expectRows)
             _f.rmSync (_tmp, { force: true });
             return { ok: false, why: 'в копии ' + _chk.rows + ' записей, а в базе ' + _expectRows };
         }
+        // v2.198: живая база в режиме WAL, и копия наследовала этот режим -- рядом оставались .tmp-wal и
+        // .tmp-shm, а сама копия требовала бы журнал. Перевожу копию в обычный журнал и убираю остатки:
+        // копия должна открываться сама по себе, одним файлом.
+        try
+        {
+            const DatabaseSync = require ('node:sqlite').DatabaseSync;
+            const _d = new DatabaseSync (_tmp);
+            _d.exec ('PRAGMA journal_mode=DELETE');
+            _d.close ();
+        }
+        catch (e) { }
+        for (const _suf of ['-wal', '-shm'])
+        {
+            try { _f.rmSync (_tmp + _suf, { force: true }); } catch (e) { }
+        }
         try { _f.renameSync (_tmp, _dst); }
         catch (e) { _f.copyFileSync (_tmp, _dst); _f.rmSync (_tmp, { force: true }); }
         return { ok: true, rows: _chk.rows };
@@ -2696,8 +2711,17 @@ function dbRestoreCli (_sel)
             catch (e) { console.log ('[restore] ' + _srv + ': не смог отложить текущую базу: ' + clipText (String ((e && e.message) || e), 160) + ' -- ничего не трогаю'); _fail++; continue; }
         }
         const _res = dbCopyAndVerify (_src, _file, _b.rows);
-        if (_res.ok) console.log ('[restore] ' + _srv + ': база восстановлена из ' + _what + ' -- ' + _res.rows + ' ' +
-            plural (_res.rows, 'запись', 'записи', 'записей') + ', файл прочитан');
+        if (_res.ok)
+        {
+            // v2.198: журнал WAL принадлежит ПРЕЖНЕЙ базе -- после подмены файла его нельзя оставлять,
+            // иначе SQLite применит старый журнал к восстановленной базе
+            for (const _suf of ['-wal', '-shm'])
+            {
+                try { _f.rmSync (_file + _suf, { force: true }); } catch (e) { }
+            }
+            console.log ('[restore] ' + _srv + ': база восстановлена из ' + _what + ' -- ' + _res.rows + ' ' +
+                plural (_res.rows, 'запись', 'записи', 'записей') + ', файл прочитан');
+        }
         else { console.log ('[restore] ' + _srv + ': не вышло: ' + _res.why + ' (' + _what + ' цела, можно повторить)'); _fail++; }
     }
     return _fail ? 1 : 0;
