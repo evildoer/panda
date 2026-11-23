@@ -9882,6 +9882,10 @@ async function netFlushToDb ()
             Promise.allSettled (NET_SAVERS.map (s => s.save (true))),
             new Promise (r => setTimeout (r, 5000)),      // жёсткий предел: выход не должен висеть на занятой базе
         ]);
+        // v2.198: после выхода свежее оставалось в -wal (2 МБ), и копия файла руками была бы неполной.
+        // Сливаю журнал в базу -- тогда один .sqlite содержит всё.
+        try { const _srv = dbServerList ()[0]; if (_srv) dbWalCheckpoint (dbFileOf (_srv)); }
+        catch (e) { }
     }
     catch (e) { }
     netFlushBusy = false;
