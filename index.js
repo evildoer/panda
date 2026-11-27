@@ -1319,6 +1319,8 @@ function netCli ()       // разбор собранного: что знаем
         const keys = Object.keys (book);
         const now = Date.now ();
         let ips = 0, signed = 0, agree = 0, oldNames = 0, oldIps = 0, asleep = 0, newest = 0, oldest = 0, newestName = '', oldestName = '';
+        // v2.203: то, о чём спрашивал владелец, -- обновляются ли записи и прибавляются ли новые адреса
+        let freshNow = 0, parked = 0, nxMark = 0, newNamesDay = 0, newIpsAll = 0, lastNewAt = 0, lastNewName = '';
         // Тот же срок, что NET_KEEP_MS в работе бота (здесь он ещё не объявлен: это консольная команда).
         const _netOld = (x, t) => (t - Math.max ((x && x.lastUsed) || 0, (x && x.at) || 0, (x && x.lastPlayedAt) || 0)) > 180 * 86400000;
         const many = [];
@@ -1332,6 +1334,17 @@ function netCli ()       // разбор собранного: что знаем
             if (at > newest) { newest = at; newestName = k; }
             if (at && (!oldest || at < oldest)) { oldest = at; oldestName = k; }
             if (_netOld (rec, now)) oldNames++;
+            // Те же числа, что DNS_TTL_MIN/MAX/DEF в работе бота: здесь они ещё не объявлены (консольная команда).
+            const _ttl = Math.max (60000, Math.min (24 * 3600000, rec.ttl || 600000));
+            if (list.length && (now - at) < _ttl) freshNow++;
+            if (rec.dead && rec.dead > now) parked++;
+            if (rec.nx) nxMark++;
+            newIpsAll += Number (rec.newAddrs) || 0;
+            if (rec.lastNewAt && (now - rec.lastNewAt) < 86400000)
+            {
+                newNamesDay++;
+                if (rec.lastNewAt > lastNewAt) { lastNewAt = rec.lastNewAt; lastNewName = k; }
+            }
             for (const x of list)
             {
                 if (x.ad) signed++;
@@ -1341,6 +1354,14 @@ function netCli ()       // разбор собранного: что знаем
             }
         }
         console.log ('[net] книга: имён ' + keys.length + ', адресов ' + ips);
+        console.log ('[net]   свежих записей сейчас: ' + freshNow + ' из ' + keys.length +
+            ' (проход обновляет до 24 самых давних в минуту)' +
+            (parked ? '; мёртвых запарковано: ' + parked : '') +
+            (nxMark ? '; ждут второго «нет имени»: ' + nxMark : ''));
+        console.log ('[net]   новые адреса: за сутки прибавились у ' + newNamesDay + ' имён' +
+            (lastNewName ? ' (последнее -- ' + lastNewName + ', ' + _when (lastNewAt) + ')' : '') +
+            '; всего с начала ведения книги прибавлено ' + newIpsAll +
+            ' (счётчик не сбрасывается); лишнее срезается раз в 6 ч: до ' + 16 + ' адресов у нужного имени и до ' + 4 + ' у неспрошенного');
         console.log ('[net]   с проверенной подписью (DNSSEC): ' + signed + ' адр.; подтверждены несколькими справочниками: ' + agree);
         console.log ('[net]   помечено древними: имён ' + oldNames + ', адресов ' + oldIps + ' (хранятся и используются, но уходят в конец выбора)');
         console.log ('[net]   сейчас после сбоя отложены: ' + asleep + ' адр.');
@@ -9462,6 +9483,11 @@ async function dnsNote (name, ips, ms, src, ttlSec, secure)     // secure: ад�
     if (taken.length) await ipNamesNote (name, taken);     // обратная запись: этот адрес -- такое-то имя
     rec.at = now;
     rec.src = src;
+    if (taken.length && (rec.dead || rec.nx))
+    {                                    // v2.203: имя ответило -- снимаю парковку «мёртвое», чтобы оно снова жило
+        delete rec.dead;                 // (раньше отметка снималась только в проходе dnsWarm, а он запаркованные имена
+        delete rec.nx;                   // не спрашивает -- ожившее имя могло просидеть в парковке весь срок)
+    }
     rec.ttl = Math.max (DNS_TTL_MIN, Math.min (DNS_TTL_MAX, ttlSec ? ttlSec * 1000 : (rec.ttl || DNS_TTL_DEF)));
     dnsAgeMark ();
     dnsChanged (name);
@@ -16527,10 +16553,9 @@ function musicAddApply (interaction, guildId, m, tracks, query, where, opts = {}
         ? (_nAdd + ' ' + plural (_nAdd, 'трек', 'трека', 'треков') + ', первый -- «' + _firstAdd + '»')
         : ('«' + _firstAdd + '»');
     const _addFrom = tracks[0].author ? ' (канал ' + clipText (String (tracks[0].author), 60) + ')' : '';
-    console.log ('[' + (d()) + '] [music] ' + whoText (interaction.user.username) + 'добавил в очередь ' +
-        _addWhat + _addFrom + ', теперь в очереди ' + m.tracks.length);
-    musicEventLog (guildId, '🎶 **' + interaction.user.username + '** добавил ' + _addWhat + _addFrom +
-        ' в <#' + interaction.channelId + '>, в очереди ' + m.tracks.length + ' · ' + d ());
+    musicEvent (guildId,
+        whoText (interaction.user.username) + 'добавил в очередь ' + _addWhat + _addFrom + ', теперь в очереди ' + m.tracks.length,
+        '🎶 **' + interaction.user.username + '** добавил ' + _addWhat + _addFrom + ' в <#' + interaction.channelId + '>, в очереди ' + m.tracks.length);
     queueMsgRedraw (guildId, 300).catch (() => {});
     if (ins.shouldStart) playNext (guildId);
     return { ins: ins, text: text, askMoveRow: (where && where.askMoveRow) || null };
@@ -18415,7 +18440,8 @@ function queueSkip (guildId, who, opts = {})
     const skipped = m.current.title || 'трек';
     m.skipRequested = true;
     m.player.stop (true);
-    console.log ('[' + (d()) + '] [music] ' + whoText (who) + 'пропустил: ' + skipped);
+    musicEvent (guildId, whoText (who) + 'пропустил: ' + skipped,
+        '⏭ **' + (who || 'кто-то') + '** пропустил: **' + skipped + '**');
     return { ok: true, text: '⏭ Пропущено: **' + skipped + '**' +
         (m.current ? ' -- играю **' + (m.current.title || 'трек') + '**' : '') };
 }
@@ -18514,13 +18540,12 @@ function queueClearAuthor (guildId, targetId, who)
             : '🈳 Треков без автора в очереди нет -- удалять нечего.' };
     const w = queuePurge (guildId, t => !hit (t));
     if (!w) return { ok: false, text: '🈳 Удалять нечего.' };
-    console.log ('[' + (d()) + '] [music] ' + whoText (who) + 'убрал из очереди треки ' +
-        (target ? u (target) : 'без автора') + ' (' + w.goneQ + ')' +
-        (w.playing ? ' -- и прервал его играющий трек' : (w.waiting ? ' -- и его ждущий трек' : '')));
-    musicEventLog (guildId, '🧹 **' + (who || 'кто-то') + '** убрал из очереди треки ' +   // v2.202: и в журнал сервера
-        (target ? u (target) : 'без автора') + ' (' + w.goneQ + ')' +
-        (w.playing ? ', играющий прерван' : (w.waiting ? ', ждущий тоже убран' : '')) +
-        ', в очереди осталось ' + w.left + ' · ' + d ());
+    musicEvent (guildId,
+        whoText (who) + 'убрал из очереди треки ' + (target ? u (target) : 'без автора') + ' (' + w.goneQ + ')' +
+        (w.playing ? ' -- и прервал его играющий трек' : (w.waiting ? ' -- и его ждущий трек' : '')),
+        '🧹 **' + (who || 'кто-то') + '** убрал из очереди треки ' + (target ? u (target) : 'без автора') +
+        ' (' + w.goneQ + ')' + (w.playing ? ', играющий прерван' : (w.waiting ? ', ждущий тоже убран' : '')) +
+        ', в очереди осталось ' + w.left);
     return {
         ok: true,
         text: '🧹 Убрал ' + w.goneQ + ' ' + plural (w.goneQ, 'трек', 'трека', 'треков') +
@@ -18648,7 +18673,9 @@ function jumpMusic (guildId, n, cut, opts = {})
         const targetCut = m.tracks[0];
         const cutTxt = (gone.length ? gone.length + ' ' + plural (gone.length, 'трек', 'трека', 'треков') + ' до него' : '') +
             (gone.length && wasCut ? ' и ' : '') + (wasCut ? 'прерванный **' + (wasCut.title || 'трек') + '**' : '');
-        console.log ('[' + (d()) + '] [music] обрезал очередь до №' + n + ': ' + (targetCut.title || 'трек') +
+        musicEvent (guildId, 'обрезал очередь до №' + n + ': ' + (targetCut.title || 'трек') +
+            (cutTxt ? ' (убрано насовсем: ' + cutTxt + ')' : ''),
+            '✂ **' + ((opts && opts.who) || 'кто-то') + '** обрезал очередь до №' + n + ': **' + (targetCut.title || 'трек') + '**' +
             (cutTxt ? ' (убрано насовсем: ' + cutTxt + ')' : ''));
         if (wasCut) { m.skipRequested = true; m.player.stop (true); }
         else playNext (guildId);
@@ -18764,14 +18791,10 @@ function queueClear (guildId, who, opts = {})
         ? (w.goneQ ? 'убрал свои треки из очереди (' + w.goneQ + ')'
                    : 'убрал своё из очереди (своих треков в ней не было)')
         : ((leave ? 'остановил и убрал очередь (' : 'очистил очередь (') + w.goneQ + ')');
-    console.log ('[' + (d()) + '] [music] ' + whoText (who) + head +
-        (w.playing ? ' и снял играющий трек' : (w.waiting ? ' и снял ждущий трек' : '')) +
+    const _clearTail = (w.playing ? ' и снял играющий трек' : (w.waiting ? ' и снял ждущий трек' : '')) +
         (w.left ? ', в очереди осталось ' + w.left : '') +
-        (left ? ', вышел из канала' : ''));
-    musicEventLog (guildId, '🧹 **' + (who || 'кто-то') + '** ' + head +      // v2.202: и в журнал сервера
-        (w.playing ? ' и снял играющий трек' : (w.waiting ? ' и снял ждущий трек' : '')) +
-        (w.left ? ', в очереди осталось ' + w.left : '') +
-        (left ? ', вышел из канала' : '') + ' · ' + d ());
+        (left ? ', вышел из канала' : '');
+    musicEvent (guildId, whoText (who) + head + _clearTail, '🧹 **' + (who || 'кто-то') + '** ' + head + _clearTail);
     const bits = [];
     if (w.goneQ) bits.push (w.goneQ + ' ' + plural (w.goneQ, 'трек', 'трека', 'треков'));
     if (w.playing) bits.push ('играющий **' + w.playing + '**' +
@@ -18901,11 +18924,15 @@ function queueFilter (guildId, opts)
         return { ok: false, text: '🈳 ' + filterNothingText (plan, text) };
     const w = queuePurge (guildId, plan.keep);
     if (!w) return { ok: false, text: '🈳 Убирать нечего -- очередь уже другая (может, её убрали с тех пор).' };
-    console.log ('[' + (d()) + '] [music] ' + whoText (opts.who) +
+    musicEvent (guildId, whoText (opts.who) +
         (plan.mode === 'keep' ? 'оставил только треки по «' + text + '»' : 'убрал треки по «' + text + '»') +
         ' (' + (plan.scope === 'all' ? 'вся очередь' : 'только его треки') + '): убрал ' + w.goneQ +
         (w.playing ? ' и снял играющий трек' : (w.waiting ? ' и снял ждущий трек' : '')) +
-        ', осталось ' + w.left);
+        ', осталось ' + w.left,
+        '🧽 **' + ((opts && opts.who) || 'кто-то') + '** ' +
+        (plan.mode === 'keep' ? 'оставил только треки по «' + text + '»' : 'убрал треки по «' + text + '»') +
+        ' (' + (plan.scope === 'all' ? 'вся очередь' : 'только его треки') + '): убрал ' + w.goneQ +
+        (w.playing ? ' и снял играющий трек' : (w.waiting ? ' и снял ждущий трек' : '')) + ', осталось ' + w.left);
     const bits = [];
     if (w.goneQ)
         bits.push (w.goneQ + ' ' + plural (w.goneQ, 'трек', 'трека', 'треков') +
@@ -18986,7 +19013,9 @@ function queueRemove (guildId, n, who, opts = {})
     saveMusicState (guildId);
     scheduleVoiceStatus (guildId, true);
     schedulePresence (true);
-    console.log ('[' + (d()) + '] [music] ' + whoText (who) + 'убрал из очереди №' + n + ': ' + (gone.title || 'трек'));
+    musicEvent (guildId, whoText (who) + 'убрал из очереди №' + n + ': ' + (gone.title || 'трек'),
+        '🗑 **' + (who || 'кто-то') + '** убрал из очереди №' + n + ': **' + (gone.title || 'трек') + '**' +
+        (m.tracks.length ? ' (в очереди осталось ' + m.tracks.length + ')' : ' (очередь пуста)'));
     return { ok: true, text: '🗑 Убрал №' + n + ': **' + (gone.title || 'трек') + '**' +
         (m.tracks.length ? ' (в очереди осталось ' + m.tracks.length + ')' : ' (очередь пуста)') };
 }
@@ -19107,7 +19136,8 @@ function queueMove (guildId, n, to, who, opts = {})
     saveMusicState (guildId);
     scheduleVoiceStatus (guildId, true);
     schedulePresence (true);
-    console.log ('[' + (d()) + '] [music] ' + whoText (who) + 'переставил в очереди №' + n + ' -> №' + to + ': ' + (moved.title || 'трек'));
+    musicEvent (guildId, whoText (who) + 'переставил в очереди №' + n + ' -> №' + to + ': ' + (moved.title || 'трек'),
+        '↕ **' + (who || 'кто-то') + '** переставил в очереди №' + n + ' → №' + to + ': **' + (moved.title || 'трек') + '**');
     return {
         ok: true,
         to: idx + 1,
@@ -19146,10 +19176,13 @@ function queuePromote (guildId, n, who, opts = {})
     m.tracks = [target].concat (after);
     dropPreload (m);
     const wasPos = was ? (after.indexOf (was) + 1) : 0;
-    console.log ('[' + (d()) + '] [music] ' + whoText (who) + 'поставил играющим №' + n + ': ' + (target.title || 'трек') +
+    musicEvent (guildId, whoText (who) + 'поставил играющим №' + n + ': ' + (target.title || 'трек') +
         (run.length ? ' (пачка автора целиком: ' + (run.length + 1) + ' шт.)' : '') +
         (was ? ' (прерванный ' + (was.title || 'трек') + ' -- в очередь, №' + wasPos + ', с ' + fmtDur (wasAt) + ')' : '') +
-        ' -- это №0 плейлиста');
+        ' -- это №0 плейлиста',
+        '▶ **' + (who || 'кто-то') + '** поставил играющим №' + n + ': **' + (target.title || 'трек') + '**' +
+        (run.length ? ' (пачка автора целиком: ' + (run.length + 1) + ' шт.)' : '') +
+        (was ? ' (прерванный **' + (was.title || 'трек') + '** -- в очередь, №' + wasPos + ', с ' + fmtDur (wasAt) + ')' : ''));
     if (was) { m.skipRequested = true; if (m.player) m.player.stop (true); }
     else playNext (guildId);
     return {
@@ -19190,8 +19223,10 @@ function queueDemote (guildId, to, who, opts = {})
     arr.splice (idx, 0, was);
     m.tracks = [newCur].concat (arr);
     dropPreload (m);
-    console.log ('[' + (d()) + '] [music] ' + whoText (who) + 'снял с эфира и вернул в очередь №' +
-        (idx + 1) + ': ' + (was.title || 'трек') + ' (с ' + fmtDur (wasAt) + ') -- играю: ' + (newCur.title || 'трек'));
+    musicEvent (guildId, whoText (who) + 'снял с эфира и вернул в очередь №' +
+        (idx + 1) + ': ' + (was.title || 'трек') + ' (с ' + fmtDur (wasAt) + ') -- играю: ' + (newCur.title || 'трек'),
+        '⏏ **' + (who || 'кто-то') + '** снял с эфира **' + (was.title || 'трек') + '** -- в очередь №' + (idx + 1) +
+        ' с ' + fmtDur (wasAt) + ', теперь играет **' + (newCur.title || 'трек') + '**');
     m.skipRequested = true;
     if (m.player) m.player.stop (true);
     return {
@@ -19438,7 +19473,8 @@ function seekMusic (guildId, sec, who, opts = {})
     dropPreload (m);
     saveMusicState (guildId);
     try { m.player.stop (true); } catch {}
-    console.log ('[' + (d()) + '] [music] ' + whoText (who) + 'перемотал трек на ' + fmtDur (to) + ': ' + (t.title || 'трек'));
+    musicEvent (guildId, whoText (who) + 'перемотал трек на ' + fmtDur (to) + ': ' + (t.title || 'трек'),
+        '⏩ **' + (who || 'кто-то') + '** перемотал на ' + fmtDur (to) + ': **' + (t.title || 'трек') + '**');
     return {
         ok: true,
         text: '⏩ ' + title + ' -- продолжаю с `' + fmtDur (to) + '`' +
@@ -20640,6 +20676,14 @@ function musicEventLog (guildId, text)
         logTo (ch).send ({ content: text, allowedMentions: { parse: [] } }).catch (() => { });
     }
     catch (e) { }
+}
+
+// v2.203 -- одно событие музыки сразу в ДВУХ местах: строка в консоль и та же мысль (с датой и временем)
+// в журнал сервера. Так каждое событие видно и в живом логе, и в канале журнала, без двух списков правды.
+function musicEvent (guildId, consoleText, journalText)
+{
+    console.log ('[' + (d()) + '] [music] ' + consoleText);
+    musicEventLog (guildId, (journalText || consoleText) + ' · ' + d ());
 }
 
 function musicNotice (guildId, text)
@@ -23387,6 +23431,11 @@ client.on ('interactionCreate', async (interaction) =>
             schedulePresence (true);
             checkListeners (guildId);
             qRedraw ();
+            musicEvent (guildId,
+                whoText (interaction.member ? uuu (interaction.member) : interaction.user.username) + 'поставил на паузу' +
+                (m.current ? ': ' + (m.current.title || 'трек') : ''),
+                '⏸ **' + (interaction.member ? uuu (interaction.member) : interaction.user.username) + '** поставил на паузу' +
+                (m.current ? ': **' + (m.current.title || 'трек') + '**' : ''));
             return interaction.reply ('⏸ Пауза.');
         }
         else if (name === 'resume')
@@ -23397,6 +23446,11 @@ client.on ('interactionCreate', async (interaction) =>
             scheduleVoiceStatus (guildId, true);
             schedulePresence (true);
             qRedraw ();
+            musicEvent (guildId,
+                whoText (interaction.member ? uuu (interaction.member) : interaction.user.username) + 'продолжил' +
+                (m.current ? ': ' + (m.current.title || 'трек') : ''),
+                '▶️ **' + (interaction.member ? uuu (interaction.member) : interaction.user.username) + '** продолжил' +
+                (m.current ? ': **' + (m.current.title || 'трек') + '**' : ''));
             return interaction.reply ('▶️ Продолжаем.');
         }
         else if (name === 'nowplaying')
@@ -23444,8 +23498,8 @@ client.on ('interactionCreate', async (interaction) =>
             const playingNow = !!(m.current && String (m.current.byId || '') === String (targetId));
             if (!res.on)
             {
-                console.log ('[' + (d()) + '] [music] ' + whoText (who) + 'выключил режим повтора для ' +
-                    targetName + ' (в очереди было ' + inQ + ')');
+                musicEvent (guildId, whoText (who) + 'выключил режим повтора для ' + targetName + ' (в очереди было ' + inQ + ')',
+                    '🔁 **' + who + '** выключил повтор для **' + targetName + '** (в очереди было ' + inQ + ')');
                 qRedraw ();
                 return interaction.reply
                 ({
@@ -23455,8 +23509,8 @@ client.on ('interactionCreate', async (interaction) =>
                     flags: MessageFlags.Ephemeral,
                 });
             }
-            console.log ('[' + (d()) + '] [music] ' + whoText (who) + 'включил режим повтора для ' +
-                targetName + ' (в очереди ' + inQ + ')');
+            musicEvent (guildId, whoText (who) + 'включил режим повтора для ' + targetName + ' (в очереди ' + inQ + ')',
+                '🔁 **' + who + '** включил повтор для **' + targetName + '** (в очереди ' + inQ + ')');
             qRedraw ();
             return interaction.reply
             ({
