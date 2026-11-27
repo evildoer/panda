@@ -20686,6 +20686,45 @@ function musicEvent (guildId, consoleText, journalText)
     musicEventLog (guildId, (journalText || consoleText) + ' · ' + d ());
 }
 
+// v2.203 -- пауза и продолжение вынесены из обработчика команды: событие в журнал пишется ровно одно,
+// и его можно прогнать стендом (из обработчика такое не достать). Поведение то же.
+function musicPause (guildId, who)
+{
+    const m = musicOf (guildId);
+    if (!m || !m.player) return false;
+    m.player.pause ();
+    m.playedMs = playedMsOf (m);
+    m.playingSince = null;
+    saveMusicState (guildId);
+    scheduleVoiceStatus (guildId, true);
+    schedulePresence (true);
+    checkListeners (guildId);
+    musicEvent (guildId, whoText (who) + 'поставил на паузу' + (m.current ? ': ' + (m.current.title || 'трек') : ''),
+        '⏸ **' + (who || 'кто-то') + '** поставил на паузу' + (m.current ? ': **' + (m.current.title || 'трек') + '**' : ''));
+    return true;
+}
+function musicResume (guildId, who)
+{
+    const m = musicOf (guildId);
+    if (!m || !m.player) return false;
+    m.player.unpause ();
+    m.playingSince = Date.now ();
+    saveMusicState (guildId);
+    scheduleVoiceStatus (guildId, true);
+    schedulePresence (true);
+    musicEvent (guildId, whoText (who) + 'продолжил' + (m.current ? ': ' + (m.current.title || 'трек') : ''),
+        '▶️ **' + (who || 'кто-то') + '** продолжил' + (m.current ? ': **' + (m.current.title || 'трек') + '**' : ''));
+    return true;
+}
+function repeatEventLog (guildId, who, on, targetName, inQ)
+{
+    musicEvent (guildId,
+        whoText (who) + (on ? 'включил режим повтора для ' : 'выключил режим повтора для ') + targetName +
+        ' (в очереди ' + (on ? '' : 'было ') + inQ + ')',
+        '🔁 **' + (who || 'кто-то') + '** ' + (on ? 'включил' : 'выключил') + ' повтор для **' + targetName +
+        '** (в очереди ' + (on ? '' : 'было ') + inQ + ')');
+}
+
 function musicNotice (guildId, text)
 {
     const m = $music[guildId];
@@ -23423,34 +23462,14 @@ client.on ('interactionCreate', async (interaction) =>
         }
         else if (name === 'pause')
         {
-            m.player.pause ();
-            m.playedMs = playedMsOf (m);
-            m.playingSince = null;
-            saveMusicState (guildId);
-            scheduleVoiceStatus (guildId, true);
-            schedulePresence (true);
-            checkListeners (guildId);
+            musicPause (guildId, interaction.member ? uuu (interaction.member) : interaction.user.username);
             qRedraw ();
-            musicEvent (guildId,
-                whoText (interaction.member ? uuu (interaction.member) : interaction.user.username) + 'поставил на паузу' +
-                (m.current ? ': ' + (m.current.title || 'трек') : ''),
-                '⏸ **' + (interaction.member ? uuu (interaction.member) : interaction.user.username) + '** поставил на паузу' +
-                (m.current ? ': **' + (m.current.title || 'трек') + '**' : ''));
             return interaction.reply ('⏸ Пауза.');
         }
         else if (name === 'resume')
         {
-            m.player.unpause ();
-            m.playingSince = Date.now ();
-            saveMusicState (guildId);
-            scheduleVoiceStatus (guildId, true);
-            schedulePresence (true);
+            musicResume (guildId, interaction.member ? uuu (interaction.member) : interaction.user.username);
             qRedraw ();
-            musicEvent (guildId,
-                whoText (interaction.member ? uuu (interaction.member) : interaction.user.username) + 'продолжил' +
-                (m.current ? ': ' + (m.current.title || 'трек') : ''),
-                '▶️ **' + (interaction.member ? uuu (interaction.member) : interaction.user.username) + '** продолжил' +
-                (m.current ? ': **' + (m.current.title || 'трек') + '**' : ''));
             return interaction.reply ('▶️ Продолжаем.');
         }
         else if (name === 'nowplaying')
@@ -23498,8 +23517,7 @@ client.on ('interactionCreate', async (interaction) =>
             const playingNow = !!(m.current && String (m.current.byId || '') === String (targetId));
             if (!res.on)
             {
-                musicEvent (guildId, whoText (who) + 'выключил режим повтора для ' + targetName + ' (в очереди было ' + inQ + ')',
-                    '🔁 **' + who + '** выключил повтор для **' + targetName + '** (в очереди было ' + inQ + ')');
+                repeatEventLog (guildId, who, false, targetName, inQ);
                 qRedraw ();
                 return interaction.reply
                 ({
@@ -23509,8 +23527,7 @@ client.on ('interactionCreate', async (interaction) =>
                     flags: MessageFlags.Ephemeral,
                 });
             }
-            musicEvent (guildId, whoText (who) + 'включил режим повтора для ' + targetName + ' (в очереди ' + inQ + ')',
-                '🔁 **' + who + '** включил повтор для **' + targetName + '** (в очереди ' + inQ + ')');
+            repeatEventLog (guildId, who, true, targetName, inQ);
             qRedraw ();
             return interaction.reply
             ({
