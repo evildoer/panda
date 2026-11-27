@@ -16520,6 +16520,17 @@ function musicAddApply (interaction, guildId, m, tracks, query, where, opts = {}
                             : '')
                         : (ins.blockBefore ? '\n📚 Пачка встала в конец твоего блока в очереди (№' + (ins.insAt + 1) + ').' : ''))) +
         (opts.warn || '');
+    // v2.202 -- добавление видно и в консоли, и в журнале сервера: кто, что, куда и сколько стало в очереди.
+    const _nAdd = tracks.length;
+    const _firstAdd = clipText (String (tracks[0].title || query || tracks[0].url || 'трек'), 90);
+    const _addWhat = _nAdd > 1
+        ? (_nAdd + ' ' + plural (_nAdd, 'трек', 'трека', 'треков') + ', первый -- «' + _firstAdd + '»')
+        : ('«' + _firstAdd + '»');
+    const _addFrom = tracks[0].author ? ' (канал ' + clipText (String (tracks[0].author), 60) + ')' : '';
+    console.log ('[' + (d()) + '] [music] ' + whoText (interaction.user.username) + 'добавил в очередь ' +
+        _addWhat + _addFrom + ', теперь в очереди ' + m.tracks.length);
+    musicEventLog (guildId, '🎶 **' + interaction.user.username + '** добавил ' + _addWhat + _addFrom +
+        ' в <#' + interaction.channelId + '>, в очереди ' + m.tracks.length + ' · ' + d ());
     queueMsgRedraw (guildId, 300).catch (() => {});
     if (ins.shouldStart) playNext (guildId);
     return { ins: ins, text: text, askMoveRow: (where && where.askMoveRow) || null };
@@ -18506,6 +18517,10 @@ function queueClearAuthor (guildId, targetId, who)
     console.log ('[' + (d()) + '] [music] ' + whoText (who) + 'убрал из очереди треки ' +
         (target ? u (target) : 'без автора') + ' (' + w.goneQ + ')' +
         (w.playing ? ' -- и прервал его играющий трек' : (w.waiting ? ' -- и его ждущий трек' : '')));
+    musicEventLog (guildId, '🧹 **' + (who || 'кто-то') + '** убрал из очереди треки ' +   // v2.202: и в журнал сервера
+        (target ? u (target) : 'без автора') + ' (' + w.goneQ + ')' +
+        (w.playing ? ', играющий прерван' : (w.waiting ? ', ждущий тоже убран' : '')) +
+        ', в очереди осталось ' + w.left + ' · ' + d ());
     return {
         ok: true,
         text: '🧹 Убрал ' + w.goneQ + ' ' + plural (w.goneQ, 'трек', 'трека', 'треков') +
@@ -18753,6 +18768,10 @@ function queueClear (guildId, who, opts = {})
         (w.playing ? ' и снял играющий трек' : (w.waiting ? ' и снял ждущий трек' : '')) +
         (w.left ? ', в очереди осталось ' + w.left : '') +
         (left ? ', вышел из канала' : ''));
+    musicEventLog (guildId, '🧹 **' + (who || 'кто-то') + '** ' + head +      // v2.202: и в журнал сервера
+        (w.playing ? ' и снял играющий трек' : (w.waiting ? ' и снял ждущий трек' : '')) +
+        (w.left ? ', в очереди осталось ' + w.left : '') +
+        (left ? ', вышел из канала' : '') + ' · ' + d ());
     const bits = [];
     if (w.goneQ) bits.push (w.goneQ + ' ' + plural (w.goneQ, 'трек', 'трека', 'треков'));
     if (w.playing) bits.push ('играющий **' + w.playing + '**' +
@@ -20606,6 +20625,21 @@ async function dpiStartFromDiscord ()            // кнопка у владел
             '\n_Голос проверяется отдельно, когда бот выключен: node . obhod --pick --voice._');
     }
     finally { dpiHealBusy = false; }
+}
+
+// v2.202 -- события музыки в ЖУРНАЛ СЕРВЕРА (log_channel): кто добавил, кто очистил. Раньше об этом знала
+// только консоль бота и личное подтверждение нажавшему, а в журнале сервера записей не было вовсе.
+// Нет канала журнала в конфиге -- просто молчим; упоминания в тексте не пингуют (parse: []).
+function musicEventLog (guildId, text)
+{
+    try
+    {
+        const srv = SERVERS[guildId];
+        const ch = srv && srv.log_channel;
+        if (!ch || !text) return;
+        logTo (ch).send ({ content: text, allowedMentions: { parse: [] } }).catch (() => { });
+    }
+    catch (e) { }
 }
 
 function musicNotice (guildId, text)
