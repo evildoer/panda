@@ -8799,7 +8799,8 @@ function dohAsk (resolver, name, timeoutMs)
                     const ans = (j.Answer || []).filter (a => a.type === 1);
                     const ips = ans.map (a => a.data).filter (x => !dohBadIp (x));
                     const ttl = Math.min.apply (null, ans.map (a => Number (a.TTL) || 0).filter (t => t > 0).concat ([0]));
-                    fin (ips.length ? { ip: ips[0], ips: ips, ttl: ttl, ad: !!j.AD } : null);   // j.AD -- ответ подписан и проверен справочником
+                    // Status 3 -- NXDOMAIN: имени нет (это не сбой связи, такое имя бессмысленно спрашивать снова)
+                    fin (ips.length ? { ip: ips[0], ips: ips, ttl: ttl, ad: !!j.AD } : (Number (j.Status) === 3 ? { nx: true } : null));   // j.AD -- ответ подписан и проверен справочником
                 }
                 catch (e) { fin (null); }
             });
@@ -8886,7 +8887,8 @@ function plainDnsAsk (server, name, timeoutMs = 1500)
                 const ips = dnsParseA (m, id);
                 try { sock.close (); } catch (e) { }
                 const good = ips ? ips.filter (x => !dohBadIp (x)) : [];   // подмена (127./10./192.168. и т.п.) -- не беру
-                fin (good.length ? { ip: good[0], ips: good, ttl: 0 } : null);
+                const rcode = m.length >= 12 ? (m[3] & 0x0f) : 0;          // 3 -- NXDOMAIN: такого имени нет
+                fin (good.length ? { ip: good[0], ips: good, ttl: 0 } : (rcode === 3 ? { nx: true } : null));
             });
             sock.on ('error', () => { clearTimeout (t); try { sock.close (); } catch (e) { } fin (null); });
             sock.send (body, 53, server, e => { if (e) { clearTimeout (t); try { sock.close (); } catch (e2) { } fin (null); } });
@@ -10983,7 +10985,7 @@ async function ipResolve (name)
         }
     }
     const all = await dnsAskAll (name);
-    if (all && all.list.length)
+    if (all && all.list && all.list.length)      // v2.201: у «такого имени нет» списка нет -- не падаю на этом
     {
         const best = all.list[0];
         const ips = all.list.map (x => x.ip);
@@ -11024,6 +11026,8 @@ let dnsWarmLastFail = 0;     // сколько имён не ответило в
 let dnsWarmFailAt = 0;       // когда последний раз говорил о сбоях (v2.199: не чаще раза в полчаса)
 const DNS_WARM_FAIL_QUIET_MS = 30 * 60 * 1000;
 const DNS_WARM_FAIL_RETRY_MS = 10 * 60 * 1000;   // имя, которое не ответило, спрашиваю снова через 10 минут
+const DNS_DEAD_AFTER = 2;                        // v2.201: столько раз подряд «такого имени нет» -- и имя замолкает
+const DNS_DEAD_PARK_MS = 24 * 60 * 60 * 1000;   // ...на сутки: мёртвые концы не занимают проход и не шумят в логе
 const dnsWarmRetry = {};     // имя -> до какого времени не спрашивать (иначе одни и те же имена занимают весь проход)
 
 const DNS_ASK_DEADLINE_MS = 4000;   // одному имени -- не больше этого на все источники: иначе проход тянется
@@ -11043,7 +11047,10 @@ async function dnsAskAll (name, deadlineMs)
         const done = v =>
         {
             const ms = Date.now () - t0;
+            // v2.201: пропускаю дальше и ответ «такого имени нет» ({ nx: true }) -- раньше он терялся здесь,
+            // и до разбора в dnsAskAll не доходил ни разу (поэтому мёртвые имена не парковались)
             if (v && v.ip) { dnsNoteSrc (q.src, true, ms); res ({ q: q, got: v, ms: ms }); }
+            else if (v && v.nx) { dnsNoteSrc (q.src, false, 0); res ({ q: q, got: v, ms: ms }); }
             else { dnsNoteSrc (q.src, false, 0); res (null); }
         };
         try
@@ -11062,12 +11069,26 @@ async function dnsAskAll (name, deadlineMs)
             else require ('dns').promises.lookup (name).then (r =>
             {
                 done ((r && r.address && !dohBadIp (r.address)) ? { ip: r.address, ips: [r.address], ttl: 0 } : null);
-            }, () => done (null));
+            }, err =>
+            {
+                // ENOTFOUND/ENODATA -- «такого имени нет», а не «справочник молчит»: второе лечится ожиданием, первое -- нет
+                done (/ENOTFOUND|ENODATA/.test (String ((err && err.code) || '')) ? { nx: true } : null);
+            });
         }
         catch (e) { done (null); }
     })));
-    const ok = got.filter (x => x);
-    if (!ok.length) return null;
+    const ok = got.filter (x => x && !(x.got && x.got.nx));
+    if (!ok.length)
+    {
+        // v2.201: ни один справочник не дал адреса, а хотя бы ДВА независимых сказали «такого имени нет» (NXDOMAIN).
+        // Требовать ответа от ВСЕХ нельзя: часть справочников просто молчит (блокировки) -- тогда бы мёртвые
+        // имена не парковались никогда, что и было видно на живой книге.
+        const nxList = got.filter (x => x && x.got && x.got.nx);
+        // хватает двух независимых «такого имени нет» либо одного от системного резолвера: он местный,
+        // его не блокируют, и именно им пользуется музыка.
+        if (nxList.length >= 2 || nxList.some (x => x.q.kind === 'system')) return { nx: true };
+        return null;
+    }
     const cnt = {}, ad = {};                    // сколько источников назвали адрес и были ли подписанные ответы
     for (const x of ok)
         for (const ip of (x.got.ips && x.got.ips.length ? x.got.ips : [x.got.ip]))
@@ -11098,6 +11119,7 @@ async function dnsAskSources (name, deadlineMs)   // то же, но одним 
 {
     const all = await dnsAskAll (name, deadlineMs);
     if (!all) return null;
+    if (all.nx) return { nx: true };      // v2.201: имени нет -- адресов не будет, вызывающий решает сам
     return { ip: all.list[0].ip, ips: all.list.map (x => x.ip), ttl: all.ttl, src: all.src, ms: all.ms, info: all.info };
 }
 
@@ -11258,8 +11280,8 @@ async function dnsWarm ()               // книга живёт как спра
     if (dnsWarmBusy) return null;
     dnsWarmBusy = true;
     const started = Date.now ();
-    let filled = 0, ips = 0, failed = 0;
-    const failNames = [];
+    let filled = 0, ips = 0, failed = 0, parked = 0;
+    const failNames = [], nxNames = [];
     try
     {
         const book = await dnsBookLoad ();
@@ -11267,13 +11289,18 @@ async function dnsWarm ()               // книга живёт как спра
         for (const n of Object.keys (dnsWarmRetry)) if (dnsWarmRetry[n] <= now) delete dnsWarmRetry[n];
         const stale = name =>
         {
-            if (dnsWarmRetry[name]) return false;                      // недавно не ответило -- не долблю каждую минуту
             const rec = book[name];
+            if (rec && rec.dead && rec.dead > now) return false;       // v2.201: имени нет -- не спрашиваю сутки
+            if (dnsWarmRetry[name]) return false;                      // недавно не ответило -- не долблю каждую минуту
             return !(rec && rec.ips && rec.ips.length && (now - (rec.at || 0)) < (rec.ttl || DNS_TTL_DEF));
         };
-        const todo = [];
+        // v2.201: в проход беру САМЫЕ ДАВНИЕ записи, а не первые по порядку в книге. Раньше одни и те же
+        // первые 24 имени обновлялись каждую минуту, а хвост книги (больше тысячи имён) стоял неделями.
+        const overdue = [];
         for (const n of Object.keys (book))                                // список имён не задаю: держу свежим всё, что есть в книге
-            if (todo.length < DNS_WARM_MAX && stale (n)) todo.push (n);
+            if (stale (n)) overdue.push (n);
+        overdue.sort ((a, b) => ((book[a] && book[a].at) || 0) - ((book[b] && book[b].at) || 0));
+        const todo = overdue.slice (0, DNS_WARM_MAX);
         const queue = todo.slice ();
         const worker = async () =>
         {
@@ -11282,6 +11309,22 @@ async function dnsWarm ()               // книга живёт как спра
                 if ((Date.now () - started) > DNS_WARM_MAX_MS) return;      // не затягиваю проход надолго
                 const name = queue.shift ();
                 const got = await dnsAskSources (name);
+                if (got && got.nx)                                   // v2.201: все источники сказали «такого имени нет»
+                {
+                    failed++;
+                    nxNames.push (name);
+                    const rec = book[name] || (book[name] = dnsRecMake (name));
+                    rec.nx = (rec.nx || 0) + 1;
+                    if (rec.nx >= DNS_DEAD_AFTER)
+                    {
+                        rec.dead = Date.now () + DNS_DEAD_PARK_MS;   // замолкает на сутки: спрашивать бессмысленно
+                        rec.nx = 0;
+                        parked++;
+                    }
+                    dnsChanged (name);
+                    dnsWarmRetry[name] = Date.now () + DNS_WARM_FAIL_RETRY_MS;
+                    continue;
+                }
                 if (!got)
                 {
                     failed++;
@@ -11289,6 +11332,8 @@ async function dnsWarm ()               // книга живёт как спра
                     dnsWarmRetry[name] = Date.now () + DNS_WARM_FAIL_RETRY_MS;   // v2.199: не спрашиваю это имя каждую минуту
                     continue;
                 }
+                const prev = book[name];
+                if (prev && (prev.nx || prev.dead)) { delete prev.nx; delete prev.dead; dnsChanged (name); }   // имя ожило
                 delete dnsWarmRetry[name];
                 const rec = await dnsNote (name, got.ips, got.ms, got.src, got.ttl, got.info);
                 filled++;
@@ -11306,10 +11351,12 @@ async function dnsWarm ()               // книга живёт как спра
             if (failed && !quiet)                // v2.199: счёт неответивших скачет 3<->2 -- раньше это был лог каждую минуту
             {
                 dnsWarmFailAt = Date.now ();     // запоминаю: следующее сообщение о сбоях -- не раньше чем через полчаса
-                const shown = failNames.slice (0, 8).join (', ') +
-                    (failNames.length > 8 ? ' и ещё ' + (failNames.length - 8) : '');   // v2.200: какие именно имена, а не только число
+                const allFailed = failNames.concat (nxNames);
+                const shown = allFailed.slice (0, 8).join (', ') +
+                    (allFailed.length > 8 ? ' и ещё ' + (allFailed.length - 8) : '');   // v2.200: какие именно имена, а не только число
                 console.error ('[' + (d()) + '] [net] книга имя↔адрес: в этот раз не ответили ' + failed +
                     ' из ' + todo.length + ' (обновил ' + filled + '; в прошлый раз ' + dnsWarmLastFail + '): ' + shown +
+                    (parked ? ' [мёртвых имён запарковал на сутки: ' + parked + ']' : '') +
                     ' -- эти имена спрошу заново через 10 минут, про сбои говорю не чаще раза в полчаса, музыка от этого не встаёт');
             }
             else if (!failed && (dnsWarmRuns === 1 || (dnsWarmRuns % 60) === 1))
@@ -11318,7 +11365,7 @@ async function dnsWarm ()               // книга живёт как спра
                     (Math.round ((Date.now () - started) / 100) / 10) + ' с; в остальное время молчу, скажу при переменах');
             dnsWarmLastFail = failed;
         }
-        return { filled: filled, ips: ips, failed: failed, failNames: failNames };
+        return { filled: filled, ips: ips, failed: failed, failNames: failNames, nx: nxNames.length, parked: parked };
     }
     catch (e) { return null; }
     finally { dnsWarmBusy = false; }
