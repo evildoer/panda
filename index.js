@@ -11020,7 +11020,11 @@ const DNS_WARM_MAX = 24;       // столько имён за один прох
 const DNS_WARM_MAX_MS = 8000;
 let dnsWarmBusy = false;
 let dnsWarmRuns = 0;         // сколько проходов книги прошло -- чтобы говорить раз в час, а не каждую минуту
-let dnsWarmLastFail = 0;     // сколько имён не ответило в прошлый раз -- про сбои говорю, только когда число меняется
+let dnsWarmLastFail = 0;     // сколько имён не ответило в прошлый раз -- для памяти, в лог само по себе не идёт
+let dnsWarmFailAt = 0;       // когда последний раз говорил о сбоях (v2.199: не чаще раза в полчаса)
+const DNS_WARM_FAIL_QUIET_MS = 30 * 60 * 1000;
+const DNS_WARM_FAIL_RETRY_MS = 10 * 60 * 1000;   // имя, которое не ответило, спрашиваю снова через 10 минут
+const dnsWarmRetry = {};     // имя -> до какого времени не спрашивать (иначе одни и те же имена занимают весь проход)
 
 const DNS_ASK_DEADLINE_MS = 4000;   // одному имени -- не больше этого на все источники: иначе проход тянется
 
@@ -11255,12 +11259,15 @@ async function dnsWarm ()               // книга живёт как спра
     dnsWarmBusy = true;
     const started = Date.now ();
     let filled = 0, ips = 0, failed = 0;
+    const failNames = [];
     try
     {
         const book = await dnsBookLoad ();
         const now = Date.now ();
+        for (const n of Object.keys (dnsWarmRetry)) if (dnsWarmRetry[n] <= now) delete dnsWarmRetry[n];
         const stale = name =>
         {
+            if (dnsWarmRetry[name]) return false;                      // недавно не ответило -- не долблю каждую минуту
             const rec = book[name];
             return !(rec && rec.ips && rec.ips.length && (now - (rec.at || 0)) < (rec.ttl || DNS_TTL_DEF));
         };
@@ -11275,7 +11282,14 @@ async function dnsWarm ()               // книга живёт как спра
                 if ((Date.now () - started) > DNS_WARM_MAX_MS) return;      // не затягиваю проход надолго
                 const name = queue.shift ();
                 const got = await dnsAskSources (name);
-                if (!got) { failed++; continue; }
+                if (!got)
+                {
+                    failed++;
+                    failNames.push (name);
+                    dnsWarmRetry[name] = Date.now () + DNS_WARM_FAIL_RETRY_MS;   // v2.199: не спрашиваю это имя каждую минуту
+                    continue;
+                }
+                delete dnsWarmRetry[name];
                 const rec = await dnsNote (name, got.ips, got.ms, got.src, got.ttl, got.info);
                 filled++;
                 ips += (rec && rec.ips ? rec.ips.length : (got.ips || []).length);
@@ -11288,16 +11302,21 @@ async function dnsWarm ()               // книга живёт как спра
         if (BOT_RUN)
         {
             dnsWarmRuns++;
-            if (failed && failed !== dnsWarmLastFail)
+            const quiet = (Date.now () - dnsWarmFailAt) < DNS_WARM_FAIL_QUIET_MS;   // про сбои -- не чаще раза в полчаса
+            if (failed && !quiet)                // v2.199: счёт неответивших скачет 3<->2 -- раньше это был лог каждую минуту
+            {
+                dnsWarmFailAt = Date.now ();     // запоминаю: следующее сообщение о сбоях -- не раньше чем через полчаса
                 console.error ('[' + (d()) + '] [net] книга имя↔адрес: в этот раз не ответили ' + failed +
-                    ' из ' + todo.length + ' (обновил ' + filled + ') -- спрошу заново по сроку, музыка от этого не встаёт');
+                    ' из ' + todo.length + ' (обновил ' + filled + '; в прошлый раз ' + dnsWarmLastFail + ') -- ' +
+                    'эти имена спрошу заново через 10 минут, про сбои говорю не чаще раза в полчаса, музыка от этого не встаёт');
+            }
             else if (!failed && (dnsWarmRuns === 1 || (dnsWarmRuns % 60) === 1))
                 console.log ('[' + (d()) + '] [net] книга имя↔адрес: раз в час докладываю -- всё отвечает, ' +
                     'за проход обновляю ' + filled + ' имён (адресов ' + ips + '), время ' +
                     (Math.round ((Date.now () - started) / 100) / 10) + ' с; в остальное время молчу, скажу при переменах');
             dnsWarmLastFail = failed;
         }
-        return { filled: filled, ips: ips, failed: failed };
+        return { filled: filled, ips: ips, failed: failed, failNames: failNames };
     }
     catch (e) { return null; }
     finally { dnsWarmBusy = false; }
